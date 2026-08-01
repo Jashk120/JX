@@ -1,0 +1,9 @@
+# crypto/Cargo.toml
+[package]
+name = "crypto"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+primitives = {workspace = true}
+
