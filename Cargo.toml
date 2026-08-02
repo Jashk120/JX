@@ -14,9 +14,10 @@ rust-version = "1.85"
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
+ed25519-dalek = "2.2.0"
 anyhow = "1"
 thiserror = "2"
-primitives = { path = "primitives", version = "0.0.1" }
+primitives = { path = "primitives"}
 sha2 = "0.10"
 
 [workspace.lints.rust]

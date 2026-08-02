@@ -46,10 +46,10 @@
 
 ### Hashing
 
-- [ ] Hashable trait
-- [ ] SHA-256 implementation
-- [ ] Canonical serialization
-- [ ] Event hashing tests
+- [x] Hashable trait
+- [x] SHA-256 implementation
+- [x] Canonical serialization
+- [~] Event hashing tests
 
 ### Signatures
 

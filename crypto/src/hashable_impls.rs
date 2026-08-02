@@ -10,7 +10,7 @@ use sha2::{
 };
 
 use crate::canonical::CanonicalEncode;
-use crate::traits::Hashable;
+use crate::hash::Hashable;
 
 impl Hashable for Event {
     type Hash = EventHash;
@@ -36,18 +36,19 @@ impl Hashable for Transaction {
 
 #[cfg(test)]
 mod tests {
+    use primitives::{
+        NodeId,
+        Signature,
+        Timestamp,
+        Transaction,
+        UnsignedEvent,
+    };
+
     use super::*;
-    use primitives::{NodeId, Timestamp, Signature, Transaction};
 
     fn make_event(payload: Vec<Transaction>) -> Event {
-        Event::new(
-            NodeId::new(1),
-            None,
-            None,
-            Timestamp::new(123),
-            payload,
-            Signature::default(),
-        )
+        UnsignedEvent::new(NodeId::new(1), None, None, Timestamp::new(123), payload)
+            .finalize(Signature::default())
     }
 
     #[test]

@@ -5,26 +5,25 @@ use crate::timestamp::Timestamp;
 use crate::transaction::Transaction;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Event {
+pub struct UnsignedEvent {
     creator: NodeId,
     self_parent: Option<EventHash>,
     other_parent: Option<EventHash>,
     timestamp: Timestamp,
     payload: Vec<Transaction>,
-    signature: Signature,
 }
 
-impl Event {
+impl UnsignedEvent {
     pub fn new(
         creator: NodeId,
         self_parent: Option<EventHash>,
         other_parent: Option<EventHash>,
         timestamp: Timestamp,
         payload: Vec<Transaction>,
-        signature: Signature,
     ) -> Self {
-        Self { creator, self_parent, other_parent, timestamp, payload, signature }
+        Self { creator, self_parent, other_parent, timestamp, payload }
     }
+
     pub fn creator(&self) -> &NodeId {
         &self.creator
     }
@@ -45,10 +44,47 @@ impl Event {
         &self.payload
     }
 
+    pub fn finalize(self, signature: Signature) -> Event {
+        Event { unsigned: self, signature }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Event {
+    unsigned: UnsignedEvent,
+    signature: Signature,
+}
+
+impl Event {
+    pub fn unsigned(&self) -> &UnsignedEvent {
+        &self.unsigned
+    }
+
+    pub fn creator(&self) -> &NodeId {
+        self.unsigned.creator()
+    }
+
+    pub fn self_parent(&self) -> Option<&EventHash> {
+        self.unsigned.self_parent()
+    }
+
+    pub fn other_parent(&self) -> Option<&EventHash> {
+        self.unsigned.other_parent()
+    }
+
+    pub fn timestamp(&self) -> Timestamp {
+        self.unsigned.timestamp()
+    }
+
+    pub fn payload(&self) -> &[Transaction] {
+        self.unsigned.payload()
+    }
+
     pub fn signature(&self) -> &Signature {
         &self.signature
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -58,14 +94,8 @@ mod tests {
         other_parent: Option<EventHash>,
         payload: Vec<Transaction>,
     ) -> Event {
-        Event::new(
-            NodeId::new(1),
-            self_parent,
-            other_parent,
-            Timestamp::new(123),
-            payload,
-            Signature::default(),
-        )
+        UnsignedEvent::new(NodeId::new(1), self_parent, other_parent, Timestamp::new(123), payload)
+            .finalize(Signature::default())
     }
 
     #[test]
@@ -74,14 +104,8 @@ mod tests {
         let timestamp = 12345;
         let signature = Signature::default();
 
-        let event = Event::new(
-            creator,
-            None,
-            None,
-            Timestamp::new(timestamp),
-            Vec::new(),
-            signature.clone(),
-        );
+        let event = UnsignedEvent::new(creator, None, None, Timestamp::new(timestamp), Vec::new())
+            .finalize(signature.clone());
 
         assert_eq!(event.creator(), &creator);
         assert_eq!(event.self_parent(), None);
@@ -113,5 +137,4 @@ mod tests {
         assert_eq!(event.payload()[0], tx1);
         assert_eq!(event.payload()[1], tx2);
     }
-    
 }
