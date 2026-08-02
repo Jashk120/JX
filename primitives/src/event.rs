@@ -1,6 +1,8 @@
 use crate::node::NodeId;
-use crate::types::{Signature, Timestamp};
+use crate::signature::Signature;
+use crate::timestamp::Timestamp;
 use crate::transaction::Transaction;
+use crate::event_hash::EventHash;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Event {
@@ -12,8 +14,6 @@ pub struct Event {
     signature: Signature,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct EventHash([u8; 32]);
 
 impl Event {
     pub fn new(
@@ -58,16 +58,6 @@ impl Event {
     }
 
 }
-impl EventHash {
-    pub fn new(bytes: [u8; 32]) -> Self {
-        Self(bytes)
-    }
-
-    pub fn as_bytes(&self) -> &[u8; 32] {
-        &self.0
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -81,7 +71,7 @@ mod tests {
             NodeId::new(1),
             self_parent,
             other_parent,
-            123,
+            Timestamp::new(123),
             payload,
             Signature::default(),
         )
@@ -97,7 +87,7 @@ mod tests {
             creator,
             None,
             None,
-            timestamp,
+            Timestamp::new(timestamp),
             Vec::new(),
             signature.clone(),
         );
@@ -105,7 +95,7 @@ mod tests {
         assert_eq!(event.creator(), &creator);
         assert_eq!(event.self_parent(), None);
         assert_eq!(event.other_parent(), None);
-        assert_eq!(event.timestamp(), timestamp);
+        assert_eq!(event.timestamp(), Timestamp::new(timestamp));
         assert!(event.payload().is_empty());
         assert_eq!(event.signature(), &signature);
     }
