@@ -1,7 +1,7 @@
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct EventHash([u8; 32]);
+pub struct TransactionHash([u8; 32]);
 
-impl EventHash {
+impl TransactionHash {
     pub fn new(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }

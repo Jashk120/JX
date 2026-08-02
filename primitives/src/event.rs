@@ -1,8 +1,8 @@
+use crate::event_hash::EventHash;
 use crate::node::NodeId;
 use crate::signature::Signature;
 use crate::timestamp::Timestamp;
 use crate::transaction::Transaction;
-use crate::event_hash::EventHash;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Event {
@@ -14,7 +14,6 @@ pub struct Event {
     signature: Signature,
 }
 
-
 impl Event {
     pub fn new(
         creator: NodeId,
@@ -24,14 +23,7 @@ impl Event {
         payload: Vec<Transaction>,
         signature: Signature,
     ) -> Self {
-        Self {
-            creator,
-            self_parent,
-            other_parent,
-            timestamp,
-            payload,
-            signature,
-        }
+        Self { creator, self_parent, other_parent, timestamp, payload, signature }
     }
     pub fn creator(&self) -> &NodeId {
         &self.creator
@@ -56,7 +48,6 @@ impl Event {
     pub fn signature(&self) -> &Signature {
         &self.signature
     }
-
 }
 #[cfg(test)]
 mod tests {
@@ -105,11 +96,7 @@ mod tests {
         let self_parent = EventHash::new([1; 32]);
         let other_parent = EventHash::new([2; 32]);
 
-        let event = make_event(
-            Some(self_parent.clone()),
-            Some(other_parent.clone()),
-            Vec::new(),
-        );
+        let event = make_event(Some(self_parent.clone()), Some(other_parent.clone()), Vec::new());
 
         assert_eq!(event.self_parent(), Some(&self_parent));
         assert_eq!(event.other_parent(), Some(&other_parent));
@@ -120,14 +107,11 @@ mod tests {
         let tx1 = Transaction::default();
         let tx2 = Transaction::default();
 
-        let event = make_event(
-            None,
-            None,
-            vec![tx1.clone(), tx2.clone()],
-        );
+        let event = make_event(None, None, vec![tx1.clone(), tx2.clone()]);
 
         assert_eq!(event.payload().len(), 2);
         assert_eq!(event.payload()[0], tx1);
         assert_eq!(event.payload()[1], tx2);
     }
+    
 }

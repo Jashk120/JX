@@ -1,7 +1,5 @@
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Timestamp(u64);
-
 
 impl Timestamp {
     pub fn new(value: u64) -> Self {

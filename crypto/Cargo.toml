@@ -5,5 +5,5 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-primitives = {workspace = true}
-
+primitives  =   {workspace = true}
+sha2        =   {workspace = true}

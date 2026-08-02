@@ -1,8 +1,6 @@
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Signature([u8; 64]);
 
-
-
 impl Default for Signature {
     fn default() -> Self {
         Self([0; 64])
