@@ -14,6 +14,7 @@ use crate::membership::MembershipRegistry;
 use crate::signable::{
     Signable,
     Verifiable,
+    VerifiedEvent,
     VerifyError,
 };
 
@@ -28,16 +29,15 @@ impl Signable for UnsignedEvent {
 }
 
 impl Verifiable for Event {
-    fn verify(&self, registry: &MembershipRegistry) -> Result<(), VerifyError> {
-        let verifying_key =
-            registry.key_for(self.creator()).ok_or(VerifyError::UnknownSigner)?;
+    fn verify(self, registry: &MembershipRegistry) -> Result<VerifiedEvent, VerifyError> {
+        let verifying_key = registry.key_for(self.creator()).ok_or(VerifyError::UnknownSigner)?;
 
         let signature = DalekSignature::from_bytes(self.signature().as_bytes());
         let bytes = self.unsigned().canonical_bytes();
 
-        verifying_key
-            .verify(&bytes, &signature)
-            .map_err(|_| VerifyError::InvalidSignature)
+        verifying_key.verify(&bytes, &signature).map_err(|_| VerifyError::InvalidSignature)?;
+
+        Ok(VerifiedEvent::new(self))
     }
 }
 
@@ -66,8 +66,12 @@ mod tests {
 
         let event = UnsignedEvent::new(node, None, None, Timestamp::new(100), Vec::new())
             .sign(&signing_key);
+        let expected = event.clone();
 
-        assert_eq!(event.verify(&registry), Ok(()));
+        let verified = event.verify(&registry).expect("signature should verify");
+
+        assert_eq!(verified.event(), &expected);
+        assert_eq!(verified.into_inner(), expected);
     }
 
     #[test]
@@ -81,9 +85,8 @@ mod tests {
 
         // Re-sign correctly, then re-derive an event with a different timestamp
         // but the *original* signature, simulating tampering after signing.
-        let tampered =
-            UnsignedEvent::new(node, None, None, Timestamp::new(999), Vec::new())
-                .finalize(event.signature().clone());
+        let tampered = UnsignedEvent::new(node, None, None, Timestamp::new(999), Vec::new())
+            .finalize(event.signature().clone());
 
         assert_eq!(tampered.verify(&registry), Err(VerifyError::InvalidSignature));
     }

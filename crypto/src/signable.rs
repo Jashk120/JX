@@ -19,9 +19,42 @@ pub trait Signable: CanonicalEncode {
 
 /// A value that carries its own signature and can check it against a
 /// `MembershipRegistry`. This is the mirror image of `Signable`: `Signable`
-/// is "unsigned -> signed", `Verifiable` is "signed -> checked".
-pub trait Verifiable {
-    fn verify(&self, registry: &MembershipRegistry) -> Result<(), VerifyError>;
+/// is "unsigned -> signed", `Verifiable` is "signed -> verified".
+///
+/// Consumes `self` by value and, on success, hands back a `VerifiedEvent` —
+/// the compiler-enforced proof that verification actually happened. There is
+/// no public way to construct a `VerifiedEvent` other than through this
+/// method, so a function that requires one (e.g. `Hashgraph::insert`, once
+/// it exists) cannot be called with an event that was never checked.
+pub trait Verifiable: Sized {
+    fn verify(self, registry: &MembershipRegistry) -> Result<VerifiedEvent, VerifyError>;
+}
+
+/// An `Event` whose signature has been checked against a `MembershipRegistry`.
+///
+/// Deliberately holds an owned `Event`, not a borrow of the registry used to
+/// check it — a `VerifiedEvent` needs to be storable in a `Hashgraph` for the
+/// long term (Phase 3), and tying its lifetime to the registry that verified
+/// it would fight the borrow checker the moment the registry needs to change
+/// (membership updates) while old verified events are still held elsewhere.
+///
+/// `new` is crate-private: the only way to obtain a `VerifiedEvent` from
+/// outside this crate is `Event::verify(registry)`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifiedEvent(primitives::Event);
+
+impl VerifiedEvent {
+    pub(crate) fn new(event: primitives::Event) -> Self {
+        Self(event)
+    }
+
+    pub fn into_inner(self) -> primitives::Event {
+        self.0
+    }
+
+    pub fn event(&self) -> &primitives::Event {
+        &self.0
+    }
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
