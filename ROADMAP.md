@@ -53,10 +53,10 @@
 
 ### Signatures
 
-- [ ] Ed25519
-- [ ] Sign event
-- [ ] Verify event
-- [ ] Signature tests
+- [x] Ed25519
+- [x] Sign event
+- [x] Verify event
+- [x] Signature tests
 
 ---
 
