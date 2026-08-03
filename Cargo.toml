@@ -10,6 +10,11 @@ members = [
 edition = "2024"
 version = "0.0.1"
 rust-version = "1.85"
+members = [
+    "primitives",
+    "crypto",
+    "consensus",
+]
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }

@@ -14,4 +14,5 @@ pub use signable::{
     Signable,
     Verifiable,
     VerifyError,
+     VerifiedEvent
 };

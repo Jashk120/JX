@@ -24,6 +24,24 @@ impl MembershipRegistry {
     pub fn key_for(&self, node: &NodeId) -> Option<&VerifyingKey> {
         self.keys.get(node)
     }
+     /// Deterministic iteration order over registered members, sorted by
+    /// `NodeId`. `consensus` uses this to assign each member a stable
+    /// array index for ancestor bit-vectors — every honest node computes
+    /// the same indexing independently, since it's derived purely from
+    /// `NodeId` ordering.
+    pub fn member_ids(&self) -> Vec<NodeId> {
+        let mut ids: Vec<NodeId> = self.keys.keys().copied().collect();
+        ids.sort();
+        ids
+    }
+
+    pub fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
 }
 
 #[cfg(test)]

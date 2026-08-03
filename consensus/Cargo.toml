@@ -1,0 +1,13 @@
+[package]
+name = "consensus"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+primitives    = { workspace = true }
+crypto        = { workspace = true }
+thiserror     = { workspace = true }
+
+[dev-dependencies]
+ed25519-dalek = { workspace = true, features = ["rand_core"] }
+rand          = "0.8"
