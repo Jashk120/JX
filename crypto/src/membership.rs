@@ -24,7 +24,7 @@ impl MembershipRegistry {
     pub fn key_for(&self, node: &NodeId) -> Option<&VerifyingKey> {
         self.keys.get(node)
     }
-     /// Deterministic iteration order over registered members, sorted by
+    /// Deterministic iteration order over registered members, sorted by
     /// `NodeId`. `consensus` uses this to assign each member a stable
     /// array index for ancestor bit-vectors — every honest node computes
     /// the same indexing independently, since it's derived purely from

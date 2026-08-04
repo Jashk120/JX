@@ -183,6 +183,10 @@ impl Hashgraph {
 
 #[cfg(test)]
 mod tests {
+    use crypto::{
+        Signable,
+        Verifiable,
+    };
     use ed25519_dalek::SigningKey;
     use primitives::{
         NodeId,
@@ -192,10 +196,6 @@ mod tests {
     use rand::rngs::OsRng;
 
     use super::*;
-    use crypto::{
-        Signable,
-        Verifiable,
-    };
 
     fn registry_of(nodes: &[(NodeId, &SigningKey)]) -> MembershipRegistry {
         let mut registry = MembershipRegistry::new();
@@ -212,13 +212,14 @@ mod tests {
         other_parent: Option<EventHash>,
         ts: u64,
     ) -> VerifiedEvent {
-        let event = UnsignedEvent::new(creator, self_parent, other_parent, Timestamp::new(ts), Vec::new())
-            .sign(key);
+        let event =
+            UnsignedEvent::new(creator, self_parent, other_parent, Timestamp::new(ts), Vec::new())
+                .sign(key);
         event.verify(&registry_of(&[(creator, key)])).expect("test event should verify")
     }
 
     #[test]
-    fn inserts_a_genesis_event() {
+    fn genesis_event_gets_seq_one() {
         let key = SigningKey::generate(&mut OsRng);
         let node = NodeId::new(1);
         let registry = registry_of(&[(node, &key)]);
@@ -228,6 +229,119 @@ mod tests {
 
         let record = hg.get(&hash).unwrap();
         assert_eq!(record.seq(), 1);
+    }
+
+    #[test]
+    fn children_of_leaf_event_is_empty() {
+        let key = SigningKey::generate(&mut OsRng);
+        let node = NodeId::new(1);
+        let registry = registry_of(&[(node, &key)]);
+        let mut hg = Hashgraph::new(&registry);
+
+        let hash = hg.insert(verified_event(&key, node, None, None, 100)).unwrap();
+
+        assert_eq!(hg.children(&hash), &[]);
+    }
+
+    #[test]
+    fn children_returns_all_children_for_multi_child_event() {
+        let key = SigningKey::generate(&mut OsRng);
+        let node = NodeId::new(1);
+        let registry = registry_of(&[(node, &key)]);
+        let mut hg = Hashgraph::new(&registry);
+
+        let parent = hg.insert(verified_event(&key, node, None, None, 100)).unwrap();
+        let child1 = hg.insert(verified_event(&key, node, Some(parent), None, 101)).unwrap();
+        let child2 = hg.insert(verified_event(&key, node, Some(parent), None, 102)).unwrap();
+
+        assert_eq!(hg.children(&parent), &[child1, child2]);
+    }
+
+    #[test]
+    fn insert_duplicate_event_returns_already_present() {
+        let key = SigningKey::generate(&mut OsRng);
+        let node = NodeId::new(1);
+        let registry = registry_of(&[(node, &key)]);
+        let mut hg = Hashgraph::new(&registry);
+
+        let ve = verified_event(&key, node, None, None, 100);
+        let hash = hg.insert(ve.clone()).unwrap();
+
+        let err = hg.insert(ve).unwrap_err();
+        assert_eq!(err, InsertError::AlreadyPresent(hash));
+    }
+
+    #[test]
+    fn insert_missing_other_parent_returns_missing_parent() {
+        let key = SigningKey::generate(&mut OsRng);
+        let node = NodeId::new(1);
+        let registry = registry_of(&[(node, &key)]);
+        let mut hg = Hashgraph::new(&registry);
+
+        let ghost = EventHash::new([9; 32]);
+        let err = hg.insert(verified_event(&key, node, None, Some(ghost), 100)).unwrap_err();
+
+        assert_eq!(err, InsertError::MissingParent(ghost));
+    }
+
+    #[test]
+    fn insert_unregistered_creator_returns_unknown_creator() {
+        let key1 = SigningKey::generate(&mut OsRng);
+        let node1 = NodeId::new(1);
+        let registry1 = registry_of(&[(node1, &key1)]);
+        let mut hg = Hashgraph::new(&registry1);
+
+        let key2 = SigningKey::generate(&mut OsRng);
+        let node2 = NodeId::new(2);
+        let ve = verified_event(&key2, node2, None, None, 100);
+
+        let err = hg.insert(ve).unwrap_err();
+        assert_eq!(err, InsertError::UnknownCreator);
+    }
+
+    #[test]
+    fn three_event_self_parent_chain_seqs_and_ancestor_seqs() {
+        let key = SigningKey::generate(&mut OsRng);
+        let node = NodeId::new(1);
+        let registry = registry_of(&[(node, &key)]);
+        let mut hg = Hashgraph::new(&registry);
+        let idx = hg.member_index_of(&node).unwrap();
+
+        let e1 = hg.insert(verified_event(&key, node, None, None, 100)).unwrap();
+        let e2 = hg.insert(verified_event(&key, node, Some(e1), None, 101)).unwrap();
+        let e3 = hg.insert(verified_event(&key, node, Some(e2), None, 102)).unwrap();
+
+        let r1 = hg.get(&e1).unwrap();
+        let r2 = hg.get(&e2).unwrap();
+        let r3 = hg.get(&e3).unwrap();
+
+        assert_eq!((r1.seq(), r2.seq(), r3.seq()), (1, 2, 3));
+        assert_eq!(r1.ancestor_seq(idx), 1);
+        assert_eq!(r2.ancestor_seq(idx), 2);
+        assert_eq!(r3.ancestor_seq(idx), 3);
+    }
+
+    #[test]
+    fn two_creator_graph_ancestor_seqs_tracks_both_creators() {
+        let key_a = SigningKey::generate(&mut OsRng);
+        let key_b = SigningKey::generate(&mut OsRng);
+        let node_a = NodeId::new(1);
+        let node_b = NodeId::new(2);
+        let registry = registry_of(&[(node_a, &key_a), (node_b, &key_b)]);
+        let mut hg = Hashgraph::new(&registry);
+
+        let idx_a = hg.member_index_of(&node_a).unwrap();
+        let idx_b = hg.member_index_of(&node_b).unwrap();
+
+        let event_a = hg.insert(verified_event(&key_a, node_a, None, None, 100)).unwrap();
+        let event_b = hg.insert(verified_event(&key_b, node_b, None, None, 105)).unwrap();
+
+        let event_c =
+            hg.insert(verified_event(&key_a, node_a, Some(event_a), Some(event_b), 110)).unwrap();
+        let record_c = hg.get(&event_c).unwrap();
+
+        assert_eq!(record_c.ancestor_seq(idx_a), 2);
+        assert_eq!(record_c.ancestor_seq(idx_b), 1);
     }
 
     #[test]
@@ -244,20 +358,6 @@ mod tests {
     }
 
     #[test]
-    fn self_parent_chain_increments_sequence() {
-        let key = SigningKey::generate(&mut OsRng);
-        let node = NodeId::new(1);
-        let registry = registry_of(&[(node, &key)]);
-        let mut hg = Hashgraph::new(&registry);
-
-        let e1 = hg.insert(verified_event(&key, node, None, None, 100)).unwrap();
-        let e2 = hg.insert(verified_event(&key, node, Some(e1), None, 101)).unwrap();
-
-        assert_eq!(hg.get(&e2).unwrap().seq(), 2);
-        assert_eq!(hg.children(&e1), &[e2]);
-    }
-
-    #[test]
     fn detects_a_fork() {
         let key = SigningKey::generate(&mut OsRng);
         let node = NodeId::new(1);
@@ -270,6 +370,119 @@ mod tests {
         hg.insert(verified_event(&key, node, Some(e1), None, 999)).unwrap();
 
         let idx = hg.member_index_of(&node).unwrap();
+        assert!(hg.creator_has_known_fork(idx));
+    }
+
+    #[test]
+    fn test_fork_same_self_parent_sets_known_forkers_true() {
+        let key = SigningKey::generate(&mut OsRng);
+        let node = NodeId::new(1);
+        let registry = registry_of(&[(node, &key)]);
+        let mut hg = Hashgraph::new(&registry);
+        let idx = hg.member_index_of(&node).unwrap();
+
+        let e1 = hg.insert(verified_event(&key, node, None, None, 100)).unwrap();
+        let _e2 = hg.insert(verified_event(&key, node, Some(e1), None, 101)).unwrap();
+        assert!(!hg.creator_has_known_fork(idx));
+
+        // Second event from same creator with same self_parent (genuine fork)
+        let _e3 = hg.insert(verified_event(&key, node, Some(e1), None, 102)).unwrap();
+        assert!(hg.creator_has_known_fork(idx));
+    }
+
+    #[test]
+    fn test_creator_without_forks_known_forkers_remains_false() {
+        let key = SigningKey::generate(&mut OsRng);
+        let node = NodeId::new(1);
+        let registry = registry_of(&[(node, &key)]);
+        let mut hg = Hashgraph::new(&registry);
+        let idx = hg.member_index_of(&node).unwrap();
+
+        let e1 = hg.insert(verified_event(&key, node, None, None, 100)).unwrap();
+        assert!(!hg.creator_has_known_fork(idx));
+
+        let e2 = hg.insert(verified_event(&key, node, Some(e1), None, 101)).unwrap();
+        assert!(!hg.creator_has_known_fork(idx));
+
+        let e3 = hg.insert(verified_event(&key, node, Some(e2), None, 102)).unwrap();
+        assert!(!hg.creator_has_known_fork(idx));
+
+        let _e4 = hg.insert(verified_event(&key, node, Some(e3), None, 103)).unwrap();
+        assert!(!hg.creator_has_known_fork(idx));
+    }
+
+    #[test]
+    fn test_fork_by_one_creator_does_not_affect_other_creators() {
+        let key_a = SigningKey::generate(&mut OsRng);
+        let key_b = SigningKey::generate(&mut OsRng);
+        let key_c = SigningKey::generate(&mut OsRng);
+        let node_a = NodeId::new(1);
+        let node_b = NodeId::new(2);
+        let node_c = NodeId::new(3);
+        let registry = registry_of(&[(node_a, &key_a), (node_b, &key_b), (node_c, &key_c)]);
+        let mut hg = Hashgraph::new(&registry);
+
+        let idx_a = hg.member_index_of(&node_a).unwrap();
+        let idx_b = hg.member_index_of(&node_b).unwrap();
+        let idx_c = hg.member_index_of(&node_c).unwrap();
+
+        let e_a1 = hg.insert(verified_event(&key_a, node_a, None, None, 100)).unwrap();
+        let e_b1 = hg.insert(verified_event(&key_b, node_b, None, None, 100)).unwrap();
+        let _e_c1 = hg.insert(verified_event(&key_c, node_c, None, None, 100)).unwrap();
+
+        // Node B forks
+        let _e_b2_1 = hg.insert(verified_event(&key_b, node_b, Some(e_b1), None, 101)).unwrap();
+        let _e_b2_2 = hg.insert(verified_event(&key_b, node_b, Some(e_b1), None, 102)).unwrap();
+
+        // Node A continues linearly
+        let _e_a2 = hg.insert(verified_event(&key_a, node_a, Some(e_a1), None, 101)).unwrap();
+
+        assert!(hg.creator_has_known_fork(idx_b));
+        assert!(!hg.creator_has_known_fork(idx_a));
+        assert!(!hg.creator_has_known_fork(idx_c));
+    }
+
+    #[test]
+    fn test_genesis_fork_detected() {
+        let key = SigningKey::generate(&mut OsRng);
+        let node = NodeId::new(1);
+        let registry = registry_of(&[(node, &key)]);
+        let mut hg = Hashgraph::new(&registry);
+        let idx = hg.member_index_of(&node).unwrap();
+
+        let _e1_a = hg.insert(verified_event(&key, node, None, None, 100)).unwrap();
+        assert!(!hg.creator_has_known_fork(idx));
+
+        // Second event with self_parent = None from same creator
+        let _e1_b = hg.insert(verified_event(&key, node, None, None, 200)).unwrap();
+        assert!(hg.creator_has_known_fork(idx));
+    }
+
+    #[test]
+    fn test_reinsert_exact_same_event_after_fork_returns_already_present() {
+        let key = SigningKey::generate(&mut OsRng);
+        let node = NodeId::new(1);
+        let registry = registry_of(&[(node, &key)]);
+        let mut hg = Hashgraph::new(&registry);
+        let idx = hg.member_index_of(&node).unwrap();
+
+        let e1 = hg.insert(verified_event(&key, node, None, None, 100)).unwrap();
+        let ve2 = verified_event(&key, node, Some(e1), None, 101);
+        let hash2 = hg.insert(ve2.clone()).unwrap();
+
+        let ve3 = verified_event(&key, node, Some(e1), None, 102);
+        let hash3 = hg.insert(ve3.clone()).unwrap();
+
+        assert!(hg.creator_has_known_fork(idx));
+
+        // Re-inserting exact same event ve2 or ve3 should hit AlreadyPresent
+        let err2 = hg.insert(ve2).unwrap_err();
+        assert_eq!(err2, InsertError::AlreadyPresent(hash2));
+
+        let err3 = hg.insert(ve3).unwrap_err();
+        assert_eq!(err3, InsertError::AlreadyPresent(hash3));
+
+        // State of known_forkers should remain true
         assert!(hg.creator_has_known_fork(idx));
     }
 }

@@ -13,6 +13,6 @@ pub use membership::MembershipRegistry;
 pub use signable::{
     Signable,
     Verifiable,
+    VerifiedEvent,
     VerifyError,
-     VerifiedEvent
 };
