@@ -27,6 +27,13 @@ pub struct EventRecord {
     /// holds the highest sequence number, among this event's ancestors,
     /// created by member `i` — 0 means "no ancestor from that member".
     ancestor_seqs: Vec<u64>,
+    /// Consensus Spec §2 — computed once at insertion time (`round.rs`),
+    /// mutated in place immediately after this record is first stored
+    /// (see `Hashgraph::insert`), never touched again afterward.
+    round: u64,
+    /// Consensus Spec §2.1 — true iff this is the first event created by
+    /// its creator in `round`.
+    is_witness: bool,
 }
 
 impl EventRecord {
@@ -40,6 +47,14 @@ impl EventRecord {
 
     pub fn ancestor_seq(&self, member_idx: usize) -> u64 {
         self.ancestor_seqs[member_idx]
+    }
+
+    pub fn round(&self) -> u64 {
+        self.round
+    }
+
+    pub fn is_witness(&self) -> bool {
+        self.is_witness
     }
 }
 
@@ -73,6 +88,11 @@ pub struct Hashgraph {
     /// observer-relative correctness lives in
     /// `ancestry::Hashgraph::ancestry_contains_fork_of`.
     known_forkers: Vec<bool>,
+    /// Consensus Spec §2.1 — witness events, indexed by round. Maintained
+    /// incrementally as events are inserted, so `round.rs`'s
+    /// strongly-see-a-supermajority-of-round-r-witnesses check
+    /// (`divideRounds`) never has to scan the whole graph for them.
+    witnesses_by_round: HashMap<u64, Vec<EventHash>>,
 }
 
 impl Hashgraph {
@@ -89,6 +109,7 @@ impl Hashgraph {
             member_index,
             member_count,
             known_forkers: vec![false; member_count],
+            witnesses_by_round: HashMap::new(),
         }
     }
 
@@ -143,7 +164,17 @@ impl Hashgraph {
             self.children.entry(*parent).or_default().push(hash);
         }
 
-        self.events.insert(hash, EventRecord { event, seq, ancestor_seqs });
+        let self_parent_round = self_parent_record.map(EventRecord::round);
+        let other_parent_round = other_parent_record.map(EventRecord::round);
+        let base_round = crate::round::base_round(self_parent_round, other_parent_round);
+
+        // Stored with a provisional round so `finalize_round` (round.rs)
+        // can query this event's own ancestor_seqs via `strongly_see`,
+        // which needs the record to already be present. Mutated in place
+        // immediately below — never read in this provisional state.
+        self.events.insert(hash, EventRecord { event, seq, ancestor_seqs, round: base_round, is_witness: false });
+
+        self.finalize_round(hash, base_round, self_parent_round)?;
 
         Ok(hash)
     }
@@ -154,6 +185,31 @@ impl Hashgraph {
 
     pub fn children(&self, hash: &EventHash) -> &[EventHash] {
         self.children.get(hash).map_or(&[], Vec::as_slice)
+    }
+
+    /// Consensus Spec §2.1 — witnesses of `round`, i.e. every event that
+    /// was the first created by its creator in that round. Empty slice if
+    /// `round` hasn't been reached yet (or has no witnesses recorded).
+    pub fn witnesses_of_round(&self, round: u64) -> &[EventHash] {
+        self.witnesses_by_round.get(&round).map_or(&[], Vec::as_slice)
+    }
+
+    /// Crate-internal: records `hash` as a witness of `round`. Only ever
+    /// called from `round.rs`'s `finalize_round`, immediately after an
+    /// event's final round is decided.
+    pub(crate) fn record_witness(&mut self, round: u64, hash: EventHash) {
+        self.witnesses_by_round.entry(round).or_default().push(hash);
+    }
+
+    /// Crate-internal: overwrites the provisional round/witness status a
+    /// freshly inserted event was stored with. Only ever called from
+    /// `round.rs`'s `finalize_round`, exactly once per event, immediately
+    /// after insertion.
+    pub(crate) fn set_event_round(&mut self, hash: &EventHash, round: u64, is_witness: bool) {
+        if let Some(record) = self.events.get_mut(hash) {
+            record.round = round;
+            record.is_witness = is_witness;
+        }
     }
 
     pub fn member_count(&self) -> usize {
