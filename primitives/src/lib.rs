@@ -1,3 +1,4 @@
+mod error;
 pub mod event;
 pub mod event_hash;
 pub mod node;
@@ -11,6 +12,7 @@ pub use event::{
     UnsignedEvent,
 };
 pub use event_hash::EventHash;
+pub use error::{Error, Result};
 pub use node::NodeId;
 pub use signature::Signature;
 pub use timestamp::Timestamp;

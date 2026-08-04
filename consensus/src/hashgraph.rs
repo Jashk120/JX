@@ -10,7 +10,8 @@ use primitives::{
     EventHash,
     NodeId,
 };
-use thiserror::Error;
+
+use crate::error::{ConsensusError, Result};
 
 /// A stored event plus the incremental bookkeeping needed for ancestry
 /// queries (Consensus Spec §1.3), computed once at insertion time so
@@ -39,15 +40,7 @@ impl EventRecord {
     }
 }
 
-#[derive(Debug, Error, PartialEq, Eq)]
-pub enum InsertError {
-    #[error("event {0:?} is already present in the hashgraph")]
-    AlreadyPresent(EventHash),
-    #[error("parent {0:?} is not present in the hashgraph")]
-    MissingParent(EventHash),
-    #[error("event creator is not a registered member")]
-    UnknownCreator,
-}
+pub type InsertError = ConsensusError;
 
 /// This node's local copy of the hashgraph (Consensus Spec §1.2).
 /// Storage plus the ancestry caching strategy from §1.3's
@@ -96,7 +89,7 @@ impl Hashgraph {
         }
     }
 
-    pub fn insert(&mut self, verified: VerifiedEvent) -> Result<EventHash, InsertError> {
+    pub fn insert(&mut self, verified: VerifiedEvent) -> Result<EventHash> {
         let event = verified.into_inner();
         let hash = event.hash();
 

@@ -15,8 +15,8 @@ use crate::signable::{
     Signable,
     Verifiable,
     VerifiedEvent,
-    VerifyError,
 };
+use crate::error::{CryptoError, Result};
 
 impl Signable for UnsignedEvent {
     type Signed = Event;
@@ -29,13 +29,15 @@ impl Signable for UnsignedEvent {
 }
 
 impl Verifiable for Event {
-    fn verify(self, registry: &MembershipRegistry) -> Result<VerifiedEvent, VerifyError> {
-        let verifying_key = registry.key_for(self.creator()).ok_or(VerifyError::UnknownSigner)?;
+    fn verify(self, registry: &MembershipRegistry) -> Result<VerifiedEvent> {
+        let verifying_key = registry.key_for(self.creator())?;
 
         let signature = DalekSignature::from_bytes(self.signature().as_bytes());
         let bytes = self.unsigned().canonical_bytes();
 
-        verifying_key.verify(&bytes, &signature).map_err(|_| VerifyError::InvalidSignature)?;
+        verifying_key
+            .verify(&bytes, &signature)
+            .map_err(|_| CryptoError::SignatureVerificationFailed)?;
 
         Ok(VerifiedEvent::new(self))
     }
@@ -88,7 +90,10 @@ mod tests {
         let tampered = UnsignedEvent::new(node, None, None, Timestamp::new(999), Vec::new())
             .finalize(event.signature().clone());
 
-        assert_eq!(tampered.verify(&registry), Err(VerifyError::InvalidSignature));
+        assert_eq!(
+            tampered.verify(&registry),
+            Err(CryptoError::SignatureVerificationFailed)
+        );
     }
 
     #[test]
@@ -100,7 +105,10 @@ mod tests {
         let event = UnsignedEvent::new(node, None, None, Timestamp::new(100), Vec::new())
             .sign(&signing_key);
 
-        assert_eq!(event.verify(&empty_registry), Err(VerifyError::UnknownSigner));
+        assert_eq!(
+            event.verify(&empty_registry),
+            Err(CryptoError::UnknownSigner { node_id: node })
+        );
     }
 
     #[test]
@@ -113,6 +121,9 @@ mod tests {
         let event = UnsignedEvent::new(node, None, None, Timestamp::new(100), Vec::new())
             .sign(&signing_key);
 
-        assert_eq!(event.verify(&registry), Err(VerifyError::InvalidSignature));
+        assert_eq!(
+            event.verify(&registry),
+            Err(CryptoError::SignatureVerificationFailed)
+        );
     }
 }

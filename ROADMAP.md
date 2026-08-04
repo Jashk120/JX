@@ -7,7 +7,7 @@
 - [x] Git
 - [x] Primitive crate
 - [x] Crypto crate
-- [ ] Consensus crate
+- [x] Consensus crate
 - [ ] Gossip crate
 
 ---
@@ -18,7 +18,7 @@
 
 - [x] Event
 - [x] EventHash
-- [ ] Tests
+- [x] Tests
 
 ### Node
 
@@ -38,7 +38,7 @@
 ### Transaction
 
 - [x] Transaction
-- [ ] Transaction model
+- [~] Transaction model (minimal payload-only scaffold)
 
 ---
 
@@ -49,7 +49,7 @@
 - [x] Hashable trait
 - [x] SHA-256 implementation
 - [x] Canonical serialization
-- [~] Event hashing tests
+- [x] Event hashing tests
 
 ### Signatures
 
@@ -64,21 +64,28 @@
 
 ### Storage
 
-- [ ] Hashgraph
-- [ ] Insert event
-- [ ] Parent lookup
-- [ ] Children lookup
+- [x] Hashgraph
+- [x] Insert event (verified events, duplicate/missing-parent/unknown-creator errors)
+- [~] Parent lookup (available through event records; dedicated helper API remains)
+- [x] Children lookup
 
 ### Traversal
 
-- [ ] Ancestor
-- [ ] Can See
-- [ ] Strongly See
+- [x] Ancestor
+- [x] Can See
+- [x] Strongly See
 
 ### Tests
 
-- [ ] Graph tests
-- [ ] Traversal tests
+- [x] Graph tests
+- [x] Traversal tests (including differential/reference tests and fork cases)
+
+### Current Implementation Notes
+
+- The hashgraph stores events and maintains incremental per-member ancestor sequence metadata.
+- Fork detection is implemented with observer-relative `see` checks and a first-seen branch policy.
+- `strongly_see` is correct and tested, but still uses per-member self-chain walks; the witness-specific optimization is deferred to round-assignment work.
+- Gossip/network event propagation, round assignment, fame voting, final ordering, and persistent storage are not implemented yet.
 
 ---
 

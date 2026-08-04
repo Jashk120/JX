@@ -3,6 +3,8 @@ use std::collections::HashMap;
 use ed25519_dalek::VerifyingKey;
 use primitives::NodeId;
 
+use crate::error::{CryptoError, Result};
+
 /// Maps each consensus member's `NodeId` to the Ed25519 key used to verify
 /// events it creates. Lives in `crypto`, not `primitives`, so that
 /// `primitives` stays free of any cryptography dependency — `NodeId` itself
@@ -21,8 +23,8 @@ impl MembershipRegistry {
         self.keys.insert(node, key);
     }
 
-    pub fn key_for(&self, node: &NodeId) -> Option<&VerifyingKey> {
-        self.keys.get(node)
+    pub fn key_for(&self, node: &NodeId) -> Result<&VerifyingKey> {
+        self.keys.get(node).ok_or(CryptoError::UnknownSigner { node_id: *node })
     }
     /// Deterministic iteration order over registered members, sorted by
     /// `NodeId`. `consensus` uses this to assign each member a stable
@@ -59,12 +61,15 @@ mod tests {
         let mut registry = MembershipRegistry::new();
         registry.register(NodeId::new(1), verifying_key);
 
-        assert_eq!(registry.key_for(&NodeId::new(1)), Some(&verifying_key));
+        assert_eq!(registry.key_for(&NodeId::new(1)), Ok(&verifying_key));
     }
 
     #[test]
-    fn unknown_node_resolves_to_none() {
+    fn unknown_node_returns_unknown_signer_error() {
         let registry = MembershipRegistry::new();
-        assert_eq!(registry.key_for(&NodeId::new(99)), None);
+        assert_eq!(
+            registry.key_for(&NodeId::new(99)),
+            Err(CryptoError::UnknownSigner { node_id: NodeId::new(99) })
+        );
     }
 }

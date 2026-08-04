@@ -8,20 +8,15 @@ use primitives::{
     EventHash,
     NodeId,
 };
-use thiserror::Error;
-
 use crate::hashgraph::Hashgraph;
+use crate::error::{ConsensusError, Result};
 
-#[derive(Debug, Error, PartialEq, Eq)]
-pub enum AncestryError {
-    #[error("event {0:?} is not present in the hashgraph")]
-    UnknownEvent(EventHash),
-}
+pub type AncestryError = ConsensusError;
 
 impl Hashgraph {
     /// Ancestor, ignoring forks entirely (Consensus Spec §1.3's raw
     /// "ancestor" definition, not "see"). `x` is an ancestor of itself.
-    pub fn is_ancestor(&self, x: &EventHash, y: &EventHash) -> Result<bool, AncestryError> {
+    pub fn is_ancestor(&self, x: &EventHash, y: &EventHash) -> Result<bool> {
         if x == y {
             return Ok(true);
         }
@@ -47,7 +42,7 @@ impl Hashgraph {
     /// creator forked -> the ancestor check alone is sufficient. Slow
     /// path: `y`'s creator is a known equivocator somewhere -> fall back
     /// to a precise, observer-relative traversal of `x`'s real ancestry.
-    pub fn see(&self, x: &EventHash, y: &EventHash) -> Result<bool, AncestryError> {
+    pub fn see(&self, x: &EventHash, y: &EventHash) -> Result<bool> {
         if !self.is_ancestor(x, y)? {
             return Ok(false);
         }
@@ -77,7 +72,7 @@ impl Hashgraph {
     /// than arbitrary event pairs. Flagging this rather than silently
     /// shipping a "final" version — worth revisiting once Phase 4 is
     /// underway.
-    pub fn strongly_see(&self, x: &EventHash, y: &EventHash) -> Result<bool, AncestryError> {
+    pub fn strongly_see(&self, x: &EventHash, y: &EventHash) -> Result<bool> {
         if !self.see(x, y)? {
             return Ok(false);
         }
@@ -108,7 +103,7 @@ impl Hashgraph {
         member_idx: usize,
         up_to_seq: u64,
         y: &EventHash,
-    ) -> Result<bool, AncestryError> {
+    ) -> Result<bool> {
         let mut current = if self.creator_has_known_fork(member_idx) {
             self.ancestor_event_for_creator(x, &creator, up_to_seq)?
         } else {
@@ -130,7 +125,7 @@ impl Hashgraph {
         x: &EventHash,
         creator: &NodeId,
         seq: u64,
-    ) -> Result<Option<EventHash>, AncestryError> {
+    ) -> Result<Option<EventHash>> {
         let mut visited: HashSet<EventHash> = HashSet::new();
         let mut queue: VecDeque<EventHash> = VecDeque::from([*x]);
 
@@ -158,7 +153,7 @@ impl Hashgraph {
         &self,
         x: &EventHash,
         target: &EventHash,
-    ) -> Result<bool, AncestryError> {
+    ) -> Result<bool> {
         let mut visited: HashSet<EventHash> = HashSet::new();
         let mut queue: VecDeque<EventHash> = VecDeque::from([*x]);
 
@@ -189,7 +184,7 @@ impl Hashgraph {
         &self,
         x: &EventHash,
         creator: &NodeId,
-    ) -> Result<bool, AncestryError> {
+    ) -> Result<bool> {
         let mut seen_seqs: HashMap<u64, EventHash> = HashMap::new();
         let mut visited: HashSet<EventHash> = HashSet::new();
         let mut queue: VecDeque<EventHash> = VecDeque::from([*x]);

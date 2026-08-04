@@ -1,7 +1,7 @@
 use ed25519_dalek::SigningKey;
-use thiserror::Error;
 
 use crate::canonical::CanonicalEncode;
+use crate::error::Result;
 use crate::membership::MembershipRegistry;
 
 /// A value that can transition from an unsigned to a signed form by
@@ -27,7 +27,7 @@ pub trait Signable: CanonicalEncode {
 /// method, so a function that requires one (e.g. `Hashgraph::insert`, once
 /// it exists) cannot be called with an event that was never checked.
 pub trait Verifiable: Sized {
-    fn verify(self, registry: &MembershipRegistry) -> Result<VerifiedEvent, VerifyError>;
+    fn verify(self, registry: &MembershipRegistry) -> Result<VerifiedEvent>;
 }
 
 /// An `Event` whose signature has been checked against a `MembershipRegistry`.
@@ -55,12 +55,4 @@ impl VerifiedEvent {
     pub fn event(&self) -> &primitives::Event {
         &self.0
     }
-}
-
-#[derive(Debug, Error, PartialEq, Eq)]
-pub enum VerifyError {
-    #[error("no registered key for this event's creator")]
-    UnknownSigner,
-    #[error("signature does not match the event contents")]
-    InvalidSignature,
 }

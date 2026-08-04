@@ -1,3 +1,4 @@
+mod error;
 pub mod canonical;
 pub mod canonical_impls;
 pub mod hash;
@@ -8,11 +9,11 @@ pub mod signable_impls;
 
 pub use canonical::CanonicalEncode;
 pub use canonical_impls::*;
+pub use error::{CryptoError, Result};
 pub use hash::Hashable;
 pub use membership::MembershipRegistry;
 pub use signable::{
     Signable,
     Verifiable,
     VerifiedEvent,
-    VerifyError,
 };
