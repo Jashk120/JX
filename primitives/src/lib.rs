@@ -7,12 +7,15 @@ pub mod timestamp;
 pub mod transaction;
 pub mod transaction_hash;
 
+pub use error::{
+    Error,
+    Result,
+};
 pub use event::{
     Event,
     UnsignedEvent,
 };
 pub use event_hash::EventHash;
-pub use error::{Error, Result};
 pub use node::NodeId;
 pub use signature::Signature;
 pub use timestamp::Timestamp;

@@ -3,7 +3,10 @@ use std::collections::HashMap;
 use ed25519_dalek::VerifyingKey;
 use primitives::NodeId;
 
-use crate::error::{CryptoError, Result};
+use crate::error::{
+    CryptoError,
+    Result,
+};
 
 /// Maps each consensus member's `NodeId` to the Ed25519 key used to verify
 /// events it creates. Lives in `crypto`, not `primitives`, so that

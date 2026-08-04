@@ -8,8 +8,12 @@ use primitives::{
     EventHash,
     NodeId,
 };
+
+use crate::error::{
+    ConsensusError,
+    Result,
+};
 use crate::hashgraph::Hashgraph;
-use crate::error::{ConsensusError, Result};
 
 pub type AncestryError = ConsensusError;
 
@@ -149,11 +153,7 @@ impl Hashgraph {
         Ok(None)
     }
 
-    fn ancestry_contains_event(
-        &self,
-        x: &EventHash,
-        target: &EventHash,
-    ) -> Result<bool> {
+    fn ancestry_contains_event(&self, x: &EventHash, target: &EventHash) -> Result<bool> {
         let mut visited: HashSet<EventHash> = HashSet::new();
         let mut queue: VecDeque<EventHash> = VecDeque::from([*x]);
 
@@ -180,11 +180,7 @@ impl Hashgraph {
     /// invoked from the `see` slow path, i.e. only for creators with
     /// known fork evidence — meant to be rare (Byzantine-minority path),
     /// so correctness is prioritized over speed here.
-    fn ancestry_contains_fork_of(
-        &self,
-        x: &EventHash,
-        creator: &NodeId,
-    ) -> Result<bool> {
+    fn ancestry_contains_fork_of(&self, x: &EventHash, creator: &NodeId) -> Result<bool> {
         let mut seen_seqs: HashMap<u64, EventHash> = HashMap::new();
         let mut visited: HashSet<EventHash> = HashSet::new();
         let mut queue: VecDeque<EventHash> = VecDeque::from([*x]);

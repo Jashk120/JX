@@ -11,7 +11,10 @@ use primitives::{
     NodeId,
 };
 
-use crate::error::{ConsensusError, Result};
+use crate::error::{
+    ConsensusError,
+    Result,
+};
 
 /// A stored event plus the incremental bookkeeping needed for ancestry
 /// queries (Consensus Spec §1.3), computed once at insertion time so

@@ -10,13 +10,16 @@ use primitives::{
 };
 
 use crate::canonical::CanonicalEncode;
+use crate::error::{
+    CryptoError,
+    Result,
+};
 use crate::membership::MembershipRegistry;
 use crate::signable::{
     Signable,
     Verifiable,
     VerifiedEvent,
 };
-use crate::error::{CryptoError, Result};
 
 impl Signable for UnsignedEvent {
     type Signed = Event;
@@ -90,10 +93,7 @@ mod tests {
         let tampered = UnsignedEvent::new(node, None, None, Timestamp::new(999), Vec::new())
             .finalize(event.signature().clone());
 
-        assert_eq!(
-            tampered.verify(&registry),
-            Err(CryptoError::SignatureVerificationFailed)
-        );
+        assert_eq!(tampered.verify(&registry), Err(CryptoError::SignatureVerificationFailed));
     }
 
     #[test]
@@ -121,9 +121,6 @@ mod tests {
         let event = UnsignedEvent::new(node, None, None, Timestamp::new(100), Vec::new())
             .sign(&signing_key);
 
-        assert_eq!(
-            event.verify(&registry),
-            Err(CryptoError::SignatureVerificationFailed)
-        );
+        assert_eq!(event.verify(&registry), Err(CryptoError::SignatureVerificationFailed));
     }
 }
