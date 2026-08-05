@@ -66,10 +66,10 @@ impl Hashgraph {
 #[cfg(test)]
 mod tests {
     use crypto::{
+        MembershipRegistry,
         Signable,
         Verifiable,
     };
-    use crypto::MembershipRegistry;
     use ed25519_dalek::SigningKey;
     use primitives::{
         NodeId,
@@ -134,25 +134,14 @@ mod tests {
 
         fn build(
             &mut self,
-            steps: &[(
-                &'static str,
-                &'static str,
-                Option<&'static str>,
-                Option<&'static str>,
-            )],
+            steps: &[(&'static str, &'static str, Option<&'static str>, Option<&'static str>)],
         ) {
             for &(label, author, sp, op) in steps {
                 let (node, ref key) = self.nodes[author];
                 let self_parent = sp.map(|l| self.events[l]);
                 let other_parent = op.map(|l| self.events[l]);
-                let ve = verified_event(
-                    &self.registry,
-                    key,
-                    node,
-                    self_parent,
-                    other_parent,
-                    self.ts,
-                );
+                let ve =
+                    verified_event(&self.registry, key, node, self_parent, other_parent, self.ts);
                 self.ts += 1;
                 let hash = self.hg.insert(ve).expect("insert should succeed");
                 self.events.insert(label, hash);
@@ -263,10 +252,8 @@ mod tests {
         ]);
 
         let witnesses = g.round_one_witnesses();
-        let witnesses_by_creator: std::collections::HashMap<_, _> = witnesses
-            .iter()
-            .map(|w| (*g.hg.get(w).unwrap().event().creator(), *w))
-            .collect();
+        let witnesses_by_creator: std::collections::HashMap<_, _> =
+            witnesses.iter().map(|w| (*g.hg.get(w).unwrap().event().creator(), *w)).collect();
 
         // No earlier event bumped to round 2: only d2 sees a supermajority.
         for label in ["a2", "b2", "a3", "b3", "a4"] {
@@ -287,7 +274,11 @@ mod tests {
 
         // d2 strongly-sees all four round-1 witnesses -- verified live.
         let seen = g.strongly_seen(&d2, &witnesses);
-        assert_eq!(seen.len(), 4, "d2 should strongly-see all four round-1 witnesses, got {seen:?}");
+        assert_eq!(
+            seen.len(),
+            4,
+            "d2 should strongly-see all four round-1 witnesses, got {seen:?}"
+        );
         for w in &witnesses {
             assert!(g.hg.strongly_see(&d2, w).unwrap(), "d2 must strongly see {w:?}");
         }

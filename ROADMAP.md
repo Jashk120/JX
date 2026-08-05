@@ -93,17 +93,17 @@
 
 ### Round Assignment
 
-- [ ] Divide rounds
+- [x] Divide rounds
 
 ### Witnesses
 
-- [ ] Witness detection
+- [x] Witness detection
 
 ### Virtual Voting
 
-- [ ] Vote
-- [ ] Coin rounds
-- [ ] Fame
+- [x] Vote
+- [x] Coin rounds
+- [x] Fame
 
 ### Ordering
 
@@ -159,3 +159,9 @@
 - [ ] Parallel execution
 - [ ] Privacy
 - [ ] Compute layer
+
+Parallel state database / lock-free scheduler 
+Aggressive gossip optimization (QUIC, batching, compression) 
+Sliding-window DAG in RAM with snapshots
+Efficient LSM + Merkle state storage 
+Batch/GPU signature verification

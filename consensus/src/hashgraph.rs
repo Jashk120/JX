@@ -16,6 +16,21 @@ use crate::error::{
     Result,
 };
 
+/// Consensus Spec §3 — the fame decision for a witness event.
+///
+/// Three states, deliberately distinct from `Option<bool>`: a *non-witness*
+/// never has a meaningful decision, a *witness* starts `Undecided`, and only
+/// once the virtual-voting election for it terminates does it become
+/// `Famous` or `NotFamous`. Distinguishing "not a witness" from "witness,
+/// undecided" this way is what lets tests (and §4's ordering task) tell
+/// them apart at a glance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FameStatus {
+    Undecided,
+    Famous,
+    NotFamous,
+}
+
 /// A stored event plus the incremental bookkeeping needed for ancestry
 /// queries (Consensus Spec §1.3), computed once at insertion time so
 /// `see`/`strongly_see` never re-traverse the graph on the fast path.
@@ -34,6 +49,15 @@ pub struct EventRecord {
     /// Consensus Spec §2.1 — true iff this is the first event created by
     /// its creator in `round`.
     is_witness: bool,
+    /// Consensus Spec §3 — votes this event cast on candidate witnesses,
+    /// keyed by candidate hash. Meaningful only when `is_witness()`;
+    /// non-witnesses simply keep an empty map (deliberately *not*
+    /// special-cased in the type — see `fame.rs`'s module doc on why a
+    /// plain map is preferred over Hedera's dense `bool[]`).
+    votes: HashMap<EventHash, bool>,
+    /// Consensus Spec §3 — this event's fame decision. Only meaningful for
+    /// witnesses; non-witnesses keep `Undecided` forever.
+    fame_status: FameStatus,
 }
 
 impl EventRecord {
@@ -55,6 +79,19 @@ impl EventRecord {
 
     pub fn is_witness(&self) -> bool {
         self.is_witness
+    }
+
+    /// Consensus Spec §3 — this event's fame decision (meaningful only for
+    /// witnesses).
+    pub fn fame(&self) -> FameStatus {
+        self.fame_status
+    }
+
+    /// Consensus Spec §3 — this witness's recorded vote on candidate `w`,
+    /// if one has been computed and cached. `None` also covers the
+    /// "not yet voted" case.
+    pub(crate) fn vote_for(&self, w: &EventHash) -> Option<bool> {
+        self.votes.get(w).copied()
     }
 }
 
@@ -93,6 +130,15 @@ pub struct Hashgraph {
     /// strongly-see-a-supermajority-of-round-r-witnesses check
     /// (`divideRounds`) never has to scan the whole graph for them.
     witnesses_by_round: HashMap<u64, Vec<EventHash>>,
+    /// Consensus Spec §3 — witnesses whose fame is still undecided, keyed
+    /// by their round. Maintained incrementally (`record_witness` adds,
+    /// `decide_fame` removes), so the fame-voting step (`fame.rs`) only
+    /// ever considers witnesses that are still live elections, never
+    /// rescanning the full graph.
+    undecided_witnesses: HashMap<EventHash, u64>,
+    /// Max key of `witnesses_by_round`, cached so a late-arriving candidate
+    /// witness (fame.rs's backfill step) knows how far forward to look.
+    highest_witness_round: u64,
 }
 
 impl Hashgraph {
@@ -110,6 +156,8 @@ impl Hashgraph {
             member_count,
             known_forkers: vec![false; member_count],
             witnesses_by_round: HashMap::new(),
+            undecided_witnesses: HashMap::new(),
+            highest_witness_round: 0,
         }
     }
 
@@ -172,9 +220,24 @@ impl Hashgraph {
         // can query this event's own ancestor_seqs via `strongly_see`,
         // which needs the record to already be present. Mutated in place
         // immediately below — never read in this provisional state.
-        self.events.insert(hash, EventRecord { event, seq, ancestor_seqs, round: base_round, is_witness: false });
+        self.events.insert(
+            hash,
+            EventRecord {
+                event,
+                seq,
+                ancestor_seqs,
+                round: base_round,
+                is_witness: false,
+                votes: HashMap::new(),
+                fame_status: FameStatus::Undecided,
+            },
+        );
 
         self.finalize_round(hash, base_round, self_parent_round)?;
+
+        if self.get(&hash).is_some_and(EventRecord::is_witness) {
+            self.vote_as_witness(hash)?;
+        }
 
         Ok(hash)
     }
@@ -196,9 +259,53 @@ impl Hashgraph {
 
     /// Crate-internal: records `hash` as a witness of `round`. Only ever
     /// called from `round.rs`'s `finalize_round`, immediately after an
-    /// event's final round is decided.
+    /// event's final round is decided. Also enrolls the witness as a live,
+    /// undecided fame election (§3).
     pub(crate) fn record_witness(&mut self, round: u64, hash: EventHash) {
         self.witnesses_by_round.entry(round).or_default().push(hash);
+        self.undecided_witnesses.insert(hash, round);
+        self.highest_witness_round = self.highest_witness_round.max(round);
+    }
+
+    /// Crate-internal: caches witness `voter`'s vote on candidate witness
+    /// `candidate` (Consensus Spec §3). Only ever called from `fame.rs`.
+    pub(crate) fn record_vote(&mut self, voter: &EventHash, candidate: &EventHash, vote: bool) {
+        if let Some(record) = self.events.get_mut(voter) {
+            record.votes.insert(*candidate, vote);
+        }
+    }
+
+    /// Crate-internal: finalizes `candidate`'s fame election and removes it
+    /// from the undecided working set. Only ever called from `fame.rs`.
+    /// Decisions are immutable: nothing in the codebase calls this twice.
+    pub(crate) fn decide_fame(&mut self, candidate: &EventHash, status: FameStatus) {
+        if let Some(record) = self.events.get_mut(candidate) {
+            record.fame_status = status;
+        }
+        self.undecided_witnesses.remove(candidate);
+    }
+
+    /// Consensus Spec §3 — the fame decision for a witness, if one exists.
+    /// Returns `None` for an unknown event *or* a non-witness (distinguish
+    /// with `get()`/`is_witness()`), `Some(FameStatus::Undecided)` for a
+    /// witness whose election has not terminated yet.
+    pub fn fame_of(&self, witness: &EventHash) -> Option<FameStatus> {
+        let record = self.events.get(witness)?;
+        if !record.is_witness {
+            return None;
+        }
+        Some(record.fame_status)
+    }
+
+    /// Crate-internal: the undecided-fame working set, keyed by witness
+    /// hash with its round. Read by `fame.rs`'s per-insert voting step.
+    pub(crate) fn undecided_witnesses(&self) -> &HashMap<EventHash, u64> {
+        &self.undecided_witnesses
+    }
+
+    /// Crate-internal: highest witness round recorded so far.
+    pub(crate) fn highest_witness_round(&self) -> u64 {
+        self.highest_witness_round
     }
 
     /// Crate-internal: overwrites the provisional round/witness status a
