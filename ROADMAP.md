@@ -107,9 +107,14 @@
 
 ### Ordering
 
-- [ ] Round received
-- [ ] Consensus timestamp
-- [ ] Final ordering
+- [x] Round received
+- [x] Consensus timestamp
+- [x] Final ordering
+
+> **Phase 4 status**: rounds, witnesses, virtual voting (fame), and order
+> finalization (`roundReceived` / `consensusTimestamp` / final order) are all
+> implemented and tested against fixed hand-constructed hashgraphs. Dynamic
+> membership and transaction execution remain future work (Phases 6/8).
 
 ---
 

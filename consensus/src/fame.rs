@@ -1,4 +1,3 @@
-
 //! Consensus Spec §3 / §3.1 — Virtual Voting (determining a witness's fame).
 //!
 //! The `decideFame(w)` election is reproduced here as an eager, incremental

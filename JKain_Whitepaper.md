@@ -8,7 +8,7 @@
 
 JKain is a distributed ledger built on hashgraph consensus (gossip-about-gossip and virtual voting), providing deterministic, non-probabilistic finality and fork-resistance by construction. It brings together, as first-class protocol services rather than smart-contract afterthoughts: a native consensus timestamping service (HCS), a native token service (HTS), a native decentralized identity layer (DID), a market-based fee model driven by on-chain time-weighted average pricing, and account-level programmable authorization.
 
-Beyond the base ledger, JKain's long-term vision (v4) extends the same DID-based identity primitive to compute itself — introducing a compute layer of user-owned, DID-anchored actors, coordinated (but not executed) by the same chain's consensus nodes. This document describes the completed design reasoning for v1 through v3, and the conceptual direction for v4.
+Beyond the base ledger, JKain's long-term vision (v3) extends the same DID-based identity primitive to compute itself — introducing a compute layer of user-owned, DID-anchored actors, coordinated (but not executed) by the same chain's consensus nodes. This document describes the completed design reasoning for v1 through v3.
 
 This is a personal research and learning project. It is not built for commercial deployment, token value, or external users. It exists to deeply understand distributed consensus, applied cryptography, and decentralized identity by building all three from first principles.
 
@@ -21,11 +21,10 @@ This is a personal research and learning project. It is not built for commercial
 3. v1 Features — Native Services
 4. v1.5 — Privacy Layer
 5. v2 Features
-6. v3 — Novel Zero-Knowledge Construction
-7. v4 — The Compute Layer: User-Owned Actors
-8. Explicitly Rejected Features
-9. Open Questions and Known Limitations
-10. Closing Notes
+6. v3 — The Compute Layer: User-Owned Actors
+7. Explicitly Rejected Features
+8. Open Questions and Known Limitations
+9. Closing Notes
 
 ---
 
@@ -33,9 +32,9 @@ This is a personal research and learning project. It is not built for commercial
 
 Most educational and hobby blockchain projects either reimplement an existing chain closely (a Bitcoin or Ethereum clone) or build a toy consensus mechanism disconnected from any real application layer. JKain takes a different approach: build a genuinely different consensus mechanism (hashgraph, rather than Nakamoto-style PoW/PoS chains) and treat several capabilities that most chains bolt on via smart contracts — identity, tokens, ordered messaging, scheduled execution — as native, first-class protocol operations instead.
 
-The guiding design principle across every decision in this document has been **coherent scope over feature count**. Many capabilities from other chains were considered and deliberately rejected (see Section 8) not because they lack merit, but because they would either duplicate functionality already provided elsewhere in the design, or introduce architectural conflicts with features already committed to as core.
+The guiding design principle across every decision in this document has been **coherent scope over feature count**. Many capabilities from other chains were considered and deliberately rejected (see Section 7) not because they lack merit, but because they would either duplicate functionality already provided elsewhere in the design, or introduce architectural conflicts with features already committed to as core.
 
-A second principle, which shaped the versioning strategy throughout: **build order should follow provable engineering difficulty, not feature excitement.** Novel cryptographic research (v3's original zero-knowledge construction) and the far larger ambitions of v4's compute layer are sequenced last, after the foundational system is complete and well-understood, specifically so that later, harder work is built on top of deep familiarity with the base system rather than guesses about it.
+A second principle, which shaped the versioning strategy throughout: **build order should follow provable engineering difficulty, not feature excitement.** Novel cryptographic research (v3's original zero-knowledge construction) and the far larger ambitions of v3's compute layer are sequenced last, after the foundational system is complete and well-understood, specifically so that later, harder work is built on top of deep familiarity with the base system rather than guesses about it.
 
 ---
 
@@ -60,9 +59,9 @@ A peer-to-peer gossip layer handles event propagation between nodes. Transaction
 **Transport protocol choice is deliberately differentiated by traffic type, rather than using one protocol everywhere:**
 
 - **Hashgraph gossip (node-to-node, L1-internal)** — raw TCP with custom binary framing. This is the single hottest, highest-frequency, most latency-sensitive path in the system, and it is also where consensus correctness is most safety-critical. A conservative, well-understood transport is deliberately chosen here rather than layering on additional protocol machinery (e.g., gRPC/HTTP framing) whose overhead isn't worth paying on this path, and rather than adopting a newer transport (e.g., QUIC) whose maturity risk isn't worth taking on the most safety-critical part of the whole system.
-- **Compute-node ↔ L1 coordination** (registry reads, DID resolution, transaction submission — see Section 7.3) — gRPC over TCP. This traffic benefits from typed, code-generated contracts and built-in streaming support, and is not latency-critical enough to justify hand-rolled framing.
+- **Compute-node ↔ L1 coordination** (registry reads, DID resolution, transaction submission — see Section 6.3) — gRPC over TCP. This traffic benefits from typed, code-generated contracts and built-in streaming support, and is not latency-critical enough to justify hand-rolled framing.
 - **External API** (third-party callers, client applications) — conventional HTTP (JSON or gRPC-Web), prioritizing broad compatibility and ease of integration over raw performance.
-- **Actor-to-actor and client-to-actor messaging** (compute layer, Section 7.6) — QUIC. Actor messaging involves many independent, short-lived messages between dynamically-relocating actors; QUIC's per-stream multiplexing (avoiding head-of-line blocking, unlike TCP, where one lost packet stalls all data behind it) and faster connection establishment are a materially better fit for this pattern than TCP-based alternatives.
+- **Actor-to-actor and client-to-actor messaging** (compute layer, Section 6.6) — QUIC. Actor messaging involves many independent, short-lived messages between dynamically-relocating actors; QUIC's per-stream multiplexing (avoiding head-of-line blocking, unlike TCP, where one lost packet stalls all data behind it) and faster connection establishment are a materially better fit for this pattern than TCP-based alternatives.
 
 ### 2.3 Account Model
 
@@ -139,7 +138,7 @@ Decentralized identifiers and associated documents are a native, first-class pro
 
 Rather than fees denominated purely in the native token (subject to full price volatility, as in Bitcoin) or fees pegged via an external price oracle (introducing an external trust dependency), JKain computes fees using a **time-weighted average price (TWAP)** derived entirely from on-chain trading data.
 
-This requires a minimal constant-product automated market maker (AMM) primitive, seeded with token trading activity, from which the TWAP is computed over a rolling window — the same general mechanism used by on-chain price oracles such as Uniswap's. This keeps fee-price smoothing self-contained within the ledger's own data, without introducing external oracle infrastructure (a substantial, separate trust and security problem in its own right, deliberately out of scope — see Section 8).
+This requires a minimal constant-product automated market maker (AMM) primitive, seeded with token trading activity, from which the TWAP is computed over a rolling window — the same general mechanism used by on-chain price oracles such as Uniswap's. This keeps fee-price smoothing self-contained within the ledger's own data, without introducing external oracle infrastructure (a substantial, separate trust and security problem in its own right, deliberately out of scope — see Section 7).
 
 Different operation types (transfer, token creation, DID operation, etc.) carry different base fee schedules, following Hedera's model of cost reflecting operational weight rather than a flat per-transaction fee.
 
@@ -208,27 +207,16 @@ Following Cosmos's model: standardized cross-chain messaging via light-client ve
 
 ---
 
-## 6. v3 — Novel Zero-Knowledge Construction
 
-Where v1.5 uses an established proving system (`halo2`/`bellman`) to ship a working shielded pool, v3 is scoped as a genuinely different category of undertaking: designing an original zero-knowledge proof construction, rather than applying an existing one.
-
-This is named explicitly as **research-level applied cryptography**, sitting alongside the kind of work that has historically been the subject of dedicated PhD research (e.g., the line of work behind Groth16, PLONK, and the original Zcash construction) — not an incremental engineering feature. The prerequisite depth includes formal treatment of finite fields and elliptic curve pairings, polynomial commitment schemes, and — critically — the ability to construct and defend a formal soundness and zero-knowledge proof for the scheme, since an informally-tested novel cryptographic construction that "seems to work" but has not been proven sound is a real and serious failure mode, distinct from ordinary software bugs in that it can fail silently and catastrophically.
-
-The realistic prerequisite path is a dedicated period of study — abstract algebra (group and field theory) followed by focused study of existing zk-SNARK constructions in depth (understanding *why* Groth16 or PLONK are sound, not merely how to invoke them) — undertaken separately from, and likely prior to, active JKain v3 development. This is estimated, informally, as many months of dedicated study in its own right, separate from build time on the rest of the system.
-
-v3 is retained on the roadmap as a genuine long-term goal, with the explicit understanding that it may ultimately mature into its own standalone research output — a paper, a separate proof-of-concept, or a thesis-adjacent project — rather than remaining strictly a "JKain feature," depending on where the underlying interest leads once the prerequisite study is underway.
-
----
-
-## 7. v4 — The Compute Layer: User-Owned Actors
+## 6. v3 — The Compute Layer: User-Owned Actors
 
 *This section is written with more conceptual detail than a typical "future vision" appendix, at the user's explicit request — the underlying idea has been reasoned through in real depth, even though implementation remains deliberately deferred until v1 through v3 exist and their real constraints are understood firsthand. It should be read as a well-developed design direction, not yet a locked specification.*
 
-### 7.1 The Problem
+### 6.1 The Problem
 
 In essentially every application platform today, a developer who builds an application also ends up owning and operating the infrastructure that runs it for every user — the backend, the database, the hosting. Users' data and compute live inside infrastructure they do not control and cannot take with them. Cross-application interoperability, where it exists at all, is mediated by centralized account systems, OAuth flows, and API keys controlled by each individual platform. Even federated alternatives such as Matrix, which explicitly aim to decouple communication from centralized control, still tie a user's identity to the specific homeserver they registered on — if that homeserver disappears, the identity becomes unreachable, since identity and hosting were never fully separated in the first place.
 
-### 7.2 Core Concept: Actors, Not Servers
+### 6.2 Core Concept: Actors, Not Servers
 
 JKain's compute layer is built around the **actor model** (in the Erlang/Akka sense): isolated units of computation with their own private state, communicating exclusively via message-passing, with no shared memory between actors. Each application deploys its own actor type — an actor is not a generic container or a shared runtime service, but application-specific logic written by that application's developer.
 
@@ -240,9 +228,9 @@ Each actor carries:
 - A messaging interface for receiving requests and pushing data to connected clients
 - Isolation from every other actor, including other actors belonging to the same user but a different application
 
-Critically, **the DID remains the fixed, permanent identifier for reaching a user's actor; the compute node executing that actor is a replaceable resource.** This directly resolves the gap identified in Section 7.1: identity is never tied to any specific host.
+Critically, **the DID remains the fixed, permanent identifier for reaching a user's actor; the compute node executing that actor is a replaceable resource.** This directly resolves the gap identified in Section 6.1: identity is never tied to any specific host.
 
-### 7.3 Compute Nodes and On-Chain Registration
+### 6.3 Compute Nodes and On-Chain Registration
 
 A **compute node** is a separate node type, distinct from JKain's consensus (L1) nodes, whose role is to host and execute actors. Compute nodes do not participate in hashgraph consensus; they read from and write to the consensus layer only for coordination purposes, described below. This is not a Layer 2 in the rollup sense — there is no batching of compute-layer activity into proofs settled back to L1. It is more accurately a second, cooperating node type on the same chain: L1 nodes provide identity, ordering, and a coordination substrate; compute nodes provide execution, entirely off the consensus path.
 
@@ -250,11 +238,11 @@ Compute nodes **announce themselves on-chain**, via a new `payload` operation ty
 
 **Liveness via re-announcement:** compute nodes periodically re-announce (heartbeat) to signal they remain reachable. This does not cause unbounded storage growth: the heartbeat *transaction* is gossiped and ordered like any other, but the node's *current state* in the registry is a single, overwritten entry (`node_id → last_seen_timestamp, address, capability_metadata`), not an appended history of every heartbeat. Storage for the live registry therefore scales with the number of compute nodes, not the number of heartbeats sent — the same current-state-vs-history pattern already established for account state (Section 2.6). A staleness threshold (an interval after which a node with no recent heartbeat is treated as unreachable) is a tunable parameter, not an open architectural question.
 
-There is no notion of a marketplace, bidding, or resource purchasing in this design — compute nodes announce availability; there is no buying or selling modeled at this layer. (Whether and how compute providers are compensated is a genuinely open question, addressed in Section 7.7.)
+There is no notion of a marketplace, bidding, or resource purchasing in this design — compute nodes announce availability; there is no buying or selling modeled at this layer. (Whether and how compute providers are compensated is a genuinely open question, addressed in Section 6.7.)
 
-### 7.3.1 Compute Node Implementation and the L1 Integration Boundary
+### 6.3.1 Compute Node Implementation and the L1 Integration Boundary
 
-Compute nodes are planned to be implemented in **Go**, deliberately distinct from L1's Rust implementation. This is a considered choice, not a default: Go's concurrency model (goroutines, shared thread pools with request queuing) fits the actor-hosting pattern in Section 7.5 more naturally than Rust's async/await model, and a simpler, single-binary operational story is an advantage for infrastructure third parties are expected to eventually run.
+Compute nodes are planned to be implemented in **Go**, deliberately distinct from L1's Rust implementation. This is a considered choice, not a default: Go's concurrency model (goroutines, shared thread pools with request queuing) fits the actor-hosting pattern in Section 6.5 more naturally than Rust's async/await model, and a simpler, single-binary operational story is an advantage for infrastructure third parties are expected to eventually run.
 
 The cross-language boundary is bounded by a governing principle: **compute nodes must always defer authorization decisions back to L1, never re-derive them independently.** L1 is the sole source of truth for ledger state, including account authorization rules (Section 2.5); if a compute node made its own independent judgment about whether a request is authorized, it would constitute a second, unsynchronized opinion about ledger state — precisely the failure mode consensus exists to prevent, and a duplicated-logic security risk in a second language. Concretely, this bounds the L1-integration surface compute nodes actually need to:
 
@@ -263,7 +251,7 @@ The cross-language boundary is bounded by a governing principle: **compute nodes
 
 Both categories are thin, relatively static, well-scoped surface area, which is what makes a second implementation language a reasonable choice here rather than a source of unmanaged long-term drift. This integration is planned over gRPC (Section 2.2).
 
-### 7.3.2 Actor Implementation: WebAssembly and the Component Model
+### 6.3.2 Actor Implementation: WebAssembly and the Component Model
 
 Actors are compiled to **WebAssembly**, hosted inside compute nodes via a Component-Model-capable runtime (e.g., Wasmtime). This choice is deliberate and preserved even where alternatives (native binaries, a modified WASM) were considered:
 
@@ -284,19 +272,19 @@ This is best understood as a **synthesis of known distributed-systems primitives
 
 **Discovery of where an actor currently lives** follows the same on-chain coordination pattern as compute-node registration: a DID-to-current-actor-location mapping, updated on migration, resolved the same way a client looks up which compute node to reach for a given DID's actor.
 
-### 7.5 Actor Lifecycle
+### 6.5 Actor Lifecycle
 
 Actors are not permanently resident processes. A compute node runs an actor's logic on request — receive a message, perform work, sleep — using an asynchronous, thread-shared execution model: many actors' work is interleaved on a shared pool of threads rather than each actor consuming a dedicated one, with requests queueing briefly if all threads are momentarily busy.
 
 Actors that receive no requests for an extended period (e.g., three months, as an illustrative threshold) are unloaded from active memory entirely, retaining only their metadata and persisted storage, and are reloaded on demand the moment a new request arrives. This mirrors the cold-start model used by existing serverless/edge-compute platforms (e.g., WASM-based edge runtimes), which is deliberately the closest existing prior art to lean on for this mechanism, rather than treating it as a novel problem.
 
-### 7.6 Discovery, Addressing, and Encryption
+### 6.6 Discovery, Addressing, and Encryption
 
-- **Inter-actor discovery is explicit, not open.** Actors (and the users behind them) discover one another through an explicit connection step analogous to a "friend request," not automatic open discovery. The underlying addressing mechanism — resolving a DID to its actor's current network location — follows the same registry pattern described in 7.3–7.4.
+- **Inter-actor discovery is explicit, not open.** Actors (and the users behind them) discover one another through an explicit connection step analogous to a "friend request," not automatic open discovery. The underlying addressing mechanism — resolving a DID to its actor's current network location — follows the same registry pattern described in 6.3–7.4.
 - **Encryption follows an established, standard pattern:** data is encrypted to the recipient's public key and only decrypted client-side using the corresponding private key held on-device. No novel cryptography is introduced here — this is the same approach already used in JKain's DID/AnonCreds layer (Section 4.3) and in existing systems such as Signal and Matrix's end-to-end encryption.
 - **Group communication** (illustrative, theoretical at this stage, using a chat application as the motivating example): a group could hold its own DID and keypair, with the group's private key separately encrypted for each member using that member's individual public key — again, a standard pattern, not a new mechanism, mentioned here only to show the identity model extends naturally to multi-party constructs.
 
-### 7.7 Explicitly Deferred: Versioning, Payment, and DDoS
+### 6.7 Explicitly Deferred: Versioning, Payment, and DDoS
 
 Several real design questions are identified but deliberately left open at this stage, to keep the project's actual scope honest:
 
@@ -308,15 +296,15 @@ Several real design questions are identified but deliberately left open at this 
 - **Compute provider compensation and metering are explicitly out of scope for now, by deliberate choice rather than oversight.** Introducing a payment/metering model at this stage would shift the project from an open-ended learning exercise into something carrying real economic and user expectations — pressure the project is intentionally avoiding while it remains a personal research effort. This is revisited only if and when that framing changes.
 - **DDoS resistance and other adversarial-network hardening** are not addressed at this stage, consistent with the project's current non-production, non-commercial scope.
 
-### 7.8 Relationship to Existing Systems
+### 6.8 Relationship to Existing Systems
 
 The closest existing prior art is Matrix's homeserver model, which already aims at decentralized, user-controlled communication infrastructure but has struggled to fully decouple user identity from the specific server a user registered on. JKain's compute layer differs by starting from DID-native identity as the foundation rather than retrofitting portability onto a server-first design, and by targeting new, purpose-built applications (each with their own actor logic) rather than migrating existing centralized applications onto the platform. Generic decentralized compute platforms (e.g., Akash Network, Flux) are a related but distinct category: they provide commoditized container/GPU rental with no concept of per-user identity-bound, persistent, migratable execution — closer to "cheaper decentralized cloud hosting" than to a personal, identity-anchored compute layer.
 
-### 7.9 Realistic Adoption Path
+### 6.9 Realistic Adoption Path
 
 There is, at present, no strong reason for a developer to choose this model over a conventional server or smart contract — this is acknowledged plainly rather than assumed away. A realistic path to any real-world traction would require, at minimum: usable SDKs (JavaScript and Python are the intended starting points, as thin wrappers around runtime APIs), the project's own developer building and dogfooding real applications on the platform, and genuine outreach/marketing effort — this is treated as a distribution and adoption problem, not merely an engineering one, and is not expected to solve itself by virtue of the underlying technology being sound. The most plausible early audience is privacy- and data-ownership-conscious users and independent developers who would rather build applications than operate and maintain backend infrastructure — a real, if currently small, demonstrated market (evidenced by sustained interest in self-hosted and local-first software), rather than a broad mainstream audience from the outset. Large, advertising-revenue-dependent platforms are correctly expected to have little incentive to adopt a model built explicitly around user data ownership.
 
-### 7.10 Path Forward
+### 6.10 Path Forward
 
 The current intent is to continue treating this section as a living design document, refined as understanding deepens, rather than to begin implementation or reserve interfaces for it inside JKain's v1 codebase ahead of time. Any interface stubbed in now, before v1 through v3 are built and their real constraints are known firsthand, would necessarily be a guess rather than an informed extension point.
 
@@ -324,7 +312,7 @@ A lightweight, low-stakes validation of the underlying consensus layer's real-wo
 
 ---
 
-## 8. Explicitly Rejected Features
+## 7. Explicitly Rejected Features
 
 The following were considered during design and deliberately excluded, with reasoning:
 
@@ -336,7 +324,7 @@ The following were considered during design and deliberately excluded, with reas
 
 ---
 
-## 9. Open Questions and Known Limitations
+## 8. Open Questions and Known Limitations
 
 Recorded explicitly, rather than left implicit, per the project's design philosophy:
 
@@ -345,12 +333,12 @@ Recorded explicitly, rather than left implicit, per the project's design philoso
 - **Shielded-pool fee pricing has an inherent blind spot** (Section 4.4), accepted as a tradeoff rather than solved.
 - **IBC is blocked on a hashgraph light client with minimal existing prior art** (Section 5.3) and is scoped as research, not conventional engineering.
 - **v3's novel zero-knowledge construction requires a substantial, separate period of mathematical study** (Section 6) not yet undertaken, and may ultimately be pursued as independent research output rather than strictly as a JKain feature.
-- **v4 remains unspecified by design** (Section 7.4) until the foundational system is complete enough to inform it honestly.
+- **v3 remains unspecified by design** (Section 6.4) until the foundational system is complete enough to inform it honestly.
 
 ---
 
-## 10. Closing Notes
+## 9. Closing Notes
 
-JKain is, first and foremost, a personal, long-horizon learning project — an attempt to genuinely understand distributed consensus, applied cryptography, and decentralized identity by building meaningful, working versions of each, rather than treating any of them as a black box. Its scope is deliberately staged: a complete, coherent v1 before ambition is layered on top, hard research-grade cryptography deferred until the necessary mathematical foundation is actually in place, and its most ambitious, platform-scale idea (v4) held at arm's length as a living vision rather than folded prematurely into a codebase not yet ready to support it.
+JKain is, first and foremost, a personal, long-horizon learning project — an attempt to genuinely understand distributed consensus, applied cryptography, and decentralized identity by building meaningful, working versions of each, rather than treating any of them as a black box. Its scope is deliberately staged: a complete, coherent v1 before ambition is layered on top, hard research-grade cryptography deferred until the necessary mathematical foundation is actually in place, and its most ambitious, platform-scale idea (v3) held at arm's length as a living vision rather than folded prematurely into a codebase not yet ready to support it.
 
 No part of this project is built with the expectation of external users, adoption, or commercial value. Its measure of success is the depth of understanding gained in building it.

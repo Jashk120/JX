@@ -2,6 +2,7 @@ pub mod ancestry;
 mod error;
 pub mod fame;
 pub mod hashgraph;
+pub mod order;
 pub mod round;
 
 pub use ancestry::AncestryError;

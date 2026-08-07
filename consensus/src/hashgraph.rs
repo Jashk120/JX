@@ -1,4 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{
+    BTreeSet,
+    HashMap,
+};
 
 use crypto::{
     Hashable,
@@ -9,6 +12,7 @@ use primitives::{
     Event,
     EventHash,
     NodeId,
+    Timestamp,
 };
 
 use crate::error::{
@@ -58,6 +62,14 @@ pub struct EventRecord {
     /// Consensus Spec §3 — this event's fame decision. Only meaningful for
     /// witnesses; non-witnesses keep `Undecided` forever.
     fame_status: FameStatus,
+    /// Consensus Spec §4 — the first round whose famous witnesses all see
+    /// this event, once that round has been decided (see `order.rs`).
+    /// `None` until then; never reassigned afterward (ordering is final).
+    round_received: Option<u64>,
+    /// Consensus Spec §4 — median of the timestamps at which the famous
+    /// witnesses of `round_received` first received this event. `None`
+    /// until `round_received` is assigned.
+    consensus_timestamp: Option<Timestamp>,
 }
 
 impl EventRecord {
@@ -92,6 +104,25 @@ impl EventRecord {
     /// "not yet voted" case.
     pub(crate) fn vote_for(&self, w: &EventHash) -> Option<bool> {
         self.votes.get(w).copied()
+    }
+
+    /// Consensus Spec §4 — this event's finalized `roundReceived`, if it has
+    /// been ordered.
+    pub fn round_received(&self) -> Option<u64> {
+        self.round_received
+    }
+
+    /// Consensus Spec §4 — this event's finalized `consensusTimestamp`, if
+    /// it has been ordered.
+    pub fn consensus_timestamp(&self) -> Option<Timestamp> {
+        self.consensus_timestamp
+    }
+
+    /// Consensus Spec §4 — marks this event as ordered. Only ever called
+    /// from `order.rs`'s `assign_order`, exactly once per event.
+    pub(crate) fn set_order(&mut self, round_received: u64, consensus_timestamp: Timestamp) {
+        self.round_received = Some(round_received);
+        self.consensus_timestamp = Some(consensus_timestamp);
     }
 }
 
@@ -139,6 +170,14 @@ pub struct Hashgraph {
     /// Max key of `witnesses_by_round`, cached so a late-arriving candidate
     /// witness (fame.rs's backfill step) knows how far forward to look.
     highest_witness_round: u64,
+    /// Consensus Spec §4 — every round whose witnesses all have a final,
+    /// non-`Undecided` fame decision. When a new round joins this set,
+    /// `order.rs` finalizes it and any earlier decided-but-unprocessed
+    /// rounds (rounds are finalized in strictly increasing order).
+    fully_decided_rounds: BTreeSet<u64>,
+    /// Consensus Spec §4 — the lowest round whose `assignOrder` has not run
+    /// yet. Rounds are finalized in strictly increasing order.
+    next_round_to_order: u64,
 }
 
 impl Hashgraph {
@@ -158,6 +197,8 @@ impl Hashgraph {
             witnesses_by_round: HashMap::new(),
             undecided_witnesses: HashMap::new(),
             highest_witness_round: 0,
+            fully_decided_rounds: BTreeSet::new(),
+            next_round_to_order: 1,
         }
     }
 
@@ -230,6 +271,8 @@ impl Hashgraph {
                 is_witness: false,
                 votes: HashMap::new(),
                 fame_status: FameStatus::Undecided,
+                round_received: None,
+                consensus_timestamp: None,
             },
         );
 
@@ -248,6 +291,43 @@ impl Hashgraph {
 
     pub fn children(&self, hash: &EventHash) -> &[EventHash] {
         self.children.get(hash).map_or(&[], Vec::as_slice)
+    }
+
+    /// Crate-internal (§4): every event that has not yet been assigned a
+    /// `roundReceived`, as owned hashes so the caller can mutate the graph
+    /// afterward without holding a borrow over the event map.
+    pub(crate) fn pending_order_events(&self) -> Vec<EventHash> {
+        self.events
+            .iter()
+            .filter(|(_, record)| record.round_received().is_none())
+            .map(|(&hash, _)| hash)
+            .collect()
+    }
+
+    /// Crate-internal: every stored event hash. Used by `consensus_order` to
+    /// look up an already-finalized round's events.
+    pub(crate) fn all_event_hashes(&self) -> Vec<EventHash> {
+        self.events.keys().copied().collect()
+    }
+
+    /// Crate-internal (§4): applies a `roundReceived` / `consensusTimestamp`
+    /// assignment to an event, for `order.rs`'s `assign_order`.
+    pub(crate) fn set_event_order(&mut self, hash: &EventHash, round: u64, timestamp: Timestamp) {
+        if let Some(record) = self.events.get_mut(hash) {
+            record.set_order(round, timestamp);
+        }
+    }
+
+    /// Test-only: force a witness's fame status directly, bypassing the
+    /// election machinery. Used by `order.rs`'s fork-dedup test to construct
+    /// the "two Famous witnesses from one forking creator" edge case that the
+    /// game cannot produce naturally (§3.2). Deliberately *does not* touch
+    /// the undecided working set, so it cannot fire `assignOrder`.
+    #[cfg(test)]
+    pub(crate) fn mark_for_test_famous(&mut self, hash: &EventHash) {
+        if let Some(record) = self.events.get_mut(hash) {
+            record.fame_status = FameStatus::Famous;
+        }
     }
 
     /// Consensus Spec §2.1 — witnesses of `round`, i.e. every event that
@@ -278,11 +358,50 @@ impl Hashgraph {
     /// Crate-internal: finalizes `candidate`'s fame election and removes it
     /// from the undecided working set. Only ever called from `fame.rs`.
     /// Decisions are immutable: nothing in the codebase calls this twice.
+    ///
+    /// If `candidate`'s round has now no undecided witnesses left, every
+    /// witness of that round has a final fame decision — the round is
+    /// "decided" and `order.rs` may finalize it (§4).
     pub(crate) fn decide_fame(&mut self, candidate: &EventHash, status: FameStatus) {
         if let Some(record) = self.events.get_mut(candidate) {
             record.fame_status = status;
         }
         self.undecided_witnesses.remove(candidate);
+        let round = self.events.get(candidate).map_or(0, |record| record.round());
+        self.note_round_decided_if_complete(round);
+    }
+
+    /// Crate-internal (§4): if `round` still has undecided witnesses it is
+    /// not decided; otherwise it joins the decided set and every round that
+    /// can now be finalized is finalized in order. Hooked from
+    /// `decide_fame`, so it fires at whatever recursion depth a fame
+    /// decision was actually produced — not just for the round of whatever
+    /// witness triggered the election.
+    pub(crate) fn note_round_decided_if_complete(&mut self, round: u64) {
+        if round == 0 {
+            return;
+        }
+        if self.undecided_witnesses.values().any(|&witness_round| witness_round == round) {
+            return;
+        }
+        self.fully_decided_rounds.insert(round);
+        self.order_decided_rounds();
+    }
+
+    /// Crate-internal (§4): finalizes every round that is safe to finalize.
+    ///
+    /// A round `r` is finalizable as soon as it is decided: at that point
+    /// every witness of `r` has a final, immutable fame decision, so round
+    /// `r`'s famous-witness set is final and `assignOrder(r)` can be run.
+    /// Rounds are processed in strictly increasing order, each exactly once
+    /// — `next_round_to_order` advances past a round only after it has been
+    /// decided.
+    pub(crate) fn order_decided_rounds(&mut self) {
+        while self.fully_decided_rounds.contains(&self.next_round_to_order) {
+            let round = self.next_round_to_order;
+            self.next_round_to_order += 1;
+            self.assign_order(round);
+        }
     }
 
     /// Consensus Spec §3 — the fame decision for a witness, if one exists.
@@ -337,6 +456,19 @@ impl Hashgraph {
 
     pub(crate) fn event_for_creator_seq(&self, creator: NodeId, seq: u64) -> Option<EventHash> {
         self.by_creator_seq.get(&(creator, seq)).copied()
+    }
+
+    /// Consensus Spec §3.2 — the first-seen event created by `creator` with
+    /// the given `self_parent`, if any. This is the canonical branch for a
+    /// forking creator: `order.rs` uses it to discard duplicate famous
+    /// witnesses from the same creator in a round (at most the first-seen
+    /// branch is carried forward).
+    pub(crate) fn canonical_child(
+        &self,
+        creator: NodeId,
+        self_parent: Option<EventHash>,
+    ) -> Option<EventHash> {
+        self.first_child.get(&(creator, self_parent)).copied()
     }
 }
 

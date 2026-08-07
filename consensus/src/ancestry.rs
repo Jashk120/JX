@@ -124,7 +124,7 @@ impl Hashgraph {
         Ok(false)
     }
 
-    fn ancestor_event_for_creator(
+    pub(crate) fn ancestor_event_for_creator(
         &self,
         x: &EventHash,
         creator: &NodeId,
