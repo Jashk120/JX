@@ -103,32 +103,38 @@ struct GeneratedGraph {
     events: Vec<(EventHash, NodeId, Option<EventHash>, Option<EventHash>)>,
 }
 
-fn insert_generated_event(
-    hashgraph: &mut Hashgraph,
-    registry: &MembershipRegistry,
-    members: &[NodeId],
-    keys: &[SigningKey],
-    latest_by_member: &mut [Option<EventHash>],
-    events: &mut Vec<(EventHash, NodeId, Option<EventHash>, Option<EventHash>)>,
-    timestamp: &mut u64,
-    creator_index: usize,
-    self_parent: Option<EventHash>,
-    other_parent: Option<EventHash>,
-) {
-    let creator = members[creator_index];
-    let event = UnsignedEvent::new(
-        creator,
-        self_parent,
-        other_parent,
-        Timestamp::new(*timestamp),
-        Vec::new(),
-    )
-    .sign(&keys[creator_index]);
-    let verified = event.verify(registry).expect("generated event must verify");
-    let hash = hashgraph.insert(verified).expect("generated graph must insert");
-    events.push((hash, creator, self_parent, other_parent));
-    latest_by_member[creator_index] = Some(hash);
-    *timestamp += 1;
+struct GraphBuilder {
+    hashgraph: Hashgraph,
+    registry: MembershipRegistry,
+    members: Vec<NodeId>,
+    keys: Vec<SigningKey>,
+    latest_by_member: Vec<Option<EventHash>>,
+    events: Vec<(EventHash, NodeId, Option<EventHash>, Option<EventHash>)>,
+    timestamp: u64,
+}
+
+impl GraphBuilder {
+    fn insert(
+        &mut self,
+        creator_index: usize,
+        self_parent: Option<EventHash>,
+        other_parent: Option<EventHash>,
+    ) {
+        let creator = self.members[creator_index];
+        let event = UnsignedEvent::new(
+            creator,
+            self_parent,
+            other_parent,
+            Timestamp::new(self.timestamp),
+            Vec::new(),
+        )
+        .sign(&self.keys[creator_index]);
+        let verified = event.verify(&self.registry).expect("generated event must verify");
+        let hash = self.hashgraph.insert(verified).expect("generated graph must insert");
+        self.events.push((hash, creator, self_parent, other_parent));
+        self.latest_by_member[creator_index] = Some(hash);
+        self.timestamp += 1;
+    }
 }
 
 fn generate_graph(seed: u64, include_fork: bool) -> GeneratedGraph {
@@ -142,75 +148,39 @@ fn generate_graph(seed: u64, include_fork: bool) -> GeneratedGraph {
     for (member, key) in members.iter().zip(&keys) {
         registry.register(*member, key.verifying_key());
     }
-    let mut hashgraph = Hashgraph::new(&registry);
-    let mut events = Vec::new();
-    let mut latest_by_member = vec![None; member_count];
-    let mut timestamp = 0;
+    let mut builder = GraphBuilder {
+        hashgraph: Hashgraph::new(&registry),
+        registry,
+        members,
+        keys,
+        latest_by_member: vec![None; member_count],
+        events: Vec::new(),
+        timestamp: 0,
+    };
 
     for creator_index in 0..member_count {
-        insert_generated_event(
-            &mut hashgraph,
-            &registry,
-            &members,
-            &keys,
-            &mut latest_by_member,
-            &mut events,
-            &mut timestamp,
-            creator_index,
-            None,
-            None,
-        );
+        builder.insert(creator_index, None, None);
     }
 
     if include_fork {
-        let fork_parent = latest_by_member[0];
-        let other_parent = events[rng.gen_range(0..events.len())].0;
-        insert_generated_event(
-            &mut hashgraph,
-            &registry,
-            &members,
-            &keys,
-            &mut latest_by_member,
-            &mut events,
-            &mut timestamp,
-            0,
-            fork_parent,
-            Some(other_parent),
-        );
-        let other_parent = events[rng.gen_range(0..events.len())].0;
-        insert_generated_event(
-            &mut hashgraph,
-            &registry,
-            &members,
-            &keys,
-            &mut latest_by_member,
-            &mut events,
-            &mut timestamp,
-            0,
-            fork_parent,
-            Some(other_parent),
-        );
+        let fork_parent = builder.latest_by_member[0];
+        let other_parent = builder.events[rng.gen_range(0..builder.events.len())].0;
+        builder.insert(0, fork_parent, Some(other_parent));
     }
 
-    while events.len() < event_count {
+    while builder.events.len() < event_count {
         let creator_index = rng.gen_range(0..member_count);
-        let self_parent = latest_by_member[creator_index];
-        let other_parent = rng.gen_bool(0.75).then(|| events[rng.gen_range(0..events.len())].0);
-        insert_generated_event(
-            &mut hashgraph,
-            &registry,
-            &members,
-            &keys,
-            &mut latest_by_member,
-            &mut events,
-            &mut timestamp,
-            creator_index,
-            self_parent,
-            other_parent,
-        );
+        let self_parent = builder.latest_by_member[creator_index];
+        let other_parent =
+            rng.gen_bool(0.75).then(|| builder.events[rng.gen_range(0..builder.events.len())].0);
+        builder.insert(creator_index, self_parent, other_parent);
     }
 
-    GeneratedGraph { hashgraph, members, events }
+    GeneratedGraph {
+        hashgraph: builder.hashgraph,
+        members: builder.members,
+        events: builder.events,
+    }
 }
 
 #[test]
@@ -259,95 +229,31 @@ fn fork_branch_selected_from_observers_ancestry_can_strongly_see() {
     for (member, key) in members.iter().zip(&keys) {
         registry.register(*member, key.verifying_key());
     }
+    let member_count = members.len();
 
-    let mut hashgraph = Hashgraph::new(&registry);
-    let mut latest_by_member = vec![None; members.len()];
-    let mut events = Vec::new();
-    let mut timestamp = 0;
+    let mut builder = GraphBuilder {
+        hashgraph: Hashgraph::new(&registry),
+        registry,
+        members,
+        keys,
+        latest_by_member: vec![None; member_count],
+        events: Vec::new(),
+        timestamp: 0,
+    };
 
-    insert_generated_event(
-        &mut hashgraph,
-        &registry,
-        &members,
-        &keys,
-        &mut latest_by_member,
-        &mut events,
-        &mut timestamp,
-        0,
-        None,
-        None,
-    );
-    insert_generated_event(
-        &mut hashgraph,
-        &registry,
-        &members,
-        &keys,
-        &mut latest_by_member,
-        &mut events,
-        &mut timestamp,
-        1,
-        None,
-        None,
-    );
+    builder.insert(0, None, None);
+    builder.insert(1, None, None);
 
-    let fork_parent = latest_by_member[0].expect("creator 1 genesis must exist");
-    let other_parent = latest_by_member[1];
-    insert_generated_event(
-        &mut hashgraph,
-        &registry,
-        &members,
-        &keys,
-        &mut latest_by_member,
-        &mut events,
-        &mut timestamp,
-        0,
-        Some(fork_parent),
-        other_parent,
-    );
-    insert_generated_event(
-        &mut hashgraph,
-        &registry,
-        &members,
-        &keys,
-        &mut latest_by_member,
-        &mut events,
-        &mut timestamp,
-        0,
-        Some(fork_parent),
-        other_parent,
-    );
-    let y = insert_hash(&events);
-    let b1_parent = latest_by_member[1].expect("creator 2 genesis must exist");
-    insert_generated_event(
-        &mut hashgraph,
-        &registry,
-        &members,
-        &keys,
-        &mut latest_by_member,
-        &mut events,
-        &mut timestamp,
-        1,
-        Some(b1_parent),
-        Some(y),
-    );
-    let b1 = insert_hash(&events);
-    insert_generated_event(
-        &mut hashgraph,
-        &registry,
-        &members,
-        &keys,
-        &mut latest_by_member,
-        &mut events,
-        &mut timestamp,
-        1,
-        Some(b1),
-        Some(y),
-    );
-    let x = insert_hash(&events);
+    let fork_parent = builder.latest_by_member[0].expect("creator 1 genesis must exist");
+    let other_parent = builder.latest_by_member[1];
+    builder.insert(0, Some(fork_parent), other_parent);
+    builder.insert(0, Some(fork_parent), other_parent);
+    let y = builder.events.last().expect("event was just inserted").0;
+    let b1_parent = builder.latest_by_member[1].expect("creator 2 genesis must exist");
+    builder.insert(1, Some(b1_parent), Some(y));
+    let b1 = builder.events.last().expect("event was just inserted").0;
+    builder.insert(1, Some(b1), Some(y));
+    let x = builder.events.last().expect("event was just inserted").0;
 
-    assert!(hashgraph.strongly_see(&x, &y).expect("events must be known"));
-}
-
-fn insert_hash(events: &[(EventHash, NodeId, Option<EventHash>, Option<EventHash>)]) -> EventHash {
-    events.last().expect("event was just inserted").0
+    assert!(builder.hashgraph.strongly_see(&x, &y).expect("events must be known"));
 }

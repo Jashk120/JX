@@ -120,7 +120,7 @@ mod tests {
         let self_parent = EventHash::new([1; 32]);
         let other_parent = EventHash::new([2; 32]);
 
-        let event = make_event(Some(self_parent.clone()), Some(other_parent.clone()), Vec::new());
+        let event = make_event(Some(self_parent), Some(other_parent), Vec::new());
 
         assert_eq!(event.self_parent(), Some(&self_parent));
         assert_eq!(event.other_parent(), Some(&other_parent));
