@@ -6,6 +6,7 @@ members = [
     "crypto",
     "consensus",
     "gossip",
+    "executor",
 ]
 
 [workspace.package]
@@ -22,6 +23,7 @@ thiserror = "2"
 primitives = { path = "primitives" }
 crypto = { path = "crypto" }
 consensus = { path = "consensus" }
+executor = { path = "executor" }
 sha2 = "0.10"
 
 [workspace.lints.rust]

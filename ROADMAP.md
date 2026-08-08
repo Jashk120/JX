@@ -175,9 +175,25 @@
 
 ## Phase 8 — Executor
 
-- [ ] State
-- [ ] Transaction execution
-- [ ] Deterministic execution
+- [x] State
+- [x] Transaction execution
+- [x] Deterministic execution
+
+> **Phase 8 status**: the `executor` crate implements a deterministic
+> executor over a key-value `State` (opaque byte-string keys/values in a
+> `BTreeMap`). `Transaction` payloads decode from a tiny explicit binary
+> format (`Op::Put`/`Op::Delete`; big-endian `u32` length prefixes) and are
+> applied to the state through pure, deterministic functions — no wall-clock
+> reads, randomness, or I/O inside execution. `finalized_events` consumes
+> `Hashgraph::consensus_order` round-by-round unchanged, so the executor
+> reuses the exact ordering `order.rs` produces instead of defining its own.
+> The determinism suite (`executor/tests/deterministic.rs`) runs the same
+> order through two independently-constructed `State`/`Executor` instances
+> and asserts identical state both by equality and by canonical bytes; it
+> also verifies finalized order follows consensus order and that malformed
+> payloads fail identically on every instance. Membership remains static;
+> add/remove-member transactions are deferred. Verified with `cargo fmt`,
+> `cargo clippy`, and `cargo test --workspace`.
 
 ---
 

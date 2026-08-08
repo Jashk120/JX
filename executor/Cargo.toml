@@ -1,0 +1,12 @@
+[package]
+name = "executor"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+primitives = { workspace = true }
+consensus  = { workspace = true }
+
+[dev-dependencies]
+crypto        = { workspace = true }
+ed25519-dalek = { workspace = true }
