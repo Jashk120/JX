@@ -27,7 +27,7 @@ An **event** is the fundamental unit of the hashgraph. Each event contains:
 | `signature` | The creator's signature over the above fields |
 | `hash` | Cryptographic hash of the above fields, used as this event's identifier |
 
-**[DECIDED, v0.1 implementation]**: SHA-256 over a custom canonical byte encoding (`CanonicalEncode` trait, `crypto/src/canonical_impls.rs`), not an off-the-shelf serialization format (no bincode/protobuf/JSON). Every field is encoded as fixed-width big-endian integers or length-prefixed bytes, in field order: `creator, self_parent (0x00/0x01-tagged), other_parent (0x00/0x01-tagged), timestamp, payload (u32-length-prefixed), signature`. `Option<EventHash>` uses an explicit presence tag rather than a variable-length encoding, so hashing never depends on omission ambiguity. This avoids taking a dependency on any external serialization format's determinism guarantees (e.g. bincode's varint behavior isn't itself a stable contract across versions) — canonical encoding is entirely self-defined and covered by `canonical_impls.rs`'s own tests, not delegated to a library.
+**[DECIDED, v0.1 implementation]**: SHA-256 over a custom canonical byte encoding (`CanonicalEncode` trait, `protocol/crypto/src/canonical_impls.rs`), not an off-the-shelf serialization format (no bincode/protobuf/JSON). Every field is encoded as fixed-width big-endian integers or length-prefixed bytes, in field order: `creator, self_parent (0x00/0x01-tagged), other_parent (0x00/0x01-tagged), timestamp, payload (u32-length-prefixed), signature`. `Option<EventHash>` uses an explicit presence tag rather than a variable-length encoding, so hashing never depends on omission ambiguity. This avoids taking a dependency on any external serialization format's determinism guarantees (e.g. bincode's varint behavior isn't itself a stable contract across versions) — canonical encoding is entirely self-defined and covered by `canonical_impls.rs`'s own tests, not delegated to a library.
 
 ### 1.2 The Hashgraph [SPEC]
 
@@ -143,7 +143,7 @@ This order, once determined, is **final** — this is what gives hashgraph its d
 
 This is what causes information (including the fact that gossip itself occurred) to propagate exponentially through the network, giving the algorithm its speed and its property that events themselves encode a verifiable history of who-knew-what-when.
 
-The engineering choices the papers leave to the implementer are resolved by the `gossip` crate (see `gossip/README.md`), over the pinned-TLS transport chosen in §2.2 of the whitepaper. **[DECIDED, v0.1 implementation]**:
+The engineering choices the papers leave to the implementer are resolved by the `gossip` crate (see `protocol/gossip/README.md`), over the pinned-TLS transport chosen in §2.2 of the whitepaper. **[DECIDED, v0.1 implementation]**:
 
 - **Peer selection strategy** — uniform random among known peers (`PeerManager::random_peer`), matching Hedera's unweighted behavior. Weighted selection is deferred as an optimization (Phase 6), not a correctness requirement.
 - **Sync frequency / interval** — a tuning parameter exposed directly as the `sync_interval` constructor knob on `GossipNode`, so each deployment chooses its own gossip-speed / bandwidth balance. The localhost integration tests use 25 ms.

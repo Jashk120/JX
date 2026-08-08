@@ -51,7 +51,7 @@
 //!
 //! # One-member-one-vote, not stake
 //!
-//! `MembershipRegistry` carries no weights (checked: `crypto/src/
+//! `MembershipRegistry` carries no weights (checked: `protocol/crypto/src/
 //! membership.rs`), so witnesses are counted — matching `round.rs`'s
 //! `strongly_seen_count * 3 > member_count() * 2` assumption — and the
 //! supermajority check uses the exact same `* 3 > * 2` integer idiom to

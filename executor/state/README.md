@@ -1,4 +1,4 @@
-# executor
+# state
 
 Deterministic transaction execution for JKain.
 

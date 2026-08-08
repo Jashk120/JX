@@ -2,11 +2,11 @@
 [workspace]
 resolver = "3"
 members = [
-    "primitives",
-    "crypto",
-    "consensus",
-    "gossip",
-    "executor",
+    "protocol/primitives",
+    "protocol/crypto",
+    "protocol/consensus",
+    "protocol/gossip",
+    "executor/state",
 ]
 
 [workspace.package]
@@ -20,10 +20,10 @@ serde = { version = "1", features = ["derive"] }
 ed25519-dalek = "2.2.0"
 anyhow = "1"
 thiserror = "2"
-primitives = { path = "primitives" }
-crypto = { path = "crypto" }
-consensus = { path = "consensus" }
-executor = { path = "executor" }
+primitives = { path = "protocol/primitives" }
+crypto = { path = "protocol/crypto" }
+consensus = { path = "protocol/consensus" }
+state = { path = "executor/state" }
 sha2 = "0.10"
 
 [workspace.lints.rust]

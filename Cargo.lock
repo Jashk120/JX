@@ -312,16 +312,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "executor"
-version = "0.0.1"
-dependencies = [
- "consensus",
- "crypto",
- "ed25519-dalek",
- "primitives",
-]
-
-[[package]]
 name = "fiat-crypto"
 version = "0.2.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -830,6 +820,16 @@ checksum = "d91ed6c858b01f942cd56b37a94b3e0a1798290327d1236e4d9cf4eaca44d29d"
 dependencies = [
  "base64ct",
  "der",
+]
+
+[[package]]
+name = "state"
+version = "0.0.1"
+dependencies = [
+ "consensus",
+ "crypto",
+ "ed25519-dalek",
+ "primitives",
 ]
 
 [[package]]

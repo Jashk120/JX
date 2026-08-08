@@ -1,5 +1,5 @@
 [package]
-name = "executor"
+name = "state"
 version.workspace = true
 edition.workspace = true
 

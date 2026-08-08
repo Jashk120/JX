@@ -14,8 +14,8 @@
 //! [`finalized_events`] bridges this crate to the consensus layer: it walks a
 //! `Hashgraph`'s rounds in increasing order and yields each round's events in
 //! the exact order `consensus`'s `consensus_order` produces (roundReceived,
-//! then consensusTimestamp, then the signature-derived tie-break), so the
-//! executor never invents its own ordering rule.
+//! then consensusTimestamp, then the signature-derived tie-break), so this
+//! crate never invents its own ordering rule.
 
 mod error;
 mod executor;

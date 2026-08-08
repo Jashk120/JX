@@ -136,7 +136,7 @@
 > Consensus Spec §5 end to end — pinned TLS 1.3 transport over TCP, uniform-
 > random peer selection, canonical length-prefixed frames, frontier-based
 > delta exchange, and the per-round event-creation rule. The end-to-end suite
-> in `gossip/tests/` covers the full stack on localhost: 2- and 4-node
+> in `protocol/gossip/tests/` covers the full stack on localhost: 2- and 4-node
 > clusters converge and reconcile after a partition, transaction payloads
 > survive gossip byte-for-byte, and every node derives an identical finalized
 > consensus order. Negative coverage exercises the failure modes — wrong TLS
@@ -156,7 +156,7 @@
 > **Phase 6 status**: gossip-level integration on localhost is done — a lone
 > node serves syncs (single-node), and 2- and 4-node clusters exchange
 > transactions, converge on identical event sets, and finalize the same
-> consensus order (`gossip/tests/gossip_integration.rs` and `e2e.rs`). What
+> consensus order (`protocol/gossip/tests/gossip_integration.rs` and `e2e.rs`). What
 > remains is real-machine networking: manual `PeerInfo` configuration
 > (address + SPKI fingerprint), firewall/open-port setup, and a VPS ↔ local
 > pair. A NAT'd home node can only initiate dials, but that still converges —
@@ -179,7 +179,7 @@
 - [x] Transaction execution
 - [x] Deterministic execution
 
-> **Phase 8 status**: the `executor` crate implements a deterministic
+> **Phase 8 status**: the `state` crate implements a deterministic
 > executor over a key-value `State` (opaque byte-string keys/values in a
 > `BTreeMap`). `Transaction` payloads decode from a tiny explicit binary
 > format (`Op::Put`/`Op::Delete`; big-endian `u32` length prefixes) and are
@@ -187,7 +187,7 @@
 > reads, randomness, or I/O inside execution. `finalized_events` consumes
 > `Hashgraph::consensus_order` round-by-round unchanged, so the executor
 > reuses the exact ordering `order.rs` produces instead of defining its own.
-> The determinism suite (`executor/tests/deterministic.rs`) runs the same
+> The determinism suite (`executor/state/tests/deterministic.rs`) runs the same
 > order through two independently-constructed `State`/`Executor` instances
 > and asserts identical state both by equality and by canonical bytes; it
 > also verifies finalized order follows consensus order and that malformed

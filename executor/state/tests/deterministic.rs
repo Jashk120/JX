@@ -22,18 +22,18 @@ use crypto::{
     Verifiable,
 };
 use ed25519_dalek::SigningKey;
-use executor::{
-    Executor,
-    ExecutorError,
-    Op,
-    finalized_events,
-};
 use primitives::{
     EventHash,
     NodeId,
     Timestamp,
     Transaction,
     UnsignedEvent,
+};
+use state::{
+    Executor,
+    ExecutorError,
+    Op,
+    finalized_events,
 };
 
 fn key_for(id: u64) -> SigningKey {
