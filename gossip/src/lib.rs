@@ -11,6 +11,7 @@
 //! (§2.2) deliberately chooses for the consensus-hot path. QUIC is deferred
 //! to a later optimization phase.
 
+pub mod cluster_config;
 pub mod error;
 pub mod frontier;
 pub mod node;
@@ -21,6 +22,10 @@ pub mod sync;
 pub mod tls;
 pub mod transport;
 
+pub use cluster_config::{
+    ClusterConfig,
+    MemberEntry,
+};
 pub use error::{
     GossipError,
     Result,

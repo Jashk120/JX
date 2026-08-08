@@ -39,6 +39,19 @@ impl PeerManager {
         self.peers.iter().find(|p| p.node_id == node_id)
     }
 
+    /// Adds `info` to the live peer set. Returns `true` if the peer was not
+    /// already present (idempotent on duplicate). Does not affect the
+    /// `MembershipRegistry` or `n` — use only when the new peer's key is
+    /// already registered in the registry (i.e., after a coordinated restart
+    /// with an updated `ClusterConfig`).
+    pub fn add_peer(&mut self, info: PeerInfo) -> bool {
+        if self.peers.iter().any(|p| p.node_id == info.node_id) {
+            return false;
+        }
+        self.peers.push(info);
+        true
+    }
+
     pub fn len(&self) -> usize {
         self.peers.len()
     }
@@ -110,5 +123,14 @@ mod tests {
         let manager = PeerManager::with_seed(vec![peer(1), peer(2)], 0);
         assert!(manager.peer(NodeId::new(2)).is_some());
         assert!(manager.peer(NodeId::new(99)).is_none());
+    }
+
+    #[test]
+    fn peer_manager_add_peer_idempotent() {
+        let mut manager = PeerManager::with_seed(vec![peer(1)], 0);
+        assert!(manager.add_peer(peer(2)), "new peer is added");
+        assert_eq!(manager.len(), 2);
+        assert!(!manager.add_peer(peer(2)), "duplicate peer id is a no-op");
+        assert_eq!(manager.len(), 2);
     }
 }
