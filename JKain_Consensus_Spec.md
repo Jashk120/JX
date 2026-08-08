@@ -133,7 +133,7 @@ This order, once determined, is **final** — this is what gives hashgraph its d
 
 ---
 
-## 5. Gossip Protocol [SPEC + DECISION NEEDED]
+## 5. Gossip Protocol [SPEC + DECIDED]
 
 **[SPEC]** — the high-level gossip mechanism ("gossip about gossip"):
 
@@ -143,11 +143,12 @@ This order, once determined, is **final** — this is what gives hashgraph its d
 
 This is what causes information (including the fact that gossip itself occurred) to propagate exponentially through the network, giving the algorithm its speed and its property that events themselves encode a verifiable history of who-knew-what-when.
 
-**[DECISION NEEDED — real engineering, not covered precisely by the original papers]**:
-- **Peer selection strategy** for choosing sync partners (uniform random is the simplest correct starting point; production systems sometimes weight this, which is an optimization, not a correctness requirement).
-- **Sync frequency / interval** — a tuning parameter directly trading off gossip speed against network bandwidth.
-- **Wire protocol for a sync exchange** — the original papers describe *what* information needs to be exchanged (events each side lacks), not the exact bytes-on-the-wire format. This is where Section 2.2 of the whitepaper's transport decision (raw TCP, custom binary framing) becomes concrete: you need to design the actual sync request/response message format.
-- **Efficient "what does the other side already have" determination** — naively this requires knowing the full state of the other member's hashgraph; real implementations use compact summaries (e.g., each member's latest known event hash per creator) to determine the delta efficiently, rather than exchanging full hashgraphs each sync.
+The engineering choices the papers leave to the implementer are resolved by the `gossip` crate (see `gossip/README.md`), over the pinned-TLS transport chosen in §2.2 of the whitepaper. **[DECIDED, v0.1 implementation]**:
+
+- **Peer selection strategy** — uniform random among known peers (`PeerManager::random_peer`), matching Hedera's unweighted behavior. Weighted selection is deferred as an optimization (Phase 6), not a correctness requirement.
+- **Sync frequency / interval** — a tuning parameter exposed directly as the `sync_interval` constructor knob on `GossipNode`, so each deployment chooses its own gossip-speed / bandwidth balance. The localhost integration tests use 25 ms.
+- **Wire protocol for a sync exchange** — a three-frame message set over one persistent pinned-TLS connection: `SyncRequest` (requester `NodeId` + per-creator known summary), `SyncResponse` (the topological event delta), and `Event` (the initiator's new event pushed back on the same stream). Frames are `[tag: u8][len: u32 BE][payload]`, with the payload in the same canonical encoding the rest of the system hashes (§1.1); tags are 0x00 / 0x01 / 0x02.
+- **Efficient "what does the other side already have" determination** — each node keeps a per-creator frontier incrementally (`Hashgraph::latest_event_by`, §1.2), so a sync summary is O(members) with no graph scan. The responder computes the delta by walking each creator's self-parent chain above the requester's frontier, then topologically sorting the union (Kahn's algorithm over both-parent edges) so the requester can insert parents-first and never hit `MissingParent`.
 
 ---
 

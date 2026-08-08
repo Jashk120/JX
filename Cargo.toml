@@ -5,6 +5,7 @@ members = [
     "primitives",
     "crypto",
     "consensus",
+    "gossip",
 ]
 
 [workspace.package]

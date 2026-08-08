@@ -8,7 +8,7 @@
 - [x] Primitive crate
 - [x] Crypto crate
 - [x] Consensus crate
-- [ ] Gossip crate
+- [x] Gossip crate
 
 ---
 
@@ -85,7 +85,7 @@
 - The hashgraph stores events and maintains incremental per-member ancestor sequence metadata.
 - Fork detection is implemented with observer-relative `see` checks and a first-seen branch policy.
 - `strongly_see` is correct and tested, but still uses per-member self-chain walks; the witness-specific optimization is deferred to round-assignment work.
-- Gossip/network event propagation, round assignment, fame voting, final ordering, and persistent storage are not implemented yet.
+- Gossip/network event propagation (Phase 5), round assignment, fame voting, and final ordering (Phase 4) are now implemented. Persistent storage is not implemented yet — the hashgraph is held in memory for the life of a process.
 
 ---
 
@@ -122,24 +122,46 @@
 
 ### Networking
 
-- [ ] TCP
-- [ ] Peer manager
-- [ ] Message protocol
+- [x] TCP
+- [x] Peer manager
+- [x] Message protocol
 
 ### Synchronization
 
-- [ ] Sync request
-- [ ] Sync response
-- [ ] Delta exchange
+- [x] Sync request
+- [x] Sync response
+- [x] Delta exchange
+
+> **Phase 5 status**: the `gossip` crate implements the consensus-hot path of
+> Consensus Spec §5 end to end — pinned TLS 1.3 transport over TCP, uniform-
+> random peer selection, canonical length-prefixed frames, frontier-based
+> delta exchange, and the per-round event-creation rule. The end-to-end suite
+> in `gossip/tests/` covers the full stack on localhost: 2- and 4-node
+> clusters converge and reconcile after a partition, transaction payloads
+> survive gossip byte-for-byte, and every node derives an identical finalized
+> consensus order. Negative coverage exercises the failure modes — wrong TLS
+> pin, forged signatures, unknown creators, missing parents, malformed
+> frames, dead peers, and protocol violations — all rejected without taking a
+> node down.
 
 ---
 
 ## Phase 6 — Integration
 
-- [ ] Single node
-- [ ] Two nodes
-- [ ] Four nodes
+- [x] Single node
+- [x] Two nodes
+- [x] Four nodes
 - [ ] VPS deployment
+
+> **Phase 6 status**: gossip-level integration on localhost is done — a lone
+> node serves syncs (single-node), and 2- and 4-node clusters exchange
+> transactions, converge on identical event sets, and finalize the same
+> consensus order (`gossip/tests/gossip_integration.rs` and `e2e.rs`). What
+> remains is real-machine networking: manual `PeerInfo` configuration
+> (address + SPKI fingerprint), firewall/open-port setup, and a VPS ↔ local
+> pair. A NAT'd home node can only initiate dials, but that still converges —
+> each sync round is a full bidirectional exchange over one connection.
+> Full-system integration with transaction execution is Phase 8.
 
 ---
 

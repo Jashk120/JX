@@ -1,0 +1,18 @@
+[package]
+name = "gossip"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+primitives     = { workspace = true }
+crypto         = { workspace = true }
+consensus      = { workspace = true }
+tokio          = { workspace = true }
+thiserror      = { workspace = true }
+ed25519-dalek  = { workspace = true, features = ["pkcs8"] }
+sha2           = { workspace = true }
+rcgen          = "0.14"
+rustls         = { version = "0.23", default-features = false, features = ["ring", "logging", "tls12"] }
+tokio-rustls   = "0.26"
+x509-parser    = "0.18.1"
+rand           = "0.8"

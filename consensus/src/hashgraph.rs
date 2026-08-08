@@ -148,6 +148,12 @@ pub struct Hashgraph {
     /// traversal. Same first-seen-wins policy as `first_child`, for the
     /// same reason.
     by_creator_seq: HashMap<(NodeId, u64), EventHash>,
+    /// Newest stored event per creator, tracked incrementally so the gossip
+    /// layer can build per-creator "what's my latest" summaries in O(1)
+    /// (Consensus Spec §5). Overwritten only when the new event's seq
+    /// exceeds the current entry's, so a straggling lower-seq branch never
+    /// clobbers the frontier.
+    latest_by_creator: HashMap<NodeId, EventHash>,
     member_index: HashMap<NodeId, usize>,
     member_count: usize,
     /// Node-global, not observer-relative: "has this local hashgraph copy
@@ -191,6 +197,7 @@ impl Hashgraph {
             children: HashMap::new(),
             first_child: HashMap::new(),
             by_creator_seq: HashMap::new(),
+            latest_by_creator: HashMap::new(),
             member_index,
             member_count,
             known_forkers: vec![false; member_count],
@@ -249,6 +256,18 @@ impl Hashgraph {
         }
         self.by_creator_seq.entry((creator, seq)).or_insert(hash);
 
+        match self.latest_by_creator.get(&creator) {
+            Some(latest) => {
+                let latest_seq = self.events.get(latest).map_or(0, |r| r.seq);
+                if seq > latest_seq {
+                    self.latest_by_creator.insert(creator, hash);
+                }
+            }
+            None => {
+                self.latest_by_creator.insert(creator, hash);
+            }
+        }
+
         for parent in [event.self_parent(), event.other_parent()].into_iter().flatten() {
             self.children.entry(*parent).or_default().push(hash);
         }
@@ -289,6 +308,13 @@ impl Hashgraph {
         self.events.get(hash)
     }
 
+    /// Consensus Spec §5 — the newest stored event created by `node`, if
+    /// any. Maintained incrementally by `insert`, so the gossip layer can
+    /// build per-creator frontier summaries without scanning the graph.
+    pub fn latest_event_by(&self, node: &NodeId) -> Option<&EventHash> {
+        self.latest_by_creator.get(node)
+    }
+
     pub fn children(&self, hash: &EventHash) -> &[EventHash] {
         self.children.get(hash).map_or(&[], Vec::as_slice)
     }
@@ -304,9 +330,10 @@ impl Hashgraph {
             .collect()
     }
 
-    /// Crate-internal: every stored event hash. Used by `consensus_order` to
-    /// look up an already-finalized round's events.
-    pub(crate) fn all_event_hashes(&self) -> Vec<EventHash> {
+    /// Every stored event hash. Used by `consensus_order` to look up an
+    /// already-finalized round's events, and by the gossip integration
+    /// tests to compare node views for convergence.
+    pub fn all_event_hashes(&self) -> Vec<EventHash> {
         self.events.keys().copied().collect()
     }
 
