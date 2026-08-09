@@ -6,7 +6,13 @@ use primitives::NodeId;
 pub enum CryptoError {
     Base(primitives::Error),
     SignatureVerificationFailed,
-    UnknownSigner { node_id: NodeId },
+    UnknownSigner {
+        node_id: NodeId,
+    },
+    /// A membership operation payload was truncated or had an invalid field.
+    MalformedOp,
+    /// The first payload byte is not a recognized membership opcode.
+    UnknownMembershipOpcode(u8),
 }
 
 pub type Result<T> = std::result::Result<T, CryptoError>;
@@ -23,6 +29,10 @@ impl fmt::Display for CryptoError {
             Self::Base(error) => write!(f, "primitives error: {error}"),
             Self::SignatureVerificationFailed => write!(f, "signature verification failed"),
             Self::UnknownSigner { node_id } => write!(f, "no registered key for node {node_id:?}"),
+            Self::MalformedOp => write!(f, "malformed membership operation"),
+            Self::UnknownMembershipOpcode(opcode) => {
+                write!(f, "unknown membership opcode {opcode:#04x}")
+            }
         }
     }
 }

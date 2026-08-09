@@ -4,6 +4,7 @@ mod error;
 pub mod hash;
 pub mod hashable_impls;
 pub mod membership;
+pub mod roster;
 pub mod signable;
 pub mod signable_impls;
 
@@ -14,6 +15,7 @@ pub use error::{
 };
 pub use hash::Hashable;
 pub use membership::MembershipRegistry;
+pub use roster::MembershipOp;
 pub use signable::{
     Signable,
     Verifiable,

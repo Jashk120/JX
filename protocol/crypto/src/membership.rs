@@ -29,6 +29,10 @@ impl MembershipRegistry {
     pub fn key_for(&self, node: &NodeId) -> Result<&VerifyingKey> {
         self.keys.get(node).ok_or(CryptoError::UnknownSigner { node_id: *node })
     }
+
+    pub fn contains(&self, node: &NodeId) -> bool {
+        self.keys.contains_key(node)
+    }
     /// Deterministic iteration order over registered members, sorted by
     /// `NodeId`. `consensus` uses this to assign each member a stable
     /// array index for ancestor bit-vectors — every honest node computes
@@ -74,5 +78,22 @@ mod tests {
             registry.key_for(&NodeId::new(99)),
             Err(CryptoError::UnknownSigner { node_id: NodeId::new(99) })
         );
+    }
+
+    #[test]
+    fn contains_returns_true_for_registered_node() {
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let verifying_key = signing_key.verifying_key();
+
+        let mut registry = MembershipRegistry::new();
+        registry.register(NodeId::new(1), verifying_key);
+
+        assert!(registry.contains(&NodeId::new(1)));
+    }
+
+    #[test]
+    fn contains_returns_false_for_unknown_node() {
+        let registry = MembershipRegistry::new();
+        assert!(!registry.contains(&NodeId::new(99)));
     }
 }

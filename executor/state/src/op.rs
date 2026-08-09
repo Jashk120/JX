@@ -13,6 +13,7 @@
 //! |--------|----------|--------------|
 //! | `0x00` | `Put`    | key, value   |
 //! | `0x01` | `Delete` | key          |
+//! | `0x02` | `MembershipOp` | (decoded by `crypto::MembershipOp`, not here) |
 //!
 //! A `Put` writes (or overwrites) `value` under `key`; a `Delete` removes
 //! `key` (a no-op if absent). Every other opcode byte, a payload too short
