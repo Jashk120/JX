@@ -6,6 +6,7 @@ use std::collections::{
 use crypto::{
     Hashable,
     MembershipRegistry,
+    RosterHistory,
     VerifiedEvent,
 };
 use primitives::{
@@ -85,6 +86,13 @@ impl EventRecord {
         self.ancestor_seqs[member_idx]
     }
 
+    /// The width of the `ancestor_seqs` row — the number of members the
+    /// event's hashgraph was operating under when it was stored. Pre-join
+    /// events are backfilled to the current width by `add_member`.
+    pub fn ancestor_seqs_len(&self) -> usize {
+        self.ancestor_seqs.len()
+    }
+
     pub fn round(&self) -> u64 {
         self.round
     }
@@ -156,6 +164,12 @@ pub struct Hashgraph {
     latest_by_creator: HashMap<NodeId, EventHash>,
     member_index: HashMap<NodeId, usize>,
     member_count: usize,
+    /// Round-indexed membership snapshots (Phase 2). Every quorum computation
+    /// reads the roster active at the *event's birth round* via
+    /// [`Hashgraph::member_count_at_round`], not the scalar `member_count`
+    /// field — the scalar is only the live width of the frozen structures
+    /// (`member_index`, `known_forkers`, `ancestor_seqs`).
+    roster_history: RosterHistory,
     /// Node-global, not observer-relative: "has this local hashgraph copy
     /// ever seen evidence this member forked, anywhere." This is only a
     /// routing hint for `see`'s fast/slow path split — the actual
@@ -200,6 +214,7 @@ impl Hashgraph {
             latest_by_creator: HashMap::new(),
             member_index,
             member_count,
+            roster_history: RosterHistory::new(registry.clone()),
             known_forkers: vec![false; member_count],
             witnesses_by_round: HashMap::new(),
             undecided_witnesses: HashMap::new(),
@@ -469,7 +484,94 @@ impl Hashgraph {
         self.member_count
     }
 
-    pub(crate) fn member_index_of(&self, node: &NodeId) -> Option<usize> {
+    /// Extends the hashgraph to include `node` as a new member. The supplied
+    /// `new_registry` becomes active for quorum computations from round
+    /// `activation_round + 1` onward; every round at or below
+    /// `activation_round` keeps its existing roster, so no decided round's
+    /// fame is ever recomputed under a changed denominator.
+    ///
+    /// Grows the four co-indexed structures atomically:
+    /// - `member_index`: assigns the next slot index.
+    /// - `member_count`: increments by 1 (the live width of the frozen
+    ///   structures — new inserts immediately size `ancestor_seqs` and index
+    ///   `known_forkers` for the new member).
+    /// - `known_forkers`: appends `false` (no fork evidence yet).
+    /// - `ancestor_seqs` on every stored `EventRecord`: appends `0`.
+    ///
+    /// The `0` backfill is correct: the new node created nothing before its
+    /// activation round, so `ancestor_seqs[new_idx] == 0` on pre-join events
+    /// is the accurate "no ancestor from this member" sentinel. Every site
+    /// that reads `ancestor_seqs[idx]` already guards `if up_to == 0 {
+    /// continue }`, so no special-casing is needed in `ancestry.rs`,
+    /// `fame.rs`, or `order.rs`.
+    ///
+    /// The `roster_history.schedule(activation_round + 1, new_registry)` call
+    /// is part of this method — not a separate call — so the structural
+    /// extension and the quorum-denominator update are always applied
+    /// together. Splitting them would leave the hashgraph in an inconsistent
+    /// state if one succeeded and the other did not.
+    ///
+    /// # Panics
+    /// Panics if `node` is already a registered member.
+    pub fn add_member(
+        &mut self,
+        node: NodeId,
+        activation_round: u64,
+        new_registry: MembershipRegistry,
+    ) {
+        assert!(
+            !self.member_index.contains_key(&node),
+            "add_member called for already-registered node {node:?}"
+        );
+
+        let idx = self.member_count;
+        self.member_index.insert(node, idx);
+        self.member_count += 1;
+        self.known_forkers.push(false);
+
+        for record in self.events.values_mut() {
+            record.ancestor_seqs.push(0);
+        }
+
+        // Atomic with structural growth: schedule the new registry one round
+        // after `activation_round`, so events born at or below
+        // `activation_round` keep the old quorum and only rounds strictly
+        // above it use the expanded one.
+        self.roster_history.schedule(activation_round + 1, new_registry);
+    }
+
+    /// The number of members active at `round`, for unit-stake supermajority
+    /// checks. Equivalent to `roster_for_round(round).len()`.
+    ///
+    /// When JX adds stake weights, replace call sites with
+    /// `roster_for_round(round).total_weight()` and
+    /// `roster_for_round(round).weight_of(node)`.
+    pub fn member_count_at_round(&self, round: u64) -> usize {
+        self.roster_history.roster_for_round(round).len()
+    }
+
+    /// A copy of the membership registry active at `round`. Used by the
+    /// gossip layer to build the post-join registry before calling
+    /// [`Hashgraph::add_member`].
+    pub fn registry_at_round(&self, round: u64) -> MembershipRegistry {
+        self.roster_history.roster_for_round(round).clone()
+    }
+
+    /// Whether `node` is a registered member of the current frozen
+    /// structures (`member_index`).
+    pub fn is_member(&self, node: &NodeId) -> bool {
+        self.member_index.contains_key(node)
+    }
+
+    /// Whether round `round` is fully decided — every witness of `round` has
+    /// a final fame decision. Same set that drives `order_decided_rounds` /
+    /// `assign_order`, i.e. the same finality notion `finalized_events`
+    /// relies on.
+    pub fn is_round_decided(&self, round: u64) -> bool {
+        self.fully_decided_rounds.contains(&round)
+    }
+
+    pub fn member_index_of(&self, node: &NodeId) -> Option<usize> {
         self.member_index.get(node).copied()
     }
 
@@ -802,5 +904,102 @@ mod tests {
 
         // State of known_forkers should remain true
         assert!(hg.creator_has_known_fork(idx));
+    }
+
+    fn three_member_graph() -> (Hashgraph, MembershipRegistry) {
+        let keys: Vec<SigningKey> = (0..3).map(|_| SigningKey::generate(&mut OsRng)).collect();
+        let nodes: Vec<NodeId> = (1..=3).map(NodeId::new).collect();
+        let registry = registry_of(&nodes.iter().copied().zip(&keys).collect::<Vec<_>>());
+        let hg = Hashgraph::new(&registry);
+        (hg, registry)
+    }
+
+    fn registry_plus_fourth(registry: &MembershipRegistry) -> MembershipRegistry {
+        let new_key = SigningKey::generate(&mut OsRng);
+        let mut new_registry = registry.clone();
+        new_registry.register(NodeId::new(4), new_key.verifying_key());
+        new_registry
+    }
+
+    #[test]
+    fn add_member_increases_member_count() {
+        let (mut hg, registry) = three_member_graph();
+        assert_eq!(hg.member_count(), 3);
+        hg.add_member(NodeId::new(4), 10, registry_plus_fourth(&registry));
+        assert_eq!(hg.member_count(), 4);
+    }
+
+    #[test]
+    fn add_member_extends_known_forkers() {
+        let (mut hg, registry) = three_member_graph();
+        hg.add_member(NodeId::new(4), 10, registry_plus_fourth(&registry));
+        let idx = hg.member_index_of(&NodeId::new(4)).unwrap();
+        assert!(!hg.creator_has_known_fork(idx));
+    }
+
+    #[test]
+    fn add_member_backfills_ancestor_seqs_with_zero() {
+        let key = SigningKey::generate(&mut OsRng);
+        let node = NodeId::new(1);
+        let registry = registry_of(&[(node, &key)]);
+        let mut hg = Hashgraph::new(&registry);
+        let e1 = hg.insert(verified_event(&key, node, None, None, 100)).unwrap();
+
+        let new_key = SigningKey::generate(&mut OsRng);
+        let new_node = NodeId::new(2);
+        let mut new_registry = registry;
+        new_registry.register(new_node, new_key.verifying_key());
+        hg.add_member(new_node, 10, new_registry);
+
+        let new_idx = hg.member_index_of(&new_node).unwrap();
+        assert_eq!(hg.get(&e1).unwrap().ancestor_seq(new_idx), 0);
+    }
+
+    #[test]
+    fn add_member_assigns_next_slot_index() {
+        let (mut hg, registry) = three_member_graph();
+        hg.add_member(NodeId::new(4), 10, registry_plus_fourth(&registry));
+        assert_eq!(hg.member_index_of(&NodeId::new(4)), Some(3));
+    }
+
+    #[test]
+    fn add_member_schedules_new_roster() {
+        let (mut hg, registry) = three_member_graph();
+        hg.add_member(NodeId::new(4), 10, registry_plus_fourth(&registry));
+        // Rounds at or below the activation round keep the old roster.
+        assert_eq!(hg.member_count_at_round(10), 3);
+        // Rounds strictly above the activation round use the new roster.
+        assert_eq!(hg.member_count_at_round(11), 4);
+    }
+
+    #[test]
+    #[should_panic(expected = "already-registered")]
+    fn add_member_panics_on_duplicate() {
+        let (mut hg, registry) = three_member_graph();
+        let new_registry = registry_plus_fourth(&registry);
+        hg.add_member(NodeId::new(4), 10, new_registry.clone());
+        hg.add_member(NodeId::new(4), 20, new_registry);
+    }
+
+    #[test]
+    fn new_member_events_use_correct_ancestor_seqs_len() {
+        let key_a = SigningKey::generate(&mut OsRng);
+        let node_a = NodeId::new(1);
+        let registry = registry_of(&[(node_a, &key_a)]);
+        let mut hg = Hashgraph::new(&registry);
+        let e1 = hg.insert(verified_event(&key_a, node_a, None, None, 100)).unwrap();
+
+        let new_key = SigningKey::generate(&mut OsRng);
+        let new_node = NodeId::new(2);
+        let mut new_registry = registry;
+        new_registry.register(new_node, new_key.verifying_key());
+        hg.add_member(new_node, 10, new_registry);
+
+        // A pre-join event's record was backfilled to the expanded width.
+        assert_eq!(hg.get(&e1).unwrap().ancestor_seqs.len(), 2);
+
+        // A post-join event from the new member sizes its row to the same width.
+        let e2 = hg.insert(verified_event(&new_key, new_node, None, Some(e1), 101)).unwrap();
+        assert_eq!(hg.get(&e2).unwrap().ancestor_seqs.len(), 2);
     }
 }

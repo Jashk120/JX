@@ -6,7 +6,7 @@ edition.workspace = true
 [dependencies]
 primitives = { workspace = true }
 consensus  = { workspace = true }
+crypto     = { workspace = true }
 
 [dev-dependencies]
-crypto        = { workspace = true }
 ed25519-dalek = { workspace = true }

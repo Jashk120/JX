@@ -1,8 +1,9 @@
 //! The transaction payload format (Phase 8).
 //!
-//! A `Transaction`'s payload bytes decode into exactly one [`Op`] before the
-//! executor applies it to the state. The format is a deliberately tiny,
-//! explicit binary encoding with no external dependencies:
+//! A `Transaction`'s payload bytes decode into exactly one [`DecodedOp`] — a
+//! pure-KV [`Op`] or a [`MembershipOp`] side channel — before the executor
+//! applies it to the state. The format is a deliberately tiny, explicit
+//! binary encoding with no external dependencies:
 //!
 //! ```text
 //! [opcode: u8]
@@ -13,15 +14,18 @@
 //! |--------|----------|--------------|
 //! | `0x00` | `Put`    | key, value   |
 //! | `0x01` | `Delete` | key          |
-//! | `0x02` | `MembershipOp` | (decoded by `crypto::MembershipOp`, not here) |
+//! | `0x02` | `MembershipOp` | decoded by `crypto::MembershipOp::decode` (body only, no `0x02` prefix) |
 //!
 //! A `Put` writes (or overwrites) `value` under `key`; a `Delete` removes
-//! `key` (a no-op if absent). Every other opcode byte, a payload too short
-//! for its declared fields, or trailing bytes after the last field decodes
-//! to a deterministic [`ExecutorError`] — identical bytes always produce the
-//! identical outcome on every node. The big-endian length prefix mirrors the
-//! `u32` length convention used by `crypto`'s canonical encoding
-//! (`CanonicalEncode` for `Transaction`).
+//! `key` (a no-op if absent). A `MembershipOp` never touches `State` — the
+//! executor hands it back as a side channel. Every other opcode byte, a
+//! payload too short for its declared fields, or trailing bytes after the
+//! last field decodes to a deterministic [`ExecutorError`] — identical bytes
+//! always produce the identical outcome on every node. The big-endian length
+//! prefix mirrors the `u32` length convention used by `crypto`'s canonical
+//! encoding (`CanonicalEncode` for `Transaction`).
+
+use crypto::MembershipOp;
 
 use crate::error::{
     ExecutorError,
@@ -30,6 +34,7 @@ use crate::error::{
 
 const OP_PUT: u8 = 0x00;
 const OP_DELETE: u8 = 0x01;
+const OP_MEMBERSHIP: u8 = 0x02;
 
 /// A single state transition decoded from a `Transaction` payload.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -84,6 +89,50 @@ impl Op {
     }
 }
 
+/// The result of decoding a single transaction payload. KV operations go to
+/// `State`; membership operations are returned as a side channel and never
+/// touch `State`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DecodedOp {
+    Kv(Op),
+    Membership(MembershipOp),
+}
+
+impl DecodedOp {
+    /// Decodes `payload` into the operation it encodes.
+    ///
+    /// Deterministic by construction: the same bytes always yield the same
+    /// `DecodedOp` or the same `ExecutorError`.
+    pub fn decode(payload: &[u8]) -> Result<DecodedOp> {
+        let (&opcode, cursor) = payload.split_first().ok_or(ExecutorError::EmptyPayload)?;
+        match opcode {
+            OP_PUT => {
+                let mut cursor = cursor;
+                let key = take_bytes(&mut cursor)?;
+                let value = take_bytes(&mut cursor)?;
+                reject_trailing(cursor)?;
+                Ok(DecodedOp::Kv(Op::Put { key, value }))
+            }
+            OP_DELETE => {
+                let mut cursor = cursor;
+                let key = take_bytes(&mut cursor)?;
+                reject_trailing(cursor)?;
+                Ok(DecodedOp::Kv(Op::Delete { key }))
+            }
+            OP_MEMBERSHIP => {
+                // `cursor` is already the body slice — the outer 0x02 type
+                // tag was consumed above. `MembershipOp::decode` receives
+                // bytes starting with the inner 0x00 (Add) or 0x01 (Remove)
+                // opcode. No re-assembly needed.
+                MembershipOp::decode(cursor)
+                    .map(DecodedOp::Membership)
+                    .map_err(|_| ExecutorError::MalformedMembershipOp)
+            }
+            _ => Err(ExecutorError::UnknownOpcode(opcode)),
+        }
+    }
+}
+
 /// Reads one length-prefixed field from `cursor`, advancing it past the
 /// field. Returns `Truncated` if the declared length overruns the payload.
 fn take_bytes(cursor: &mut &[u8]) -> Result<Vec<u8>> {
@@ -107,7 +156,18 @@ fn write_bytes(buf: &mut Vec<u8>, bytes: &[u8]) {
 
 #[cfg(test)]
 mod tests {
+    use ed25519_dalek::SigningKey;
+    use primitives::NodeId;
+
     use super::*;
+
+    fn add_membership_op() -> MembershipOp {
+        MembershipOp::Add {
+            node: NodeId::new(7),
+            key: Box::new(SigningKey::from_bytes(&[1u8; 32]).verifying_key()),
+            addr: "127.0.0.1:7000".parse().expect("valid addr"),
+        }
+    }
 
     #[test]
     fn put_round_trips_through_encode_decode() {
@@ -157,5 +217,32 @@ mod tests {
         let mut payload = Op::Delete { key: b"k".to_vec() }.encode();
         payload[0] = OP_PUT;
         assert_eq!(Op::decode(&payload), Err(ExecutorError::Truncated));
+    }
+
+    #[test]
+    fn membership_op_round_trips_through_decoded_op() {
+        let op = add_membership_op();
+        let mut payload = vec![OP_MEMBERSHIP];
+        payload.extend_from_slice(&op.encode());
+        assert_eq!(DecodedOp::decode(&payload), Ok(DecodedOp::Membership(op)));
+    }
+
+    #[test]
+    fn kv_ops_decode_to_kv_variant() {
+        let put = Op::Put { key: b"k".to_vec(), value: b"v".to_vec() };
+        assert_eq!(DecodedOp::decode(&put.encode()), Ok(DecodedOp::Kv(put)));
+    }
+
+    #[test]
+    fn malformed_membership_body_is_rejected() {
+        // 0x02 followed by a truncated Add body (opcode but no node id).
+        let payload = [OP_MEMBERSHIP, 0x00];
+        assert_eq!(DecodedOp::decode(&payload), Err(ExecutorError::MalformedMembershipOp));
+    }
+
+    #[test]
+    fn unknown_opcode_under_decoded_op_is_rejected() {
+        let payload = [0x7f];
+        assert_eq!(DecodedOp::decode(&payload), Err(ExecutorError::UnknownOpcode(0x7f)));
     }
 }

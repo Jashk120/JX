@@ -20,17 +20,13 @@ impl Hashgraph {
     /// bumps to `base_round + 1`, then records both the final round and
     /// witness status on the stored `EventRecord`.
     ///
-    /// Membership used for the `2n/3` threshold is today's static,
-    /// whole-graph `member_count()` (matching `Hashgraph::new`'s current
-    /// fixed registry). Dynamic membership is deliberately *not* handled
-    /// here — see the note in ROADMAP / project discussion: doing it
-    /// correctly requires gating on finalized order (§4's
-    /// `roundReceived`), which doesn't exist until Ordering is built.
-    /// Real Hedera/Hiero confirms this split: its `RosterHistory` /
-    /// `RosterRetriever` look up "the roster active as of round r" from
-    /// state, but that state is only ever written by the app layer after
-    /// consensus handling — never by the round-assignment algorithm
-    /// itself.
+    /// Membership used for the `2n/3` threshold is the roster active at
+    /// `base_round` — the event's own birth round — via
+    /// `member_count_at_round`, not the scalar `member_count` (Phase 2).
+    /// A member that joins at round `activation_round` counts toward the
+    /// threshold only for events born strictly after `activation_round`;
+    /// events born before it keep the old quorum, which is exactly what makes
+    /// a mid-stream join safe without a coordinated restart.
     pub(crate) fn finalize_round(
         &mut self,
         hash: EventHash,
@@ -45,7 +41,7 @@ impl Hashgraph {
                 strongly_seen_count += 1;
             }
         }
-        let bumps_round = strongly_seen_count * 3 > self.member_count() * 2;
+        let bumps_round = strongly_seen_count * 3 > self.member_count_at_round(base_round) * 2;
 
         let final_round = if bumps_round { base_round + 1 } else { base_round };
         let is_witness = match self_parent_round {

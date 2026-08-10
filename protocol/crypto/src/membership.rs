@@ -12,7 +12,7 @@ use crate::error::{
 /// events it creates. Lives in `crypto`, not `primitives`, so that
 /// `primitives` stays free of any cryptography dependency — `NodeId` itself
 /// remains a plain index with no knowledge that keys exist at all.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct MembershipRegistry {
     keys: HashMap<NodeId, VerifyingKey>,
 }

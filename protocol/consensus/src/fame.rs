@@ -53,9 +53,9 @@
 //!
 //! `MembershipRegistry` carries no weights (checked: `protocol/crypto/src/
 //! membership.rs`), so witnesses are counted — matching `round.rs`'s
-//! `strongly_seen_count * 3 > member_count() * 2` assumption — and the
-//! supermajority check uses the exact same `* 3 > * 2` integer idiom to
-//! avoid float rounding.
+//! `strongly_seen_count * 3 > member_count_at_round(round) * 2` assumption —
+//! and the supermajority check uses the exact same `* 3 > * 2` integer idiom
+//! to avoid float rounding.
 //!
 //! # Forking (§3.2) — deferred, by design
 //!
@@ -254,7 +254,7 @@ impl Hashgraph {
         let v = yes >= no;
         let stake = if v { yes } else { no };
         let is_coin_round = (y_round - w_round) % coin_round_frequency() == 0;
-        let has_supermajority = stake * 3 > self.member_count() * 2;
+        let has_supermajority = stake * 3 > self.member_count_at_round(y_round) * 2;
 
         if is_coin_round && !has_supermajority {
             let vote = coin_round_vote(self, y);

@@ -1,5 +1,8 @@
-use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::collections::{
+    BTreeMap,
+    HashMap,
+};
 use std::sync::Arc;
 use std::sync::atomic::{
     AtomicBool,
@@ -7,9 +10,19 @@ use std::sync::atomic::{
 };
 use std::time::Duration;
 
-use crypto::MembershipRegistry;
-use ed25519_dalek::SigningKey;
-use primitives::NodeId;
+use crypto::{
+    Hashable,
+    MembershipOp,
+    MembershipRegistry,
+};
+use ed25519_dalek::{
+    SigningKey,
+    VerifyingKey,
+};
+use primitives::{
+    Event,
+    NodeId,
+};
 use tokio::net::{
     TcpListener,
     TcpStream,
@@ -37,17 +50,30 @@ use crate::transport::{
     TcpTransport,
 };
 
+/// The membership-op activation queue plus the processed-event watermark.
+///
+/// Both live under one `Mutex` so the watermark and the pending queue advance
+/// together atomically: a concurrent `process_finalized_rounds` can never
+/// skip events whose ops have not been bucketed yet.
+#[derive(Default)]
+struct ActivationState {
+    pending: BTreeMap<u64, Vec<MembershipOp>>,
+    processed_through_round: u64,
+}
+
 /// A JKain node: owns a hashgraph, a TLS identity, the known-peer table,
 /// and the async machinery that runs gossip syncs on a fixed interval.
 pub struct GossipNode {
     pub node_id: NodeId,
     pub hashgraph: Arc<Mutex<consensus::Hashgraph>>,
     signing_key: SigningKey,
-    registry: MembershipRegistry,
+    registry: Mutex<MembershipRegistry>,
     identity: TlsIdentity,
     peers: Mutex<PeerManager>,
     sync_interval: Duration,
     sync_timeout: Duration,
+    executor: Mutex<state::Executor>,
+    activation: Mutex<ActivationState>,
 }
 
 impl GossipNode {
@@ -74,12 +100,25 @@ impl GossipNode {
             node_id,
             hashgraph: Arc::new(Mutex::new(hashgraph)),
             signing_key,
-            registry,
+            registry: Mutex::new(registry),
             identity,
             peers: Mutex::new(PeerManager::new(peers)),
             sync_interval,
             sync_timeout,
+            executor: Mutex::new(state::Executor::new()),
+            activation: Mutex::new(ActivationState::default()),
         }
+    }
+
+    /// Whether `node` is a registered member of this node's hashgraph.
+    pub async fn is_consensus_member(&self, node: NodeId) -> bool {
+        let hg = self.hashgraph.lock().await;
+        hg.is_member(&node)
+    }
+
+    /// The number of known peers (observability helper).
+    pub async fn peer_count(&self) -> usize {
+        self.peers.lock().await.len()
     }
 
     /// Runs the node: accepts inbound gossip connections and, every
@@ -125,12 +164,13 @@ impl GossipNode {
                 }
             };
 
+            let registry = self.registry.lock().await.clone();
             let round = tokio::time::timeout(
                 self.sync_timeout,
                 run_sync(
                     transport,
                     &self.hashgraph,
-                    &self.registry,
+                    &registry,
                     self.node_id,
                     &self.signing_key,
                     peer.node_id,
@@ -149,8 +189,117 @@ impl GossipNode {
             if round.is_err() {
                 outbound.remove(&peer.node_id);
             }
+
+            // Decode newly finalized events and drive any membership
+            // activations that are now safe to apply.
+            self.process_finalized_rounds().await;
         }
         Ok(())
+    }
+
+    /// Decodes every newly finalized event's payload, buckets membership ops
+    /// by `roundReceived`, and activates any whose activation round is now
+    /// fully decided. Called after each sync round, regardless of whether the
+    /// sync itself succeeded.
+    ///
+    /// Activation round = `roundReceived + 1`, and activation fires only once
+    /// that round is fully decided — the same finality notion `order.rs` uses
+    /// to produce finalized order — so node 4 is never admitted into a
+    /// round whose fame elections are still running under the old roster.
+    /// The new roster first applies to `activation_round + 1`.
+    ///
+    /// Lock discipline: Phase A collects all needed data under the hashgraph
+    /// lock alone; Phase B holds only the executor + activation locks; Phase C
+    /// touches each store with its own short lock and never holds two at
+    /// once. This eliminates the deadlock hazard of acquiring `hg`,
+    /// `registry`, and `peers` in nested order.
+    pub async fn process_finalized_rounds(&self) {
+        // Phase A: collect (event, round_received) pairs under the hg lock only.
+        let finalized: Vec<(Event, u64)> = {
+            let hg = self.hashgraph.lock().await;
+            state::finalized_events(&hg)
+                .into_iter()
+                .filter_map(|event| {
+                    let hash = event.hash();
+                    hg.round_received(&hash).map(|rr| (event, rr))
+                })
+                .collect()
+        };
+        if finalized.is_empty() {
+            return;
+        }
+
+        // Phase B: decode ops and bucket by roundReceived; advance the
+        // watermark so the next call over the same batch is a no-op.
+        {
+            let mut activation = self.activation.lock().await;
+            let ActivationState { pending, processed_through_round } = &mut *activation;
+            let mut executor = self.executor.lock().await;
+            executor.bucket_finalized(pending, processed_through_round, &finalized);
+        }
+
+        // Phase C: activate ops whose activation round is now fully decided.
+        let candidate_rrs: Vec<u64> = {
+            let activation = self.activation.lock().await;
+            activation.pending.keys().copied().collect()
+        };
+
+        for rr in candidate_rrs {
+            let activation_round = rr + 1;
+            let is_decided = {
+                let hg = self.hashgraph.lock().await;
+                hg.is_round_decided(activation_round)
+            };
+            if !is_decided {
+                continue;
+            }
+
+            let ops = {
+                let mut activation = self.activation.lock().await;
+                activation.pending.remove(&rr).unwrap_or_default()
+            };
+
+            for op in ops {
+                if let MembershipOp::Add { node, key, addr } = op {
+                    let already_member = {
+                        let hg = self.hashgraph.lock().await;
+                        hg.is_member(&node)
+                    };
+                    if already_member {
+                        continue;
+                    }
+
+                    let key: VerifyingKey = *key;
+                    // Build the post-join registry from the roster active at
+                    // the activation round (which still excludes the new node).
+                    let mut new_registry = {
+                        let hg = self.hashgraph.lock().await;
+                        hg.registry_at_round(activation_round)
+                    };
+                    new_registry.register(node, key);
+
+                    // Atomic: structural growth + roster schedule in one call.
+                    {
+                        let mut hg = self.hashgraph.lock().await;
+                        hg.add_member(node, activation_round, new_registry);
+                    }
+
+                    // Keep the event-verification registry in sync so the new
+                    // node's events can be verified and inserted.
+                    {
+                        let mut registry = self.registry.lock().await;
+                        registry.register(node, key);
+                    }
+
+                    // TLS-pin the new peer, deriving the fingerprint from its
+                    // Ed25519 key (same derivation as boot-time peers).
+                    {
+                        let mut pm = self.peers.lock().await;
+                        pm.add_peer_from_key(node, &key, addr);
+                    }
+                }
+            }
+        }
     }
 
     async fn accept_loop(self: Arc<Self>, listener: TcpListener) {
@@ -195,7 +344,8 @@ impl GossipNode {
                     }
                 }
                 Frame::Event(event) => {
-                    if insert_verified(&self.hashgraph, &self.registry, event).await.is_err() {
+                    let registry = self.registry.lock().await.clone();
+                    if insert_verified(&self.hashgraph, &registry, event).await.is_err() {
                         return;
                     }
                 }

@@ -15,7 +15,10 @@ pub use error::{
 };
 pub use hash::Hashable;
 pub use membership::MembershipRegistry;
-pub use roster::MembershipOp;
+pub use roster::{
+    MembershipOp,
+    RosterHistory,
+};
 pub use signable::{
     Signable,
     Verifiable,

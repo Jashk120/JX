@@ -30,6 +30,7 @@
 //! an Ed25519 [`VerifyingKey`]; `primitives` stays free of any cryptography
 //! dependency (see the rationale in `membership.rs`).
 
+use std::collections::BTreeMap;
 use std::net::{
     IpAddr,
     Ipv4Addr,
@@ -44,6 +45,7 @@ use crate::error::{
     CryptoError,
     Result,
 };
+use crate::membership::MembershipRegistry;
 
 const MEMBERSHIP_ADD: u8 = 0x00;
 const MEMBERSHIP_REMOVE: u8 = 0x01;
@@ -133,6 +135,57 @@ impl PartialEq for MembershipOp {
 }
 
 impl Eq for MembershipOp {}
+
+/// A time-ordered sequence of `MembershipRegistry` snapshots, keyed by the
+/// consensus round at which each snapshot becomes active.
+///
+/// Backed by `BTreeMap` so [`RosterHistory::roster_for_round`] is an O(log n)
+/// predecessor lookup, not a linear scan. This matters because it is called
+/// on every quorum computation in `ancestry.rs`, `fame.rs`, and `round.rs`.
+///
+/// # Invariant: round ≥ 1
+///
+/// The genesis snapshot is always inserted at round 1. Round 0 is never a
+/// valid event birth round in the hashgraph (all events start at round 1),
+/// so `roster_for_round(0)` is unreachable under correct usage. If a future
+/// refactor introduces a round-0 genesis event, this invariant must be
+/// revisited before it silently hits the panic inside `roster_for_round`.
+#[derive(Clone, Debug)]
+pub struct RosterHistory {
+    snapshots: BTreeMap<u64, MembershipRegistry>,
+}
+
+impl RosterHistory {
+    /// Creates a `RosterHistory` with `genesis` activated at round 1.
+    /// Round 1 is the earliest valid event birth round.
+    pub fn new(genesis: MembershipRegistry) -> Self {
+        let mut snapshots = BTreeMap::new();
+        snapshots.insert(1, genesis);
+        Self { snapshots }
+    }
+
+    /// The registry active at `round` — the last snapshot whose activation
+    /// round is ≤ `round`.
+    ///
+    /// # Panics
+    /// Panics if `round` is 0 (no snapshot exists at or before round 0).
+    /// Valid event birth rounds are always ≥ 1.
+    pub fn roster_for_round(&self, round: u64) -> &MembershipRegistry {
+        self.snapshots
+            .range(..=round)
+            .next_back()
+            .map(|(_, reg)| reg)
+            .expect("roster_for_round called with round 0 or before any snapshot")
+    }
+
+    /// Records a new registry snapshot that activates at `activation_round`.
+    /// Idempotent: a second call with the same round overwrites the previous
+    /// snapshot (all nodes derive the same registry from the same finalized
+    /// op, so the result is always identical).
+    pub fn schedule(&mut self, activation_round: u64, registry: MembershipRegistry) {
+        self.snapshots.insert(activation_round, registry);
+    }
+}
 
 /// Reads exactly `len` bytes from `cursor`, advancing it past them. Returns
 /// `MalformedOp` if fewer than `len` bytes remain.
@@ -331,5 +384,46 @@ mod tests {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 8080);
         write_bytes(&mut payload, &encode_addr(&addr));
         assert_eq!(MembershipOp::decode(&payload), Err(CryptoError::MalformedOp));
+    }
+
+    mod roster_history_tests {
+        use super::*;
+
+        fn registry_with(members: &[u64]) -> MembershipRegistry {
+            let mut registry = MembershipRegistry::new();
+            for id in members {
+                let key = SigningKey::generate(&mut OsRng).verifying_key();
+                registry.register(NodeId::new(*id), key);
+            }
+            registry
+        }
+
+        #[test]
+        fn genesis_snapshot_is_active_at_round_one() {
+            let history = RosterHistory::new(registry_with(&[1]));
+            assert_eq!(history.roster_for_round(1).len(), 1);
+        }
+
+        #[test]
+        fn roster_for_round_returns_predecessor_snapshot() {
+            let mut history = RosterHistory::new(registry_with(&[1]));
+            history.schedule(5, registry_with(&[1, 2]));
+            assert_eq!(history.roster_for_round(4).len(), 1);
+        }
+
+        #[test]
+        fn roster_for_round_at_exact_activation_round() {
+            let mut history = RosterHistory::new(registry_with(&[1]));
+            history.schedule(5, registry_with(&[1, 2]));
+            assert_eq!(history.roster_for_round(5).len(), 2);
+        }
+
+        #[test]
+        fn schedule_overwrites_existing_round() {
+            let mut history = RosterHistory::new(registry_with(&[1]));
+            history.schedule(5, registry_with(&[1, 2]));
+            history.schedule(5, registry_with(&[1, 2, 3]));
+            assert_eq!(history.roster_for_round(5).len(), 3);
+        }
     }
 }

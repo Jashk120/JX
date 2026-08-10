@@ -23,8 +23,10 @@ use crypto::{
 };
 use ed25519_dalek::SigningKey;
 use primitives::{
+    Event,
     EventHash,
     NodeId,
+    Signature,
     Timestamp,
     Transaction,
     UnsignedEvent,
@@ -54,6 +56,11 @@ fn put(key: &[u8], value: &[u8]) -> Transaction {
 
 fn delete(key: &[u8]) -> Transaction {
     Transaction::from_bytes(Op::Delete { key: key.to_vec() }.encode())
+}
+
+fn event_with(payload: Vec<Transaction>) -> Event {
+    UnsignedEvent::new(NodeId::new(1), None, None, Timestamp::new(1), payload)
+        .finalize(Signature::default())
 }
 
 /// Deterministic 4-member deep clique builder. Fixed keys (per-id seeds), a
@@ -141,8 +148,9 @@ fn same_transaction_order_yields_bit_identical_state() {
     let mut left = Executor::new();
     let mut right = Executor::new();
     for tx in &order {
-        assert_eq!(left.execute_transaction(tx), Ok(()));
-        assert_eq!(right.execute_transaction(tx), Ok(()));
+        let event = event_with(vec![tx.clone()]);
+        assert!(left.execute_event(&event).0.is_empty());
+        assert!(right.execute_event(&event).0.is_empty());
     }
 
     assert_eq!(left.state(), right.state());
@@ -207,10 +215,16 @@ fn malformed_payloads_fail_deterministically() {
 
     let mut left = Executor::new();
     let mut right = Executor::new();
-    let left_errors: Vec<ExecutorError> =
-        order.iter().filter_map(|tx| left.execute_transaction(tx).err()).collect();
-    let right_errors: Vec<ExecutorError> =
-        order.iter().filter_map(|tx| right.execute_transaction(tx).err()).collect();
+    let left_errors: Vec<ExecutorError> = order
+        .iter()
+        .map(|tx| event_with(vec![tx.clone()]))
+        .flat_map(|event| left.execute_event(&event).0)
+        .collect();
+    let right_errors: Vec<ExecutorError> = order
+        .iter()
+        .map(|tx| event_with(vec![tx.clone()]))
+        .flat_map(|event| right.execute_event(&event).0)
+        .collect();
 
     assert_eq!(left_errors, right_errors);
     assert_eq!(left.state(), right.state());

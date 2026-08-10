@@ -13,10 +13,11 @@ use crate::peer::PeerInfo;
 /// consistent. This is the single source of truth for cluster membership
 /// during the static-membership era (pre-Phase 8).
 ///
-/// Adding a member is an explicit, coordinated change: extend the config with
-/// one `MemberEntry` and restart every node with the rebuilt config. This does
-/// not mutate `n` on a running node — a runtime change to quorum math must go
-/// through consensus-ordered membership transactions (Phase 8).
+/// Adding a member at runtime is handled by submitting a `MembershipOp::Add`
+/// transaction through consensus. The membership change propagates through
+/// `RosterHistory` and `Hashgraph::add_member` at the activation round
+/// (roundReceived + 1), without requiring a cluster restart or rebuilding
+/// this config.
 #[derive(Clone, Debug)]
 pub struct ClusterConfig {
     members: Vec<MemberEntry>,

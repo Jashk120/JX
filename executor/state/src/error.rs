@@ -17,6 +17,8 @@ pub enum ExecutorError {
     UnknownOpcode(u8),
     /// The payload has bytes left over after the last declared field.
     TrailingBytes,
+    /// The `0x02` membership-op body did not decode cleanly.
+    MalformedMembershipOp,
 }
 
 pub type Result<T> = std::result::Result<T, ExecutorError>;
@@ -28,6 +30,7 @@ impl fmt::Display for ExecutorError {
             Self::Truncated => write!(f, "transaction payload is truncated"),
             Self::UnknownOpcode(opcode) => write!(f, "unknown transaction opcode {opcode:#04x}"),
             Self::TrailingBytes => write!(f, "transaction payload has trailing bytes"),
+            Self::MalformedMembershipOp => write!(f, "malformed membership-op payload"),
         }
     }
 }

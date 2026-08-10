@@ -1,7 +1,14 @@
+use std::net::SocketAddr;
+
+use ed25519_dalek::VerifyingKey;
 use rand::rngs::StdRng;
 use rand::{
     Rng,
     SeedableRng,
+};
+use sha2::{
+    Digest,
+    Sha256,
 };
 
 use crate::peer::PeerInfo;
@@ -52,6 +59,29 @@ impl PeerManager {
         true
     }
 
+    /// Adds a new peer derived from its Ed25519 `VerifyingKey`. The SPKI
+    /// fingerprint is computed from the key using the same derivation that
+    /// `TlsIdentity::spki_fingerprint_of` produces for a boot-time peer
+    /// (SubjectPublicKeyInfo encoding, SHA-256 hash), so runtime-added peers
+    /// are TLS-pinned consistently.
+    ///
+    /// Returns `false` if the peer was already present (idempotent on
+    /// duplicate). Does not affect `RosterHistory` or quorum math — the
+    /// caller (`GossipNode::process_finalized_rounds`) owns those updates.
+    pub fn add_peer_from_key(
+        &mut self,
+        node_id: primitives::NodeId,
+        key: &VerifyingKey,
+        addr: SocketAddr,
+    ) -> bool {
+        if self.peers.iter().any(|p| p.node_id == node_id) {
+            return false;
+        }
+        let spki_fingerprint = spki_fingerprint_of(key);
+        self.peers.push(PeerInfo::new(node_id, addr, spki_fingerprint));
+        true
+    }
+
     pub fn len(&self) -> usize {
         self.peers.len()
     }
@@ -59,6 +89,25 @@ impl PeerManager {
     pub fn is_empty(&self) -> bool {
         self.peers.is_empty()
     }
+}
+
+/// Derives an SPKI fingerprint from an Ed25519 `VerifyingKey` by encoding it
+/// as SubjectPublicKeyInfo bytes (RFC 8410) and taking the SHA-256 digest.
+/// This must produce the same bytes as `TlsIdentity::spki_fingerprint_of`
+/// for the cert built from the same key — verified by
+/// `spki_derivation_matches_tls_identity`.
+fn spki_fingerprint_of(key: &VerifyingKey) -> [u8; 32] {
+    // Ed25519 SPKI DER: fixed 12-byte OID header + 32-byte key (RFC 8410).
+    let mut spki = Vec::with_capacity(44);
+    spki.extend_from_slice(&[
+        0x30, 0x2a, // SEQUENCE (42 bytes)
+        0x30, 0x05, // SEQUENCE (5 bytes) — AlgorithmIdentifier
+        0x06, 0x03, // OID (3 bytes)
+        0x2b, 0x65, 0x70, // 1.3.101.112 (id-EdDSA Ed25519)
+        0x03, 0x21, 0x00, // BIT STRING, 33 bytes, 0 unused bits
+    ]);
+    spki.extend_from_slice(key.as_bytes());
+    Sha256::digest(&spki).into()
 }
 
 #[cfg(test)]
@@ -69,9 +118,11 @@ mod tests {
         SocketAddr,
     };
 
+    use ed25519_dalek::SigningKey;
     use primitives::NodeId;
 
     use super::*;
+    use crate::tls::TlsIdentity;
 
     fn peer(node_id: u64) -> PeerInfo {
         PeerInfo::new(
@@ -132,5 +183,34 @@ mod tests {
         assert_eq!(manager.len(), 2);
         assert!(!manager.add_peer(peer(2)), "duplicate peer id is a no-op");
         assert_eq!(manager.len(), 2);
+    }
+
+    #[test]
+    fn spki_derivation_matches_tls_identity() {
+        let seed = [7u8; 32];
+        let verifying_key = SigningKey::from_bytes(&seed).verifying_key();
+        let identity = TlsIdentity::from_seed(seed, 1).expect("identity builds");
+        assert_eq!(spki_fingerprint_of(&verifying_key), identity.spki_fingerprint());
+    }
+
+    #[test]
+    fn add_peer_from_key_derives_spki_fingerprint() {
+        let key = SigningKey::from_bytes(&[3u8; 32]);
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
+        let mut manager = PeerManager::with_seed(Vec::new(), 0);
+        assert!(manager.add_peer_from_key(NodeId::new(9), &key.verifying_key(), addr));
+        let peer = manager.peer(NodeId::new(9)).expect("peer added");
+        assert_eq!(peer.addr, addr);
+        assert_eq!(peer.expected_spki_fingerprint, spki_fingerprint_of(&key.verifying_key()));
+    }
+
+    #[test]
+    fn add_peer_from_key_idempotent_on_duplicate() {
+        let key = SigningKey::from_bytes(&[3u8; 32]);
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
+        let mut manager = PeerManager::with_seed(Vec::new(), 0);
+        assert!(manager.add_peer_from_key(NodeId::new(9), &key.verifying_key(), addr));
+        assert!(!manager.add_peer_from_key(NodeId::new(9), &key.verifying_key(), addr));
+        assert_eq!(manager.len(), 1);
     }
 }

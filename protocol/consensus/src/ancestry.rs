@@ -97,7 +97,20 @@ impl Hashgraph {
             }
         }
 
-        Ok(supermajority_count * 3 > self.member_count() * 2)
+        // Use x's birth round as the roster anchor (Phase 2).
+        //
+        // Strictly, the correct roster for each intermediate event's
+        // contribution to the supermajority is the roster at *that event's*
+        // birth round, not x's. Using x_round is a conservative
+        // approximation: it may produce a slightly larger (or equal)
+        // denominator than the per-event-optimal anchor, but it is safe — it
+        // never lowers the bar for consensus. This approximation holds as
+        // long as the roster only grows (Add-only in Phase 2) and activation
+        // rounds are strictly increasing, which the design guarantees.
+        // Document this if stake weights are ever added, as weighted rosters
+        // may require the exact per-event anchor.
+        let x_round = self.get(x).map_or(1, |r| r.round());
+        Ok(supermajority_count * 3 > self.member_count_at_round(x_round) * 2)
     }
 
     fn member_chain_reaches(
