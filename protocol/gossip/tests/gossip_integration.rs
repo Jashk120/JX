@@ -125,16 +125,30 @@ async fn diverged_node_rejoins_and_reconciles() {
     )
     .await; // B2, B-only
 
-    let (counts, lates) = stop_and_settle(&[&a, &b], Duration::from_millis(500)).await;
+    // Reconcile: poll until both divergent events are present on BOTH nodes.
+    // Checkpoints (Phase 3) eventually prune these old-round events, so the
+    // reconciliation is verified while they are still retained.
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let mut reconciled = true;
+            for node in [&a, &b] {
+                let hashgraph = node.node.hashgraph.lock().await;
+                if hashgraph.get(&a2).is_none() || hashgraph.get(&b2).is_none() {
+                    reconciled = false;
+                    break;
+                }
+            }
+            if reconciled {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("divergent events reconcile on both nodes");
+
+    // The cluster still converges to a consistent frontier afterward.
+    let (counts, lates) = stop_and_settle(&[&a, &b], Duration::from_millis(300)).await;
     assert_converged(&counts, &lates, "diverged nodes");
-
-    // The specific events each node held in isolation must now be present
-    // in the other node's hashgraph.
-    for node in [&a, &b] {
-        let hashgraph = node.node.hashgraph.lock().await;
-        assert!(hashgraph.get(&a2).is_some(), "node must hold A2");
-        assert!(hashgraph.get(&b2).is_some(), "node must hold B2");
-    }
-
     drop_nodes(vec![a, b]);
 }

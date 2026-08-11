@@ -16,6 +16,7 @@ use primitives::{
     Timestamp,
 };
 
+use crate::checkpoint::CheckpointPayload;
 use crate::error::{
     ConsensusError,
     Result,
@@ -557,6 +558,106 @@ impl Hashgraph {
         self.roster_history.roster_for_round(round).clone()
     }
 
+    /// Phase 3 — the checkpoint payload for `round`, once that round is fully
+    /// decided. The caller supplies the SHA-256 of the deterministic state
+    /// (`State::to_bytes()`); the roster snapshot and its hash are taken from
+    /// this node's roster history at that round. Returns `None` while `round`
+    /// is not yet decided.
+    pub fn checkpoint_payload(
+        &self,
+        round: u64,
+        state_hash: [u8; 32],
+    ) -> Option<CheckpointPayload> {
+        if !self.is_round_decided(round) {
+            return None;
+        }
+        let roster_snapshot = self.registry_at_round(round);
+        Some(CheckpointPayload::new(round, state_hash, roster_snapshot))
+    }
+
+    /// Phase 3 — removes every event with `round_received <
+    /// prune_before_round` from the live graph, preserving any event that is
+    /// the self- or other-parent of a *live* event (round `prune_before_round`
+    /// or later, or not yet ordered) — the "border" anchors. Border anchors
+    /// do **not** protect their own parents: history strictly below the
+    /// confirmed checkpoint is dropped, while the last few live rounds stay
+    /// intact so recent inserts and delta-syncs never hit a `MissingParent`.
+    /// Also trims `roster_history` snapshots whose activation round is below
+    /// `prune_before_round`, keeping the one immediately at-or-before so the
+    /// live window stays self-consistent.
+    ///
+    /// Ordering is unaffected: pruning only removes rounds that have already
+    /// been finalized by `assign_order`, and round_received is immutable once
+    /// assigned, so `consensus_order(r)` for `r >= prune_before_round` is
+    /// identical before and after.
+    ///
+    /// # Panics
+    /// Panics if `prune_before_round` is not below `next_round_to_order`
+    /// (i.e. you cannot prune a round that has not been ordered yet).
+    pub fn prune_before_round(&mut self, prune_before_round: u64) {
+        assert!(
+            prune_before_round < self.next_round_to_order,
+            "cannot prune a round that has not been ordered yet: \
+             requested {prune_before_round}, ordered through {}",
+            self.next_round_to_order - 1
+        );
+
+        let threshold = prune_before_round;
+
+        let mut pruned: BTreeSet<EventHash> = self
+            .events
+            .iter()
+            .filter(|(_, record)| record.round_received().is_some_and(|rr| rr < threshold))
+            .map(|(&hash, _)| hash)
+            .collect();
+        if pruned.is_empty() {
+            return;
+        }
+
+        // Border anchors: the parent of a live event (round >= threshold, or
+        // not yet ordered) must survive, or future inserts would fail with
+        // MissingParent. Border anchors themselves are kept but do not
+        // protect their own parents.
+        for record in self.events.values() {
+            let live = record.round_received().is_none_or(|rr| rr >= threshold);
+            if !live {
+                continue;
+            }
+            for parent in
+                [record.event().self_parent(), record.event().other_parent()].into_iter().flatten()
+            {
+                pruned.remove(parent);
+            }
+        }
+
+        for hash in &pruned {
+            let Some(record) = self.events.remove(hash) else { continue };
+            let creator = *record.event().creator();
+            let seq = record.seq();
+
+            for parent in
+                [record.event().self_parent(), record.event().other_parent()].into_iter().flatten()
+            {
+                if let Some(children) = self.children.get_mut(parent) {
+                    children.retain(|child| child != hash);
+                }
+            }
+            self.children.remove(hash);
+            let self_parent = record.event().self_parent().copied();
+            if self.first_child.get(&(creator, self_parent)) == Some(hash) {
+                self.first_child.remove(&(creator, self_parent));
+            }
+            if self.by_creator_seq.get(&(creator, seq)) == Some(hash) {
+                self.by_creator_seq.remove(&(creator, seq));
+            }
+            if self.latest_by_creator.get(&creator) == Some(hash) {
+                self.latest_by_creator.remove(&creator);
+            }
+        }
+
+        self.roster_history.prune_before(threshold);
+    }
+
     /// Whether `node` is a registered member of the current frozen
     /// structures (`member_index`).
     pub fn is_member(&self, node: &NodeId) -> bool {
@@ -1001,5 +1102,118 @@ mod tests {
         // A post-join event from the new member sizes its row to the same width.
         let e2 = hg.insert(verified_event(&new_key, new_node, None, Some(e1), 101)).unwrap();
         assert_eq!(hg.get(&e2).unwrap().ancestor_seqs.len(), 2);
+    }
+
+    /// A small graph with an explicit, controlled `roundReceived`
+    /// assignment, so the pruning tests can assert exactly which events are
+    /// pruned, which survive as border anchors, and which are untouched.
+    ///
+    /// Topology:
+    /// ```text
+    /// A: a1 -> a2 -> a3 -> a4 -> a5
+    /// B: b1 -> b2 -> b3            (b2 other-parent a3, b3 other-parent a5)
+    /// C: c1                         (isolated, childless)
+    /// ```
+    ///
+    /// Rounds: a1,a2,c1 -> 1; a3,b1 -> 2; a4,a5,b2,b3 -> 3. `a2` is the
+    /// self-parent of the live `a3`, so it is the one round-1 border anchor.
+    fn build_prune_graph() -> (Hashgraph, std::collections::HashMap<&'static str, EventHash>) {
+        let keys: Vec<SigningKey> = (0..3).map(|_| SigningKey::generate(&mut OsRng)).collect();
+        let nodes = [NodeId::new(1), NodeId::new(2), NodeId::new(3)];
+        let registry = registry_of(&nodes.iter().copied().zip(&keys).collect::<Vec<_>>());
+        let mut hg = Hashgraph::new(&registry);
+        let mut events = std::collections::HashMap::new();
+        let mut ts = 100u64;
+        let mut step = |label: &'static str,
+                        author: usize,
+                        self_parent: Option<&'static str>,
+                        other_parent: Option<&'static str>| {
+            let self_parent = self_parent.map(|label| events[label]);
+            let other_parent = other_parent.map(|label| events[label]);
+            let ve = verified_event(&keys[author], nodes[author], self_parent, other_parent, ts);
+            ts += 1;
+            let hash = hg.insert(ve).expect("insert should succeed");
+            events.insert(label, hash);
+        };
+        step("a1", 0, None, None);
+        step("a2", 0, Some("a1"), None);
+        step("a3", 0, Some("a2"), None);
+        step("a4", 0, Some("a3"), None);
+        step("a5", 0, Some("a4"), None);
+        step("b1", 1, None, None);
+        step("b2", 1, Some("b1"), Some("a3"));
+        step("b3", 1, Some("b2"), Some("a5"));
+        step("c1", 2, None, None);
+
+        // Assign roundReceived directly (bypassing the fame machinery, which
+        // would leave these small rounds unresolved) and mark rounds 1-3 as
+        // ordered so the prune guard admits a threshold of 2.
+        hg.set_event_order(&events["a1"], 1, Timestamp::new(100));
+        hg.set_event_order(&events["a2"], 1, Timestamp::new(101));
+        hg.set_event_order(&events["c1"], 1, Timestamp::new(102));
+        hg.set_event_order(&events["a3"], 2, Timestamp::new(200));
+        hg.set_event_order(&events["b1"], 2, Timestamp::new(201));
+        hg.set_event_order(&events["a4"], 3, Timestamp::new(300));
+        hg.set_event_order(&events["a5"], 3, Timestamp::new(301));
+        hg.set_event_order(&events["b2"], 3, Timestamp::new(302));
+        hg.set_event_order(&events["b3"], 3, Timestamp::new(303));
+        hg.next_round_to_order = 4;
+        (hg, events)
+    }
+
+    #[test]
+    fn prune_before_round_removes_ordered_events() {
+        let (mut hg, events) = build_prune_graph();
+        let a1 = events["a1"];
+        let c1 = events["c1"];
+        assert!(hg.get(&a1).is_some());
+        assert!(hg.get(&c1).is_some());
+
+        hg.prune_before_round(2);
+
+        assert!(hg.get(&a1).is_none(), "round-1 event that is not a border anchor is pruned");
+        assert!(hg.get(&c1).is_none(), "childless round-1 event is pruned");
+        assert!(hg.get(&events["a5"]).is_some(), "live round-3 event survives");
+    }
+
+    #[test]
+    fn prune_preserves_border_anchor_events() {
+        let (mut hg, events) = build_prune_graph();
+        // a2 has rr=1 but is the self-parent of the live a3 (rr=2).
+        let a2 = events["a2"];
+        let a3 = events["a3"];
+        assert_eq!(hg.get(&a2).unwrap().round_received(), Some(1));
+        assert_eq!(hg.get(&a3).unwrap().round_received(), Some(2));
+
+        hg.prune_before_round(2);
+
+        assert!(hg.get(&a2).is_some(), "a2 must survive as a border anchor");
+        assert!(hg.get(&a3).is_some(), "the live child survives too");
+        // The border anchor's own parent (a1) is not protected.
+        assert!(hg.get(&events["a1"]).is_none(), "a border anchor does not protect its parents");
+    }
+
+    #[test]
+    fn prune_does_not_affect_consensus_order_after_checkpoint() {
+        let (mut hg, events) = build_prune_graph();
+        let before_r2 = hg.consensus_order(2);
+        let before_r3 = hg.consensus_order(3);
+        assert!(!before_r2.is_empty());
+        assert!(!before_r3.is_empty());
+
+        hg.prune_before_round(2);
+
+        assert_eq!(hg.consensus_order(2), before_r2, "round-2 order is unchanged");
+        assert_eq!(hg.consensus_order(3), before_r3, "round-3 order is unchanged");
+        // The pruned round-1 history no longer contributes to ordering.
+        assert_eq!(hg.consensus_order(1), vec![events["a2"]]);
+    }
+
+    #[test]
+    #[should_panic(expected = "not been ordered")]
+    fn prune_before_unordered_round_panics() {
+        let (mut hg, _events) = build_prune_graph();
+        // Rounds are ordered through 3; pruning at 4 is not allowed.
+        hg.prune_before_round(4);
     }
 }

@@ -100,6 +100,7 @@ fn frame_name(frame: &Frame) -> &'static str {
         Frame::SyncRequest(_) => "SyncRequest",
         Frame::SyncResponse(_) => "SyncResponse",
         Frame::Event(_) => "Event",
+        Frame::CheckpointSig(_) => "CheckpointSig",
     }
 }
 

@@ -112,31 +112,62 @@ async fn transaction_events_propagate_with_payloads() {
     let refs: Vec<&TestNode> = nodes.iter().collect();
     let registry = registry_for_ids(&[1, 2]);
 
+    // Let the cluster establish a self-parent chain, then insert the payload
+    // events as the latest event of each creator so they are recent (and
+    // hence retained) when we verify them.
+    sleep(Duration::from_millis(300)).await;
     let payload = b"hello ledger".to_vec();
+    let a1_latest = {
+        let hashgraph = nodes[0].node.hashgraph.lock().await;
+        hashgraph.latest_event_by(&NodeId::new(1)).copied()
+    };
+    let b1_latest = {
+        let hashgraph = nodes[1].node.hashgraph.lock().await;
+        hashgraph.latest_event_by(&NodeId::new(2)).copied()
+    };
     let a1 = make_event_with_payload(
         &nodes[0].key,
         1,
-        None,
+        a1_latest,
         None,
         vec![Transaction::from_bytes(payload.clone())],
     );
-    let a1_hash = insert_event(&nodes[0], &registry, a1.clone()).await;
+    let a1_hash = insert_event(&nodes[0], &registry, a1).await;
     let b1 = make_event_with_payload(
         &nodes[1].key,
         2,
-        None,
+        b1_latest,
         None,
         vec![Transaction::from_bytes(payload.clone())],
     );
-    let b1_hash = insert_event(&nodes[1], &registry, b1.clone()).await;
+    let b1_hash = insert_event(&nodes[1], &registry, b1).await;
 
-    let (counts, lates) = stop_and_settle(&refs, Duration::from_millis(800)).await;
-    assert_converged(&counts, &lates, "payload propagation");
+    // Verify the payloads as soon as they propagate to every node — pruning
+    // only reaches these events once checkpoints are several rounds past
+    // them, so the poll below always reads them before that happens.
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let mut all_present = true;
+            for node in &refs {
+                let hashgraph = node.node.hashgraph.lock().await;
+                if hashgraph.get(&a1_hash).is_none() || hashgraph.get(&b1_hash).is_none() {
+                    all_present = false;
+                    break;
+                }
+            }
+            if all_present {
+                return;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("payload events propagate to every node");
 
     for node in &refs {
         let hashgraph = node.node.hashgraph.lock().await;
         for hash in [a1_hash, b1_hash] {
-            let record = hashgraph.get(&hash).expect("injected event must propagate to every node");
+            let record = hashgraph.get(&hash).expect("injected event is present");
             let txs = record.event().payload();
             assert_eq!(txs.len(), 1, "payload must survive gossip byte-for-byte");
             assert_eq!(txs[0].payload(), payload.as_slice());

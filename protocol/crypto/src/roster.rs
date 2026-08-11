@@ -185,6 +185,18 @@ impl RosterHistory {
     pub fn schedule(&mut self, activation_round: u64, registry: MembershipRegistry) {
         self.snapshots.insert(activation_round, registry);
     }
+
+    /// Drops every snapshot whose activation round is strictly below
+    /// `keep_from_round`, except the one snapshot immediately before it (its
+    /// predecessor), which is retained so [`RosterHistory::roster_for_round`]
+    /// still resolves for every round at or above `keep_from_round`. Used by
+    /// the checkpoint-pruning path to discard membership history that is no
+    /// longer reachable from the retained event window.
+    pub fn prune_before(&mut self, keep_from_round: u64) {
+        let predecessor =
+            self.snapshots.range(..keep_from_round).next_back().map(|(&round, _)| round);
+        self.snapshots.retain(|&round, _| round >= keep_from_round || Some(round) == predecessor);
+    }
 }
 
 /// Reads exactly `len` bytes from `cursor`, advancing it past them. Returns
@@ -424,6 +436,33 @@ mod tests {
             history.schedule(5, registry_with(&[1, 2]));
             history.schedule(5, registry_with(&[1, 2, 3]));
             assert_eq!(history.roster_for_round(5).len(), 3);
+        }
+
+        #[test]
+        fn prune_before_keeps_predecessor_and_forward() {
+            let mut history = RosterHistory::new(registry_with(&[1]));
+            history.schedule(5, registry_with(&[1, 2]));
+            history.schedule(9, registry_with(&[1, 2, 3]));
+            // The predecessor of 7 is the round-5 snapshot; 9 and beyond stay.
+            history.prune_before(7);
+            assert_eq!(history.roster_for_round(7).len(), 2, "round 5 snapshot must survive");
+            assert_eq!(history.roster_for_round(9).len(), 3);
+            // Lookups below the predecessor are gone.
+            let mut remaining = history.snapshots.keys().copied();
+            assert_eq!(remaining.next(), Some(5));
+            assert_eq!(remaining.next(), Some(9));
+            assert!(remaining.next().is_none());
+        }
+
+        #[test]
+        fn prune_before_with_no_predecessor_keeps_only_forward() {
+            let mut history = RosterHistory::new(registry_with(&[1]));
+            history.schedule(5, registry_with(&[1, 2]));
+            history.prune_before(1);
+            let mut remaining = history.snapshots.keys().copied();
+            assert_eq!(remaining.next(), Some(1));
+            assert_eq!(remaining.next(), Some(5));
+            assert!(remaining.next().is_none());
         }
     }
 }

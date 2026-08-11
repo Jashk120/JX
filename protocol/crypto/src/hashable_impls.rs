@@ -11,6 +11,7 @@ use sha2::{
 
 use crate::canonical::CanonicalEncode;
 use crate::hash::Hashable;
+use crate::membership::MembershipRegistry;
 
 impl Hashable for Event {
     type Hash = EventHash;
@@ -31,6 +32,17 @@ impl Hashable for Transaction {
         let bytes = self.canonical_bytes();
         let digest = Sha256::digest(&bytes);
         TransactionHash::new(digest.into())
+    }
+}
+
+/// SHA-256 of [`MembershipRegistry::to_bytes`] — the canonical roster hash
+/// a checkpoint payload commits to (Phase 3). Deterministic across nodes for
+/// the same roster, so every node derives the identical `roster_hash`.
+impl Hashable for MembershipRegistry {
+    type Hash = [u8; 32];
+
+    fn hash(&self) -> [u8; 32] {
+        Sha256::digest(self.to_bytes()).into()
     }
 }
 

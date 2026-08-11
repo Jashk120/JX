@@ -13,6 +13,25 @@ This document defines the development rules for contributors and AI coding agent
 
 ---
 
+## Before Implementing Any Plan
+
+1. Read the plan document fully.
+2. Read the relevant source files.
+3. Cross-check the plan's assumptions against the actual code.
+4. List any mismatches, ambiguities, or unresolved questions and raise them
+   to the user before writing a single line of implementation.
+5. Do not resolve open questions by reasoning through them independently.
+   Ask instead.
+
+---
+## During Implementation
+
+- Treat decisions stated in the plan as closed. Do not re-examine them.
+- If you encounter something the plan did not anticipate, stop and ask.
+- Do not think through alternatives silently — surface them immediately.
+
+---
+
 # Formatting
 
 Always format Rust code using the nightly formatter.

@@ -169,16 +169,28 @@ pub fn assert_converged(counts: &[usize], lates: &[Vec<Option<u64>>], label: &st
     let no_island = lates
         .iter()
         .all(|per_creator| per_creator.iter().all(|seq| seq.is_some_and(|value| value > 0)));
-    let min = counts.iter().copied().min().unwrap_or(0);
-    let max = counts.iter().copied().max().unwrap_or(0);
-    let bound = 2 * (counts.len().saturating_sub(1));
-    let gap_ok = max.saturating_sub(min) <= bound;
-    eprintln!(
-        "[{label}] counts={counts:?} latest_per_creator={lates:?} no_island={no_island} gap={}/{bound}",
-        max.saturating_sub(min)
-    );
+    // Phase 3 checkpoints prune old history once confirmed, so total event
+    // counts legitimately differ across nodes; convergence is judged on the
+    // retained frontier — each creator's latest sequence number must be
+    // within `2 * node_count` of the others (a couple of sync intervals).
+    let node_count = counts.len();
+    let bound = 2 * node_count.max(1);
+    let width = lates.first().map_or(0, Vec::len);
+    for creator in 0..width {
+        let seqs: Vec<u64> = lates.iter().filter_map(|per_creator| per_creator[creator]).collect();
+        let (min, max) = match (seqs.iter().min(), seqs.iter().max()) {
+            (Some(min), Some(max)) => (*min, *max),
+            _ => continue,
+        };
+        assert!(
+            max - min <= bound as u64,
+            "[{label}] frontier gap for creator {} is {} (bound {bound})",
+            creator + 1,
+            max - min
+        );
+    }
+    eprintln!("[{label}] counts={counts:?} latest_per_creator={lates:?} no_island={no_island}");
     assert!(no_island, "[{label}] a node is missing an entire creator's events");
-    assert!(gap_ok, "[{label}] nodes are too far apart ({min}..{max}, bound {bound})");
 }
 
 pub fn drop_nodes(nodes: Vec<TestNode>) {

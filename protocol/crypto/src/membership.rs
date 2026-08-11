@@ -51,6 +51,22 @@ impl MembershipRegistry {
     pub fn is_empty(&self) -> bool {
         self.keys.is_empty()
     }
+
+    /// Canonical byte serialization of the roster: the sorted `(NodeId,
+    /// VerifyingKey)` pairs in [`MembershipRegistry::member_ids`] order.
+    /// Deterministic on every node — the same roster always produces the
+    /// same bytes — so a SHA-256 of this value anchors a checkpoint message
+    /// (Phase 3).
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut members: Vec<(&NodeId, &VerifyingKey)> = self.keys.iter().collect();
+        members.sort_by_key(|(id, _)| **id);
+        let mut buf = Vec::with_capacity(members.len() * 40);
+        for (id, key) in members {
+            buf.extend_from_slice(&id.get().to_be_bytes());
+            buf.extend_from_slice(&key.to_bytes());
+        }
+        buf
+    }
 }
 
 #[cfg(test)]
@@ -95,5 +111,27 @@ mod tests {
     fn contains_returns_false_for_unknown_node() {
         let registry = MembershipRegistry::new();
         assert!(!registry.contains(&NodeId::new(99)));
+    }
+
+    #[test]
+    fn to_bytes_is_canonical_and_order_independent() {
+        let mut registry = MembershipRegistry::new();
+        for id in [3u64, 1, 2] {
+            registry.register(NodeId::new(id), SigningKey::generate(&mut OsRng).verifying_key());
+        }
+
+        let bytes = registry.to_bytes();
+        // 3 members, each serialized as 8-byte id + 32-byte key.
+        assert_eq!(bytes.len(), 3 * 40);
+        // The first entry is the smallest NodeId (1), regardless of the
+        // insertion order above.
+        assert_eq!(u64::from_be_bytes(bytes[0..8].try_into().unwrap()), 1);
+
+        // Identical rosters serialize identically.
+        let mut clone = MembershipRegistry::new();
+        for id in [1u64, 2, 3] {
+            clone.register(NodeId::new(id), registry.key_for(&NodeId::new(id)).unwrap().to_owned());
+        }
+        assert_eq!(clone.to_bytes(), bytes);
     }
 }

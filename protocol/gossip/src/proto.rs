@@ -17,6 +17,7 @@ pub enum MessageType {
     SyncRequest = 0x00,
     SyncResponse = 0x01,
     Event = 0x02,
+    CheckpointSig = 0x03,
 }
 
 impl MessageType {
@@ -25,6 +26,7 @@ impl MessageType {
             0x00 => Ok(Self::SyncRequest),
             0x01 => Ok(Self::SyncResponse),
             0x02 => Ok(Self::Event),
+            0x03 => Ok(Self::CheckpointSig),
             other => Err(GossipError::framing(format!("unknown message tag {other:#04x}"))),
         }
     }
@@ -53,6 +55,7 @@ pub enum Frame {
     SyncRequest(SyncRequest),
     SyncResponse(SyncResponse),
     Event(Event),
+    CheckpointSig(consensus::CheckpointSig),
 }
 
 impl Frame {
@@ -61,6 +64,7 @@ impl Frame {
             Self::SyncRequest(_) => MessageType::SyncRequest,
             Self::SyncResponse(_) => MessageType::SyncResponse,
             Self::Event(_) => MessageType::Event,
+            Self::CheckpointSig(_) => MessageType::CheckpointSig,
         }
     }
 
@@ -72,6 +76,7 @@ impl Frame {
             Self::SyncRequest(req) => req.encode_canonical(&mut payload),
             Self::SyncResponse(resp) => resp.encode_canonical(&mut payload),
             Self::Event(event) => event.encode_canonical(&mut payload),
+            Self::CheckpointSig(sig) => sig.encode_canonical(&mut payload),
         }
 
         let mut out = Vec::with_capacity(5 + payload.len());
@@ -104,6 +109,11 @@ impl Frame {
                 let event = decode_event(&mut cursor)?;
                 cursor.finish()?;
                 Ok(Self::Event(event))
+            }
+            MessageType::CheckpointSig => {
+                let sig = consensus::CheckpointSig::decode(payload)
+                    .ok_or_else(|| GossipError::framing("invalid checkpoint signature frame"))?;
+                Ok(Self::CheckpointSig(sig))
             }
         }
     }
@@ -311,6 +321,19 @@ mod tests {
         .finalize(Signature::new([5; 64]));
         let decoded = Frame::from_bytes(&Frame::Event(event.clone()).to_bytes()).expect("parses");
         assert_eq!(decoded, Frame::Event(event));
+    }
+
+    #[test]
+    fn checkpoint_sig_frame_round_trips() {
+        let sig = consensus::CheckpointSig {
+            round: 42,
+            signer: NodeId::new(7),
+            sig: Signature::new([9; 64]),
+        };
+        let frame = Frame::CheckpointSig(sig.clone());
+        let decoded = Frame::from_bytes(&frame.to_bytes()).expect("parses");
+        assert_eq!(decoded, Frame::CheckpointSig(sig));
+        assert_eq!(frame.message_type(), MessageType::CheckpointSig);
     }
 
     #[test]
