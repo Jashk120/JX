@@ -18,6 +18,7 @@ pub mod node;
 pub mod peer;
 pub mod peer_manager;
 pub mod proto;
+pub mod reconnect;
 pub mod sync;
 pub mod tls;
 pub mod transport;
@@ -35,8 +36,14 @@ pub use peer::PeerInfo;
 pub use peer_manager::PeerManager;
 pub use proto::{
     Frame,
+    ReconnectRequest,
+    ReconnectResponse,
     SyncRequest,
     SyncResponse,
+};
+pub use reconnect::{
+    fetch_checkpoint,
+    verify_signed_checkpoint,
 };
 pub use sync::run_sync;
 pub use tls::TlsIdentity;

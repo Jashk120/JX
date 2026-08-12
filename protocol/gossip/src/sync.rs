@@ -50,6 +50,13 @@ pub async fn run_sync(
 
     let response = match transport.recv_frame().await? {
         Frame::SyncResponse(response) => response,
+        Frame::Behind => {
+            // Phase 4: the peer cannot build a delta because it has pruned
+            // the history this node needs — the "too far behind" signal.
+            return Err(GossipError::Reconnect(
+                "peer reports this node is behind its retained history".into(),
+            ));
+        }
         other => {
             return Err(GossipError::UnexpectedFrame {
                 expected: "SyncResponse",
@@ -101,6 +108,9 @@ fn frame_name(frame: &Frame) -> &'static str {
         Frame::SyncResponse(_) => "SyncResponse",
         Frame::Event(_) => "Event",
         Frame::CheckpointSig(_) => "CheckpointSig",
+        Frame::Reconnect(_) => "Reconnect",
+        Frame::ReconnectResponse(_) => "ReconnectResponse",
+        Frame::Behind => "Behind",
     }
 }
 

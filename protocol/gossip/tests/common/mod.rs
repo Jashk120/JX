@@ -119,6 +119,33 @@ pub async fn spawn_cluster(ids: &[u64]) -> Vec<TestNode> {
     nodes
 }
 
+/// Waits until `node` has accepted a checkpoint at a round at least
+/// `min_round`, returning it. A round of `min_round` high enough that
+/// `min_round - RETENTION_ROUNDS` is past the earliest rounds guarantees
+/// `prune_before_round` has fired.
+///
+/// Shared by several test binaries that do not all use it, hence the
+/// `dead_code` allowance (same pattern as the other `common` helpers).
+#[allow(dead_code)]
+pub async fn wait_for_pruned_checkpoint(
+    node: &Arc<GossipNode>,
+    min_round: u64,
+    deadline: Duration,
+) -> u64 {
+    timeout(deadline, async {
+        loop {
+            if let Some(round) = node.latest_accepted_checkpoint_round().await
+                && round >= min_round
+            {
+                return round;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("cluster accepts a checkpoint and pruning fires")
+}
+
 /// Lets the cluster gossip for `warmup`, stops every node's sync driver,
 /// and waits for in-flight syncs to settle. Returns per-node event counts
 /// and per-node latest seq per creator.

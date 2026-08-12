@@ -31,7 +31,7 @@ use primitives::{
 pub const RETENTION_ROUNDS: u64 = 2;
 
 /// The unsigned payload every node commits to for a given round.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CheckpointPayload {
     pub round: u64,
     /// SHA-256 of `State::to_bytes()` as it stood when the round's events
@@ -97,7 +97,7 @@ impl CheckpointSig {
 
 /// A [`CheckpointPayload`] together with ≥ 2/3-weight signatures: the
 /// "accepted" form that authorises pruning.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SignedCheckpoint {
     pub payload: CheckpointPayload,
     pub sigs: Vec<CheckpointSig>,

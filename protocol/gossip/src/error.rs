@@ -32,6 +32,9 @@ pub enum GossipError {
 
     #[error("sync failed: {0}")]
     Sync(String),
+
+    #[error("reconnect failed: {0}")]
+    Reconnect(String),
 }
 
 pub type Result<T> = std::result::Result<T, GossipError>;

@@ -32,6 +32,12 @@ impl Executor {
         Self::default()
     }
 
+    /// Wraps an existing `State`, restoring an executor to a previously
+    /// serialized checkpoint state (Phase 4 reconnect).
+    pub fn from_state(state: State) -> Self {
+        Self { state }
+    }
+
     /// The state accumulated by the transactions applied so far.
     pub fn state(&self) -> &State {
         &self.state
@@ -101,18 +107,20 @@ impl Executor {
 /// Collects every finalized event in the hashgraph's consensus order, ready
 /// to feed to [`Executor::execute_event`].
 ///
-/// Rounds are visited in increasing order, and within a round the events come
-/// from [`Hashgraph::consensus_order`] unchanged — that function sorts by
-/// `roundReceived`, then `consensusTimestamp`, then the signature-derived
-/// tie-break. The executor therefore reuses the exact ordering `order.rs`
-/// already produces instead of defining its own.
+/// Rounds are visited in increasing order up to [`Hashgraph::max_ordered_round`],
+/// and within a round the events come from [`Hashgraph::consensus_order`]
+/// unchanged — that function sorts by `roundReceived`, then
+/// `consensusTimestamp`, then the signature-derived tie-break. The executor
+/// therefore reuses the exact ordering `order.rs` already produces instead of
+/// defining its own.
 ///
-/// Rounds with no recorded witnesses (nothing beyond the highest reached
-/// round) end the walk; rounds that were decided but assigned zero events
-/// simply contribute nothing.
+/// The walk is bounded by the highest round that has an ordered event, not by
+/// witness contiguity from round 1: a Phase 4 reconnect learner holds no
+/// round-1 history (its accepted rounds were seeded from a checkpoint), so
+/// `witnesses_of_round(1)` is empty for it even though later rounds have
+/// ordered events. Rounds with no ordered events simply contribute nothing.
 pub fn finalized_events(hashgraph: &Hashgraph) -> Vec<Event> {
-    (1..)
-        .take_while(|&round| !hashgraph.witnesses_of_round(round).is_empty())
+    (1..=hashgraph.max_ordered_round())
         .flat_map(|round| hashgraph.consensus_order(round))
         .filter_map(|hash| hashgraph.get(&hash).map(|record| record.event().clone()))
         .collect()
@@ -160,6 +168,15 @@ mod tests {
         assert!(errors.is_empty());
         assert!(membership_ops.is_empty());
         assert_eq!(executor.state().get(b"k"), Some(&b"v"[..]));
+    }
+
+    #[test]
+    fn from_state_restores_exactly_the_given_state() {
+        let mut state = State::new();
+        state.apply(&Op::Put { key: b"k".to_vec(), value: b"v".to_vec() });
+        let executor = Executor::from_state(state.clone());
+        assert_eq!(executor.state(), &state);
+        assert_eq!(executor.into_state(), state);
     }
 
     #[test]

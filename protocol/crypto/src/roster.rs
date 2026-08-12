@@ -150,7 +150,7 @@ impl Eq for MembershipOp {}
 /// so `roster_for_round(0)` is unreachable under correct usage. If a future
 /// refactor introduces a round-0 genesis event, this invariant must be
 /// revisited before it silently hits the panic inside `roster_for_round`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RosterHistory {
     snapshots: BTreeMap<u64, MembershipRegistry>,
 }
@@ -184,6 +184,24 @@ impl RosterHistory {
     /// op, so the result is always identical).
     pub fn schedule(&mut self, activation_round: u64, registry: MembershipRegistry) {
         self.snapshots.insert(activation_round, registry);
+    }
+
+    /// Iterates the snapshots in ascending activation-round order. Used by
+    /// the reconnect codec to serialize a `RosterHistory` onto the wire.
+    pub fn snapshots(&self) -> impl Iterator<Item = (&u64, &MembershipRegistry)> {
+        self.snapshots.iter()
+    }
+
+    /// Builds a history from an explicit snapshot list, in ascending
+    /// activation-round order. Returns `None` for an empty list. Unlike
+    /// [`RosterHistory::new`], the earliest snapshot need not activate at
+    /// round 1 — a pruned history legitimately starts later.
+    pub fn from_snapshots(snapshots: Vec<(u64, MembershipRegistry)>) -> Option<Self> {
+        let snapshots: BTreeMap<u64, MembershipRegistry> = snapshots.into_iter().collect();
+        if snapshots.is_empty() {
+            return None;
+        }
+        Some(Self { snapshots })
     }
 
     /// Drops every snapshot whose activation round is strictly below
@@ -463,6 +481,34 @@ mod tests {
             assert_eq!(remaining.next(), Some(1));
             assert_eq!(remaining.next(), Some(5));
             assert!(remaining.next().is_none());
+        }
+
+        #[test]
+        fn snapshots_iterates_in_ascending_round_order() {
+            let mut history = RosterHistory::new(registry_with(&[1]));
+            history.schedule(5, registry_with(&[1, 2]));
+            history.schedule(3, registry_with(&[1, 3]));
+            let rounds: Vec<u64> = history.snapshots().map(|(&r, _)| r).collect();
+            assert_eq!(rounds, vec![1, 3, 5]);
+        }
+
+        #[test]
+        fn from_snapshots_rebuilds_history() {
+            let mut history = RosterHistory::new(registry_with(&[1]));
+            history.schedule(5, registry_with(&[1, 2]));
+            history.prune_before(4);
+            let snapshots: Vec<(u64, MembershipRegistry)> =
+                history.snapshots().map(|(&r, reg)| (r, reg.clone())).collect();
+
+            let rebuilt = RosterHistory::from_snapshots(snapshots).expect("rebuild");
+            assert_eq!(rebuilt.roster_for_round(1).len(), 1);
+            assert_eq!(rebuilt.roster_for_round(4).len(), 1);
+            assert_eq!(rebuilt.roster_for_round(5).len(), 2);
+        }
+
+        #[test]
+        fn from_snapshots_rejects_empty_list() {
+            assert!(RosterHistory::from_snapshots(Vec::new()).is_none());
         }
     }
 }

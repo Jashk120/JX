@@ -67,11 +67,39 @@ impl State {
         }
         buf
     }
+
+    /// The inverse of [`State::to_bytes`]: parses the length-prefixed
+    /// (key, value) pairs in the exact format `to_bytes` produces. Returns
+    /// `None` on any truncation or length overflow. Empty bytes decode to
+    /// `State::new()`.
+    pub fn from_bytes(mut bytes: &[u8]) -> Option<Self> {
+        let mut entries = BTreeMap::new();
+        while !bytes.is_empty() {
+            let key = read_bytes(&mut bytes)?;
+            let value = read_bytes(&mut bytes)?;
+            entries.insert(key, value);
+        }
+        Some(Self { entries })
+    }
 }
 
 fn write_bytes(buf: &mut Vec<u8>, bytes: &[u8]) {
     buf.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
     buf.extend_from_slice(bytes);
+}
+
+fn read_bytes(bytes: &mut &[u8]) -> Option<Vec<u8>> {
+    if bytes.len() < 4 {
+        return None;
+    }
+    let len = u32::from_be_bytes(bytes[..4].try_into().ok()?) as usize;
+    let end = 4usize.checked_add(len)?;
+    if bytes.len() < end {
+        return None;
+    }
+    let out = bytes[4..end].to_vec();
+    *bytes = &bytes[end..];
+    Some(out)
 }
 
 #[cfg(test)]
@@ -126,5 +154,44 @@ mod tests {
         expected.extend_from_slice(b"2");
 
         assert_eq!(state.to_bytes(), expected);
+    }
+
+    #[test]
+    fn from_bytes_round_trips() {
+        let mut state = State::new();
+        state.apply(&Op::Put { key: b"alpha".to_vec(), value: vec![0; 200] });
+        state.apply(&Op::Put { key: b"beta".to_vec(), value: b"v".to_vec() });
+        state.apply(&Op::Delete { key: b"gamma".to_vec() });
+
+        assert_eq!(State::from_bytes(&state.to_bytes()), Some(state));
+    }
+
+    #[test]
+    fn from_bytes_rejects_truncated_input() {
+        let mut state = State::new();
+        state.apply(&Op::Put { key: b"k".to_vec(), value: b"value".to_vec() });
+        let bytes = state.to_bytes();
+
+        // Truncate inside the length prefix, inside the key, and inside the value.
+        assert_eq!(State::from_bytes(&bytes[..1]), None);
+        assert_eq!(State::from_bytes(&bytes[..bytes.len() - 5]), None);
+        assert_eq!(State::from_bytes(&bytes[..bytes.len() - 1]), None);
+    }
+
+    #[test]
+    fn from_bytes_rejects_overflowing_length() {
+        let mut state = State::new();
+        state.apply(&Op::Put { key: b"k".to_vec(), value: b"v".to_vec() });
+        let bytes = state.to_bytes();
+        // A length prefix claiming more bytes than the buffer holds.
+        let mut bad = bytes[..4].to_vec();
+        bad.extend_from_slice(&u32::MAX.to_be_bytes());
+        bad.extend_from_slice(b"x");
+        assert_eq!(State::from_bytes(&bad), None);
+    }
+
+    #[test]
+    fn from_bytes_empty_is_empty_state() {
+        assert_eq!(State::from_bytes(&[]), Some(State::new()));
     }
 }

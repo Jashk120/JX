@@ -18,6 +18,12 @@ pub enum MessageType {
     SyncResponse = 0x01,
     Event = 0x02,
     CheckpointSig = 0x03,
+    Reconnect = 0x04,
+    ReconnectResponse = 0x05,
+    /// The responder's delta-computation failed because the requester is
+    /// behind the history this node has pruned (Phase 4). The requester
+    /// must reconnect from a checkpoint.
+    Behind = 0x06,
 }
 
 impl MessageType {
@@ -27,6 +33,9 @@ impl MessageType {
             0x01 => Ok(Self::SyncResponse),
             0x02 => Ok(Self::Event),
             0x03 => Ok(Self::CheckpointSig),
+            0x04 => Ok(Self::Reconnect),
+            0x05 => Ok(Self::ReconnectResponse),
+            0x06 => Ok(Self::Behind),
             other => Err(GossipError::framing(format!("unknown message tag {other:#04x}"))),
         }
     }
@@ -49,6 +58,39 @@ pub struct SyncResponse {
     pub events: Vec<Event>,
 }
 
+/// Phase 4 — the reconnect learner's request: "I need to reconnect from a
+/// checkpoint." Carries nothing but the requester's identity; the teacher
+/// answers with a [`ReconnectResponse`] on its dedicated reconnect port.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReconnectRequest {
+    pub from: NodeId,
+}
+
+/// Phase 4 — the teacher's response: everything the learner needs to
+/// bootstrap from a checkpoint and participate from that round onward.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReconnectResponse {
+    /// The accepted checkpoint (self-describing: embeds the roster snapshot
+    /// active at its round, plus the signatures over its signing bytes).
+    pub signed_checkpoint: consensus::SignedCheckpoint,
+    /// Raw `State::to_bytes()` exactly as it stood at the checkpoint round, so
+    /// `Sha256(state_bytes)` equals `signed_checkpoint.payload.state_hash` and
+    /// the learner's replay of the retained events newer than the checkpoint
+    /// is exactly-once.
+    pub state_bytes: Vec<u8>,
+    /// Encoded [`consensus::RosterHistory`] (see `consensus::reconnect`).
+    pub roster_history_bytes: Vec<u8>,
+    /// The teacher's highest fully-decided round, so the learner can seed its
+    /// decided-round set and continue producing checkpoints without
+    /// re-deciding the history it already holds.
+    pub decided_round: u64,
+    /// The teacher's entire retained graph, with full record metadata. The
+    /// learner inserts these as accepted history, so its known-summary
+    /// frontier is honest (it holds full chains, not just per-creator heads)
+    /// and subsequent delta syncs never reference a parent it lacks.
+    pub retained: Vec<consensus::RetainedEvent>,
+}
+
 /// One unit of wire traffic on a gossip connection.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Frame {
@@ -56,6 +98,11 @@ pub enum Frame {
     SyncResponse(SyncResponse),
     Event(Event),
     CheckpointSig(consensus::CheckpointSig),
+    Reconnect(ReconnectRequest),
+    ReconnectResponse(ReconnectResponse),
+    /// The responder could not build a delta for the requester because the
+    /// requester is behind the history the responder has pruned.
+    Behind,
 }
 
 impl Frame {
@@ -65,6 +112,9 @@ impl Frame {
             Self::SyncResponse(_) => MessageType::SyncResponse,
             Self::Event(_) => MessageType::Event,
             Self::CheckpointSig(_) => MessageType::CheckpointSig,
+            Self::Reconnect(_) => MessageType::Reconnect,
+            Self::ReconnectResponse(_) => MessageType::ReconnectResponse,
+            Self::Behind => MessageType::Behind,
         }
     }
 
@@ -77,6 +127,40 @@ impl Frame {
             Self::SyncResponse(resp) => resp.encode_canonical(&mut payload),
             Self::Event(event) => event.encode_canonical(&mut payload),
             Self::CheckpointSig(sig) => sig.encode_canonical(&mut payload),
+            Self::Reconnect(req) => {
+                req.from.encode_canonical(&mut payload);
+            }
+            Self::ReconnectResponse(resp) => {
+                let cp_bytes =
+                    consensus::reconnect::encode_signed_checkpoint(&resp.signed_checkpoint);
+                payload.extend_from_slice(&(cp_bytes.len() as u32).to_be_bytes());
+                payload.extend_from_slice(&cp_bytes);
+                payload.extend_from_slice(&(resp.state_bytes.len() as u32).to_be_bytes());
+                payload.extend_from_slice(&resp.state_bytes);
+                payload.extend_from_slice(&(resp.roster_history_bytes.len() as u32).to_be_bytes());
+                payload.extend_from_slice(&resp.roster_history_bytes);
+                payload.extend_from_slice(&resp.decided_round.to_be_bytes());
+                payload.extend_from_slice(&(resp.retained.len() as u32).to_be_bytes());
+                for retained in &resp.retained {
+                    payload.extend_from_slice(&retained.seq.to_be_bytes());
+                    payload.extend_from_slice(&retained.round.to_be_bytes());
+                    match retained.round_received {
+                        Some(rr) => {
+                            payload.push(0x01);
+                            payload.extend_from_slice(&rr.to_be_bytes());
+                        }
+                        None => payload.push(0x00),
+                    }
+                    payload.extend_from_slice(&(retained.ancestor_seqs.len() as u32).to_be_bytes());
+                    for seq in &retained.ancestor_seqs {
+                        payload.extend_from_slice(&seq.to_be_bytes());
+                    }
+                    let event_bytes = retained.event.canonical_bytes();
+                    payload.extend_from_slice(&(event_bytes.len() as u32).to_be_bytes());
+                    payload.extend_from_slice(&event_bytes);
+                }
+            }
+            Self::Behind => {}
         }
 
         let mut out = Vec::with_capacity(5 + payload.len());
@@ -114,6 +198,71 @@ impl Frame {
                 let sig = consensus::CheckpointSig::decode(payload)
                     .ok_or_else(|| GossipError::framing("invalid checkpoint signature frame"))?;
                 Ok(Self::CheckpointSig(sig))
+            }
+            MessageType::Reconnect => {
+                let mut cursor = Cursor::new(payload);
+                let from = decode_node_id(&mut cursor)?;
+                cursor.finish()?;
+                Ok(Self::Reconnect(ReconnectRequest { from }))
+            }
+            MessageType::ReconnectResponse => {
+                let mut cursor = Cursor::new(payload);
+                let cp_len = cursor.read_u32()? as usize;
+                let cp_bytes = cursor.read(cp_len)?;
+                let signed_checkpoint = consensus::reconnect::decode_signed_checkpoint(cp_bytes)
+                    .ok_or_else(|| {
+                        GossipError::framing("invalid signed checkpoint in reconnect response")
+                    })?;
+                let state_len = cursor.read_u32()? as usize;
+                let state_bytes = cursor.read(state_len)?.to_vec();
+                let rh_len = cursor.read_u32()? as usize;
+                let roster_history_bytes = cursor.read(rh_len)?.to_vec();
+                let decided_round = cursor.read_u64()?;
+                let retained_count = cursor.read_u32()? as usize;
+                let mut retained = Vec::with_capacity(retained_count);
+                for _ in 0..retained_count {
+                    let seq = cursor.read_u64()?;
+                    let round = cursor.read_u64()?;
+                    let round_received = match cursor.read(1)?[0] {
+                        0x00 => None,
+                        0x01 => Some(cursor.read_u64()?),
+                        other => {
+                            return Err(GossipError::framing(format!(
+                                "invalid round-received tag {other:#04x}"
+                            )));
+                        }
+                    };
+                    let ancestor_count = cursor.read_u32()? as usize;
+                    let mut ancestor_seqs = Vec::with_capacity(ancestor_count);
+                    for _ in 0..ancestor_count {
+                        ancestor_seqs.push(cursor.read_u64()?);
+                    }
+                    let event_len = cursor.read_u32()? as usize;
+                    let event_bytes = cursor.read(event_len)?;
+                    let mut event_cursor = Cursor::new(event_bytes);
+                    let event = decode_event(&mut event_cursor)?;
+                    event_cursor.finish()?;
+                    retained.push(consensus::RetainedEvent {
+                        event,
+                        seq,
+                        round,
+                        ancestor_seqs,
+                        round_received,
+                    });
+                }
+                cursor.finish()?;
+                Ok(Self::ReconnectResponse(ReconnectResponse {
+                    signed_checkpoint,
+                    state_bytes,
+                    roster_history_bytes,
+                    decided_round,
+                    retained,
+                }))
+            }
+            MessageType::Behind => {
+                let cursor = Cursor::new(payload);
+                cursor.finish()?;
+                Ok(Self::Behind)
             }
         }
     }
@@ -262,6 +411,7 @@ fn decode_optional_hash(cursor: &mut Cursor<'_>) -> Result<Option<EventHash>> {
 
 #[cfg(test)]
 mod tests {
+    use ed25519_dalek::SigningKey;
     use primitives::{
         Signature,
         Timestamp,
@@ -368,5 +518,75 @@ mod tests {
             Frame::SyncRequest(SyncRequest { from: NodeId::new(1), known: Vec::new() }).to_bytes();
         bytes[0] = 0xFF;
         assert!(Frame::from_bytes(&bytes).is_err());
+    }
+
+    #[test]
+    fn reconnect_request_round_trips() {
+        let request = ReconnectRequest { from: NodeId::new(3) };
+        let frame = Frame::Reconnect(request.clone());
+        let decoded = Frame::from_bytes(&frame.to_bytes()).expect("parses");
+        assert_eq!(decoded, Frame::Reconnect(request));
+        assert_eq!(frame.message_type(), MessageType::Reconnect);
+    }
+
+    #[test]
+    fn behind_frame_round_trips() {
+        let frame = Frame::Behind;
+        let decoded = Frame::from_bytes(&frame.to_bytes()).expect("parses");
+        assert_eq!(decoded, Frame::Behind);
+        assert_eq!(frame.message_type(), MessageType::Behind);
+    }
+
+    /// A real `SignedCheckpoint`-bearing response with a live roster, one
+    /// retained event, and an encoded roster history — the full wire shape
+    /// the reconnect protocol uses.
+    fn sample_reconnect_response() -> ReconnectResponse {
+        let mut registry = crypto::MembershipRegistry::new();
+        for id in [1u64, 2, 3] {
+            let key = SigningKey::from_bytes(&[id as u8; 32]);
+            registry.register(NodeId::new(id), key.verifying_key());
+        }
+        let payload = consensus::CheckpointPayload::new(4, [7u8; 32], registry.clone());
+        let sigs = vec![consensus::CheckpointSig {
+            round: 4,
+            signer: NodeId::new(1),
+            sig: Signature::new([9; 64]),
+        }];
+        let roster_history = crypto::RosterHistory::new(registry);
+        ReconnectResponse {
+            signed_checkpoint: consensus::SignedCheckpoint { payload, sigs },
+            state_bytes: vec![0xDE, 0xAD, 0xBE, 0xEF],
+            roster_history_bytes: consensus::reconnect::encode_roster_history(&roster_history),
+            decided_round: 6,
+            retained: vec![consensus::RetainedEvent {
+                event: sample_event(3),
+                seq: 2,
+                round: 1,
+                ancestor_seqs: vec![2, 0, 0],
+                round_received: Some(1),
+            }],
+        }
+    }
+
+    #[test]
+    fn reconnect_response_round_trips() {
+        let response = sample_reconnect_response();
+        let frame = Frame::ReconnectResponse(response.clone());
+        let decoded = Frame::from_bytes(&frame.to_bytes()).expect("parses");
+        assert_eq!(frame.message_type(), MessageType::ReconnectResponse);
+
+        let Frame::ReconnectResponse(decoded) = decoded else {
+            panic!("decoded to the wrong frame type");
+        };
+        assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn reconnect_response_rejects_truncated_payload() {
+        let bytes = Frame::ReconnectResponse(sample_reconnect_response()).to_bytes();
+        // Cutting inside the checkpoint/state/roster/frontier regions.
+        for cut in [5, 40, 80, bytes.len() - 10] {
+            assert!(Frame::from_bytes(&bytes[..cut]).is_err(), "cut at {cut}");
+        }
     }
 }

@@ -12,7 +12,7 @@ use crate::error::{
 /// events it creates. Lives in `crypto`, not `primitives`, so that
 /// `primitives` stays free of any cryptography dependency — `NodeId` itself
 /// remains a plain index with no knowledge that keys exist at all.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MembershipRegistry {
     keys: HashMap<NodeId, VerifyingKey>,
 }
@@ -66,6 +66,22 @@ impl MembershipRegistry {
             buf.extend_from_slice(&key.to_bytes());
         }
         buf
+    }
+
+    /// The inverse of [`MembershipRegistry::to_bytes`]: parses the sorted
+    /// `(NodeId, VerifyingKey)` pairs. Returns `None` on truncation or an
+    /// invalid compressed Edwards point. Used by the reconnect codec to
+    /// rebuild the roster snapshot embedded in a signed checkpoint.
+    pub fn from_bytes(mut bytes: &[u8]) -> Option<Self> {
+        let mut registry = Self::new();
+        while !bytes.is_empty() {
+            let head = bytes.get(..40)?;
+            let node = NodeId::new(u64::from_be_bytes(head[..8].try_into().ok()?));
+            let key = VerifyingKey::from_bytes(head[8..40].try_into().ok()?).ok()?;
+            registry.register(node, key);
+            bytes = &bytes[40..];
+        }
+        Some(registry)
     }
 }
 
@@ -133,5 +149,44 @@ mod tests {
             clone.register(NodeId::new(id), registry.key_for(&NodeId::new(id)).unwrap().to_owned());
         }
         assert_eq!(clone.to_bytes(), bytes);
+    }
+
+    #[test]
+    fn from_bytes_round_trips() {
+        let mut registry = MembershipRegistry::new();
+        for id in [3u64, 1, 2] {
+            registry.register(NodeId::new(id), SigningKey::generate(&mut OsRng).verifying_key());
+        }
+        assert_eq!(MembershipRegistry::from_bytes(&registry.to_bytes()), Some(registry.clone()));
+
+        // The rebuilt roster resolves the same keys.
+        let rebuilt = MembershipRegistry::from_bytes(&registry.to_bytes()).expect("rebuild");
+        for id in registry.member_ids() {
+            assert_eq!(rebuilt.key_for(&id), registry.key_for(&id));
+        }
+    }
+
+    #[test]
+    fn from_bytes_empty_is_empty_registry() {
+        assert_eq!(MembershipRegistry::from_bytes(&[]), Some(MembershipRegistry::new()));
+    }
+
+    #[test]
+    fn from_bytes_rejects_truncation_and_invalid_keys() {
+        let mut registry = MembershipRegistry::new();
+        registry.register(NodeId::new(1), SigningKey::generate(&mut OsRng).verifying_key());
+        let bytes = registry.to_bytes();
+
+        assert_eq!(MembershipRegistry::from_bytes(&bytes[..bytes.len() - 1]), None);
+        assert_eq!(MembershipRegistry::from_bytes(&bytes[..7]), None);
+
+        // A y-coordinate of 2 encodes no valid Edwards point.
+        let mut bad = Vec::new();
+        bad.extend_from_slice(&1u64.to_be_bytes());
+        bad.extend_from_slice(&[
+            2u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0,
+        ]);
+        assert_eq!(MembershipRegistry::from_bytes(&bad), None);
     }
 }

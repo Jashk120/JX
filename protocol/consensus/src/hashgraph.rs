@@ -21,6 +21,7 @@ use crate::error::{
     ConsensusError,
     Result,
 };
+use crate::reconnect::RetainedEvent;
 
 /// Consensus Spec §3 — the fame decision for a witness event.
 ///
@@ -85,6 +86,12 @@ impl EventRecord {
 
     pub fn ancestor_seq(&self, member_idx: usize) -> u64 {
         self.ancestor_seqs[member_idx]
+    }
+
+    /// The full `ancestor_seqs` row, as stored. Used by the reconnect
+    /// state-transfer to serialize the teacher's graph to a learner.
+    pub fn ancestor_seqs(&self) -> &[u64] {
+        &self.ancestor_seqs
     }
 
     /// The width of the `ancestor_seqs` row — the number of members the
@@ -225,6 +232,47 @@ impl Hashgraph {
         }
     }
 
+    /// Phase 4 — initialises a `Hashgraph` as if the history up to
+    /// `checkpoint` has already been processed, without storing any of those
+    /// events. The structure is empty but correctly sized: `member_index`,
+    /// `member_count`, `known_forkers`, and `roster_history` are seeded from
+    /// the checkpoint's roster snapshot.
+    ///
+    /// `next_round_to_order` is set to `checkpoint.round + 1` so
+    /// [`Hashgraph::prune_before_round`] never panics (it asserts
+    /// `prune_before_round < next_round_to_order`), and
+    /// `fully_decided_rounds` includes every round up to `checkpoint.round`
+    /// so [`Hashgraph::is_round_decided`] returns `true` for any round the
+    /// learner has "accepted" via the checkpoint.
+    pub fn from_checkpoint(checkpoint: &CheckpointPayload, roster_history: RosterHistory) -> Self {
+        let registry = &checkpoint.roster_snapshot;
+        let member_ids = registry.member_ids();
+        let member_count = member_ids.len();
+        let member_index: HashMap<NodeId, usize> = member_ids.into_iter().zip(0..).collect();
+
+        let mut fully_decided_rounds = BTreeSet::new();
+        for r in 1..=checkpoint.round {
+            fully_decided_rounds.insert(r);
+        }
+
+        Self {
+            events: HashMap::new(),
+            children: HashMap::new(),
+            first_child: HashMap::new(),
+            by_creator_seq: HashMap::new(),
+            latest_by_creator: HashMap::new(),
+            member_index,
+            member_count,
+            roster_history,
+            known_forkers: vec![false; member_count],
+            witnesses_by_round: HashMap::new(),
+            undecided_witnesses: HashMap::new(),
+            highest_witness_round: checkpoint.round,
+            fully_decided_rounds,
+            next_round_to_order: checkpoint.round + 1,
+        }
+    }
+
     pub fn insert(&mut self, verified: VerifiedEvent) -> Result<EventHash> {
         let event = verified.into_inner();
         let hash = event.hash();
@@ -322,6 +370,118 @@ impl Hashgraph {
 
     pub fn get(&self, hash: &EventHash) -> Option<&EventRecord> {
         self.events.get(hash)
+    }
+
+    /// Phase 4 — records an already-accepted historical event (part of the
+    /// retained graph transferred by a reconnect checkpoint) without running
+    /// the round/witness/fame machinery. The event's parents may be absent —
+    /// the caller has accepted all history up to the checkpoint — so no
+    /// parent validation is performed and no new elections are started.
+    ///
+    /// The record is marked ordered at `round_received` when that is `Some`
+    /// (the teacher already ordered it; copying the assignment is safe
+    /// because both nodes hold the identical event set and ordering is
+    /// deterministic), and `Some` records are never re-ordered by a later
+    /// `assign_order`. Events transferred before their fame resolved keep
+    /// `round_received: None` and are ordered by this node's own machinery
+    /// once their rounds are decided.
+    ///
+    /// `ancestor_seqs` is the teacher's stored row for the event — the
+    /// elementwise-max ancestry summary — without which this node's future
+    /// `see`/`strongly_see` computations would be wrong. `seq` is the
+    /// creator's sequence number, which becomes the known-summary frontier.
+    pub fn insert_accepted(
+        &mut self,
+        event: Event,
+        seq: u64,
+        round: u64,
+        mut ancestor_seqs: Vec<u64>,
+        round_received: Option<u64>,
+    ) -> Result<EventHash> {
+        let hash = event.hash();
+        if self.events.contains_key(&hash) {
+            return Err(InsertError::AlreadyPresent(hash));
+        }
+        let creator = *event.creator();
+        let creator_idx = *self.member_index.get(&creator).ok_or(InsertError::UnknownCreator)?;
+        if ancestor_seqs.len() != self.member_count {
+            ancestor_seqs.resize(self.member_count, 0);
+        }
+        ancestor_seqs[creator_idx] = seq;
+
+        self.by_creator_seq.entry((creator, seq)).or_insert(hash);
+        match self.latest_by_creator.get(&creator) {
+            Some(latest) => {
+                let latest_seq = self.events.get(latest).map_or(0, |record| record.seq());
+                if seq > latest_seq {
+                    self.latest_by_creator.insert(creator, hash);
+                }
+            }
+            None => {
+                self.latest_by_creator.insert(creator, hash);
+            }
+        }
+        for parent in [event.self_parent(), event.other_parent()].into_iter().flatten() {
+            if self.events.contains_key(parent) {
+                self.children.entry(*parent).or_default().push(hash);
+            }
+        }
+
+        self.events.insert(
+            hash,
+            EventRecord {
+                event,
+                seq,
+                ancestor_seqs,
+                round,
+                is_witness: false,
+                votes: HashMap::new(),
+                fame_status: FameStatus::Undecided,
+                round_received,
+                consensus_timestamp: round_received.map(|_| Timestamp::new(0)),
+            },
+        );
+        Ok(hash)
+    }
+
+    /// Phase 4 — the teacher's entire retained graph: every stored event with
+    /// the exact record metadata a learner needs to reconstruct this node's
+    /// view (creator seq, birth round, ancestry summary, and ordering).
+    /// Because the learner holds the full chains — not just per-creator
+    /// heads — its known-summary frontier is honest, so subsequent delta
+    /// syncs never reference a parent the learner lacks.
+    pub fn retained_events(&self) -> Vec<RetainedEvent> {
+        self.events
+            .values()
+            .map(|record| RetainedEvent {
+                event: record.event().clone(),
+                seq: record.seq(),
+                round: record.round(),
+                ancestor_seqs: record.ancestor_seqs().to_vec(),
+                round_received: record.round_received(),
+            })
+            .collect()
+    }
+
+    /// Phase 4 — the highest round whose fame is fully decided (every
+    /// witness has a final decision), or 0 if none. The reconnect teacher
+    /// sends this so the learner can seed `fully_decided_rounds` up to the
+    /// same point and continue producing checkpoints without re-deciding
+    /// history it already holds.
+    pub fn highest_decided_round(&self) -> u64 {
+        self.fully_decided_rounds.last().copied().unwrap_or(0)
+    }
+
+    /// Phase 4 — marks every round from `next_round_to_order` through `round`
+    /// as decided (the reconnect learner's equivalent of "the teacher already
+    /// finalized these rounds"), advancing the ordering watermark past them.
+    /// Rounds marked here have their events already assigned (transferred
+    /// records), so `assign_order` is a no-op for them.
+    pub fn mark_decided_through(&mut self, round: u64) {
+        for r in self.next_round_to_order..=round {
+            self.fully_decided_rounds.insert(r);
+        }
+        self.order_decided_rounds();
     }
 
     /// Consensus Spec §5 — the newest stored event created by `node`, if
@@ -483,6 +643,19 @@ impl Hashgraph {
 
     pub fn member_count(&self) -> usize {
         self.member_count
+    }
+
+    /// Phase 4 — the round-indexed roster snapshots, for serializing a
+    /// `RosterHistory` onto the reconnect wire.
+    pub fn roster_history(&self) -> &RosterHistory {
+        &self.roster_history
+    }
+
+    /// Phase 4 — the lowest round whose `assign_order` has not run yet.
+    /// The teacher reads this to pick a checkpoint that leaves the learner a
+    /// non-empty incremental sync window.
+    pub fn next_round_to_order(&self) -> u64 {
+        self.next_round_to_order
     }
 
     /// Extends the hashgraph to include `node` as a new member. The supplied
@@ -656,6 +829,13 @@ impl Hashgraph {
         }
 
         self.roster_history.prune_before(threshold);
+    }
+
+    /// Phase 4 — the highest round that has any ordered event, or 0 if none.
+    /// Bounds the `finalized_events` walk without assuming witnesses are
+    /// contiguous from round 1 (a reconnect learner holds no round-1 history).
+    pub fn max_ordered_round(&self) -> u64 {
+        self.events.values().filter_map(EventRecord::round_received).max().unwrap_or(0)
     }
 
     /// Whether `node` is a registered member of the current frozen
@@ -1215,5 +1395,171 @@ mod tests {
         let (mut hg, _events) = build_prune_graph();
         // Rounds are ordered through 3; pruning at 4 is not allowed.
         hg.prune_before_round(4);
+    }
+
+    #[test]
+    fn from_checkpoint_builds_empty_but_sized_structure() {
+        let registry = registry_of(&[
+            (NodeId::new(1), &SigningKey::generate(&mut OsRng)),
+            (NodeId::new(2), &SigningKey::generate(&mut OsRng)),
+        ]);
+        let checkpoint = CheckpointPayload::new(5, [0u8; 32], registry.clone());
+        let roster_history = RosterHistory::new(registry);
+
+        let hg = Hashgraph::from_checkpoint(&checkpoint, roster_history);
+        assert_eq!(hg.member_count(), 2);
+        assert!(hg.all_event_hashes().is_empty(), "no events are stored");
+        assert_eq!(hg.next_round_to_order(), 6);
+        assert_eq!(hg.highest_witness_round(), 5);
+        for round in 1..=5 {
+            assert!(hg.is_round_decided(round), "round {round} accepted via checkpoint");
+        }
+        assert!(!hg.is_round_decided(6), "round 6 is not decided yet");
+    }
+
+    #[test]
+    fn from_checkpoint_prune_before_round_does_not_panic() {
+        let registry = registry_of(&[(NodeId::new(1), &SigningKey::generate(&mut OsRng))]);
+        let checkpoint = CheckpointPayload::new(5, [0u8; 32], registry.clone());
+        let history = RosterHistory::new(registry);
+        // Pruning at any round below next_round_to_order (6) is legal.
+        for threshold in [1, 3, 5] {
+            let mut hg = Hashgraph::from_checkpoint(&checkpoint, history.clone());
+            hg.prune_before_round(threshold);
+        }
+    }
+
+    #[test]
+    fn insert_accepted_records_event_without_round_machinery() {
+        let key = SigningKey::generate(&mut OsRng);
+        let node = NodeId::new(1);
+        let registry = registry_of(&[(node, &key)]);
+        let checkpoint = CheckpointPayload::new(5, [0u8; 32], registry.clone());
+        let mut hg = Hashgraph::from_checkpoint(&checkpoint, RosterHistory::new(registry));
+
+        let event =
+            UnsignedEvent::new(node, None, None, Timestamp::new(100), Vec::new()).sign(&key);
+        let ancestor_seqs = vec![7u64];
+        let hash = hg
+            .insert_accepted(event.clone(), 7, 3, ancestor_seqs.clone(), Some(3))
+            .expect("accepted event inserts");
+
+        let record = hg.get(&hash).expect("record present");
+        assert_eq!(record.seq(), 7);
+        assert_eq!(record.round(), 3);
+        assert_eq!(record.round_received(), Some(3));
+        assert_eq!(record.ancestor_seqs(), ancestor_seqs.as_slice());
+        assert!(!record.is_witness(), "accepted events are never witnesses");
+        assert_eq!(hg.latest_event_by(&node), Some(&hash), "frontier drives known-summary");
+        assert!(hg.witnesses_of_round(3).is_empty(), "no witness machinery runs");
+        assert!(hg.pending_order_events().is_empty(), "ordered accepted event is never re-ordered");
+
+        // A duplicate accepted insert is rejected.
+        assert_eq!(
+            hg.insert_accepted(event, 7, 3, ancestor_seqs, Some(3)),
+            Err(InsertError::AlreadyPresent(hash))
+        );
+    }
+
+    #[test]
+    fn insert_accepted_keeps_unordered_events_pending() {
+        let key = SigningKey::generate(&mut OsRng);
+        let node = NodeId::new(1);
+        let registry = registry_of(&[(node, &key)]);
+        let checkpoint = CheckpointPayload::new(5, [0u8; 32], registry.clone());
+        let mut hg = Hashgraph::from_checkpoint(&checkpoint, RosterHistory::new(registry));
+
+        let event =
+            UnsignedEvent::new(node, None, None, Timestamp::new(100), Vec::new()).sign(&key);
+        // round_received None: the teacher had not ordered this event yet, so
+        // the learner leaves it pending for its own ordering machinery.
+        let hash = hg.insert_accepted(event, 7, 3, vec![7], None).expect("accepted event inserts");
+        assert_eq!(hg.get(&hash).expect("present").round_received(), None);
+        assert_eq!(hg.pending_order_events(), vec![hash]);
+    }
+
+    #[test]
+    fn insert_accepted_unknown_creator_is_rejected() {
+        let registry = registry_of(&[(NodeId::new(1), &SigningKey::generate(&mut OsRng))]);
+        let checkpoint = CheckpointPayload::new(1, [0u8; 32], registry.clone());
+        let mut hg = Hashgraph::from_checkpoint(&checkpoint, RosterHistory::new(registry));
+
+        let rogue = NodeId::new(99);
+        let event = UnsignedEvent::new(rogue, None, None, Timestamp::new(100), Vec::new())
+            .sign(&SigningKey::generate(&mut OsRng));
+        assert_eq!(
+            hg.insert_accepted(event, 1, 1, vec![1], Some(1)),
+            Err(InsertError::UnknownCreator)
+        );
+    }
+
+    #[test]
+    fn retained_events_returns_all_events_with_metadata() {
+        let key_a = SigningKey::generate(&mut OsRng);
+        let key_b = SigningKey::generate(&mut OsRng);
+        let node_a = NodeId::new(1);
+        let node_b = NodeId::new(2);
+        let registry = registry_of(&[(node_a, &key_a), (node_b, &key_b)]);
+        let mut hg = Hashgraph::new(&registry);
+
+        let a1 = hg.insert(verified_event(&key_a, node_a, None, None, 100)).unwrap();
+        let a2 = hg.insert(verified_event(&key_a, node_a, Some(a1), None, 101)).unwrap();
+        let _b1 = hg.insert(verified_event(&key_b, node_b, None, None, 102)).unwrap();
+
+        // Order a1 and a2; b1 stays unordered (the tip).
+        hg.set_event_order(&a1, 1, Timestamp::new(100));
+        hg.set_event_order(&a2, 2, Timestamp::new(101));
+
+        let retained = hg.retained_events();
+        assert_eq!(retained.len(), 3);
+        let by_seq: std::collections::HashMap<(NodeId, u64), RetainedEvent> =
+            retained.into_iter().map(|re| ((*re.event.creator(), re.seq), re)).collect();
+
+        let re_a1 = &by_seq[&(node_a, 1)];
+        assert_eq!(re_a1.round, 1);
+        assert_eq!(re_a1.round_received, Some(1));
+        assert_eq!(re_a1.ancestor_seqs.len(), 2, "ancestor_seqs covers both members");
+        assert_eq!(re_a1.event.hash(), a1);
+
+        let re_a2 = &by_seq[&(node_a, 2)];
+        assert_eq!(re_a2.round, 1, "birth round tracks the parents, not the ordering");
+        assert_eq!(re_a2.round_received, Some(2), "round_received is the ordering round");
+        // a2's row must reflect its own seq and a1's contribution.
+        assert_eq!(re_a2.ancestor_seqs[0], 2);
+
+        let re_b1 = &by_seq[&(node_b, 1)];
+        assert_eq!(re_b1.round, 1);
+        assert_eq!(re_b1.round_received, None, "unordered tip events keep round_received None");
+    }
+
+    #[test]
+    fn highest_decided_round_and_mark_decided_through() {
+        let registry = registry_of(&[(NodeId::new(1), &SigningKey::generate(&mut OsRng))]);
+        let checkpoint = CheckpointPayload::new(3, [0u8; 32], registry.clone());
+        let mut hg = Hashgraph::from_checkpoint(&checkpoint, RosterHistory::new(registry));
+        assert_eq!(hg.highest_decided_round(), 3);
+        assert!(!hg.is_round_decided(4));
+
+        hg.mark_decided_through(6);
+        assert_eq!(hg.highest_decided_round(), 6);
+        for round in 1..=6 {
+            assert!(hg.is_round_decided(round), "round {round} decided");
+        }
+        assert_eq!(hg.next_round_to_order(), 7, "ordering watermark advances past marked rounds");
+        assert!(!hg.is_round_decided(7));
+    }
+
+    #[test]
+    fn max_ordered_round_tracks_highest_round_received() {
+        let key = SigningKey::generate(&mut OsRng);
+        let node = NodeId::new(1);
+        let registry = registry_of(&[(node, &key)]);
+        let mut hg = Hashgraph::new(&registry);
+        assert_eq!(hg.max_ordered_round(), 0);
+
+        let e1 = hg.insert(verified_event(&key, node, None, None, 100)).unwrap();
+        assert_eq!(hg.max_ordered_round(), 0, "unordered events do not count");
+        hg.set_event_order(&e1, 2, Timestamp::new(100));
+        assert_eq!(hg.max_ordered_round(), 2);
     }
 }
