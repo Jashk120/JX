@@ -360,9 +360,17 @@ async fn malformed_frame_over_wire_does_not_crash_node() {
     let mut client = TcpTransport::new(TlsIdentity::from_seed(tls_seed(1), 1).expect("identity"));
     let peer = PeerInfo::new(NodeId::new(2), addr, pin);
     client.connect(&peer).await.expect("connect");
-    run_sync(&mut client, &client_hashgraph, &registry, NodeId::new(1), &key1, NodeId::new(2))
-        .await
-        .expect("sync after malformed input");
+    run_sync(
+        &mut client,
+        &client_hashgraph,
+        &registry,
+        NodeId::new(1),
+        &key1,
+        NodeId::new(2),
+        Vec::new(),
+    )
+    .await
+    .expect("sync after malformed input");
 
     let client_latest = client_hashgraph
         .lock()
@@ -426,9 +434,17 @@ async fn tampered_signature_event_rejected_over_wire() {
     let mut client = TcpTransport::new(TlsIdentity::from_seed(tls_seed(1), 1).expect("identity"));
     let peer = PeerInfo::new(NodeId::new(2), addr, identity2.spki_fingerprint());
     client.connect(&peer).await.expect("connect");
-    run_sync(&mut client, &client_hashgraph, &registry, NodeId::new(1), &key1, NodeId::new(2))
-        .await
-        .expect("sync after forged event");
+    run_sync(
+        &mut client,
+        &client_hashgraph,
+        &registry,
+        NodeId::new(1),
+        &key1,
+        NodeId::new(2),
+        Vec::new(),
+    )
+    .await
+    .expect("sync after forged event");
 
     let hashgraph = node.hashgraph.lock().await;
     assert!(hashgraph.get(&forged_hash).is_none(), "forged event must never be stored");
@@ -508,9 +524,16 @@ async fn unexpected_frame_type_fails_run_sync() {
     );
 
     let mut transport = ResponseForbidden { frames: VecDeque::from([rogue]) };
-    let result =
-        run_sync(&mut transport, &hashgraph, &registry, NodeId::new(1), &key1, NodeId::new(2))
-            .await;
+    let result = run_sync(
+        &mut transport,
+        &hashgraph,
+        &registry,
+        NodeId::new(1),
+        &key1,
+        NodeId::new(2),
+        Vec::new(),
+    )
+    .await;
     assert!(matches!(
         result,
         Err(GossipError::UnexpectedFrame { expected: "SyncResponse", got: "Event" })
@@ -527,9 +550,16 @@ async fn behind_frame_surfaces_as_reconnect_error() {
     let hashgraph = Arc::new(Mutex::new(consensus::Hashgraph::new(&registry)));
 
     let mut transport = ResponseForbidden { frames: VecDeque::from([Frame::Behind]) };
-    let result =
-        run_sync(&mut transport, &hashgraph, &registry, NodeId::new(1), &key1, NodeId::new(2))
-            .await;
+    let result = run_sync(
+        &mut transport,
+        &hashgraph,
+        &registry,
+        NodeId::new(1),
+        &key1,
+        NodeId::new(2),
+        Vec::new(),
+    )
+    .await;
     assert!(
         matches!(result, Err(GossipError::Reconnect(_))),
         "Behind must surface as a reconnect error, got {result:?}"

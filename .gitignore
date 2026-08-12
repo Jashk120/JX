@@ -44,3 +44,11 @@ Thumbs.db
 
 *.pdf
 *~
+
+# ==========================================
+# Node daemon
+# ==========================================
+
+# Per-node secrets and runtime data directories
+secret-*.bin
+data/

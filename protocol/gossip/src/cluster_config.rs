@@ -29,6 +29,9 @@ pub struct ClusterConfig {
 pub struct MemberEntry {
     pub node_id: NodeId,
     pub addr: SocketAddr,
+    /// The member's dedicated reconnect port (Phase 4), if it serves the
+    /// reconnect protocol. `None` for members that do not.
+    pub reconnect_addr: Option<SocketAddr>,
     pub verifying_key: VerifyingKey,
     pub spki_fingerprint: [u8; 32],
 }
@@ -55,7 +58,13 @@ impl ClusterConfig {
         self.members
             .iter()
             .filter(|member| member.node_id != node_id)
-            .map(|member| PeerInfo::new(member.node_id, member.addr, member.spki_fingerprint))
+            .map(|member| {
+                let peer = PeerInfo::new(member.node_id, member.addr, member.spki_fingerprint);
+                match member.reconnect_addr {
+                    Some(reconnect_addr) => peer.with_reconnect(reconnect_addr),
+                    None => peer,
+                }
+            })
             .collect()
     }
 }
@@ -74,6 +83,7 @@ mod tests {
         MemberEntry {
             node_id: NodeId::new(node_id),
             addr: "10.0.0.1:7000".parse().expect("valid addr"),
+            reconnect_addr: None,
             verifying_key: key.verifying_key(),
             spki_fingerprint: [spki_fingerprint; 32],
         }
@@ -111,5 +121,27 @@ mod tests {
                 assert_ne!(peer.node_id, NodeId::new(id), "peer list must exclude self");
             }
         }
+    }
+
+    #[test]
+    fn cluster_config_peers_carry_reconnect_addr() {
+        let ids = [1u64, 2, 3];
+        let mut config =
+            ClusterConfig::new(ids.map(|id| entry(id, &key_for(id), id as u8)).to_vec());
+        config.members[1].reconnect_addr = Some("10.0.0.2:7001".parse().expect("valid addr"));
+        let peers = config.peers_for(NodeId::new(1));
+        assert_eq!(
+            peers.iter().find(|p| p.node_id == NodeId::new(2)).expect("peer 2").reconnect_addr,
+            Some("10.0.0.2:7001".parse().expect("valid addr"))
+        );
+        assert!(
+            peers
+                .iter()
+                .find(|p| p.node_id == NodeId::new(3))
+                .expect("peer 3")
+                .reconnect_addr
+                .is_none(),
+            "peer without a reconnect port keeps None"
+        );
     }
 }

@@ -31,7 +31,10 @@ pub use error::{
     GossipError,
     Result,
 };
-pub use node::GossipNode;
+pub use node::{
+    CheckpointSink,
+    GossipNode,
+};
 pub use peer::PeerInfo;
 pub use peer_manager::PeerManager;
 pub use proto::{

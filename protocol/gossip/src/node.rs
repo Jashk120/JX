@@ -2,6 +2,7 @@ use std::collections::hash_map::Entry;
 use std::collections::{
     BTreeMap,
     HashMap,
+    VecDeque,
 };
 use std::sync::Arc;
 use std::sync::atomic::{
@@ -30,6 +31,7 @@ use ed25519_dalek::{
 use primitives::{
     Event,
     NodeId,
+    Transaction,
 };
 use sha2::{
     Digest,
@@ -79,6 +81,11 @@ struct ActivationState {
     checkpoint_watermark: u64,
 }
 
+/// How many pending transaction payloads the sync driver drains into one
+/// own event per sync round. Bounded so a burst cannot produce unbounded
+/// events; ordering across payloads is consensus's job, not the driver's.
+const TX_PER_SYNC: usize = 64;
+
 /// A JKain node: owns a hashgraph, a TLS identity, the known-peer table,
 /// and the async machinery that runs gossip syncs on a fixed interval.
 pub struct GossipNode {
@@ -115,6 +122,12 @@ pub struct GossipNode {
     /// checkpoint. Only ever set by the sync driver and read on the next loop
     /// iteration, so an `AtomicBool` (no mutex) suffices.
     needs_reconnect: AtomicBool,
+    /// Raw transaction payloads submitted via [`Self::submit_transaction`],
+    /// drained by the sync driver into the next own events.
+    pending_transactions: Mutex<VecDeque<Vec<u8>>>,
+    /// Durable sink for accepted checkpoints, set by the embedding
+    /// application (e.g. the `jkaind` daemon). `None` means no persistence.
+    checkpoint_sink: Mutex<Option<Arc<dyn CheckpointSink + Send + Sync>>>,
 }
 
 impl GossipNode {
@@ -154,6 +167,8 @@ impl GossipNode {
             outbound_checkpoint_sigs: Mutex::new(Vec::new()),
             pending_checkpoint_sigs: Mutex::new(BTreeMap::new()),
             needs_reconnect: AtomicBool::new(false),
+            pending_transactions: Mutex::new(VecDeque::new()),
+            checkpoint_sink: Mutex::new(None),
         }
     }
 
@@ -163,9 +178,50 @@ impl GossipNode {
         hg.is_member(&node)
     }
 
+    /// A clone of the executor's current deterministic state (observability
+    /// helper; the daemon and tests read the committed state through this).
+    pub async fn executor_state(&self) -> state::State {
+        self.executor.lock().await.state().clone()
+    }
+
     /// The number of known peers (observability helper).
     pub async fn peer_count(&self) -> usize {
         self.peers.lock().await.len()
+    }
+
+    /// Queues a raw transaction payload to be included in this node's next
+    /// own event. Payloads are drained by the sync driver, up to
+    /// [`TX_PER_SYNC`] per round, and passed into the initiator's own event.
+    /// If that sync round fails the drained payloads are dropped — ordering
+    /// is consensus's job, so a dropped payload is simply not included.
+    pub async fn submit_transaction(&self, payload: Vec<u8>) {
+        self.pending_transactions.lock().await.push_back(payload);
+    }
+
+    /// Requests a reconnect from a live peer on the next sync interval, even
+    /// when no sync round has signalled `MissingParent`/`Behind`. Used by the
+    /// daemon restart path: a node rebuilt from a persisted checkpoint holds
+    /// only the checkpointed state and must fetch the live event window from
+    /// a peer before resuming normal delta-sync.
+    pub fn request_reconnect(&self) {
+        self.needs_reconnect.store(true, Ordering::Release);
+    }
+
+    /// Drains up to [`TX_PER_SYNC`] pending payloads into transactions for
+    /// the next own event. Removes them from the queue; if the sync round
+    /// they were destined for fails, they are dropped (inclusion-only).
+    async fn drain_pending_transactions(&self) -> Vec<Transaction> {
+        let mut pending = self.pending_transactions.lock().await;
+        (0..TX_PER_SYNC).filter_map(|_| pending.pop_front().map(Transaction::from_bytes)).collect()
+    }
+
+    /// Registers `sink` as the durable checkpoint destination. It is invoked
+    /// with every newly accepted [`SignedCheckpoint`] and the serialized state
+    /// snapshot for that checkpoint round (`State::to_bytes()`), so the
+    /// embedding application can persist both. Replacing the sink at runtime
+    /// is allowed but unusual.
+    pub async fn set_checkpoint_sink(&self, sink: Arc<dyn CheckpointSink + Send + Sync>) {
+        *self.checkpoint_sink.lock().await = Some(sink);
     }
 
     /// Runs the node: accepts inbound gossip connections and, every
@@ -244,6 +300,7 @@ impl GossipNode {
             };
 
             let registry = self.registry.lock().await.clone();
+            let payload = self.drain_pending_transactions().await;
             let round = tokio::time::timeout(
                 self.sync_timeout,
                 run_sync(
@@ -253,6 +310,7 @@ impl GossipNode {
                     self.node_id,
                     &self.signing_key,
                     peer.node_id,
+                    payload,
                 ),
             )
             .await;
@@ -579,6 +637,17 @@ impl GossipNode {
     /// again and keeping it would only grow memory.
     async fn accept_checkpoint(&self, accepted: SignedCheckpoint) {
         let round = accepted.payload.round;
+        // Persist before pruning: the state snapshot for the accepted round
+        // must still be present. The same predecessor lookup
+        // (`range(..=round).next_back()`) that selected the state hash in
+        // `produce_checkpoint` selects the bytes that hash to it.
+        let snapshot = {
+            let snapshots = self.state_snapshots.lock().await;
+            snapshots.range(..=round).next_back().map(|(_, bytes)| bytes.clone())
+        };
+        if let Some(snapshot) = snapshot {
+            self.notify_checkpoint_accepted(&accepted, &snapshot).await;
+        }
         {
             let mut signed = self.signed_checkpoints.lock().await;
             signed.push(accepted);
@@ -591,6 +660,15 @@ impl GossipNode {
         }
         let mut hg = self.hashgraph.lock().await;
         hg.prune_before_round(prune_before_round);
+    }
+
+    /// Feeds an accepted checkpoint plus its state snapshot to the registered
+    /// [`CheckpointSink`], if any.
+    async fn notify_checkpoint_accepted(&self, checkpoint: &SignedCheckpoint, snapshot: &[u8]) {
+        let sink = self.checkpoint_sink.lock().await.clone();
+        if let Some(sink) = sink {
+            sink.persist(checkpoint, snapshot);
+        }
     }
 
     /// The public inbound entry for a checkpoint signature — mirrors the
@@ -848,8 +926,8 @@ impl GossipNode {
         //    `signed_checkpoint_for` and future reconnects.
         self.signed_checkpoints.lock().await.push(checkpoint.clone());
 
-        // 9. Persist to durable storage (stub for now).
-        save_checkpoint_to_db(checkpoint).await;
+        // 9. Persist to durable storage via the registered sink, if any.
+        self.notify_checkpoint_accepted(checkpoint, &response.state_bytes).await;
         true
     }
 
@@ -983,11 +1061,13 @@ fn verify_checkpoint_sig(
     key.verify_strict(signing_bytes, &signature).is_ok()
 }
 
-/// Persists `checkpoint` to durable storage. Currently a no-op stub — no
-/// database is wired yet. The signature is in place so the implementation
-/// can be filled in without changing call sites.
-///
-/// TODO: wire to RocksDB / sled when a storage layer is introduced.
-async fn save_checkpoint_to_db(_checkpoint: &SignedCheckpoint) {
-    // Nothing saved yet.
+/// Persists an accepted [`SignedCheckpoint`] plus its serialized state
+/// snapshot. Implemented by the embedding application (e.g. the `jkaind`
+/// daemon's `storage` module); `GossipNode` only invokes it.
+pub trait CheckpointSink {
+    /// `snapshot` is `State::to_bytes()` for the checkpoint round — the bytes
+    /// whose SHA-256 equals `checkpoint.payload.state_hash`. Called
+    /// synchronously on the node's async task; implementations must not block
+    /// for long.
+    fn persist(&self, checkpoint: &SignedCheckpoint, snapshot: &[u8]);
 }

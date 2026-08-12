@@ -10,6 +10,7 @@ use primitives::{
     Event,
     NodeId,
     Timestamp,
+    Transaction,
     UnsignedEvent,
 };
 use tokio::sync::Mutex;
@@ -31,7 +32,8 @@ use crate::transport::SyncTransport;
 /// 2. Receive the peer's delta, verify and insert each event (skipping
 ///    ones we already have).
 /// 3. Create our own event — `self_parent` our last, `other_parent` the
-///    peer's last — insert it, and push it back on the same stream.
+///    peer's last, payload from `payload` — insert it, and push it back on
+///    the same stream.
 pub async fn run_sync(
     transport: &mut (impl SyncTransport + Send),
     hashgraph: &Arc<Mutex<consensus::Hashgraph>>,
@@ -39,6 +41,7 @@ pub async fn run_sync(
     node_id: NodeId,
     signing_key: &SigningKey,
     peer_id: NodeId,
+    payload: Vec<Transaction>,
 ) -> Result<()> {
     let known = {
         let hashgraph = hashgraph.lock().await;
@@ -76,8 +79,7 @@ pub async fn run_sync(
         (self_parent, other_parent)
     };
 
-    let unsigned =
-        UnsignedEvent::new(node_id, self_parent, other_parent, now_timestamp(), Vec::new());
+    let unsigned = UnsignedEvent::new(node_id, self_parent, other_parent, now_timestamp(), payload);
     let event = unsigned.sign(signing_key);
     insert_verified(hashgraph, registry, event.clone()).await?;
     transport.send_frame(&Frame::Event(event)).await?;
