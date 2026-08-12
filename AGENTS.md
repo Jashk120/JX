@@ -129,6 +129,19 @@ When changing public APIs:
 - Update examples if needed.
 - Keep comments synchronized with implementation.
 
+Every crate and every umbrella directory (a directory containing crates or
+subdirectories, e.g. `protocol/`, `executor/`) must contain a `README.md`
+describing its role in the workspace:
+
+- Crate `README.md` files live at the crate root (e.g.
+  `protocol/gossip/README.md`).
+- Umbrella `README.md` files live at the directory root (e.g.
+  `protocol/README.md`) and summarize the crates beneath them.
+- `tests/` and other internal-only directories do not need a `README.md`.
+
+Keep these READMEs synchronized with the code they describe; update them
+when a crate's public surface or role changes.
+
 ---
 
 # Dependencies
