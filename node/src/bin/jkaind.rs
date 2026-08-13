@@ -1,7 +1,7 @@
 //! `jkaind` — the JKain node daemon.
 //!
 //! ```text
-//! jkaind init --member <id>:<gossip-addr>:<reconnect-addr> [--member ...] \
+//! jkaind init --member <id>:<gossip-addr>[:<reconnect-addr>] [--member ...] \
 //!             --out <dir> [--force]
 //! jkaind run --cluster <cluster.toml> --node-id <id> --secret <secret-<id>.bin> \
 //!            [--gossip-port <port>] [--reconnect-port <port>] [--data <dir>]
@@ -170,7 +170,6 @@ fn init(args: &[String]) -> Result<()> {
             identity.spki_fingerprint(),
         ));
     }
-
     let config = ClusterConfigFile { members: member_files };
     let config_path = out_dir.join("cluster.toml");
     config.save(&config_path).with_context(|| format!("writing {}", config_path.display()))?;
@@ -182,7 +181,7 @@ fn init(args: &[String]) -> Result<()> {
 fn print_init_summary(
     out_dir: &Path,
     config_path: &Path,
-    members: &[(u64, std::net::SocketAddr, std::net::SocketAddr)],
+    members: &[(u64, std::net::SocketAddr, Option<std::net::SocketAddr>)],
 ) {
     println!("Wrote cluster config: {}", config_path.display());
     println!("Secret files (keep each one only on its own node):");
@@ -201,25 +200,32 @@ fn print_init_summary(
     }
 }
 
-/// Parses `<id>:<gossip-addr>:<reconnect-addr>`. The two addresses are split
-/// at the `:` that leaves both halves valid `SocketAddr`s, so IPv6 bracket
-/// literals are handled.
-fn parse_member(input: &str) -> Result<(u64, std::net::SocketAddr, std::net::SocketAddr)> {
+/// Parses `<id>:<gossip-addr>[:<reconnect-addr>]`. The reconnect address is
+/// optional: without it the member has no dedicated reconnect port (gossip
+/// only — such a node can pull a checkpoint from a peer but cannot serve as a
+/// reconnect source). The two-address form is split at the `:` that leaves
+/// both halves valid `SocketAddr`s, so IPv6 bracket literals are handled.
+fn parse_member(input: &str) -> Result<(u64, std::net::SocketAddr, Option<std::net::SocketAddr>)> {
     let (id_part, addrs) = input.split_once(':').with_context(|| {
-        format!("invalid --member '{input}': expected <id>:<gossip>:<reconnect>")
+        format!("invalid --member '{input}': expected <id>:<gossip>[:<reconnect>]")
     })?;
     let node_id: u64 = id_part
         .parse()
         .with_context(|| format!("invalid node id '{id_part}' in --member '{input}'"))?;
+    // Single-address form: <id>:<gossip>.
+    if let Ok(gossip) = addrs.parse() {
+        return Ok((node_id, gossip, None));
+    }
+    // Two-address form: <id>:<gossip>:<reconnect>.
     for (i, ch) in addrs.char_indices() {
         if ch != ':' {
             continue;
         }
         if let (Ok(gossip), Ok(reconnect)) = (addrs[..i].parse(), addrs[i + 1..].parse()) {
-            return Ok((node_id, gossip, reconnect));
+            return Ok((node_id, gossip, Some(reconnect)));
         }
     }
-    bail!("invalid --member '{input}': could not split gossip and reconnect addresses")
+    bail!("invalid --member '{input}': expected <id>:<gossip> or <id>:<gossip>:<reconnect>")
 }
 
 // --- run --------------------------------------------------------------------
@@ -372,21 +378,34 @@ async fn run_node(opts: &RunOptions) -> Result<()> {
     }
 
     let gossip_port = opts.gossip_port.unwrap_or(member.gossip_addr.port());
-    let reconnect_addr = member.reconnect_addr.with_context(|| {
-        format!("member {} has no reconnect_addr in cluster config", opts.node_id)
-    })?;
-    let reconnect_port = opts.reconnect_port.unwrap_or(reconnect_addr.port());
+    // A member may have no dedicated reconnect port (gossip-only). Such a node
+    // can still pull a checkpoint from a peer that serves reconnect, but
+    // cannot serve one itself. `--reconnect-port` overrides the configured
+    // port, or forces a reconnect listener for a gossip-only member.
+    let reconnect_addr = member.reconnect_addr;
+    let reconnect_port = match (opts.reconnect_port, reconnect_addr) {
+        (Some(port), _) => Some(port),
+        (None, Some(addr)) => Some(addr.port()),
+        (None, None) => None,
+    };
 
     let cluster = config.to_cluster_config()?;
     let registry = cluster.registry();
     let peers: Vec<PeerInfo> = cluster.peers_for(NodeId::new(opts.node_id));
     let storage = Storage::new(&opts.data_dir)?;
 
-    eprintln!(
-        "[jkaind] node {}: gossip on 0.0.0.0:{gossip_port}, reconnect on 0.0.0.0:{reconnect_port}, data in {}",
-        opts.node_id,
-        opts.data_dir.display()
-    );
+    match reconnect_port {
+        Some(port) => eprintln!(
+            "[jkaind] node {}: gossip on 0.0.0.0:{gossip_port}, reconnect on 0.0.0.0:{port}, data in {}",
+            opts.node_id,
+            opts.data_dir.display()
+        ),
+        None => eprintln!(
+            "[jkaind] node {}: gossip on 0.0.0.0:{gossip_port}, reconnect disabled (gossip-only member), data in {}",
+            opts.node_id,
+            opts.data_dir.display()
+        ),
+    }
 
     // Restart recovery: restore from the last persisted checkpoint if one
     // exists; the node then reconnects from a live peer for the event window.
@@ -434,13 +453,17 @@ async fn run_node(opts: &RunOptions) -> Result<()> {
     let gossip_listener =
         TcpListener::from_std(gossip_listener).context("wrapping gossip listener")?;
 
-    let reconnect_listener = std::net::TcpListener::bind(("0.0.0.0", reconnect_port))
-        .with_context(|| format!("binding reconnect port {reconnect_port}"))?;
-    reconnect_listener
-        .set_nonblocking(true)
-        .with_context(|| "setting reconnect listener nonblocking".to_string())?;
-    let reconnect_listener =
-        TcpListener::from_std(reconnect_listener).context("wrapping reconnect listener")?;
+    let reconnect_listener = match reconnect_port {
+        Some(port) => {
+            let listener = std::net::TcpListener::bind(("0.0.0.0", port))
+                .with_context(|| format!("binding reconnect port {port}"))?;
+            listener
+                .set_nonblocking(true)
+                .with_context(|| "setting reconnect listener nonblocking".to_string())?;
+            Some(TcpListener::from_std(listener).context("wrapping reconnect listener")?)
+        }
+        None => None,
+    };
 
     let control_socket_path =
         opts.control_socket.clone().unwrap_or_else(|| opts.data_dir.join("jkaind.sock"));
@@ -464,7 +487,7 @@ async fn run_node(opts: &RunOptions) -> Result<()> {
 async fn run_until_shutdown(
     node: Arc<GossipNode>,
     gossip_listener: TcpListener,
-    reconnect_listener: TcpListener,
+    reconnect_listener: Option<TcpListener>,
     control_listener: UnixListener,
     control_socket_path: PathBuf,
 ) -> Result<()> {
@@ -481,8 +504,12 @@ async fn run_until_shutdown(
         control::serve(control_listener, control_node, control_stop).await;
     });
 
-    let result =
-        node.run_until_stopped_with_reconnect(gossip_listener, reconnect_listener, stop).await;
+    let result = match reconnect_listener {
+        Some(reconnect_listener) => {
+            node.run_until_stopped_with_reconnect(gossip_listener, reconnect_listener, stop).await
+        }
+        None => node.run_until_stopped(gossip_listener, stop).await,
+    };
     signal_task.abort();
     control_task.abort();
     let _ = std::fs::remove_file(&control_socket_path);
@@ -755,7 +782,7 @@ fn member_init(args: &[String]) -> Result<()> {
     members.push(MemberFile::new(
         node_id,
         gossip,
-        reconnect,
+        Some(reconnect),
         &signing_key.verifying_key(),
         identity.spki_fingerprint(),
     ));
@@ -897,7 +924,7 @@ fn print_usage() {
         "jkaind — JKain node daemon\n\
          \n\
          Usage:\n\
-         \x20 jkaind init --member <id>:<gossip-addr>:<reconnect-addr> [--member ...] \\\n\
+         \x20 jkaind init --member <id>:<gossip-addr>[:<reconnect-addr>] [--member ...] \\\n\
          \x20            --out <dir> [--force]\n\
          \x20 jkaind run  --cluster <cluster.toml> --node-id <id> --secret <secret-<id>.bin> \\\n\
          \x20            [--gossip-port <port>] [--reconnect-port <port>] [--data <dir>] \\\n\

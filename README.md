@@ -54,6 +54,10 @@ cargo run --bin jkaind -- run \
   --secret ./cluster/secret-1.bin --data ./data
 ```
 
+The `:reconnect-addr` part of `--member` is optional — a member given as just
+`<id>:<gossip-addr>` runs gossip-only and cannot serve checkpoints to a behind
+peer, so the reconnect address is recommended for availability.
+
 ## Controlling a running node
 
 `jkaind run` opens a Unix control socket (default `<data>/jkaind.sock`) so a

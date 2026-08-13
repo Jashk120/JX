@@ -45,6 +45,12 @@ jkaind init \
   --out ./cluster
 ```
 
+The `:reconnect-addr` is optional: `--member 2:203.0.113.6:7000` creates a
+gossip-only member. Such a node can still pull checkpoints from a peer that
+serves reconnect, but cannot serve them itself, so it is a single point of
+failure for behind peers — give every member a reconnect port for full
+availability.
+
 This writes `cluster.toml`, `secret-1.bin`, and `secret-2.bin`, then prints
 the copy plan.
 

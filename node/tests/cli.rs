@@ -199,6 +199,58 @@ fn member_init_single_seed_secret_pins_match_and_leaves_genesis_untouched() {
     assert_eq!(genesis.members.len(), 2, "genesis cluster.toml stays the original snapshot");
 }
 
+#[test]
+fn init_accepts_members_without_reconnect_addr() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let out = tmp.path().join("cluster");
+    let status = Command::new(binary())
+        .arg("init")
+        .arg("--member")
+        .arg("1:203.0.113.5:7000")
+        .arg("--member")
+        .arg("2:203.0.113.6:7000")
+        .arg("--out")
+        .arg(&out)
+        .status()
+        .expect("init runs");
+    assert!(status.success(), "single-address members are accepted");
+
+    let config = ClusterConfigFile::load(&out.join("cluster.toml")).expect("loads");
+    assert_eq!(config.members.len(), 2);
+    for member in &config.members {
+        assert_eq!(member.reconnect_addr, None, "member {} has no reconnect addr", member.node_id);
+        assert_eq!(member.gossip_addr.port(), 7000);
+    }
+
+    // The config still converts to the gossip-layer cluster config; peers just
+    // carry no reconnect address.
+    let cluster = config.to_cluster_config().expect("converts");
+    let peers = cluster.peers_for(NodeId::new(1));
+    assert_eq!(peers.len(), 1);
+    assert!(peers[0].reconnect_addr.is_none(), "gossip-only member is not reconnect-capable");
+}
+
+#[test]
+fn init_accepts_mixed_member_forms() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let out = tmp.path().join("cluster");
+    let status = Command::new(binary())
+        .arg("init")
+        .arg("--member")
+        .arg("1:203.0.113.5:7000:203.0.113.5:7001")
+        .arg("--member")
+        .arg("2:203.0.113.6:7000")
+        .arg("--out")
+        .arg(&out)
+        .status()
+        .expect("init runs");
+    assert!(status.success(), "mixed single/two-address members are accepted");
+
+    let config = ClusterConfigFile::load(&out.join("cluster.toml")).expect("loads");
+    assert_eq!(config.member_for(1).expect("node 1").reconnect_addr.map(|a| a.port()), Some(7001));
+    assert_eq!(config.member_for(2).expect("node 2").reconnect_addr, None);
+}
+
 /// Derivation from a fixed secret is deterministic: the same seed always
 /// yields the same key and fingerprint, and `MemberFile` hex round-trips them.
 #[test]
@@ -217,7 +269,7 @@ fn derivation_from_fixed_secret_is_stable_and_round_trips() {
     let member = MemberFile::new(
         1,
         "127.0.0.1:7000".parse().expect("addr"),
-        "127.0.0.1:7001".parse().expect("addr"),
+        Some("127.0.0.1:7001".parse().expect("addr")),
         &key.verifying_key(),
         identity.spki_fingerprint(),
     );

@@ -97,18 +97,22 @@ impl ClusterConfigFile {
 
 impl MemberFile {
     /// Builds a member entry from already-derived material. Used by `init`
-    /// to assemble the config before writing it.
+    /// and `member init` to assemble the config before writing it.
+    ///
+    /// `reconnect_addr` is optional: a member without one runs gossip-only and
+    /// cannot serve as a reconnect source (though it can still pull a
+    /// checkpoint from a peer that does).
     pub fn new(
         node_id: u64,
         gossip_addr: SocketAddr,
-        reconnect_addr: SocketAddr,
+        reconnect_addr: Option<SocketAddr>,
         verifying_key: &VerifyingKey,
         spki_fingerprint: [u8; 32],
     ) -> Self {
         Self {
             node_id,
             gossip_addr,
-            reconnect_addr: Some(reconnect_addr),
+            reconnect_addr,
             verifying_key: encode_hex(&verifying_key.to_bytes()),
             spki_fingerprint: encode_hex(&spki_fingerprint),
         }
@@ -171,14 +175,14 @@ mod tests {
                 MemberFile::new(
                     1,
                     "203.0.113.5:7000".parse().expect("addr"),
-                    "203.0.113.5:7001".parse().expect("addr"),
+                    Some("203.0.113.5:7001".parse().expect("addr")),
                     &key1.verifying_key(),
                     [1u8; 32],
                 ),
                 MemberFile::new(
                     2,
                     "203.0.113.6:7000".parse().expect("addr"),
-                    "203.0.113.6:7001".parse().expect("addr"),
+                    Some("203.0.113.6:7001".parse().expect("addr")),
                     &key2.verifying_key(),
                     [2u8; 32],
                 ),

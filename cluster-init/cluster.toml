@@ -1,0 +1,13 @@
+[[members]]
+node_id = 1
+gossip_addr = "130.210.20.45:7000"
+reconnect_addr = "130.210.20.45:7001"
+verifying_key = "2376e3548819775966f447491dd5982916822af0fb34d9eda5dc4d0755111e37"
+spki_fingerprint = "b69537b5c10d6352efaf63ef5c1fad315d82a62eab645c64027a1ecf8697adc7"
+
+[[members]]
+node_id = 2
+gossip_addr = "35.238.37.73:7000"
+reconnect_addr = "35.238.37.73:7001"
+verifying_key = "2422f80b37d6f41f18f21d878135d1c26002b9fd995e742de8b74c10d716ba82"
+spki_fingerprint = "08ccb298a98168371b7777c16468c762c732dd0df8cf4061d8cbfcc9622c5273"
