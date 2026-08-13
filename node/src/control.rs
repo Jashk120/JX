@@ -77,6 +77,10 @@ pub struct StatusReport {
     pub ordered_round: u64,
     pub decided_round: u64,
     pub latest_checkpoint_round: Option<u64>,
+    /// The roster embedded in the highest accepted checkpoint. Differs from
+    /// `members` when a node restored a checkpoint written under keys that no
+    /// longer match the live registry — the silent-stall signal.
+    pub checkpoint_roster: Vec<MemberReport>,
 }
 
 /// One consensus member in the `status` report.
@@ -232,6 +236,19 @@ async fn status_response(node: &GossipNode) -> ControlResponse {
         })
         .collect();
     let latest_checkpoint_round = node.latest_accepted_checkpoint_round().await;
+    let checkpoint_roster = match node.latest_signed_checkpoint().await {
+        Some(checkpoint) => checkpoint
+            .payload
+            .roster_snapshot
+            .member_ids()
+            .into_iter()
+            .filter_map(|id| {
+                let key = checkpoint.payload.roster_snapshot.key_for(&id).ok()?;
+                Some(MemberReport { node_id: id.get(), verifying_key: encode_hex(&key.to_bytes()) })
+            })
+            .collect(),
+        None => Vec::new(),
+    };
     ok_response(json!(StatusReport {
         node_id,
         members,
@@ -239,6 +256,7 @@ async fn status_response(node: &GossipNode) -> ControlResponse {
         ordered_round,
         decided_round,
         latest_checkpoint_round,
+        checkpoint_roster,
     }))
 }
 

@@ -58,16 +58,28 @@ The `:reconnect-addr` part of `--member` is optional — a member given as just
 `<id>:<gossip-addr>` runs gossip-only and cannot serve checkpoints to a behind
 peer, so the reconnect address is recommended for availability.
 
+Key rotation is a membership change, not an init operation: `jkaind init
+--force` regenerates keys that no longer match any persisted checkpoint roster,
+so every node that restores one silently stalls consensus. `init --force`
+refuses when it detects local checkpoints (override with
+`--i-understand-this-rotates-keys-and-breaks-existing-data`); always wipe
+`data/` on every node after regenerating.
+
 ## Controlling a running node
 
 `jkaind run` opens a Unix control socket (default `<data>/jkaind.sock`) so a
 live node can be inspected and told to submit transactions from the terminal:
 
 ```bash
-jkaind status                              # members, peers, watermarks
+jkaind status                              # members, checkpoint roster, peers, watermarks
 jkaind tx put --key balance --value 100
 jkaind tx delete --key balance
 ```
+
+`jkaind status` also prints the roster embedded in the latest accepted
+checkpoint and warns when it disagrees with the live member set — the
+signature of a restored node that is silently stalled because its events no
+longer verify.
 
 ## Growing the cluster (dynamic membership)
 

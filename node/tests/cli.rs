@@ -99,6 +99,43 @@ fn init_refuses_to_overwrite_secrets_without_force() {
 }
 
 #[test]
+fn init_force_refuses_when_checkpoints_exist_unless_acknowledged() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let out = tmp.path().join("cluster");
+
+    // Seed a local checkpoint hazard: `jkaind run` writes accepted checkpoints
+    // under <data>/checkpoints/, so out/data/checkpoints/ is exactly the layout
+    // a node that ran from this output dir would leave behind. Regenerated keys
+    // will not match that checkpoint roster and every node would silently stall.
+    let checkpoints = out.join("data").join("checkpoints");
+    std::fs::create_dir_all(&checkpoints).expect("create checkpoints dir");
+    std::fs::write(checkpoints.join("checkpoint-1.cp"), b"stale").expect("write checkpoint");
+
+    // Without the acknowledgment flag, --force must refuse to regenerate.
+    let status = init_args(&out, true).status().expect("forced init");
+    assert!(!status.success(), "--force refuses while persisted checkpoints exist");
+    assert!(
+        std::fs::read_dir(&checkpoints).expect("dir").count() >= 1,
+        "existing checkpoints are never deleted by the refusal"
+    );
+
+    // With the explicit acknowledgment, regeneration proceeds.
+    let mut cmd = init_args(&out, true);
+    cmd.arg("--i-understand-this-rotates-keys-and-breaks-existing-data");
+    let status = cmd.status().expect("forced init with ack");
+    assert!(status.success(), "--force with the acknowledgment succeeds");
+}
+
+#[test]
+fn init_force_warns_but_succeeds_on_clean_machine() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let out = tmp.path().join("cluster");
+    assert!(init_args(&out, false).status().expect("first init").success());
+    let status = init_args(&out, true).status().expect("forced init");
+    assert!(status.success(), "--force succeeds when no local checkpoints exist");
+}
+
+#[test]
 fn init_rejects_bad_member_spec() {
     let tmp = tempfile::tempdir().expect("temp dir");
     let out = tmp.path().join("cluster");

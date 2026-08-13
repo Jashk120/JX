@@ -24,8 +24,10 @@ a process lifecycle. It adds no consensus logic of its own.
   directory. `Storage` implements `gossip::CheckpointSink`, so the daemon
   just hands a `Storage` to the node.
 - `src/restart.rs` — loads the latest persisted checkpoint, verifies its
-  signature quorum and state hash, and rebuilds a node via
-  `GossipNode::from_checkpoint` plus a reconnect for the event window.
+  signature quorum and state hash, checks that its embedded roster still holds
+  this node's current key (refusing to restore a checkpoint written under
+  rotated keys), and rebuilds a node via `GossipNode::from_checkpoint` plus a
+  reconnect for the event window.
 - `tests/` — config/CLI round-trips, the single-seed pin-match regression,
   control-socket protocol tests, storage round-trips, transaction propagation,
   a restart-recovery end-to-end test, and dynamic add-member via the socket.

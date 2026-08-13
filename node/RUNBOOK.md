@@ -54,6 +54,18 @@ availability.
 This writes `cluster.toml`, `secret-1.bin`, and `secret-2.bin`, then prints
 the copy plan.
 
+> **Key rotation is a membership change, not an init operation.** Running
+> `jkaind init --force` regenerates every member's keys. Those keys no longer
+> match the roster embedded in any already-persisted checkpoint, so a node
+> that restores one would sign events no peer can verify and **silently stall
+> consensus** (`ordered round` frozen at its current value). `jkaind init
+> --force` refuses to run when it detects local checkpoints, and warns
+> otherwise. To rotate keys you must **wipe `data/` on every node** (after
+> backing up what you need) so all nodes re-genesis under the new roster, and
+> confirm on each VPS that no live checkpoints remain. Pass
+> `--i-understand-this-rotates-keys-and-breaks-existing-data` only after doing
+> so.
+
 ## 3. Copy keys and config
 
 ```bash
@@ -140,6 +152,12 @@ sudo ls -l /var/lib/jkaind/checkpoints/   # checkpoint-<round>.cp / .snap files
   reconnects from the live peer.
 - A node whose `--data` directory is intact recovers its committed state even
   after a full machine reboot.
+- A node whose persisted checkpoint roster no longer matches its configured
+  secret refuses to start instead of silently stalling. The error tells you
+  which case you hit: either the secret was swapped without wiping the data
+  dir (`restore the original secret or wipe data/ to re-genesis`), or the
+  node's key is not in the checkpoint roster at all (`wipe data/ and use
+  `add-member` to join from the current round`).
 - If **both** nodes are down simultaneously and restart before either can
   sync, they recover their state up to their respective persisted checkpoints
   and continue from there (re-genesis above the restored state). Wipe

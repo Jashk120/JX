@@ -14,6 +14,7 @@ use anyhow::{
     bail,
 };
 use crypto::RosterHistory;
+use ed25519_dalek::VerifyingKey;
 use primitives::NodeId;
 use sha2::{
     Digest,
@@ -38,13 +39,34 @@ pub fn verify_persisted(state: &PersistedCheckpoint) -> bool {
 /// is empty (the graph is not persisted), and `decided_round` is the
 /// checkpoint round — `Hashgraph::from_checkpoint` already marks everything
 /// at or below it decided.
+///
+/// The persisted roster must agree with the node's current `expected_key`:
+/// restoring a checkpoint whose roster holds a different key for this node
+/// would make every event it signs fail verification and silently stall
+/// consensus (a classic `jkaind init --force` key-rotation footgun). The two
+/// failure modes are distinguished so the operator knows whether to restore
+/// the original secret or wipe `data/` and re-genesis.
 pub fn build_reconnect_response(
     state: PersistedCheckpoint,
     node_id: u64,
+    expected_key: &VerifyingKey,
 ) -> Result<gossip::ReconnectResponse> {
     let checkpoint = &state.checkpoint;
-    if checkpoint.payload.roster_snapshot.key_for(&NodeId::new(node_id)).is_err() {
-        bail!("node {node_id} is not a member of the persisted checkpoint roster");
+    match checkpoint.payload.roster_snapshot.key_for(&NodeId::new(node_id)) {
+        Err(_) => {
+            bail!(
+                "node {node_id}: this node's key is not in the checkpoint roster — if you are \
+                 joining as a new member, wipe data/ and use `jkaind add-member` to join from \
+                 the current round instead of restoring an incompatible checkpoint"
+            );
+        }
+        Ok(key) if key.as_bytes() != expected_key.as_bytes() => {
+            bail!(
+                "node {node_id}: secret key does not match this node's verifying key in the \
+                 checkpoint roster — restore the original secret or wipe data/ to re-genesis"
+            );
+        }
+        Ok(_) => {}
     }
     let roster_history = RosterHistory::new(checkpoint.payload.roster_snapshot.clone());
     let roster_history_bytes = consensus::encode_roster_history(&roster_history);
@@ -65,6 +87,7 @@ pub fn build_reconnect_response(
 pub fn latest_for_restart(
     storage: &crate::storage::Storage,
     node_id: u64,
+    expected_key: &VerifyingKey,
 ) -> Result<Option<gossip::ReconnectResponse>> {
     let Some(state) = storage.latest()? else {
         return Ok(None);
@@ -75,7 +98,7 @@ pub fn latest_for_restart(
             state.checkpoint.payload.round
         );
     }
-    let response = build_reconnect_response(state, node_id)?;
+    let response = build_reconnect_response(state, node_id, expected_key)?;
     Ok(Some(response))
 }
 
@@ -150,10 +173,40 @@ mod tests {
         let state_hash: [u8; 32] = Sha256::digest(&state_bytes).into();
         let checkpoint = quorum_checkpoint(4, state_hash, &[1, 2]);
         let state = PersistedCheckpoint { checkpoint: checkpoint.clone(), state_bytes };
-        let response = build_reconnect_response(state, 1).expect("builds");
+        let key = SigningKey::from_bytes(&[1u8; 32]).verifying_key();
+        let response = build_reconnect_response(state, 1, &key).expect("builds");
         assert_eq!(response.signed_checkpoint, checkpoint);
         assert_eq!(response.decided_round, 4);
         assert!(response.retained.is_empty());
         assert!(!response.roster_history_bytes.is_empty());
+    }
+
+    #[test]
+    fn rejects_key_mismatch_in_persisted_roster() {
+        let state_bytes = vec![0u8; 32];
+        let state_hash: [u8; 32] = Sha256::digest(&state_bytes).into();
+        let checkpoint = quorum_checkpoint(4, state_hash, &[1, 2]);
+        let state = PersistedCheckpoint { checkpoint, state_bytes };
+        // The checkpoint roster holds `[1u8; 32]`'s key for node 1; restoring
+        // with a different secret (e.g. after `jkaind init --force`) must be
+        // rejected up front instead of silently stalling consensus.
+        let rotated_key = SigningKey::from_bytes(&[9u8; 32]).verifying_key();
+        let err =
+            build_reconnect_response(state, 1, &rotated_key).expect_err("mismatched key must fail");
+        assert!(err.to_string().contains("secret key does not match"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn rejects_node_absent_from_persisted_roster() {
+        let state_bytes = vec![0u8; 32];
+        let state_hash: [u8; 32] = Sha256::digest(&state_bytes).into();
+        let checkpoint = quorum_checkpoint(4, state_hash, &[1, 2]);
+        let state = PersistedCheckpoint { checkpoint, state_bytes };
+        let key = SigningKey::from_bytes(&[3u8; 32]).verifying_key();
+        let err = build_reconnect_response(state, 3, &key).expect_err("absent node must fail");
+        assert!(
+            err.to_string().contains("key is not in the checkpoint roster"),
+            "unexpected error: {err}"
+        );
     }
 }

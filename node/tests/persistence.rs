@@ -125,7 +125,8 @@ async fn restart_from_persisted_checkpoint_restores_state_and_resumes() {
     );
 
     // Rebuild node 1 from the persisted checkpoint with its original peers.
-    let response = latest_for_restart(&storage1, 1)
+    let expected_key = ed25519_dalek::SigningKey::from_bytes(&consensus_seed(1)).verifying_key();
+    let response = latest_for_restart(&storage1, 1, &expected_key)
         .expect("restart data loads")
         .expect("a restart response exists");
     assert_eq!(response.signed_checkpoint.payload.round, persisted.checkpoint.payload.round);

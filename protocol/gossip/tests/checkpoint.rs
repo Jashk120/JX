@@ -13,9 +13,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::*;
+use consensus::{
+    CheckpointAccumulator,
+    CheckpointPayload,
+    encode_roster_history,
+};
 use crypto::{
     Hashable,
     MembershipRegistry,
+    RosterHistory,
     Signable,
     Verifiable,
 };
@@ -25,6 +31,7 @@ use ed25519_dalek::{
 };
 use gossip::{
     GossipNode,
+    ReconnectResponse,
     TlsIdentity,
 };
 use primitives::{
@@ -33,6 +40,10 @@ use primitives::{
     NodeId,
     Timestamp,
     UnsignedEvent,
+};
+use sha2::{
+    Digest,
+    Sha256,
 };
 
 fn registry_for_ids(ids: &[u64]) -> MembershipRegistry {
@@ -208,4 +219,60 @@ async fn pruning_old_events_does_not_break_ordering_after_checkpoint() {
         assert!(hg.get(&new_hash).is_some(), "new event inserts after pruning");
     }
     drop_nodes(nodes);
+}
+
+/// A learner whose secret does not match the key the checkpoint roster holds
+/// for it could never produce a verifiable event — every sync round would
+/// fail silently and consensus would stall (the `jkaind init --force`-without-
+/// wiping-data/ footgun). `apply_checkpoint` must reject such a checkpoint
+/// before any state is loaded, while a matching secret restores normally.
+#[tokio::test]
+async fn from_checkpoint_rejects_roster_key_mismatched_to_the_learner() {
+    let roster = registry_for_ids(&[1, 4]);
+    let state_bytes = state::State::new().to_bytes();
+    let state_hash: [u8; 32] = Sha256::digest(&state_bytes).into();
+    let payload = CheckpointPayload::new(1, state_hash, roster.clone());
+
+    // Both members sign: the 2-node roster's quorum is all of them.
+    let mut accumulator = CheckpointAccumulator::new(payload.clone());
+    accumulator.add_sig(checkpoint_sig_for(1, 1, &payload.signing_bytes()), &roster);
+    let accepted = accumulator
+        .add_sig(checkpoint_sig_for(4, 1, &payload.signing_bytes()), &roster)
+        .expect("2-node roster reaches quorum");
+    let response = ReconnectResponse {
+        signed_checkpoint: accepted,
+        state_bytes,
+        roster_history_bytes: encode_roster_history(&RosterHistory::new(roster)),
+        decided_round: 1,
+        retained: Vec::new(),
+    };
+
+    let node4_id = NodeId::new(4);
+    let identity4 = TlsIdentity::from_seed(tls_seed(4), 4).expect("identity");
+
+    // The matching secret restores from the checkpoint.
+    let correct = GossipNode::from_checkpoint(
+        node4_id,
+        SigningKey::from_bytes(&consensus_seed(4)),
+        identity4.clone(),
+        Vec::new(),
+        SYNC_INTERVAL,
+        SYNC_TIMEOUT,
+        response.clone(),
+    )
+    .await;
+    assert!(correct.is_ok(), "a matching secret restores");
+
+    // A rotated secret is rejected up front, before any state is applied.
+    let rotated = GossipNode::from_checkpoint(
+        node4_id,
+        SigningKey::from_bytes(&[9u8; 32]),
+        identity4,
+        Vec::new(),
+        SYNC_INTERVAL,
+        SYNC_TIMEOUT,
+        response,
+    )
+    .await;
+    assert!(rotated.is_err(), "a rotated secret is rejected before restoring");
 }

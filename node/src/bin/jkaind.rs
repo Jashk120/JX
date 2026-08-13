@@ -108,6 +108,7 @@ fn init(args: &[String]) -> Result<()> {
     let mut members = Vec::new();
     let mut out_dir: Option<PathBuf> = None;
     let mut force = false;
+    let mut i_understand_rotation = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -124,6 +125,10 @@ fn init(args: &[String]) -> Result<()> {
                 force = true;
                 i += 1;
             }
+            "--i-understand-this-rotates-keys-and-breaks-existing-data" => {
+                i_understand_rotation = true;
+                i += 1;
+            }
             other => bail!("init: unknown argument '{other}'"),
         }
     }
@@ -133,6 +138,41 @@ fn init(args: &[String]) -> Result<()> {
     let out_dir = out_dir.context("init: --out <dir> is required")?;
     std::fs::create_dir_all(&out_dir)
         .with_context(|| format!("creating output dir {}", out_dir.display()))?;
+
+    // Key rotation is a membership change, not an init operation: a
+    // `--force` regeneration writes secrets whose keys no longer match any
+    // persisted checkpoint roster, and every node that restores one would
+    // silently stall consensus. Refuse unless the operator confirms, and even
+    // then point out that checkpoints on the VPS data dirs (which `init`
+    // cannot see) are invalidated too.
+    if force {
+        match checkpoint_hazard(&out_dir) {
+            Some(hazard) if !i_understand_rotation => {
+                bail!(
+                    "refusing to regenerate cluster keys: persisted checkpoints found at {} — \
+                     regenerated keys will not match the checkpoint roster and every node \
+                     would silently stall consensus. Wipe `data/` on every node before \
+                     restarting, or pass \
+                     --i-understand-this-rotates-keys-and-breaks-existing-data to override.",
+                    hazard.display()
+                );
+            }
+            Some(hazard) => {
+                eprintln!(
+                    "WARNING: persisted checkpoints found at {} will be incompatible with the \
+                     regenerated keys. Wipe `data/` on every node before restarting.",
+                    hazard.display()
+                );
+            }
+            None => {
+                eprintln!(
+                    "WARNING: regenerating cluster keys invalidates any persisted checkpoints \
+                     on running nodes (none found on this machine, but check each VPS's data \
+                     dir). Wipe `data/` on every node before restarting."
+                );
+            }
+        }
+    }
 
     let mut member_files = Vec::new();
     for &(node_id, gossip_addr, reconnect_addr) in &members {
@@ -176,6 +216,23 @@ fn init(args: &[String]) -> Result<()> {
 
     print_init_summary(&out_dir, &config_path, &members);
     Ok(())
+}
+
+/// The first location holding persisted checkpoints that regenerated keys
+/// would silently break, if any. `jkaind run` writes checkpoints under
+/// `<data>/checkpoints/` (default `data/checkpoints/`); `init` checks the
+/// output dir and the default data dir. VPS-side data dirs cannot be seen
+/// from the machine running `init`, so a clean result is advisory only.
+fn checkpoint_hazard(out_dir: &Path) -> Option<PathBuf> {
+    let candidates = [
+        out_dir.join("data").join("checkpoints"),
+        out_dir.join("checkpoints"),
+        PathBuf::from("data").join("checkpoints"),
+    ];
+    candidates.into_iter().find(|dir| {
+        dir.is_dir()
+            && std::fs::read_dir(dir).map(|mut entries| entries.next().is_some()).unwrap_or(false)
+    })
 }
 
 fn print_init_summary(
@@ -409,7 +466,7 @@ async fn run_node(opts: &RunOptions) -> Result<()> {
 
     // Restart recovery: restore from the last persisted checkpoint if one
     // exists; the node then reconnects from a live peer for the event window.
-    let node = match latest_for_restart(&storage, opts.node_id)? {
+    let node = match latest_for_restart(&storage, opts.node_id, &signing_key.verifying_key())? {
         Some(response) => {
             eprintln!(
                 "[jkaind] restoring from persisted checkpoint at round {}",
@@ -553,6 +610,42 @@ async fn status_cmd(args: &[String]) -> Result<()> {
     println!("members:");
     for member in &report.members {
         println!("  node {}  key {}", member.node_id, member.verifying_key);
+    }
+    println!("checkpoint roster:");
+    if report.checkpoint_roster.is_empty() {
+        println!("  (no accepted checkpoint yet)");
+    } else {
+        for member in &report.checkpoint_roster {
+            println!("  node {}  key {}", member.node_id, member.verifying_key);
+        }
+    }
+    // A restored checkpoint whose roster disagrees with the live registry is
+    // the silent-consensus-stall signal: the node's events no longer verify.
+    let live = report
+        .members
+        .iter()
+        .find(|m| m.node_id == report.node_id)
+        .map(|m| m.verifying_key.as_str());
+    let checkpoint = report
+        .checkpoint_roster
+        .iter()
+        .find(|m| m.node_id == report.node_id)
+        .map(|m| m.verifying_key.as_str());
+    match (live, checkpoint) {
+        (Some(live_key), Some(checkpoint_key)) if live_key != checkpoint_key => {
+            println!(
+                "WARNING: checkpoint roster key for this node does not match the live member \
+                 key — consensus may be silently stalled. Restore the original secret or wipe \
+                 data/ and re-genesis."
+            );
+        }
+        (Some(_), None) if !report.checkpoint_roster.is_empty() => {
+            println!(
+                "WARNING: this node is not in the latest checkpoint roster — it may have \
+                 restored an incompatible checkpoint."
+            );
+        }
+        _ => {}
     }
     println!("peers:");
     for peer in &report.peers {
@@ -926,6 +1019,13 @@ fn print_usage() {
          Usage:\n\
          \x20 jkaind init --member <id>:<gossip-addr>[:<reconnect-addr>] [--member ...] \\\n\
          \x20            --out <dir> [--force]\n\
+         \x20            [--i-understand-this-rotates-keys-and-breaks-existing-data]\n\
+         \n\
+         \x20   Key rotation is a membership change, not an init operation: --force writes\n\
+         \x20   secrets whose keys no longer match any persisted checkpoint roster, silently\n\
+         \x20   stalling every node that restores one. Refused when checkpoints are detected\n\
+         \x20   locally; otherwise warn. Always wipe data/ on every node after regenerating.\n\
+         \n\
          \x20 jkaind run  --cluster <cluster.toml> --node-id <id> --secret <secret-<id>.bin> \\\n\
          \x20            [--gossip-port <port>] [--reconnect-port <port>] [--data <dir>] \\\n\
          \x20            [--control-socket <path>] [--sync-interval <ms>] [--sync-timeout <ms>]\n\

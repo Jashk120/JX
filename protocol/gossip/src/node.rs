@@ -267,6 +267,8 @@ impl GossipNode {
         let _accept_task = tokio::spawn(self.clone().accept_loop(listener));
 
         let mut outbound: HashMap<NodeId, TcpTransport> = HashMap::new();
+        let mut consecutive_failures: u64 = 0;
+        let mut decided_watermark: u64 = 0;
         loop {
             if stop.load(Ordering::Acquire) {
                 break;
@@ -315,7 +317,14 @@ impl GossipNode {
                 Entry::Occupied(entry) => entry.into_mut(),
                 Entry::Vacant(entry) => {
                     let mut transport = TcpTransport::new(self.identity.clone());
-                    if transport.connect(&peer).await.is_err() {
+                    if let Err(e) = transport.connect(&peer).await {
+                        consecutive_failures += 1;
+                        if consecutive_failures == 1 || consecutive_failures.is_multiple_of(10) {
+                            eprintln!(
+                                "[jkaind] sync: connect to peer {peer:?} failed \
+                                 ({consecutive_failures} consecutive failures): {e}"
+                            );
+                        }
                         continue;
                     }
                     entry.insert(transport)
@@ -346,14 +355,25 @@ impl GossipNode {
                 ))),
             };
 
-            if round.is_err() {
-                outbound.remove(&peer.node_id);
-            } else {
-                // Piggyback any pending checkpoint signatures on this sync
-                // round (Phase 3). Sigs are re-sent on every successful sync
-                // until the round's checkpoint is accepted — the peer that
-                // needs one the most is exactly the one that fell behind.
-                self.gossip_checkpoint_sigs(transport).await;
+            match &round {
+                Err(e) => {
+                    consecutive_failures += 1;
+                    if consecutive_failures == 1 || consecutive_failures.is_multiple_of(10) {
+                        eprintln!(
+                            "[jkaind] sync: round with peer {peer:?} failed \
+                             ({consecutive_failures} consecutive failures): {e}"
+                        );
+                    }
+                    outbound.remove(&peer.node_id);
+                }
+                Ok(()) => {
+                    consecutive_failures = 0;
+                    // Piggyback any pending checkpoint signatures on this sync
+                    // round (Phase 3). Sigs are re-sent on every successful sync
+                    // until the round's checkpoint is accepted — the peer that
+                    // needs one the most is exactly the one that fell behind.
+                    self.gossip_checkpoint_sigs(transport).await;
+                }
             }
 
             // Phase 4: a sync round concluded this node is too far behind for
@@ -371,6 +391,17 @@ impl GossipNode {
             // Decode newly finalized events, drive any membership
             // activations, and emit checkpoints for newly decided rounds.
             self.process_finalized_rounds().await;
+
+            // Periodic liveness heartbeat: consensus progress is otherwise
+            // silent, so log whenever the decided round advances.
+            let decided = {
+                let hg = self.hashgraph.lock().await;
+                hg.highest_decided_round()
+            };
+            if decided > decided_watermark {
+                decided_watermark = decided;
+                eprintln!("[jkaind] sync: decided round advanced to {decided}");
+            }
         }
         Ok(())
     }
@@ -732,6 +763,13 @@ impl GossipNode {
         self.signed_checkpoints.lock().await.last().map(|c| c.payload.round)
     }
 
+    /// The highest accepted [`SignedCheckpoint`], if any. Exposes the
+    /// embedded roster snapshot for observability — `jkaind status` uses it
+    /// to flag a checkpoint roster that disagrees with the live registry.
+    pub async fn latest_signed_checkpoint(&self) -> Option<SignedCheckpoint> {
+        self.signed_checkpoints.lock().await.last().cloned()
+    }
+
     /// Sends every pending checkpoint signature on the given transport. Own
     /// signatures are re-sent on each successful sync until the round's
     /// checkpoint is accepted, so a peer that missed one delivery still
@@ -884,6 +922,34 @@ impl GossipNode {
         if roster_at_cp.hash() != checkpoint.payload.roster_hash {
             eprintln!("reconnect: roster hash mismatch; rejecting checkpoint");
             return false;
+        }
+
+        // 3b. The roster must carry this node's own key. If it is absent or
+        //     holds a different key, this node could never produce an event
+        //     that verifies against the restored registry — every sync round
+        //     would fail silently and consensus would stall. This is the
+        //     live-path guard for the same misconfiguration the restart path
+        //     refuses in `node::restart` (a `jkaind init --force` rotation
+        //     without wiping `data/`).
+        let own_key = self.signing_key.verifying_key();
+        match checkpoint.payload.roster_snapshot.key_for(&self.node_id) {
+            Err(_) => {
+                eprintln!(
+                    "reconnect: node {} is not in the served checkpoint roster; rejecting \
+                     checkpoint",
+                    self.node_id.get()
+                );
+                return false;
+            }
+            Ok(key) if key.as_bytes() != own_key.as_bytes() => {
+                eprintln!(
+                    "reconnect: served checkpoint roster key for node {} does not match this \
+                     node's secret; rejecting checkpoint",
+                    self.node_id.get()
+                );
+                return false;
+            }
+            Ok(_) => {}
         }
 
         // 4. Restore the executor from the checkpoint state — the state
