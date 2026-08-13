@@ -151,7 +151,7 @@
 - [x] Single node
 - [x] Two nodes
 - [x] Four nodes
-- [ ] VPS deployment
+- [x] VPS deployment
 
 > **Phase 6 status**: gossip-level integration on localhost is done — a lone
 > node serves syncs (single-node), and 2- and 4-node clusters exchange
@@ -167,19 +167,12 @@
 
 ## Phase 7 — Native Services
 
-- [ ] HCS
-- [ ] HTS
-- [ ] DID
-
----
-
-## Phase 8 — Executor
 
 - [x] State
 - [x] Transaction execution
 - [x] Deterministic execution
 
-> **Phase 8 status**: the `state` crate implements a deterministic
+> **Phase 7 status**: the `state` crate implements a deterministic
 > executor over a key-value `State` (opaque byte-string keys/values in a
 > `BTreeMap`). `Transaction` payloads decode from a tiny explicit binary
 > format (`Op::Put`/`Op::Delete`; big-endian `u32` length prefixes) and are
@@ -197,9 +190,78 @@
 
 ---
 
-## Phase 9 — Future
+## Phase 8 — Durable State & Mirror Support (Consensus Side)
 
-- [ ] Parallel execution
+The consensus-node side of the mirror-node story: durable, replayable
+storage plus the file types a mirror consumes. Everything here is what the
+*consensus node* must persist and emit so any program can reconstruct the
+DAG and verify consensus output offline — the mirror node itself (a
+separate Go project) is downstream of this phase.
+
+### Fjall (LSM) event log
+
+- [ ] Fjall-backed append-only event log: every verified event appended on
+      insert, keyed by `EventHash`, decoupled from `.cp`/`.snap`
+- [ ] Two-partition layout: `by_seq` (monotonic `u64` BE key → record,
+      preserving insertion = topological order for replay) and `by_hash`
+      (`EventHash` → record, for dedup/lookup)
+- [ ] Replay-on-startup: rebuild the graph from the local log instead of
+      `request_reconnect()` — a node recovers independently, no live peer
+- [ ] Full-rebuild replay verifies each event against the roster active at
+      its birth round (roster/key verification exercised at graph rebuild
+      time, not just at checkpoint load)
+- [ ] The log stores the complete event set, so any program can rebuild the
+      DAG from it
+- [ ] Log pruning mirroring `RETENTION_ROUNDS` (bounded disk; history older
+      than the prune floor is covered by the checkpoint)
+
+### Merkle tree state
+
+- [ ] Sparse Merkle tree over the KV state; `state_hash` in `.cp` becomes
+      the Merkle root
+- [ ] Incremental root updates (a `Put`/`Delete` touches O(depth) nodes) for
+      cheap per-round checkpoint hashing
+- [ ] Per-key proof of inclusion without shipping the whole state
+      (mirror-friendly)
+- [ ] Restart/reconnect verification switches from hashing serialized bytes
+      to tree rebuild + root compare
+- [ ] Fjall as the KV state backend: `State`'s `BTreeMap` moves to an LSM
+      partition with WAL; the `.snap` file disappears
+
+### New file types (mirror consumption)
+
+- [ ] Event stream file: append-only, chained, every gossip event — the
+      offline DAG source; a mirror stores all events and points from each
+      event to its transactions
+- [ ] Record stream file (`.rcd`): ordered finalized transactions per round
+- [ ] Record stream anchored to the threshold-signed checkpoint state root,
+      so a mirror verifies consensus output cryptographically rather than
+      trusting any single node (source-agnostic)
+- [ ] Cross-language record format decodable by the Go mirror
+
+### Parallel execution
+
+- [ ] Batch transaction execution across finalized rounds
+- [ ] Deterministic parallelism: result independent of thread scheduling
+- [ ] Parallel signature verification
+
+> **Phase 8 status**: planned — nothing implemented yet. The event log and
+> the event/record stream files are the consensus-side prerequisites for the
+> mirror node; the Merkle tree turns the `.cp` commitment into the
+> threshold-signed state root a mirror can verify. The `.cp` is already
+> threshold-signed (2/3+ of the roster; both nodes in a 2-node cluster).
+
+---
+
+## Phase 9 — Executor
+- [ ] HCS
+- [ ] HTS
+- [ ] DID
+
+---
+
+## Phase 10 — Future
+
 - [ ] Privacy
 - [ ] Compute layer
 

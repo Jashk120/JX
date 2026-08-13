@@ -154,6 +154,22 @@ Before adding a new dependency:
 
 ---
 
+# Wire Formats
+
+Anything that speaks externally — to another SDK, an external app, or a node
+that is not a consensus node (e.g. a mirror node) — must use protobuf as its
+wire/schema format, always.
+
+Internal Rust-to-Rust communication (consensus protocol, gossip frames,
+checkpoint files, `.cp`/`.snap`) keeps the canonical binary encoding; do not
+convert it to protobuf.
+
+Before building any new external-facing interface, confirm the protobuf
+schema and its scope with the user first — do not decide the boundary or
+schema independently.
+
+---
+
 # Performance
 
 Avoid unnecessary:
