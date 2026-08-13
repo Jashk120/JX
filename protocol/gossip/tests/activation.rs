@@ -54,6 +54,7 @@ fn membership_add_tx(new_node: u64) -> Transaction {
         node: NodeId::new(new_node),
         key: Box::new(key_for(new_node).verifying_key()),
         addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7000),
+        reconnect_addr: Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7001)),
     };
     let mut payload = vec![0x02];
     payload.extend_from_slice(&op.encode());
@@ -161,7 +162,8 @@ async fn finalized_membership_op_activates_new_member_idempotently() {
     node.process_finalized_rounds().await;
 
     // Activation: hashgraph grows, the roster schedules node 5 one round
-    // after the activation round, and the peer set gains node 5.
+    // after the activation round, and the peer set gains node 5 with its
+    // reconnect port pinned.
     assert!(node.is_consensus_member(NodeId::new(5)).await);
     assert_eq!(node.peer_count().await, 1);
     {
@@ -171,6 +173,21 @@ async fn finalized_membership_op_activates_new_member_idempotently() {
         // the expanded one.
         assert_eq!(hg.registry_at_round(activation_round).len(), 4);
         assert_eq!(hg.registry_at_round(activation_round + 1).len(), 5);
+    }
+    {
+        let peers = node.peers().await;
+        assert_eq!(peers.len(), 1);
+        let added = &peers[0];
+        assert_eq!(added.node_id, NodeId::new(5));
+        assert_eq!(added.reconnect_addr, Some("127.0.0.1:7001".parse().expect("valid addr")));
+        // The pin must be derived from node 5's consensus key.
+        let key = key_for(5).verifying_key();
+        let fingerprint = {
+            let hg = node.hashgraph.lock().await;
+            let registry = hg.registry_at_round(activation_round + 1);
+            registry.key_for(&NodeId::new(5)).expect("registered").to_owned()
+        };
+        assert_eq!(key, fingerprint);
     }
 
     // Idempotency: a second pass over the same finalized set changes nothing.

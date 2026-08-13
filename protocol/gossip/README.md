@@ -15,9 +15,11 @@ later optimization phase.
 
 ## Contents
 
-- `peer` / `peer_manager` — known peers (NodeId, address, expected TLS
-  fingerprint) and uniform-random selection for the sync target, matching
-  Hedera's unweighted behavior.
+- `peer` / `peer_manager` — known peers (NodeId, address, reconnect address,
+  expected TLS fingerprint) and uniform-random selection for the sync target,
+  matching Hedera's unweighted behavior. `add_peer_from_key` admits a
+  runtime-added member by deriving its TLS pin from its Ed25519 consensus key
+  (the single-seed convention) and carrying its reconnect port.
 - `tls` — per-node TLS identity. The durable secret is an Ed25519 seed;
   a self-signed X.509 certificate is re-wrapped from it (via `rcgen`) on
   every startup. Peers pin by comparing the presented certificate's SPKI
@@ -42,7 +44,9 @@ later optimization phase.
   table, and the async machinery (inbound accept loop + a sync driver on a
   fixed interval). A per-round timeout bounds how long a silent peer can
   stall the driver; a `stop` flag lets the driver drain in-flight syncs and
-  exit cleanly.
+  exit cleanly. Finalized events carrying a `MembershipOp::Add` payload are
+  decoded and activated (hashgraph growth, roster schedule, peer pin) once
+  the round after their `roundReceived` is fully decided.
 
 ## Design
 

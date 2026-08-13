@@ -7,9 +7,15 @@
 //! process lifecycle.
 
 pub mod config;
+pub mod control;
 pub mod restart;
 pub mod storage;
 
 pub use config::ClusterConfigFile;
+pub use control::{
+    ControlRequest,
+    ControlResponse,
+    StatusReport,
+};
 pub use restart::build_reconnect_response;
 pub use storage::Storage;

@@ -2,19 +2,27 @@
 
 `jkaind` runs one long-lived JKain node per process. Two VPSes form the
 cluster; each runs one node. This runbook covers key generation, deployment,
-systemd supervision, firewall ports, and restart/recovery.
+systemd supervision, firewall ports, restart/recovery, and — after the cluster
+is up — controlling the running node and growing the cluster dynamically
+through its Unix control socket.
 
 ## Architecture recap
 
-- One `cluster.toml` (shared, no secrets) describes both members: node id,
-  gossip address, reconnect address, Ed25519 verifying key, TLS SPKI
-  fingerprint.
-- One `secret-<id>.bin` per node (64 bytes = consensus signing seed ‖ TLS
-  seed), generated once by `jkaind init` and kept **only on that node**.
+- One `cluster.toml` (shared, no secrets) describes the **genesis** members:
+  node id, gossip address, reconnect address, Ed25519 verifying key, TLS SPKI
+  fingerprint. It is written once by `jkaind init` and never modified — later
+  members join through consensus, not by editing this file.
+- One `secret-<id>.bin` per node. Genesis members get 64 bytes (consensus
+  signing seed ‖ TLS seed). Dynamically-added members (`jkaind member init`)
+  get a single 32-byte seed used for both signing and TLS — that is what makes
+  the runtime add path's TLS pinning work.
 - Each node persists accepted checkpoints + state snapshots under its `--data`
   directory. On restart it reloads the latest checkpoint (verifying the
   signature quorum and that the state hashes to the committed `state_hash`)
   and reconnects from its live peer for the event window.
+- Each running node serves a **Unix control socket** (default
+  `<data>/jkaind.sock`, mode `0600`) for terminal-driven inspection and
+  transaction submission.
 
 ## 1. Build
 
@@ -132,10 +140,81 @@ sudo ls -l /var/lib/jkaind/checkpoints/   # checkpoint-<round>.cp / .snap files
   `/var/lib/jkaind` **and** the secrets only when you intend to start a
   brand-new cluster.
 
+## 8. Control a running node
+
+Each node serves a Unix control socket at `<data>/jkaind.sock` (override with
+`--control-socket <path>`). The client subcommands connect over it:
+
+```bash
+jkaind status                    # members, peers, ordering/checkpoint watermarks
+jkaind tx put --key balance --value 100
+jkaind tx delete --key balance
+```
+
+`tx put`/`tx delete` encode a KV transaction (`Op::Put`/`Op::Delete`) and queue
+it on the node; it is included in the node's next own event and executed by
+every node once consensus orders it. The socket is `0600`; point the client at
+it with `--socket <path>` if the data dir is not `./data`.
+
+## 9. Add a third member (dynamic membership)
+
+Adding a member never edits the genesis `cluster.toml`. It is a consensus
+operation: a `MembershipOp::Add` transaction is submitted to any running node,
+orders through the hashgraph, and activates one round after its `roundReceived`
+is decided. Until then the new node has no place in the cluster, so the order
+is:
+
+**1. Provision the new member's secret + local config** (on any machine with
+the genesis `cluster.toml`):
+
+```bash
+jkaind member init \
+  --node-id 3 --gossip 203.0.113.7:7000 --reconnect 203.0.113.7:7001 \
+  --cluster ./cluster/cluster.toml --out ./cluster
+```
+
+This writes `secret-3.bin` (a single 32-byte seed used for both consensus
+signing and TLS) and a **local** config for node 3 (genesis members 1,2 +
+node 3) as `cluster-3.toml`, then prints the `--key <hex>` to pass to
+`add-member`. The node-specific filename means it can never overwrite the
+shared `./cluster/cluster.toml` on nodes 1 and 2, which stays untouched —
+and **never** deploy `cluster-3.toml` to nodes 1 or 2, or they would start
+with node 3 already in their genesis roster.
+
+**2. Submit the add-member transaction** on node 1 **or** node 2:
+
+```bash
+jkaind add-member \
+  --node-id 3 --gossip 203.0.113.7:7000 --reconnect 203.0.113.7:7001 \
+  --key <hex-from-member-init>
+```
+
+The node queues the op; once ordered and activated, nodes 1 and 2 can gossip
+with node 3 and pin its TLS identity + reconnect port. `add-member` prints the
+`ufw` commands to open the gossip/reconnect ports in both directions.
+
+**3. Start node 3** (deploy `cluster-3.toml` + `secret-3.bin` to VPS C and run):
+
+```bash
+jkaind run --cluster ./cluster/cluster-3.toml --node-id 3 \
+           --secret ./cluster/secret-3.bin --data ./data
+```
+
+Because node 3's TLS identity derives from the same 32-byte seed as its
+consensus key, the fingerprint nodes 1,2 pin via `add_peer_from_key` matches
+node 3's real certificate, and its reconnect port is pinned too — so node 3
+can serve as a reconnect source, keeping the reconnect graph symmetric.
+
 ## Boundaries
 
 - The retained event graph is not persisted. A restarting node reloads state
-  and roster from its checkpoint and reconnects from a live peer for the
-  event window; a single-node restart is fully covered.
-- Transaction submission from the terminal is not wired in this pass;
-  transactions are queued in-process via `GossipNode::submit_transaction`.
+  and roster from its checkpoint and reconnects from a live peer for the event
+  window; a single-node restart is fully covered.
+- `MembershipOp::Remove` is not implemented: membership only grows. Removal is
+  deferred consensus work (roster shrinkage, quorum math, hashgraph removal).
+- Addresses of *later* members (node 4, 5, …) are only propagated to nodes that
+  observe their `MembershipOp::Add`; a brand-new joiner's local `cluster.toml`
+  only lists the genesis members plus itself. Fine for adding one member at a
+  time; multi-hop membership needs a future address-propagation mechanism.
+- The control socket trusts Unix file permissions (`0600`), not a shared secret
+  or client certificate.

@@ -128,14 +128,21 @@ pub fn encode_hex(bytes: &[u8]) -> String {
 
 /// Decodes a lowercase or uppercase hex string of exactly 32 bytes.
 pub fn decode_hex(input: &str) -> Option<[u8; 32]> {
-    if input.len() != 64 {
+    let bytes = decode_hex_bytes(input)?;
+    bytes.try_into().ok()
+}
+
+/// Decodes a lowercase or uppercase hex string into a byte vector of any
+/// length. Returns `None` on a non-even or non-hex character.
+pub fn decode_hex_bytes(input: &str) -> Option<Vec<u8>> {
+    if !input.len().is_multiple_of(2) {
         return None;
     }
-    let mut out = [0u8; 32];
-    for (i, byte) in out.iter_mut().enumerate() {
-        let hi = nibble(input.as_bytes()[i * 2])?;
-        let lo = nibble(input.as_bytes()[i * 2 + 1])?;
-        *byte = (hi << 4) | lo;
+    let mut out = Vec::with_capacity(input.len() / 2);
+    for pair in input.as_bytes().chunks_exact(2) {
+        let hi = nibble(pair[0])?;
+        let lo = nibble(pair[1])?;
+        out.push((hi << 4) | lo);
     }
     Some(out)
 }

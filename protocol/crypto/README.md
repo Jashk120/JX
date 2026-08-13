@@ -21,6 +21,11 @@ through this crate.
 - `MembershipRegistry` — maps each `NodeId` to its Ed25519 verifying key,
   with a deterministic `NodeId`-sorted iteration order so every honest
   node derives the same member indexing independently.
+- `MembershipOp` / `RosterHistory` — the membership-change wire format
+  (`Add` carries the node id, verifying key, gossip address, and an optional
+  reconnect address; `Remove` carries just the node id) and the round-indexed
+  sequence of registry snapshots that activates changes at their agreed
+  round.
 
 ## Design
 

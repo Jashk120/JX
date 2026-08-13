@@ -189,6 +189,29 @@ impl GossipNode {
         self.peers.lock().await.len()
     }
 
+    /// A snapshot of the known peer set (observability helper; feeds the
+    /// daemon's `status`/`peers` control output).
+    pub async fn peers(&self) -> Vec<PeerInfo> {
+        self.peers.lock().await.all()
+    }
+
+    /// The live (structurally-registered) member set as `(NodeId, key)`
+    /// pairs. A member appears here as soon as its `MembershipOp::Add`
+    /// activates, exactly matching [`Self::is_consensus_member`] — unlike a
+    /// round-indexed roster lookup, which can still lag by the one round the
+    /// new roster is scheduled to activate.
+    pub async fn members(&self) -> Vec<(NodeId, VerifyingKey)> {
+        let registry = self.registry.lock().await;
+        registry
+            .member_ids()
+            .into_iter()
+            .map(|id| {
+                let key = registry.key_for(&id).expect("registered member has a key");
+                (id, *key)
+            })
+            .collect()
+    }
+
     /// Queues a raw transaction payload to be included in this node's next
     /// own event. Payloads are drained by the sync driver, up to
     /// [`TX_PER_SYNC`] per round, and passed into the initiator's own event.
@@ -451,7 +474,7 @@ impl GossipNode {
                 };
 
                 for op in ops {
-                    if let MembershipOp::Add { node, key, addr } = op {
+                    if let MembershipOp::Add { node, key, addr, reconnect_addr } = op {
                         let already_member = {
                             let hg = self.hashgraph.lock().await;
                             hg.is_member(&node)
@@ -483,10 +506,12 @@ impl GossipNode {
                         }
 
                         // TLS-pin the new peer, deriving the fingerprint from its
-                        // Ed25519 key (same derivation as boot-time peers).
+                        // Ed25519 key (same derivation as boot-time peers), and
+                        // carry its reconnect port so it can serve as a
+                        // reconnect source for the existing cluster.
                         {
                             let mut pm = self.peers.lock().await;
-                            pm.add_peer_from_key(node, &key, addr);
+                            pm.add_peer_from_key(node, &key, addr, reconnect_addr);
                         }
                     }
                 }

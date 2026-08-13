@@ -4,7 +4,10 @@
 use std::process::Command;
 
 use ed25519_dalek::SigningKey;
-use gossip::TlsIdentity;
+use gossip::{
+    PeerManager,
+    TlsIdentity,
+};
 use node::config::{
     ClusterConfigFile,
     MemberFile,
@@ -108,6 +111,92 @@ fn init_rejects_bad_member_spec() {
         .status()
         .expect("init runs");
     assert!(!status.success(), "malformed --member is rejected");
+}
+
+/// `jkaind member init` provisions a new member with a 32-byte single seed and
+/// its own local cluster.toml (genesis + self). The critical assertion is the
+/// exact bug this feature exists to prevent: an existing node pins a
+/// runtime-added peer's TLS fingerprint by deriving it from the peer's
+/// consensus key, so the new member's TLS identity must present exactly that
+/// fingerprint. A test that merely checked "both secret lengths are accepted"
+/// would pass even if the single-seed derivation were subtly wrong.
+#[test]
+fn member_init_single_seed_secret_pins_match_and_leaves_genesis_untouched() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let genesis_out = tmp.path().join("genesis");
+    assert!(init_args(&genesis_out, false).status().expect("genesis init").success());
+
+    let member_out = tmp.path().join("member3");
+    let status = Command::new(binary())
+        .arg("member")
+        .arg("init")
+        .arg("--node-id")
+        .arg("3")
+        .arg("--gossip")
+        .arg("203.0.113.7:7000")
+        .arg("--reconnect")
+        .arg("203.0.113.7:7001")
+        .arg("--cluster")
+        .arg(genesis_out.join("cluster.toml"))
+        .arg("--out")
+        .arg(&member_out)
+        .status()
+        .expect("member init runs");
+    assert!(status.success(), "member init exits 0");
+
+    // A dynamic member's secret is a single 32-byte seed.
+    let secret = std::fs::read(member_out.join("secret-3.bin")).expect("secret file");
+    assert_eq!(secret.len(), 32, "single-seed secret is 32 bytes");
+    let seed: [u8; 32] = secret.try_into().expect("32 bytes");
+
+    // Derive exactly like `jkaind run` does for a single-seed secret.
+    let signing_key = SigningKey::from_bytes(&seed);
+    let identity = TlsIdentity::from_seed(seed, 3).expect("identity builds");
+
+    // The member's local cluster.toml (node-specific filename, so the shared
+    // genesis cluster.toml can never be clobbered) lists genesis + itself, and
+    // its own entry is self-consistent with the secret (so `run`'s sanity
+    // checks pass).
+    let config = ClusterConfigFile::load(&member_out.join("cluster-3.toml")).expect("loads");
+    assert_eq!(config.members.len(), 3, "genesis 1,2 + new member 3");
+    let member3 = config.member_for(3).expect("member 3 present");
+    assert_eq!(
+        decode_hex(&member3.verifying_key).expect("key hex"),
+        signing_key.verifying_key().to_bytes(),
+        "member 3's configured key matches its secret"
+    );
+    assert_eq!(
+        decode_hex(&member3.spki_fingerprint).expect("fingerprint hex"),
+        identity.spki_fingerprint(),
+        "member 3's configured TLS pin matches its secret"
+    );
+
+    // THE EXACT BUG: a peer that node 1 (or 2) pins via add_peer_from_key
+    // derives the SPKI fingerprint from node 3's consensus key. That pinned
+    // value must equal node 3's actual TLS identity fingerprint, or node 1's
+    // TLS connections to node 3 would always be rejected.
+    let mut manager = PeerManager::new(Vec::new());
+    assert!(manager.add_peer_from_key(
+        NodeId::new(3),
+        &signing_key.verifying_key(),
+        member3.gossip_addr,
+        member3.reconnect_addr,
+    ));
+    let peer = manager.peer(NodeId::new(3)).expect("peer pinned");
+    assert_eq!(
+        peer.expected_spki_fingerprint,
+        identity.spki_fingerprint(),
+        "existing-node TLS pin matches the new member's real certificate"
+    );
+    assert_eq!(
+        peer.reconnect_addr, member3.reconnect_addr,
+        "the pinned peer carries the new member's reconnect address"
+    );
+
+    // The shared genesis cluster.toml must NOT be rewritten by member init.
+    let genesis =
+        ClusterConfigFile::load(&genesis_out.join("cluster.toml")).expect("genesis loads");
+    assert_eq!(genesis.members.len(), 2, "genesis cluster.toml stays the original snapshot");
 }
 
 /// Derivation from a fixed secret is deterministic: the same seed always

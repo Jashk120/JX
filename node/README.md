@@ -9,10 +9,15 @@ a process lifecycle. It adds no consensus logic of its own.
 
 ## Layout
 
-- `src/bin/jkaind.rs` — the CLI: `jkaind init` generates per-node secrets
-  and the shared `cluster.toml`; `jkaind run` loads the config, restores
+- `src/bin/jkaind.rs` — the CLI: `jkaind init` generates per-node secrets and
+  the shared genesis `cluster.toml`; `jkaind run` loads the config, restores
   from the last persisted checkpoint if one exists, and runs a
-  `gossip::GossipNode` on 0.0.0.0 until SIGINT/SIGTERM.
+  `gossip::GossipNode` on 0.0.0.0 until SIGINT/SIGTERM. Client subcommands
+  (`status`, `tx`, `add-member`, `member init`) drive a running node over its
+  Unix control socket and provision new members.
+- `src/control.rs` — the Unix-socket control plane: line-delimited JSON
+  requests (`status`, `peers`, `submit_tx`) served over a `0600` socket, plus
+  the transaction payload encodings (`kv_op_payload`, `membership_op_payload`).
 - `src/config.rs` — the `cluster.toml` file format and its conversion to
   `gossip::ClusterConfig`.
 - `src/storage.rs` — atomic checkpoint persistence under the `--data`
@@ -21,18 +26,20 @@ a process lifecycle. It adds no consensus logic of its own.
 - `src/restart.rs` — loads the latest persisted checkpoint, verifies its
   signature quorum and state hash, and rebuilds a node via
   `GossipNode::from_checkpoint` plus a reconnect for the event window.
-- `tests/` — config/CLI round-trips, storage round-trips, transaction
-  propagation, and a restart-recovery end-to-end test.
+- `tests/` — config/CLI round-trips, the single-seed pin-match regression,
+  control-socket protocol tests, storage round-trips, transaction propagation,
+  a restart-recovery end-to-end test, and dynamic add-member via the socket.
 
 ## Deployment
 
 See `RUNBOOK.md` for the 2-VPS deployment: systemd units, firewall ports,
-and key/config copy steps.
+key/config copy steps, and the add-a-third-member flow.
 
 ## Boundaries
 
 - The retained event graph is not persisted. A restarting node reloads state
   and roster from its checkpoint and reconnects from a live peer for the
   event window; a single-node restart is fully covered.
-- Transaction submission from the terminal is not wired in this pass;
-  transactions are queued in-process via `GossipNode::submit_transaction`.
+- `MembershipOp::Remove` is not implemented; membership only grows.
+- The control socket trusts Unix file permissions (`0600`), not a shared
+  secret or client certificate.

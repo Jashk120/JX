@@ -14,14 +14,16 @@
 //!
 //! | opcode | meaning  | fields              |
 //! |--------|----------|---------------------|
-//! | `0x00` | `Add`    | node_id, key, addr  |
+//! | `0x00` | `Add`    | node_id, key, addr, reconnect_addr |
 //! | `0x01` | `Remove` | node_id             |
 //!
 //! `node_id` (8 bytes) and the Ed25519 verifying key (32 bytes) are
-//! fixed-width and written raw; only `addr` is length-prefixed, since its
-//! serialized length varies with the IP version. `SocketAddr` is encoded as
-//! `[tag: u8]` (`0x04` = IPv4, `0x06` = IPv6) followed by the IP bytes and a
-//! big-endian `u16` port. Every other opcode byte, a payload too short for its
+//! fixed-width and written raw; only the addresses are length-prefixed, since
+//! their serialized length varies with the IP version. `SocketAddr` is encoded
+//! as `[tag: u8]` (`0x04` = IPv4, `0x06` = IPv6) followed by the IP bytes and a
+//! big-endian `u16` port. The optional `reconnect_addr` is encoded as a
+//! `u8` presence flag after `addr` (`0x00` = none, `0x01` = a length-prefixed
+//! `SocketAddr` follows). Every other opcode byte, a payload too short for its
 //! declared fields, or trailing bytes after the last field decodes to a
 //! deterministic [`CryptoError`] — identical bytes always produce the
 //! identical outcome on every node.
@@ -53,6 +55,11 @@ const MEMBERSHIP_REMOVE: u8 = 0x01;
 const ADDR_IPV4: u8 = 0x04;
 const ADDR_IPV6: u8 = 0x06;
 
+/// `MembershipOp::Add` payload flag: no reconnect address follows.
+const RECONNECT_ABSENT: u8 = 0x00;
+/// `MembershipOp::Add` payload flag: a reconnect address follows.
+const RECONNECT_PRESENT: u8 = 0x01;
+
 /// A membership change decoded from a `Transaction` payload.
 ///
 /// A `MembershipOp` is the wire message that mutates a `MembershipRegistry`
@@ -63,9 +70,20 @@ pub enum MembershipOp {
     /// Adds `node`, registering `key` as the Ed25519 key used to verify events
     /// it creates, together with the `SocketAddr` where it can be reached.
     ///
+    /// `reconnect_addr`, when present, is the member's dedicated reconnect
+    /// port (Phase 4) — the same field a genesis member carries in
+    /// `cluster.toml`. Carrying it here lets a runtime-added member serve as a
+    /// reconnect source for the existing cluster, keeping the reconnect graph
+    /// symmetric instead of one-directional toward the genesis set.
+    ///
     /// `key` is boxed to keep the enum small — a `VerifyingKey` is 192 bytes,
     /// and the `Remove` variant holds only an 8-byte `NodeId`.
-    Add { node: NodeId, key: Box<VerifyingKey>, addr: SocketAddr },
+    Add {
+        node: NodeId,
+        key: Box<VerifyingKey>,
+        addr: SocketAddr,
+        reconnect_addr: Option<SocketAddr>,
+    },
     /// Removes `node` from the registry.
     Remove { node: NodeId },
 }
@@ -84,8 +102,9 @@ impl MembershipOp {
                 let node = NodeId::new(take_u64(&mut cursor)?);
                 let key = take_key(&mut cursor)?;
                 let addr = take_addr(&mut cursor)?;
+                let reconnect_addr = take_optional_addr(&mut cursor)?;
                 reject_trailing(cursor)?;
-                Ok(MembershipOp::Add { node, key: Box::new(key), addr })
+                Ok(MembershipOp::Add { node, key: Box::new(key), addr, reconnect_addr })
             }
             MEMBERSHIP_REMOVE => {
                 let node = NodeId::new(take_u64(&mut cursor)?);
@@ -101,11 +120,18 @@ impl MembershipOp {
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = Vec::new();
         match self {
-            MembershipOp::Add { node, key, addr } => {
+            MembershipOp::Add { node, key, addr, reconnect_addr } => {
                 buf.push(MEMBERSHIP_ADD);
                 buf.extend_from_slice(&node.get().to_be_bytes());
                 buf.extend_from_slice(&key.to_bytes());
                 write_bytes(&mut buf, &encode_addr(addr));
+                match reconnect_addr {
+                    Some(reconnect_addr) => {
+                        buf.push(RECONNECT_PRESENT);
+                        write_bytes(&mut buf, &encode_addr(reconnect_addr));
+                    }
+                    None => buf.push(RECONNECT_ABSENT),
+                }
             }
             MembershipOp::Remove { node } => {
                 buf.push(MEMBERSHIP_REMOVE);
@@ -116,6 +142,18 @@ impl MembershipOp {
     }
 }
 
+/// Reads the optional reconnect address that follows `addr` in an `Add`
+/// payload: a presence flag byte, then — when the flag says so — one
+/// length-prefixed `SocketAddr`.
+fn take_optional_addr(cursor: &mut &[u8]) -> Result<Option<SocketAddr>> {
+    let flag = take_exact(cursor, 1)?[0];
+    match flag {
+        RECONNECT_ABSENT => Ok(None),
+        RECONNECT_PRESENT => take_addr(cursor).map(Some),
+        _ => Err(CryptoError::MalformedOp),
+    }
+}
+
 // `VerifyingKey` implements `Eq`, but via its compressed-point encoding;
 // comparing `.to_bytes()` instead gives the canonical representation, which
 // is the same bytes `encode`/`decode` round-trip.
@@ -123,9 +161,19 @@ impl PartialEq for MembershipOp {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (
-                MembershipOp::Add { node, key, addr },
-                MembershipOp::Add { node: other_node, key: other_key, addr: other_addr },
-            ) => node == other_node && key.to_bytes() == other_key.to_bytes() && addr == other_addr,
+                MembershipOp::Add { node, key, addr, reconnect_addr },
+                MembershipOp::Add {
+                    node: other_node,
+                    key: other_key,
+                    addr: other_addr,
+                    reconnect_addr: other_reconnect_addr,
+                },
+            ) => {
+                node == other_node
+                    && key.to_bytes() == other_key.to_bytes()
+                    && addr == other_addr
+                    && reconnect_addr == other_reconnect_addr
+            }
             (MembershipOp::Remove { node }, MembershipOp::Remove { node: other_node }) => {
                 node == other_node
             }
@@ -315,7 +363,23 @@ mod tests {
     fn add_op(addr: SocketAddr) -> MembershipOp {
         let signing_key = SigningKey::generate(&mut OsRng);
         let verifying_key = signing_key.verifying_key();
-        MembershipOp::Add { node: NodeId::new(1), key: Box::new(verifying_key), addr }
+        MembershipOp::Add {
+            node: NodeId::new(1),
+            key: Box::new(verifying_key),
+            addr,
+            reconnect_addr: None,
+        }
+    }
+
+    fn add_op_with_reconnect(addr: SocketAddr, reconnect_addr: SocketAddr) -> MembershipOp {
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let verifying_key = signing_key.verifying_key();
+        MembershipOp::Add {
+            node: NodeId::new(1),
+            key: Box::new(verifying_key),
+            addr,
+            reconnect_addr: Some(reconnect_addr),
+        }
     }
 
     #[test]
@@ -331,6 +395,25 @@ mod tests {
             8080,
         ));
         assert_eq!(MembershipOp::decode(&op.encode()), Ok(op));
+    }
+
+    #[test]
+    fn add_with_reconnect_addr_round_trips() {
+        let op = add_op_with_reconnect(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 7000),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 7001),
+        );
+        assert_eq!(MembershipOp::decode(&op.encode()), Ok(op));
+    }
+
+    #[test]
+    fn add_without_reconnect_addr_stays_absent() {
+        let op = add_op(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 7000));
+        let decoded = MembershipOp::decode(&op.encode()).expect("decodes");
+        match decoded {
+            MembershipOp::Add { reconnect_addr, .. } => assert_eq!(reconnect_addr, None),
+            _ => panic!("expected Add"),
+        }
     }
 
     #[test]
@@ -398,6 +481,34 @@ mod tests {
         let mut payload =
             add_op(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 8080)).encode();
         payload.push(0xff);
+        assert_eq!(MembershipOp::decode(&payload), Err(CryptoError::MalformedOp));
+    }
+
+    #[test]
+    fn invalid_reconnect_flag_is_rejected() {
+        let mut payload = Vec::new();
+        payload.push(MEMBERSHIP_ADD);
+        payload.extend_from_slice(&1u64.to_be_bytes());
+        payload.extend_from_slice(&SigningKey::generate(&mut OsRng).verifying_key().to_bytes());
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 7000);
+        write_bytes(&mut payload, &encode_addr(&addr));
+        // A presence flag that is neither 0x00 nor 0x01 is malformed.
+        payload.push(0x7f);
+        assert_eq!(MembershipOp::decode(&payload), Err(CryptoError::MalformedOp));
+    }
+
+    #[test]
+    fn truncated_reconnect_addr_is_rejected() {
+        let mut payload = Vec::new();
+        payload.push(MEMBERSHIP_ADD);
+        payload.extend_from_slice(&1u64.to_be_bytes());
+        payload.extend_from_slice(&SigningKey::generate(&mut OsRng).verifying_key().to_bytes());
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 7000);
+        write_bytes(&mut payload, &encode_addr(&addr));
+        // Present flag but the reconnect addr blob is cut short.
+        payload.push(RECONNECT_PRESENT);
+        payload.extend_from_slice(&2u32.to_be_bytes());
+        payload.extend_from_slice(&[ADDR_IPV4, 0x01]);
         assert_eq!(MembershipOp::decode(&payload), Err(CryptoError::MalformedOp));
     }
 

@@ -166,6 +166,7 @@ mod tests {
             node: NodeId::new(7),
             key: Box::new(SigningKey::from_bytes(&[1u8; 32]).verifying_key()),
             addr: "127.0.0.1:7000".parse().expect("valid addr"),
+            reconnect_addr: None,
         }
     }
 

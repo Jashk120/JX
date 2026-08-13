@@ -54,4 +54,37 @@ cargo run --bin jkaind -- run \
   --secret ./cluster/secret-1.bin --data ./data
 ```
 
+## Controlling a running node
+
+`jkaind run` opens a Unix control socket (default `<data>/jkaind.sock`) so a
+live node can be inspected and told to submit transactions from the terminal:
+
+```bash
+jkaind status                              # members, peers, watermarks
+jkaind tx put --key balance --value 100
+jkaind tx delete --key balance
+```
+
+## Growing the cluster (dynamic membership)
+
+The genesis `cluster.toml` is never rewritten. To add node 3 to a 1,2 cluster,
+provision node 3's secret + local config, submit the add-member op to node 1
+or 2, then start node 3:
+
+```bash
+jkaind member init --node-id 3 --gossip 203.0.113.7:7000 \
+  --reconnect 203.0.113.7:7001 --cluster ./cluster/cluster.toml --out ./cluster
+jkaind add-member --node-id 3 --gossip 203.0.113.7:7000 \
+  --reconnect 203.0.113.7:7001 --key <hex-from-member-init>
+jkaind run --cluster ./cluster/cluster-3.toml --node-id 3 \
+  --secret ./cluster/secret-3.bin --data ./data
+```
+
+`member init` writes the new member's local config as `cluster-3.toml`, so the
+shared genesis `cluster.toml` is never rewritten; deploy `cluster-3.toml` only
+to node 3.
+
+Membership changes are `MembershipOp::Add` transactions that propagate through
+consensus and activate one round after `roundReceived` is decided.
+
 See `node/RUNBOOK.md` for the full 2-VPS deployment.

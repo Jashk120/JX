@@ -1,21 +1,35 @@
 //! `jkaind` — the JKain node daemon.
 //!
-//! Two subcommands, no dependencies beyond the workspace:
-//!
 //! ```text
 //! jkaind init --member <id>:<gossip-addr>:<reconnect-addr> [--member ...] \
 //!             --out <dir> [--force]
 //! jkaind run --cluster <cluster.toml> --node-id <id> --secret <secret-<id>.bin> \
 //!            [--gossip-port <port>] [--reconnect-port <port>] [--data <dir>]
-//!            [--sync-interval <ms>] [--sync-timeout <ms>]
+//!            [--control-socket <path>] [--sync-interval <ms>] [--sync-timeout <ms>]
+//!
+//! jkaind status  [--socket <path>]
+//! jkaind tx put    --key <k> --value <v>  [--socket <path>]
+//! jkaind tx delete --key <k>              [--socket <path>]
+//! jkaind add-member --node-id <id> --gossip <ip:port> [--reconnect <ip:port>] \
+//!                   --key <hex> [--socket <path>]
+//! jkaind member init --node-id <id> --gossip <ip:port> --reconnect <ip:port> \
+//!                    --cluster <genesis cluster.toml> --out <dir>
 //! ```
 //!
 //! `init` generates per-node secrets (64 bytes each: consensus signing seed ‖
 //! TLS seed), derives each member's verifying key and TLS SPKI fingerprint
 //! from them, and writes the shared `cluster.toml` plus the secret files.
 //! `run` loads the config, restores from the last persisted checkpoint if one
-//! exists, binds both ports on 0.0.0.0, and runs until SIGINT/SIGTERM.
+//! exists, binds the gossip/reconnect ports plus a Unix control socket, and
+//! runs until SIGINT/SIGTERM.
+//!
+//! The control subcommands (`status`, `tx`, `add-member`) talk to a running
+//! node over its Unix socket, so transactions — including `MembershipOp::Add`
+//! — can be submitted from the terminal without a restart. `member init`
+//! provisions a brand-new node's secret and local `cluster.toml` (the genesis
+//! `cluster.toml` itself is never rewritten; it stays the genesis snapshot).
 
+use std::net::SocketAddr;
 use std::path::{
     Path,
     PathBuf,
@@ -32,7 +46,11 @@ use anyhow::{
     Result,
     bail,
 };
-use ed25519_dalek::SigningKey;
+use crypto::MembershipOp;
+use ed25519_dalek::{
+    SigningKey,
+    VerifyingKey,
+};
 use gossip::{
     GossipNode,
     PeerInfo,
@@ -40,18 +58,31 @@ use gossip::{
 };
 use node::config::{
     ClusterConfigFile,
+    MemberFile,
     decode_hex,
+    encode_hex,
+};
+use node::control::{
+    self,
+    ControlRequest,
+    StatusReport,
 };
 use node::restart::latest_for_restart;
 use node::storage::Storage;
 use primitives::NodeId;
 use rand::RngCore;
 use rand::rngs::OsRng;
-use tokio::net::TcpListener;
+use state::Op;
+use tokio::net::{
+    TcpListener,
+    UnixListener,
+};
 
 const SECRET_LEN: usize = 64;
+const SINGLE_SEED_LEN: usize = 32;
 const DEFAULT_SYNC_INTERVAL: Duration = Duration::from_millis(500);
 const DEFAULT_SYNC_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_SOCKET: &str = "data/jkaind.sock";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -63,6 +94,10 @@ async fn main() -> Result<()> {
     match args[0].as_str() {
         "init" => init(&args[1..]),
         "run" => run(&args[1..]).await,
+        "status" => status_cmd(&args[1..]).await,
+        "tx" => tx_cmd(&args[1..]).await,
+        "add-member" => add_member(&args[1..]).await,
+        "member" => member_cmd(&args[1..]),
         other => bail!("unknown subcommand '{other}'"),
     }
 }
@@ -196,6 +231,7 @@ async fn run(args: &[String]) -> Result<()> {
     let mut gossip_port: Option<u16> = None;
     let mut reconnect_port: Option<u16> = None;
     let mut data_dir = PathBuf::from("data");
+    let mut control_socket: Option<PathBuf> = None;
     let mut sync_interval = DEFAULT_SYNC_INTERVAL;
     let mut sync_timeout = DEFAULT_SYNC_TIMEOUT;
 
@@ -227,6 +263,10 @@ async fn run(args: &[String]) -> Result<()> {
                 let value = next_value(args, &mut i, "--data")?;
                 data_dir = PathBuf::from(value);
             }
+            "--control-socket" => {
+                let value = next_value(args, &mut i, "--control-socket")?;
+                control_socket = Some(PathBuf::from(value));
+            }
             "--sync-interval" => {
                 let value = next_value(args, &mut i, "--sync-interval")?;
                 sync_interval = Duration::from_millis(parse_ms(&value, "--sync-interval")?);
@@ -249,6 +289,7 @@ async fn run(args: &[String]) -> Result<()> {
         gossip_port,
         reconnect_port,
         data_dir,
+        control_socket,
         sync_interval,
         sync_timeout,
     };
@@ -264,6 +305,7 @@ struct RunOptions {
     gossip_port: Option<u16>,
     reconnect_port: Option<u16>,
     data_dir: PathBuf,
+    control_socket: Option<PathBuf>,
     sync_interval: Duration,
     sync_timeout: Duration,
 }
@@ -276,14 +318,37 @@ async fn run_node(opts: &RunOptions) -> Result<()> {
 
     let secret = std::fs::read(&opts.secret_path)
         .with_context(|| format!("reading secret {}", opts.secret_path.display()))?;
-    if secret.len() != SECRET_LEN {
-        bail!("{}: expected {SECRET_LEN} bytes, got {}", opts.secret_path.display(), secret.len());
-    }
-    let signing_key =
-        SigningKey::from_bytes(&secret[..32].try_into().expect("32-byte consensus seed"));
-    let identity =
-        TlsIdentity::from_seed(secret[32..].try_into().expect("32-byte TLS seed"), opts.node_id)
+    // Two secret formats are accepted:
+    // - 64 bytes (genesis, `jkaind init`): consensus signing seed ‖ TLS seed,
+    //   two independent keys.
+    // - 32 bytes (dynamic member, `jkaind member init`): a single seed used
+    //   for BOTH consensus signing and TLS. This is what makes the runtime
+    //   add path work — an existing node pins a new peer's TLS fingerprint by
+    //   deriving it from the peer's consensus key (`add_peer_from_key`), so
+    //   the new node's TLS identity MUST come from that same key.
+    let (signing_key, identity) = match secret.len() {
+        SECRET_LEN => {
+            let signing_key =
+                SigningKey::from_bytes(&secret[..32].try_into().expect("32-byte consensus seed"));
+            let identity = TlsIdentity::from_seed(
+                secret[32..].try_into().expect("32-byte TLS seed"),
+                opts.node_id,
+            )
             .with_context(|| format!("building TLS identity for node {}", opts.node_id))?;
+            (signing_key, identity)
+        }
+        SINGLE_SEED_LEN => {
+            let seed: [u8; SINGLE_SEED_LEN] = secret.try_into().expect("32-byte single seed");
+            let signing_key = SigningKey::from_bytes(&seed);
+            let identity = TlsIdentity::from_seed(seed, opts.node_id)
+                .with_context(|| format!("building TLS identity for node {}", opts.node_id))?;
+            (signing_key, identity)
+        }
+        len => bail!(
+            "{}: expected {SINGLE_SEED_LEN} or {SECRET_LEN} bytes, got {len}",
+            opts.secret_path.display()
+        ),
+    };
 
     // Sanity: the secret must derive the same key and TLS pin the config
     // declares for this node.
@@ -377,14 +442,31 @@ async fn run_node(opts: &RunOptions) -> Result<()> {
     let reconnect_listener =
         TcpListener::from_std(reconnect_listener).context("wrapping reconnect listener")?;
 
-    eprintln!("[jkaind] node {}: listening, waiting for shutdown (SIGINT/SIGTERM)", opts.node_id);
-    run_until_shutdown(node, gossip_listener, reconnect_listener).await
+    let control_socket_path =
+        opts.control_socket.clone().unwrap_or_else(|| opts.data_dir.join("jkaind.sock"));
+    let control_listener = control::bind(&control_socket_path).await?;
+
+    eprintln!(
+        "[jkaind] node {}: listening, control socket {} (waiting for SIGINT/SIGTERM)",
+        opts.node_id,
+        control_socket_path.display()
+    );
+    run_until_shutdown(
+        node,
+        gossip_listener,
+        reconnect_listener,
+        control_listener,
+        control_socket_path,
+    )
+    .await
 }
 
 async fn run_until_shutdown(
     node: Arc<GossipNode>,
     gossip_listener: TcpListener,
     reconnect_listener: TcpListener,
+    control_listener: UnixListener,
+    control_socket_path: PathBuf,
 ) -> Result<()> {
     let stop = Arc::new(AtomicBool::new(false));
     let signal_stop = stop.clone();
@@ -393,9 +475,17 @@ async fn run_until_shutdown(
         signal_stop.store(true, Ordering::Release);
     });
 
+    let control_stop = stop.clone();
+    let control_node = node.clone();
+    let control_task = tokio::spawn(async move {
+        control::serve(control_listener, control_node, control_stop).await;
+    });
+
     let result =
         node.run_until_stopped_with_reconnect(gossip_listener, reconnect_listener, stop).await;
     signal_task.abort();
+    control_task.abort();
+    let _ = std::fs::remove_file(&control_socket_path);
     match result {
         Ok(()) => {
             eprintln!("[jkaind] shutdown requested; sync driver drained, exiting");
@@ -421,6 +511,368 @@ async fn wait_for_shutdown_signal() {
     {
         let _ = ctrl_c.await;
     }
+}
+
+// --- control subcommands ------------------------------------------------------
+
+/// `jkaind status`: prints a summary of a running node's cluster view.
+async fn status_cmd(args: &[String]) -> Result<()> {
+    let socket = parse_socket_flag(args)?;
+    let report = fetch_status(&socket).await?;
+    println!(
+        "node {}: ordered round {}, decided round {}, latest checkpoint round {:?}",
+        report.node_id, report.ordered_round, report.decided_round, report.latest_checkpoint_round
+    );
+    println!("members:");
+    for member in &report.members {
+        println!("  node {}  key {}", member.node_id, member.verifying_key);
+    }
+    println!("peers:");
+    for peer in &report.peers {
+        let reconnect = peer.reconnect_addr.as_deref().unwrap_or("-");
+        println!("  node {} @ {} (reconnect {reconnect})", peer.node_id, peer.gossip_addr);
+    }
+    Ok(())
+}
+
+/// `jkaind tx put|delete`: submits a KV transaction for consensus ordering.
+async fn tx_cmd(args: &[String]) -> Result<()> {
+    let sub = args.first().context("tx requires a subcommand: put or delete")?;
+    match sub.as_str() {
+        "put" => tx_put(&args[1..]).await,
+        "delete" => tx_delete(&args[1..]).await,
+        other => bail!("tx: unknown subcommand '{other}'"),
+    }
+}
+
+async fn tx_put(args: &[String]) -> Result<()> {
+    let mut socket = default_socket();
+    let mut key: Option<String> = None;
+    let mut value: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--socket" => socket = PathBuf::from(next_value(args, &mut i, "--socket")?),
+            "--key" => key = Some(next_value(args, &mut i, "--key")?),
+            "--value" => value = Some(next_value(args, &mut i, "--value")?),
+            other => bail!("tx put: unknown argument '{other}'"),
+        }
+    }
+    let key = key.context("tx put: --key <k> is required")?;
+    let value = value.context("tx put: --value <v> is required")?;
+    let op = Op::Put { key: key.into_bytes(), value: value.into_bytes() };
+    submit_payload(&socket, &control::kv_op_payload(&op)).await?;
+    println!("put queued on {}", socket.display());
+    Ok(())
+}
+
+async fn tx_delete(args: &[String]) -> Result<()> {
+    let mut socket = default_socket();
+    let mut key: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--socket" => socket = PathBuf::from(next_value(args, &mut i, "--socket")?),
+            "--key" => key = Some(next_value(args, &mut i, "--key")?),
+            other => bail!("tx delete: unknown argument '{other}'"),
+        }
+    }
+    let key = key.context("tx delete: --key <k> is required")?;
+    let op = Op::Delete { key: key.into_bytes() };
+    submit_payload(&socket, &control::kv_op_payload(&op)).await?;
+    println!("delete queued on {}", socket.display());
+    Ok(())
+}
+
+/// `jkaind add-member`: submits a `MembershipOp::Add` transaction to a running
+/// node. The `--key` hex is the new member's Ed25519 verifying key (printed by
+/// `jkaind member init`). After the op is ordered and activated, the existing
+/// cluster can gossip with the new node; the new node itself is provisioned by
+/// `member init` and its own local `cluster.toml`.
+async fn add_member(args: &[String]) -> Result<()> {
+    let mut socket = default_socket();
+    let mut node_id: Option<u64> = None;
+    let mut gossip: Option<SocketAddr> = None;
+    let mut reconnect: Option<SocketAddr> = None;
+    let mut key_hex: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--socket" => socket = PathBuf::from(next_value(args, &mut i, "--socket")?),
+            "--node-id" => {
+                let value = next_value(args, &mut i, "--node-id")?;
+                node_id =
+                    Some(value.parse().with_context(|| format!("invalid --node-id '{value}'"))?);
+            }
+            "--gossip" => {
+                gossip =
+                    Some(parse_socket_addr(&next_value(args, &mut i, "--gossip")?, "--gossip")?)
+            }
+            "--reconnect" => {
+                reconnect = Some(parse_socket_addr(
+                    &next_value(args, &mut i, "--reconnect")?,
+                    "--reconnect",
+                )?);
+            }
+            "--key" => key_hex = Some(next_value(args, &mut i, "--key")?),
+            other => bail!("add-member: unknown argument '{other}'"),
+        }
+    }
+    let node_id = node_id.context("add-member: --node-id <id> is required")?;
+    let gossip = gossip.context("add-member: --gossip <ip:port> is required")?;
+    let key_hex = key_hex.context("add-member: --key <hex> is required")?;
+    let key_bytes = decode_hex(&key_hex)
+        .context("add-member: --key must be a 64-char hex Ed25519 verifying key")?;
+    let key = VerifyingKey::from_bytes(&key_bytes)
+        .context("add-member: --key is not a valid Ed25519 verifying key")?;
+
+    let op = MembershipOp::Add {
+        node: NodeId::new(node_id),
+        key: Box::new(key),
+        addr: gossip,
+        reconnect_addr: reconnect,
+    };
+    let payload = control::membership_op_payload(&op);
+    submit_payload(&socket, &payload).await?;
+    println!(
+        "node {node_id} add-member submitted; it activates one round after the op is ordered."
+    );
+
+    // Firewall convenience: print the copy/paste ufw commands for both
+    // directions, using the existing peers' addresses from status.
+    let report = fetch_status(&socket).await?;
+    let existing: Vec<(u64, SocketAddr, Option<SocketAddr>)> = report
+        .peers
+        .iter()
+        .filter(|peer| peer.node_id != node_id)
+        .map(|peer| {
+            let gossip = peer
+                .gossip_addr
+                .parse()
+                .with_context(|| format!("peer {}: invalid gossip_addr", peer.node_id))?;
+            let reconnect =
+                match &peer.reconnect_addr {
+                    Some(addr) => Some(addr.parse().with_context(|| {
+                        format!("peer {}: invalid reconnect_addr", peer.node_id)
+                    })?),
+                    None => None,
+                };
+            Ok((peer.node_id, gossip, reconnect))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let reconnect = reconnect.unwrap_or(gossip);
+    print_firewall_plan(node_id, gossip, reconnect, &existing);
+    Ok(())
+}
+
+/// `jkaind member init`: provisions a brand-new member's secret (single 32-byte
+/// seed) and its own local `cluster.toml` (genesis members + the new member).
+/// The shared genesis `cluster.toml` is never modified. Prints the `--key` hex
+/// to pass to `add-member` on an existing node, plus firewall instructions.
+fn member_cmd(args: &[String]) -> Result<()> {
+    let sub = args.first().context("member requires a subcommand: init")?;
+    match sub.as_str() {
+        "init" => member_init(&args[1..]),
+        other => bail!("member: unknown subcommand '{other}'"),
+    }
+}
+
+fn member_init(args: &[String]) -> Result<()> {
+    let mut node_id: Option<u64> = None;
+    let mut gossip: Option<SocketAddr> = None;
+    let mut reconnect: Option<SocketAddr> = None;
+    let mut cluster_path: Option<PathBuf> = None;
+    let mut out_dir: Option<PathBuf> = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--node-id" => {
+                let value = next_value(args, &mut i, "--node-id")?;
+                node_id =
+                    Some(value.parse().with_context(|| format!("invalid --node-id '{value}'"))?);
+            }
+            "--gossip" => {
+                gossip =
+                    Some(parse_socket_addr(&next_value(args, &mut i, "--gossip")?, "--gossip")?);
+            }
+            "--reconnect" => {
+                reconnect = Some(parse_socket_addr(
+                    &next_value(args, &mut i, "--reconnect")?,
+                    "--reconnect",
+                )?);
+            }
+            "--cluster" => {
+                cluster_path = Some(PathBuf::from(next_value(args, &mut i, "--cluster")?))
+            }
+            "--out" => out_dir = Some(PathBuf::from(next_value(args, &mut i, "--out")?)),
+            other => bail!("member init: unknown argument '{other}'"),
+        }
+    }
+    let node_id = node_id.context("member init: --node-id <id> is required")?;
+    let gossip = gossip.context("member init: --gossip <ip:port> is required")?;
+    let reconnect = reconnect.context("member init: --reconnect <ip:port> is required")?;
+    let cluster_path =
+        cluster_path.context("member init: --cluster <genesis cluster.toml> is required")?;
+    let out_dir = out_dir.context("member init: --out <dir> is required")?;
+
+    let genesis = ClusterConfigFile::load(&cluster_path)?;
+    if genesis.member_for(node_id).is_some() {
+        bail!("member init: node-id {node_id} is already a member of the genesis cluster");
+    }
+    std::fs::create_dir_all(&out_dir)
+        .with_context(|| format!("creating output dir {}", out_dir.display()))?;
+
+    // Single 32-byte seed: consensus signing AND TLS identity derive from it,
+    // so the fingerprint an existing node pins via add_peer_from_key matches
+    // this node's real TLS cert.
+    let mut seed = [0u8; SINGLE_SEED_LEN];
+    OsRng.fill_bytes(&mut seed);
+    let signing_key = SigningKey::from_bytes(&seed);
+    let identity = TlsIdentity::from_seed(seed, node_id)
+        .with_context(|| format!("building TLS identity for node {node_id}"))?;
+
+    let secret_path = out_dir.join(format!("secret-{node_id}.bin"));
+    std::fs::write(&secret_path, seed)
+        .with_context(|| format!("writing {}", secret_path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&secret_path)
+            .with_context(|| format!("stat {}", secret_path.display()))?
+            .permissions();
+        perms.set_mode(0o600);
+        std::fs::set_permissions(&secret_path, perms)
+            .with_context(|| format!("chmod {}", secret_path.display()))?;
+    }
+
+    // The new member's LOCAL cluster.toml = genesis members + itself, written
+    // under a node-specific filename so it can never clobber the shared
+    // genesis `cluster.toml`, even when `--out` is the genesis directory.
+    // Nodes in the genesis set keep their own cluster.toml unchanged; they
+    // learn about this member through the add-member transaction.
+    let mut members = genesis.members.clone();
+    members.push(MemberFile::new(
+        node_id,
+        gossip,
+        reconnect,
+        &signing_key.verifying_key(),
+        identity.spki_fingerprint(),
+    ));
+    let config = ClusterConfigFile { members };
+    let config_path = out_dir.join(format!("cluster-{node_id}.toml"));
+    config.save(&config_path).with_context(|| format!("writing {}", config_path.display()))?;
+
+    println!("Wrote node {node_id} local cluster config: {}", config_path.display());
+    println!("Secret (keep on node {node_id} only): {}", secret_path.display());
+    println!();
+    println!("This local config is for node {node_id} ONLY — the genesis cluster.toml");
+    println!("on nodes 1 and 2 is left untouched and must not be replaced with this file.");
+    println!();
+    println!("On an existing node, add this member with:");
+    println!(
+        "  jkaind add-member --node-id {node_id} --gossip {gossip} --reconnect {reconnect} --key {}",
+        encode_hex(&signing_key.verifying_key().to_bytes())
+    );
+    println!();
+    println!("Copy plan (run on the new member's VPS):");
+    println!(
+        "  scp {} user@vps:jkaind/ && scp {} user@vps:jkaind/",
+        secret_path.display(),
+        config_path.display()
+    );
+    println!();
+
+    let existing: Vec<(u64, SocketAddr, Option<SocketAddr>)> = genesis
+        .members
+        .iter()
+        .map(|member| (member.node_id, member.gossip_addr, member.reconnect_addr))
+        .collect();
+    print_firewall_plan(node_id, gossip, reconnect, &existing);
+    Ok(())
+}
+
+/// Fetches the `status` report from a running node over the control socket.
+async fn fetch_status(socket: &Path) -> Result<StatusReport> {
+    let response = control::request(socket, &ControlRequest::Status).await?;
+    control::ensure_ok(&response)?;
+    let result = response.result.context("status response carries no result")?;
+    serde_json::from_value(result).context("parsing status report")
+}
+
+/// Submits a raw transaction payload (already encoded) through the control
+/// socket and fails on a non-ok response.
+async fn submit_payload(socket: &Path, payload: &[u8]) -> Result<()> {
+    let request = ControlRequest::SubmitTx { payload_hex: encode_hex(payload) };
+    let response = control::request(socket, &request).await?;
+    control::ensure_ok(&response)?;
+    Ok(())
+}
+
+/// Prints the copy/paste `ufw` commands to open the gossip and reconnect ports
+/// in both directions. The node cannot configure another VPS's firewall; this
+/// is a convenience for the operator.
+fn print_firewall_plan(
+    new_node: u64,
+    new_gossip: SocketAddr,
+    new_reconnect: SocketAddr,
+    existing: &[(u64, SocketAddr, Option<SocketAddr>)],
+) {
+    let new_ip = new_gossip.ip();
+    println!("Firewall (run on the VPSes — these are the ports to open in both directions):");
+    println!();
+    println!(
+        "  On the new member's VPS (node {new_node}), allow the existing members to reach it:"
+    );
+    for (id, gossip, _) in existing {
+        println!(
+            "    sudo ufw allow from {} to any port {} proto tcp   # node {id} gossip",
+            gossip.ip(),
+            new_gossip.port()
+        );
+        println!(
+            "    sudo ufw allow from {} to any port {} proto tcp   # node {id} reconnect",
+            gossip.ip(),
+            new_reconnect.port()
+        );
+    }
+    println!();
+    println!("  On each existing member's VPS, allow the new member (IP {new_ip}) to reach it:");
+    for (id, gossip, reconnect) in existing {
+        println!(
+            "    sudo ufw allow from {new_ip} to any port {} proto tcp   # node {id} gossip",
+            gossip.port()
+        );
+        if let Some(reconnect) = reconnect {
+            println!(
+                "    sudo ufw allow from {new_ip} to any port {} proto tcp   # node {id} reconnect",
+                reconnect.port()
+            );
+        }
+    }
+    println!();
+}
+
+fn default_socket() -> PathBuf {
+    PathBuf::from(DEFAULT_SOCKET)
+}
+
+/// Extracts `--socket <path>` (default `data/jkaind.sock`) for the client
+/// subcommands that take only that flag.
+fn parse_socket_flag(args: &[String]) -> Result<PathBuf> {
+    let mut socket = default_socket();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--socket" => socket = PathBuf::from(next_value(args, &mut i, "--socket")?),
+            other => bail!("unknown argument '{other}' (expected --socket <path>)"),
+        }
+    }
+    Ok(socket)
+}
+
+fn parse_socket_addr(value: &str, flag: &str) -> Result<SocketAddr> {
+    value.parse().with_context(|| format!("{flag} must be <ip>:<port>, got '{value}'"))
 }
 
 // --- arg helpers -------------------------------------------------------------
@@ -449,12 +901,27 @@ fn print_usage() {
          \x20            --out <dir> [--force]\n\
          \x20 jkaind run  --cluster <cluster.toml> --node-id <id> --secret <secret-<id>.bin> \\\n\
          \x20            [--gossip-port <port>] [--reconnect-port <port>] [--data <dir>] \\\n\
-         \x20            [--sync-interval <ms>] [--sync-timeout <ms>]\n\
+         \x20            [--control-socket <path>] [--sync-interval <ms>] [--sync-timeout <ms>]\n\
+         \n\
+         Control (talk to a running node over its Unix socket):\n\
+         \x20 jkaind status  [--socket <path>]\n\
+         \x20 jkaind tx put    --key <k> --value <v> [--socket <path>]\n\
+         \x20 jkaind tx delete --key <k>             [--socket <path>]\n\
+         \x20 jkaind add-member --node-id <id> --gossip <ip:port> \\\n\
+         \x20                  [--reconnect <ip:port>] --key <hex> [--socket <path>]\n\
+         \n\
+         Provision a new member (never touches the genesis cluster.toml):\n\
+         \x20 jkaind member init --node-id <id> --gossip <ip:port> --reconnect <ip:port> \\\n\
+         \x20                    --cluster <genesis cluster.toml> --out <dir>\n\
          \n\
          Examples:\n\
          \x20 jkaind init --member 1:203.0.113.5:7000:203.0.113.5:7001 \\\n\
          \x20             --member 2:203.0.113.6:7000:203.0.113.6:7001 --out ./cluster\n\
          \x20 jkaind run --cluster ./cluster/cluster.toml --node-id 1 \\\n\
-         \x20            --secret ./cluster/secret-1.bin --data ./data"
+         \x20            --secret ./cluster/secret-1.bin --data ./data\n\
+         \x20 jkaind status\n\
+         \x20 jkaind tx put --key balance --value 100\n\
+         \x20 jkaind add-member --node-id 3 --gossip 203.0.113.7:7000 \\\n\
+         \x20                 --reconnect 203.0.113.7:7001 --key <hex-from-member-init>"
     );
 }

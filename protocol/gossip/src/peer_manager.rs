@@ -46,6 +46,13 @@ impl PeerManager {
         self.peers.iter().find(|p| p.node_id == node_id)
     }
 
+    /// A snapshot of the current peer set (clones, so the caller never holds
+    /// the manager's lock). Observability helper for `status`-style output and
+    /// tests.
+    pub fn all(&self) -> Vec<PeerInfo> {
+        self.peers.clone()
+    }
+
     /// Adds `info` to the live peer set. Returns `true` if the peer was not
     /// already present (idempotent on duplicate). Does not affect the
     /// `MembershipRegistry` or `n` — use only when the new peer's key is
@@ -65,6 +72,12 @@ impl PeerManager {
     /// (SubjectPublicKeyInfo encoding, SHA-256 hash), so runtime-added peers
     /// are TLS-pinned consistently.
     ///
+    /// `reconnect_addr`, when `Some`, marks the peer as serving the reconnect
+    /// protocol (Phase 4) on that address — mirroring the reconnect port a
+    /// genesis member carries in `cluster.toml`. It comes from the same
+    /// `MembershipOp::Add` that admitted the peer, so a dynamically-added
+    /// member can serve as a reconnect source for the existing cluster.
+    ///
     /// Returns `false` if the peer was already present (idempotent on
     /// duplicate). Does not affect `RosterHistory` or quorum math — the
     /// caller (`GossipNode::process_finalized_rounds`) owns those updates.
@@ -73,12 +86,17 @@ impl PeerManager {
         node_id: primitives::NodeId,
         key: &VerifyingKey,
         addr: SocketAddr,
+        reconnect_addr: Option<SocketAddr>,
     ) -> bool {
         if self.peers.iter().any(|p| p.node_id == node_id) {
             return false;
         }
         let spki_fingerprint = spki_fingerprint_of(key);
-        self.peers.push(PeerInfo::new(node_id, addr, spki_fingerprint));
+        let mut peer = PeerInfo::new(node_id, addr, spki_fingerprint);
+        if let Some(reconnect_addr) = reconnect_addr {
+            peer = peer.with_reconnect(reconnect_addr);
+        }
+        self.peers.push(peer);
         true
     }
 
@@ -198,10 +216,26 @@ mod tests {
         let key = SigningKey::from_bytes(&[3u8; 32]);
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
         let mut manager = PeerManager::with_seed(Vec::new(), 0);
-        assert!(manager.add_peer_from_key(NodeId::new(9), &key.verifying_key(), addr));
+        assert!(manager.add_peer_from_key(NodeId::new(9), &key.verifying_key(), addr, None));
         let peer = manager.peer(NodeId::new(9)).expect("peer added");
         assert_eq!(peer.addr, addr);
         assert_eq!(peer.expected_spki_fingerprint, spki_fingerprint_of(&key.verifying_key()));
+    }
+
+    #[test]
+    fn add_peer_from_key_carries_reconnect_addr() {
+        let key = SigningKey::from_bytes(&[3u8; 32]);
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
+        let reconnect_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8081);
+        let mut manager = PeerManager::with_seed(Vec::new(), 0);
+        assert!(manager.add_peer_from_key(
+            NodeId::new(9),
+            &key.verifying_key(),
+            addr,
+            Some(reconnect_addr)
+        ));
+        let peer = manager.peer(NodeId::new(9)).expect("peer added");
+        assert_eq!(peer.reconnect_addr, Some(reconnect_addr));
     }
 
     #[test]
@@ -209,8 +243,8 @@ mod tests {
         let key = SigningKey::from_bytes(&[3u8; 32]);
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
         let mut manager = PeerManager::with_seed(Vec::new(), 0);
-        assert!(manager.add_peer_from_key(NodeId::new(9), &key.verifying_key(), addr));
-        assert!(!manager.add_peer_from_key(NodeId::new(9), &key.verifying_key(), addr));
+        assert!(manager.add_peer_from_key(NodeId::new(9), &key.verifying_key(), addr, None));
+        assert!(!manager.add_peer_from_key(NodeId::new(9), &key.verifying_key(), addr, None));
         assert_eq!(manager.len(), 1);
     }
 }
