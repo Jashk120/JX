@@ -10,14 +10,19 @@
 //! signature quorum against the payload alone (no external roster lookup).
 
 use crypto::{
+    CanonicalEncode,
     Hashable,
     MembershipRegistry,
     RosterHistory,
 };
 use primitives::{
     Event,
+    EventHash,
     NodeId,
     Signature,
+    Timestamp,
+    Transaction,
+    UnsignedEvent,
 };
 
 use crate::checkpoint::{
@@ -40,6 +45,108 @@ pub struct RetainedEvent {
     pub ancestor_seqs: Vec<u64>,
     /// The teacher's ordering for the event, if it was already ordered.
     pub round_received: Option<u64>,
+}
+
+/// Encodes a retained event to its canonical on-log/on-wire form:
+///
+/// ```text
+/// [seq: u64 BE]
+/// [round: u64 BE]
+/// [round_received tag: u8]  — 0x00 (none) | 0x01 + [round_received: u64 BE]
+/// [ancestor_seqs_len: u32 BE]
+///   per seq: [u64 BE]
+/// [event_len: u32 BE][event canonical bytes]
+/// ```
+///
+/// This is the record format of the durable event log (Phase 8): the full
+/// record metadata a replay needs to rebuild the graph, plus the event
+/// itself. It deliberately shares `RetainedEvent` with the reconnect
+/// protocol so one type describes both the on-wire retained graph and the
+/// on-log event set.
+pub fn encode_retained_event(record: &RetainedEvent) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&record.seq.to_be_bytes());
+    buf.extend_from_slice(&record.round.to_be_bytes());
+    match record.round_received {
+        Some(rr) => {
+            buf.push(0x01);
+            buf.extend_from_slice(&rr.to_be_bytes());
+        }
+        None => buf.push(0x00),
+    }
+    buf.extend_from_slice(&(record.ancestor_seqs.len() as u32).to_be_bytes());
+    for seq in &record.ancestor_seqs {
+        buf.extend_from_slice(&seq.to_be_bytes());
+    }
+    let event_bytes = record.event.canonical_bytes();
+    buf.extend_from_slice(&(event_bytes.len() as u32).to_be_bytes());
+    buf.extend_from_slice(&event_bytes);
+    buf
+}
+
+/// The inverse of [`encode_retained_event`]. Returns `None` on truncation, a
+/// bad optional tag, trailing bytes, or an event whose canonical bytes do not
+/// decode.
+pub fn decode_retained_event(bytes: &[u8]) -> Option<RetainedEvent> {
+    let mut cursor = bytes;
+    let seq = take_u64(&mut cursor)?;
+    let round = take_u64(&mut cursor)?;
+    let round_received = match take_exact(&mut cursor, 1)?[0] {
+        0x00 => None,
+        0x01 => Some(take_u64(&mut cursor)?),
+        _ => return None,
+    };
+    let ancestor_count = take_u32(&mut cursor)? as usize;
+    let ancestor_seqs: Vec<u64> =
+        (0..ancestor_count).map(|_| take_u64(&mut cursor)).collect::<Option<_>>()?;
+    let event_len = take_u32(&mut cursor)? as usize;
+    let event_bytes = take_exact(&mut cursor, event_len)?;
+    let event = decode_event_bytes(event_bytes)?;
+    if !cursor.is_empty() {
+        return None;
+    }
+    Some(RetainedEvent { event, seq, round, ancestor_seqs, round_received })
+}
+
+/// Decodes a [`Event`] from its canonical byte form (the inverse of
+/// `CanonicalEncode for Event`): creator, self_parent, other_parent,
+/// timestamp, payload, signature — in exactly the field order the
+/// canonical encoder writes.
+fn decode_event_bytes(bytes: &[u8]) -> Option<Event> {
+    let mut cursor = bytes;
+    let creator = NodeId::new(take_u64(&mut cursor)?);
+    let self_parent = take_optional_hash(&mut cursor)?;
+    let other_parent = take_optional_hash(&mut cursor)?;
+    let timestamp = Timestamp::new(take_u64(&mut cursor)?);
+    let payload_count = take_u32(&mut cursor)? as usize;
+    let payload = (0..payload_count)
+        .map(|_| {
+            let tx_len = take_u32(&mut cursor)? as usize;
+            let tx_bytes = take_exact(&mut cursor, tx_len)?;
+            Some(Transaction::from_bytes(tx_bytes.to_vec()))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let signature_bytes = take_exact(&mut cursor, 64)?;
+    let mut signature = [0u8; 64];
+    signature.copy_from_slice(signature_bytes);
+    if !cursor.is_empty() {
+        return None;
+    }
+    let unsigned = UnsignedEvent::new(creator, self_parent, other_parent, timestamp, payload);
+    Some(unsigned.finalize(Signature::new(signature)))
+}
+
+fn take_optional_hash(cursor: &mut &[u8]) -> Option<Option<EventHash>> {
+    match take_exact(cursor, 1)?[0] {
+        0x00 => Some(None),
+        0x01 => {
+            let bytes = take_exact(cursor, 32)?;
+            let mut hash = [0u8; 32];
+            hash.copy_from_slice(bytes);
+            Some(Some(EventHash::new(hash)))
+        }
+        _ => None,
+    }
 }
 
 /// Encodes `sc` as:
@@ -262,5 +369,92 @@ mod tests {
         assert_eq!(decode_roster_history(&bytes[..bytes.len() - 1]), None);
         // Empty history (no entries) is rejected.
         assert!(decode_roster_history(&[]).is_none());
+    }
+
+    #[test]
+    fn retained_event_round_trips_no_round_received() {
+        let event = UnsignedEvent::new(
+            NodeId::new(3),
+            Some(EventHash::new([1; 32])),
+            None,
+            Timestamp::new(1234),
+            vec![Transaction::from_bytes(vec![7u8; 12])],
+        )
+        .finalize(Signature::new([9; 64]));
+        let record = RetainedEvent {
+            event,
+            seq: 4,
+            round: 2,
+            ancestor_seqs: vec![4, 0, 2],
+            round_received: None,
+        };
+        assert_eq!(decode_retained_event(&encode_retained_event(&record)), Some(record));
+    }
+
+    #[test]
+    fn retained_event_round_trips_with_round_received() {
+        let event = UnsignedEvent::new(NodeId::new(1), None, None, Timestamp::new(5), Vec::new())
+            .finalize(Signature::new([1; 64]));
+        let record = RetainedEvent {
+            event,
+            seq: 1,
+            round: 1,
+            ancestor_seqs: vec![1],
+            round_received: Some(3),
+        };
+        assert_eq!(decode_retained_event(&encode_retained_event(&record)), Some(record));
+    }
+
+    #[test]
+    fn retained_event_decode_rejects_truncation() {
+        let event = UnsignedEvent::new(NodeId::new(1), None, None, Timestamp::new(5), Vec::new())
+            .finalize(Signature::new([1; 64]));
+        let record = RetainedEvent {
+            event,
+            seq: 1,
+            round: 1,
+            ancestor_seqs: vec![1],
+            round_received: Some(3),
+        };
+        let bytes = encode_retained_event(&record);
+        for cut in [1, 9, 17, bytes.len() - 1] {
+            assert_eq!(decode_retained_event(&bytes[..cut]), None, "cut at {cut}");
+        }
+    }
+
+    #[test]
+    fn retained_event_decode_rejects_trailing_bytes() {
+        let event = UnsignedEvent::new(NodeId::new(1), None, None, Timestamp::new(5), Vec::new())
+            .finalize(Signature::new([1; 64]));
+        let record =
+            RetainedEvent { event, seq: 1, round: 1, ancestor_seqs: vec![1], round_received: None };
+        let mut bytes = encode_retained_event(&record);
+        bytes.push(0);
+        assert_eq!(decode_retained_event(&bytes), None);
+    }
+
+    #[test]
+    fn retained_event_decode_rejects_bad_round_received_tag() {
+        let event = UnsignedEvent::new(NodeId::new(1), None, None, Timestamp::new(5), Vec::new())
+            .finalize(Signature::new([1; 64]));
+        let record =
+            RetainedEvent { event, seq: 1, round: 1, ancestor_seqs: vec![1], round_received: None };
+        let mut bytes = encode_retained_event(&record);
+        // Flip the round_received tag to an invalid value (0x7f).
+        bytes[16] = 0x7f;
+        assert_eq!(decode_retained_event(&bytes), None);
+    }
+
+    #[test]
+    fn retained_event_decode_rejects_corrupt_record_bytes() {
+        let event = UnsignedEvent::new(NodeId::new(1), None, None, Timestamp::new(5), Vec::new())
+            .finalize(Signature::new([1; 64]));
+        let record =
+            RetainedEvent { event, seq: 1, round: 1, ancestor_seqs: vec![1], round_received: None };
+        let mut bytes = encode_retained_event(&record);
+        // Corrupt the ancestor_seqs count (u32 BE after the round_received tag)
+        // so the decoder cannot read that many rows — a structural failure.
+        bytes[17..21].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert_eq!(decode_retained_event(&bytes), None);
     }
 }

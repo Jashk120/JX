@@ -24,6 +24,9 @@ order finalization. Depends on `primitives` for the value types and
 - `order` — order finalization: `roundReceived`, `consensusTimestamp`, and
   the final total order (sorted by round, then timestamp, then a
   signature-derived tie-break).
+- `reconnect` — wire codecs for `SignedCheckpoint`, `RosterHistory`, and the
+  `RetainedEvent` record (event + record metadata) shared by the reconnect
+  protocol and the Phase 8 durable event log.
 - `latest_event_by` / `all_event_hashes` — per-creator frontier accessors
   (maintained incrementally by `insert`) that the gossip layer uses to
   build sync summaries and enumerate stored events.

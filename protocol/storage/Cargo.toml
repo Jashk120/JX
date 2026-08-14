@@ -1,0 +1,16 @@
+[package]
+name = "storage"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+primitives  = { workspace = true }
+crypto      = { workspace = true }
+consensus   = { workspace = true }
+fjall       = { workspace = true }
+thiserror   = { workspace = true }
+
+[dev-dependencies]
+ed25519-dalek = { workspace = true, features = ["rand_core"] }
+rand          = { workspace = true }
+tempfile      = "3"

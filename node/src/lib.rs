@@ -17,5 +17,9 @@ pub use control::{
     ControlResponse,
     StatusReport,
 };
-pub use restart::build_reconnect_response;
+pub use restart::{
+    build_reconnect_response,
+    latest_for_restart_with_log,
+    replay_response,
+};
 pub use storage::Storage;

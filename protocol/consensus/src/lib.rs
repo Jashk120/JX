@@ -26,8 +26,10 @@ pub use hashgraph::{
 };
 pub use reconnect::{
     RetainedEvent,
+    decode_retained_event,
     decode_roster_history,
     decode_signed_checkpoint,
+    encode_retained_event,
     encode_roster_history,
     encode_signed_checkpoint,
 };

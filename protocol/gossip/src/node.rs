@@ -30,6 +30,7 @@ use ed25519_dalek::{
 };
 use primitives::{
     Event,
+    EventHash,
     NodeId,
     Transaction,
 };
@@ -128,6 +129,10 @@ pub struct GossipNode {
     /// Durable sink for accepted checkpoints, set by the embedding
     /// application (e.g. the `jkaind` daemon). `None` means no persistence.
     checkpoint_sink: Mutex<Option<Arc<dyn CheckpointSink + Send + Sync>>>,
+    /// Durable event-log sink (Phase 8): every freshly inserted event is
+    /// appended, ordering updates and roster-history changes are recorded,
+    /// and prunes are mirrored. `None` means no event persistence.
+    event_sink: Mutex<Option<Arc<dyn storage::EventSink + Send + Sync>>>,
 }
 
 impl GossipNode {
@@ -169,6 +174,7 @@ impl GossipNode {
             needs_reconnect: AtomicBool::new(false),
             pending_transactions: Mutex::new(VecDeque::new()),
             checkpoint_sink: Mutex::new(None),
+            event_sink: Mutex::new(None),
         }
     }
 
@@ -245,6 +251,35 @@ impl GossipNode {
     /// is allowed but unusual.
     pub async fn set_checkpoint_sink(&self, sink: Arc<dyn CheckpointSink + Send + Sync>) {
         *self.checkpoint_sink.lock().await = Some(sink);
+    }
+
+    /// Registers `sink` as the durable event-log destination. It is invoked
+    /// on every fresh event insert, on ordering/roster-history changes, and
+    /// on graph prunes, so a restarting node can rebuild its retained graph
+    /// from the log. Replacing the sink at runtime is allowed but unusual.
+    pub async fn set_event_sink(&self, sink: Arc<dyn storage::EventSink + Send + Sync>) {
+        *self.event_sink.lock().await = Some(sink);
+    }
+
+    /// Appends every freshly inserted event in `fresh` to the durable event
+    /// log (Phase 8), reading each event's record metadata from the graph.
+    /// Called right after insertion, before any pruning can remove the
+    /// events, so the log and the live graph stay in lockstep.
+    async fn log_fresh_inserts(&self, fresh: &[EventHash]) {
+        let sink = self.event_sink.lock().await.clone();
+        let Some(sink) = sink else { return };
+        let hg = self.hashgraph.lock().await;
+        for hash in fresh {
+            if let Some(record) = hg.get(hash) {
+                sink.append(&consensus::RetainedEvent {
+                    event: record.event().clone(),
+                    seq: record.seq(),
+                    round: record.round(),
+                    ancestor_seqs: record.ancestor_seqs().to_vec(),
+                    round_received: None,
+                });
+            }
+        }
     }
 
     /// Runs the node: accepts inbound gossip connections and, every
@@ -366,12 +401,15 @@ impl GossipNode {
                     }
                     outbound.remove(&peer.node_id);
                 }
-                Ok(()) => {
+                Ok(fresh) => {
                     consecutive_failures = 0;
-                    // Piggyback any pending checkpoint signatures on this sync
-                    // round (Phase 3). Sigs are re-sent on every successful sync
-                    // until the round's checkpoint is accepted — the peer that
-                    // needs one the most is exactly the one that fell behind.
+                    // Append every freshly inserted event to the durable log
+                    // (Phase 8), then piggyback any pending checkpoint
+                    // signatures on this sync round (Phase 3). Sigs are
+                    // re-sent on every successful sync until the round's
+                    // checkpoint is accepted — the peer that needs one the
+                    // most is exactly the one that fell behind.
+                    self.log_fresh_inserts(fresh).await;
                     self.gossip_checkpoint_sigs(transport).await;
                 }
             }
@@ -434,6 +472,20 @@ impl GossipNode {
                 })
                 .collect()
         };
+
+        // Phase A.5: record each newly finalized event's ordering in the
+        // durable log (Phase 8) so a later replay reproduces `roundReceived`
+        // exactly instead of re-deriving it. Filtered by the same watermark
+        // `bucket_finalized` uses, so each event's ordering is written once.
+        let sink = self.event_sink.lock().await.clone();
+        if let Some(sink) = &sink {
+            let processed = self.activation.lock().await.processed_through_round;
+            for (event, rr) in &finalized {
+                if *rr > processed {
+                    sink.set_round_received(&event.hash(), *rr);
+                }
+            }
+        }
 
         if !finalized.is_empty() {
             // Phase B: execute finalized events one round at a time,
@@ -527,6 +579,18 @@ impl GossipNode {
                         {
                             let mut hg = self.hashgraph.lock().await;
                             hg.add_member(node, activation_round, new_registry);
+                        }
+
+                        // Persist the extended roster history (Phase 8) so a
+                        // future restart can replay the log and verify each
+                        // event against the roster active at its birth round.
+                        let roster_bytes = {
+                            let hg = self.hashgraph.lock().await;
+                            consensus::encode_roster_history(hg.roster_history())
+                        };
+                        let sink = self.event_sink.lock().await.clone();
+                        if let Some(sink) = &sink {
+                            sink.set_roster_history(&roster_bytes);
                         }
 
                         // Keep the event-verification registry in sync so the new
@@ -714,8 +778,17 @@ impl GossipNode {
             let mut snapshots = self.state_snapshots.lock().await;
             snapshots.retain(|&snap_round, _| snap_round >= prune_before_round);
         }
-        let mut hg = self.hashgraph.lock().await;
-        hg.prune_before_round(prune_before_round);
+        let pruned = {
+            let mut hg = self.hashgraph.lock().await;
+            hg.prune_before_round(prune_before_round)
+        };
+        // Mirror the in-memory prune in the durable log (Phase 8) and make
+        // everything up to this checkpoint durable.
+        let sink = self.event_sink.lock().await.clone();
+        if let Some(sink) = &sink {
+            sink.prune(&pruned);
+            sink.flush();
+        }
     }
 
     /// Feeds an accepted checkpoint plus its state snapshot to the registered
@@ -839,8 +912,13 @@ impl GossipNode {
                 }
                 Frame::Event(event) => {
                     let registry = self.registry.lock().await.clone();
-                    if insert_verified(&self.hashgraph, &registry, event).await.is_err() {
-                        return;
+                    match insert_verified(&self.hashgraph, &registry, event).await {
+                        Ok(fresh) => {
+                            if let Some(hash) = fresh {
+                                self.log_fresh_inserts(&[hash]).await;
+                            }
+                        }
+                        Err(_) => return,
                     }
                 }
                 Frame::CheckpointSig(sig) => {
@@ -898,6 +976,7 @@ impl GossipNode {
     async fn apply_checkpoint(&self, response: ReconnectResponse) -> bool {
         let checkpoint = &response.signed_checkpoint;
         let cp_round = checkpoint.payload.round;
+        let sink = self.event_sink.lock().await.clone();
 
         // 1. State bytes must hash to the committed state_hash. The teacher
         //    serves the state exactly as it stood at the checkpoint round, so
@@ -995,11 +1074,22 @@ impl GossipNode {
                     eprintln!("reconnect: retained event rejected: {e}");
                     return false;
                 }
+                if let Some(sink) = &sink {
+                    sink.append(retained);
+                }
             }
             // Rounds the teacher already finalized stay finalized here, so
             // this node keeps producing matching checkpoints instead of
             // re-deciding history it holds.
             hg.mark_decided_through(response.decided_round);
+        }
+
+        // Persist the roster history (Phase 8) so a future restart can
+        // replay the log and verify each event against the roster active at
+        // its birth round — regardless of whether this node learned the
+        // history from a peer or from its own log.
+        if let Some(sink) = &sink {
+            sink.set_roster_history(&response.roster_history_bytes);
         }
 
         // 6. The live verification registry mirrors the checkpoint roster.

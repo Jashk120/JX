@@ -200,19 +200,19 @@ separate Go project) is downstream of this phase.
 
 ### Fjall (LSM) event log
 
-- [ ] Fjall-backed append-only event log: every verified event appended on
+- [x] Fjall-backed append-only event log: every verified event appended on
       insert, keyed by `EventHash`, decoupled from `.cp`/`.snap`
-- [ ] Two-partition layout: `by_seq` (monotonic `u64` BE key → record,
+- [x] Two-partition layout: `by_seq` (monotonic `u64` BE key → record,
       preserving insertion = topological order for replay) and `by_hash`
       (`EventHash` → record, for dedup/lookup)
-- [ ] Replay-on-startup: rebuild the graph from the local log instead of
+- [x] Replay-on-startup: rebuild the graph from the local log instead of
       `request_reconnect()` — a node recovers independently, no live peer
-- [ ] Full-rebuild replay verifies each event against the roster active at
+- [x] Full-rebuild replay verifies each event against the roster active at
       its birth round (roster/key verification exercised at graph rebuild
       time, not just at checkpoint load)
-- [ ] The log stores the complete event set, so any program can rebuild the
+- [x] The log stores the complete event set, so any program can rebuild the
       DAG from it
-- [ ] Log pruning mirroring `RETENTION_ROUNDS` (bounded disk; history older
+- [x] Log pruning mirroring `RETENTION_ROUNDS` (bounded disk; history older
       than the prune floor is covered by the checkpoint)
 
 ### Merkle tree state
@@ -245,11 +245,18 @@ separate Go project) is downstream of this phase.
 - [ ] Deterministic parallelism: result independent of thread scheduling
 - [ ] Parallel signature verification
 
-> **Phase 8 status**: planned — nothing implemented yet. The event log and
-> the event/record stream files are the consensus-side prerequisites for the
-> mirror node; the Merkle tree turns the `.cp` commitment into the
-> threshold-signed state root a mirror can verify. The `.cp` is already
-> threshold-signed (2/3+ of the roster; both nodes in a 2-node cluster).
+> **Phase 8 status**: the Fjall event log (point 1) is implemented — a new
+> `protocol/storage` crate appends every verified event into a two-keyspace
+> Fjall database (`by_seq` insertion order for replay, `by_hash` for
+> dedup/lookup), records `roundReceived` as events are finalized, persists the
+> roster history on membership change, and prunes in lockstep with the
+> in-memory graph (`RETENTION_ROUNDS`). A restarting node replays the log to
+> rebuild its retained graph independently — each record signature-verified
+> against the roster active at its birth round — so `request_reconnect()` is
+> only a fallback for pre-event-log data. Verified with `cargo test`: codec
+> round-trips, append dedup, replay equivalence, prune, and a no-peer restart
+> integration test. Remaining in Phase 8: Merkle state (point 2), event/
+> record stream files (point 3), and parallel execution (point 4).
 
 ---
 

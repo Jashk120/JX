@@ -767,7 +767,11 @@ impl Hashgraph {
     /// # Panics
     /// Panics if `prune_before_round` is not below `next_round_to_order`
     /// (i.e. you cannot prune a round that has not been ordered yet).
-    pub fn prune_before_round(&mut self, prune_before_round: u64) {
+    ///
+    /// Returns the set of pruned event hashes so a caller can mirror the
+    /// same prune decision in secondary storage (e.g. the durable event
+    /// log, Phase 8).
+    pub fn prune_before_round(&mut self, prune_before_round: u64) -> Vec<EventHash> {
         assert!(
             prune_before_round < self.next_round_to_order,
             "cannot prune a round that has not been ordered yet: \
@@ -784,7 +788,7 @@ impl Hashgraph {
             .map(|(&hash, _)| hash)
             .collect();
         if pruned.is_empty() {
-            return;
+            return Vec::new();
         }
 
         // Border anchors: the parent of a live event (round >= threshold, or
@@ -829,6 +833,7 @@ impl Hashgraph {
         }
 
         self.roster_history.prune_before(threshold);
+        pruned.into_iter().collect()
     }
 
     /// Phase 4 — the highest round that has any ordered event, or 0 if none.

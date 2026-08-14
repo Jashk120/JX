@@ -67,12 +67,13 @@ use node::control::{
     ControlRequest,
     StatusReport,
 };
-use node::restart::latest_for_restart;
+use node::restart::latest_for_restart_with_log;
 use node::storage::Storage;
 use primitives::NodeId;
 use rand::RngCore;
 use rand::rngs::OsRng;
 use state::Op;
+use storage::EventLog;
 use tokio::net::{
     TcpListener,
     UnixListener,
@@ -450,6 +451,7 @@ async fn run_node(opts: &RunOptions) -> Result<()> {
     let registry = cluster.registry();
     let peers: Vec<PeerInfo> = cluster.peers_for(NodeId::new(opts.node_id));
     let storage = Storage::new(&opts.data_dir)?;
+    let event_log = Arc::new(EventLog::open(&opts.data_dir)?);
 
     match reconnect_port {
         Some(port) => eprintln!(
@@ -465,12 +467,23 @@ async fn run_node(opts: &RunOptions) -> Result<()> {
     }
 
     // Restart recovery: restore from the last persisted checkpoint if one
-    // exists; the node then reconnects from a live peer for the event window.
-    let node = match latest_for_restart(&storage, opts.node_id, &signing_key.verifying_key())? {
+    // exists, replaying the retained graph from the local event log (Phase 8)
+    // so the node recovers independently — no live peer needed. When the log
+    // is empty (pre-event-log data, or a checkpoint without logged events),
+    // fall back to reconnecting from a live peer for the event window.
+    let node = match latest_for_restart_with_log(
+        &storage,
+        &event_log,
+        opts.node_id,
+        &signing_key.verifying_key(),
+    )? {
         Some(response) => {
+            let replay_has_events = !response.retained.is_empty();
             eprintln!(
-                "[jkaind] restoring from persisted checkpoint at round {}",
-                response.signed_checkpoint.payload.round
+                "[jkaind] restoring from persisted checkpoint at round {} ({} retained events \
+                 replayed from the event log)",
+                response.signed_checkpoint.payload.round,
+                response.retained.len()
             );
             let node = GossipNode::from_checkpoint(
                 NodeId::new(opts.node_id),
@@ -482,7 +495,9 @@ async fn run_node(opts: &RunOptions) -> Result<()> {
                 response,
             )
             .await?;
-            node.request_reconnect();
+            if !replay_has_events {
+                node.request_reconnect();
+            }
             node
         }
         None => {
@@ -501,6 +516,16 @@ async fn run_node(opts: &RunOptions) -> Result<()> {
     let node = Arc::new(node);
 
     node.set_checkpoint_sink(Arc::new(storage)).await;
+    node.set_event_sink(event_log.clone()).await;
+    // Keep the current roster history durable (Phase 8) so a future restart
+    // can replay the log and verify each event against the roster active at
+    // its birth round. Idempotent — membership changes overwrite it via the
+    // node's own activation path.
+    let roster_bytes = {
+        let hg = node.hashgraph.lock().await;
+        consensus::encode_roster_history(hg.roster_history())
+    };
+    event_log.set_roster_history(&roster_bytes)?;
 
     let gossip_listener = std::net::TcpListener::bind(("0.0.0.0", gossip_port))
         .with_context(|| format!("binding gossip port {gossip_port}"))?;

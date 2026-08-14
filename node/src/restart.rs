@@ -10,10 +10,15 @@
 //! which is acceptable for the smoke-test scope of a static 2-node cluster.
 
 use anyhow::{
+    Context,
     Result,
     bail,
 };
-use crypto::RosterHistory;
+use crypto::{
+    Hashable,
+    RosterHistory,
+    Verifiable,
+};
 use ed25519_dalek::VerifyingKey;
 use primitives::NodeId;
 use sha2::{
@@ -33,25 +38,17 @@ pub fn verify_persisted(state: &PersistedCheckpoint) -> bool {
     computed.as_slice() == state.checkpoint.payload.state_hash.as_slice()
 }
 
-/// Builds the [`gossip::ReconnectResponse`] that reconstructs a node from a
-/// verified persisted checkpoint. The roster history is seeded from the
-/// checkpoint's embedded roster snapshot (static cluster scope), `retained`
-/// is empty (the graph is not persisted), and `decided_round` is the
-/// checkpoint round — `Hashgraph::from_checkpoint` already marks everything
-/// at or below it decided.
-///
 /// The persisted roster must agree with the node's current `expected_key`:
 /// restoring a checkpoint whose roster holds a different key for this node
 /// would make every event it signs fail verification and silently stall
 /// consensus (a classic `jkaind init --force` key-rotation footgun). The two
 /// failure modes are distinguished so the operator knows whether to restore
 /// the original secret or wipe `data/` and re-genesis.
-pub fn build_reconnect_response(
-    state: PersistedCheckpoint,
+fn check_own_key(
+    checkpoint: &consensus::SignedCheckpoint,
     node_id: u64,
     expected_key: &VerifyingKey,
-) -> Result<gossip::ReconnectResponse> {
-    let checkpoint = &state.checkpoint;
+) -> Result<()> {
     match checkpoint.payload.roster_snapshot.key_for(&NodeId::new(node_id)) {
         Err(_) => {
             bail!(
@@ -68,6 +65,22 @@ pub fn build_reconnect_response(
         }
         Ok(_) => {}
     }
+    Ok(())
+}
+
+/// Builds the [`gossip::ReconnectResponse`] that reconstructs a node from a
+/// verified persisted checkpoint. The roster history is seeded from the
+/// checkpoint's embedded roster snapshot (static cluster scope), `retained`
+/// is empty (the graph is not persisted), and `decided_round` is the
+/// checkpoint round — `Hashgraph::from_checkpoint` already marks everything
+/// at or below it decided.
+pub fn build_reconnect_response(
+    state: PersistedCheckpoint,
+    node_id: u64,
+    expected_key: &VerifyingKey,
+) -> Result<gossip::ReconnectResponse> {
+    let checkpoint = &state.checkpoint;
+    check_own_key(checkpoint, node_id, expected_key)?;
     let roster_history = RosterHistory::new(checkpoint.payload.roster_snapshot.clone());
     let roster_history_bytes = consensus::encode_roster_history(&roster_history);
     Ok(gossip::ReconnectResponse {
@@ -76,6 +89,55 @@ pub fn build_reconnect_response(
         roster_history_bytes,
         decided_round: checkpoint.payload.round,
         retained: Vec::new(),
+    })
+}
+
+/// Builds the [`gossip::ReconnectResponse`] that reconstructs a node from a
+/// verified persisted checkpoint **plus the durable event log** (Phase 8).
+///
+/// The retained graph is replayed from the local log instead of being
+/// fetched from a live peer, so a node recovers independently. Each replayed
+/// record is signature-verified against the roster active at its birth round
+/// (the persisted roster history, falling back to the checkpoint's single
+/// snapshot when no history was ever written — e.g. a static cluster), so a
+/// corrupt or tampered log is surfaced at rebuild time rather than trusted.
+///
+/// `decided_round` is the checkpoint round; the replayed records already
+/// carry their `roundReceived` (recorded by the previous run), so ordering
+/// is reproduced exactly instead of being re-derived.
+pub fn replay_response(
+    state: PersistedCheckpoint,
+    node_id: u64,
+    expected_key: &VerifyingKey,
+    event_log: &storage::EventLog,
+) -> Result<gossip::ReconnectResponse> {
+    let checkpoint = &state.checkpoint;
+    check_own_key(checkpoint, node_id, expected_key)?;
+    let roster_history = match event_log.roster_history()? {
+        Some(bytes) => consensus::decode_roster_history(&bytes)
+            .with_context(|| "decoding persisted roster history from the event log")?,
+        None => RosterHistory::new(checkpoint.payload.roster_snapshot.clone()),
+    };
+
+    let mut retained = Vec::new();
+    for record in event_log.replay()? {
+        let roster = roster_history.roster_for_round(record.round);
+        record.event.clone().verify(roster).with_context(|| {
+            format!(
+                "replayed event {:?} failed verification against the roster active at its \
+                     birth round",
+                record.event.hash()
+            )
+        })?;
+        retained.push(record);
+    }
+
+    Ok(gossip::ReconnectResponse {
+        signed_checkpoint: checkpoint.clone(),
+        state_bytes: state.state_bytes,
+        roster_history_bytes: consensus::encode_roster_history(&roster_history),
+        decided_round: checkpoint.payload.round,
+        retained,
     })
 }
 
@@ -102,6 +164,28 @@ pub fn latest_for_restart(
     Ok(Some(response))
 }
 
+/// Like [`latest_for_restart`], but rebuilds the retained graph from the
+/// durable event log (Phase 8) instead of leaving it to be fetched from a
+/// live peer. Returns `Ok(None)` when the node has nothing persisted yet.
+pub fn latest_for_restart_with_log(
+    storage: &crate::storage::Storage,
+    event_log: &storage::EventLog,
+    node_id: u64,
+    expected_key: &VerifyingKey,
+) -> Result<Option<gossip::ReconnectResponse>> {
+    let Some(state) = storage.latest()? else {
+        return Ok(None);
+    };
+    if !verify_persisted(&state) {
+        bail!(
+            "persisted checkpoint for round {} failed verification (quorum or state hash)",
+            state.checkpoint.payload.round
+        );
+    }
+    let response = replay_response(state, node_id, expected_key, event_log)?;
+    Ok(Some(response))
+}
+
 #[cfg(test)]
 mod tests {
     use consensus::{
@@ -109,7 +193,10 @@ mod tests {
         CheckpointPayload,
         SignedCheckpoint,
     };
-    use crypto::MembershipRegistry;
+    use crypto::{
+        MembershipRegistry,
+        Signable,
+    };
     use ed25519_dalek::{
         Signer,
         SigningKey,
@@ -208,5 +295,79 @@ mod tests {
             err.to_string().contains("key is not in the checkpoint roster"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn replay_verifies_each_event_against_the_roster_at_its_birth_round() {
+        // A checkpoint committing nodes 1 and 2 at round 1, an empty roster
+        // history (so replay falls back to the checkpoint snapshot), and a
+        // log holding an event signed by a creator that is NOT in that
+        // roster: the replay must refuse the corrupt log.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let event_log = storage::EventLog::open(tmp.path()).expect("event log opens");
+
+        let state_bytes = vec![0u8; 32];
+        let state_hash: [u8; 32] = Sha256::digest(&state_bytes).into();
+        let checkpoint = quorum_checkpoint(1, state_hash, &[1, 2]);
+        let state = PersistedCheckpoint { checkpoint, state_bytes };
+
+        let bogus = primitives::UnsignedEvent::new(
+            primitives::NodeId::new(9),
+            None,
+            None,
+            primitives::Timestamp::new(1),
+            Vec::new(),
+        )
+        .finalize(primitives::Signature::new([9; 64]));
+        event_log
+            .append(&consensus::RetainedEvent {
+                event: bogus,
+                seq: 1,
+                round: 1,
+                ancestor_seqs: vec![1],
+                round_received: None,
+            })
+            .expect("append");
+
+        let key = SigningKey::from_bytes(&[1u8; 32]).verifying_key();
+        let err = replay_response(state, 1, &key, &event_log).expect_err("corrupt log must fail");
+        assert!(err.to_string().contains("failed verification"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn replay_returns_the_logged_events_when_all_verify() {
+        // Same setup, but the logged event is genuinely signed by a member
+        // of the roster active at its birth round — the replay accepts it.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let event_log = storage::EventLog::open(tmp.path()).expect("event log opens");
+
+        let state_bytes = vec![0u8; 32];
+        let state_hash: [u8; 32] = Sha256::digest(&state_bytes).into();
+        let checkpoint = quorum_checkpoint(1, state_hash, &[1, 2]);
+        let state = PersistedCheckpoint { checkpoint, state_bytes };
+
+        let key1 = SigningKey::from_bytes(&[1u8; 32]);
+        let valid = primitives::UnsignedEvent::new(
+            primitives::NodeId::new(1),
+            None,
+            None,
+            primitives::Timestamp::new(1),
+            Vec::new(),
+        )
+        .sign(&key1);
+        event_log
+            .append(&consensus::RetainedEvent {
+                event: valid,
+                seq: 1,
+                round: 1,
+                ancestor_seqs: vec![1],
+                round_received: Some(1),
+            })
+            .expect("append");
+
+        let response =
+            replay_response(state, 1, &key1.verifying_key(), &event_log).expect("replays");
+        assert_eq!(response.retained.len(), 1);
+        assert_eq!(response.retained[0].round_received, Some(1));
     }
 }

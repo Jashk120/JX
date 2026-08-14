@@ -9,6 +9,7 @@ crypto         = { workspace = true }
 consensus      = { workspace = true }
 gossip         = { workspace = true }
 state          = { workspace = true }
+storage        = { workspace = true }
 tokio          = { workspace = true }
 serde          = { workspace = true }
 serde_json     = { workspace = true }

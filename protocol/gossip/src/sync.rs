@@ -8,6 +8,7 @@ use crypto::{
 use ed25519_dalek::SigningKey;
 use primitives::{
     Event,
+    EventHash,
     NodeId,
     Timestamp,
     Transaction,
@@ -34,6 +35,9 @@ use crate::transport::SyncTransport;
 /// 3. Create our own event — `self_parent` our last, `other_parent` the
 ///    peer's last, payload from `payload` — insert it, and push it back on
 ///    the same stream.
+///
+/// Returns the hashes of every event that was freshly inserted this round,
+/// so the caller can append them to the durable event log (Phase 8).
 pub async fn run_sync(
     transport: &mut (impl SyncTransport + Send),
     hashgraph: &Arc<Mutex<consensus::Hashgraph>>,
@@ -42,7 +46,7 @@ pub async fn run_sync(
     signing_key: &SigningKey,
     peer_id: NodeId,
     payload: Vec<Transaction>,
-) -> Result<()> {
+) -> Result<Vec<EventHash>> {
     let known = {
         let hashgraph = hashgraph.lock().await;
         known_summary(&hashgraph, registry)
@@ -68,8 +72,11 @@ pub async fn run_sync(
         }
     };
 
+    let mut fresh = Vec::new();
     for event in response.events {
-        insert_verified(hashgraph, registry, event).await?;
+        if let Some(hash) = insert_verified(hashgraph, registry, event).await? {
+            fresh.push(hash);
+        }
     }
 
     let (self_parent, other_parent) = {
@@ -81,25 +88,28 @@ pub async fn run_sync(
 
     let unsigned = UnsignedEvent::new(node_id, self_parent, other_parent, now_timestamp(), payload);
     let event = unsigned.sign(signing_key);
-    insert_verified(hashgraph, registry, event.clone()).await?;
+    if let Some(hash) = insert_verified(hashgraph, registry, event.clone()).await? {
+        fresh.push(hash);
+    }
     transport.send_frame(&Frame::Event(event)).await?;
 
-    Ok(())
+    Ok(fresh)
 }
 
 /// Verifies an inbound event against the registry and inserts it, treating
 /// `AlreadyPresent` as a benign no-op (events can arrive via concurrent
-/// syncs).
+/// syncs). Returns the hash of a freshly inserted event, or `None` for a
+/// duplicate.
 pub(crate) async fn insert_verified(
     hashgraph: &Arc<Mutex<consensus::Hashgraph>>,
     registry: &MembershipRegistry,
     event: Event,
-) -> Result<()> {
+) -> Result<Option<EventHash>> {
     let verified = event.verify(registry)?;
     let mut hashgraph = hashgraph.lock().await;
     match hashgraph.insert(verified) {
-        Ok(_) => Ok(()),
-        Err(consensus::ConsensusError::AlreadyPresent(_)) => Ok(()),
+        Ok(hash) => Ok(Some(hash)),
+        Err(consensus::ConsensusError::AlreadyPresent(_)) => Ok(None),
         Err(error) => Err(error.into()),
     }
 }

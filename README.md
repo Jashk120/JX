@@ -12,6 +12,7 @@ protocol/     consensus-critical network layer
   primitives/   value types (zero dependencies)
   crypto/       hashing, signing, membership
   consensus/    virtual-voting Hashgraph: rounds, fame, order, checkpoints
+  storage/      Fjall-backed durable event log + roster history
   gossip/       pinned-TLS gossip network + GossipNode runtime
 executor/     deterministic execution layer
   state/        pure executor over the consensus order

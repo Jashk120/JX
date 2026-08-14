@@ -6,6 +6,7 @@ members = [
     "protocol/crypto",
     "protocol/consensus",
     "protocol/gossip",
+    "protocol/storage",
     "executor/state",
     "node",
 ]
@@ -25,6 +26,7 @@ primitives = { path = "protocol/primitives" }
 crypto = { path = "protocol/crypto" }
 consensus = { path = "protocol/consensus" }
 gossip = { path = "protocol/gossip" }
+storage = { path = "protocol/storage" }
 state = { path = "executor/state" }
 sha2 = "0.10"
 rand = "0.8"
