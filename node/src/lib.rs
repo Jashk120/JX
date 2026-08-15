@@ -8,6 +8,7 @@
 
 pub mod config;
 pub mod control;
+pub mod format;
 pub mod restart;
 pub mod storage;
 
@@ -17,9 +18,16 @@ pub use control::{
     ControlResponse,
     StatusReport,
 };
+pub use format::{
+    CURRENT_FORMAT,
+    check_or_init_data_dir,
+};
 pub use restart::{
     build_reconnect_response,
+    latest_for_restart,
     latest_for_restart_with_log,
     replay_response,
+    restore_state,
+    verify_persisted,
 };
 pub use storage::Storage;

@@ -142,8 +142,12 @@ orders events, and accepts checkpoints, which are written under
 `/var/lib/jkaind/checkpoints/`:
 
 ```bash
-sudo ls -l /var/lib/jkaind/checkpoints/   # checkpoint-<round>.cp / .snap files
+sudo ls -l /var/lib/jkaind/checkpoints/   # checkpoint-<round>.cp files
 ```
+
+The per-round state snapshot that hashes to each checkpoint's `state_hash` is
+stored in the Fjall state database's `snap` keyspace (`/var/lib/jkaind/statedb/`),
+not as a `.snap` file.
 
 ## 7. Restart / recovery
 

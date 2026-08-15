@@ -19,7 +19,10 @@ use std::sync::atomic::{
 use std::time::Duration;
 
 use common::*;
-use gossip::GossipNode;
+use gossip::{
+    GossipNode,
+    SyncTiming,
+};
 use node::restart::latest_for_restart_with_log;
 use node::storage::Storage;
 use primitives::{
@@ -29,6 +32,7 @@ use primitives::{
 use state::{
     Op,
     State,
+    StateDb,
 };
 use storage::EventLog;
 use tokio::net::TcpListener;
@@ -37,16 +41,37 @@ use tokio::time::{
     timeout,
 };
 
-/// Waits until the persisted checkpoint's snapshot includes `key`, so a
+/// Decodes the canonical `State::to_bytes()` snapshot into a `State` over a
+/// fresh tempdir keyspace (kept readable by the `Arc<Keyspace>` the state
+/// holds).
+fn state_from_bytes(bytes: &[u8]) -> State {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = StateDb::open(dir.path()).expect("state db opens");
+    State::from_bytes(db.state_keyspace(), bytes).expect("state decodes")
+}
+
+/// Waits until the persisted checkpoint's state snapshot includes `key`, so a
 /// restart is guaranteed to resume with the submitted state already present.
-async fn wait_for_persisted_state(storage: &Storage, key: &[u8], deadline: Duration) {
+/// The snapshot is read from the state database's `snap` keyspace.
+async fn wait_for_persisted_state(
+    storage: &Storage,
+    state_db: &StateDb,
+    key: &[u8],
+    deadline: Duration,
+) {
     timeout(deadline, async {
         loop {
             let Some(persisted) = storage.latest().expect("latest") else {
                 sleep(Duration::from_millis(25)).await;
                 continue;
             };
-            let snapshot = State::from_bytes(&persisted.state_bytes).expect("state decodes");
+            let Some(bytes) =
+                state_db.snapshot_for(persisted.checkpoint.payload.round).expect("snapshot")
+            else {
+                sleep(Duration::from_millis(25)).await;
+                continue;
+            };
+            let snapshot = state_from_bytes(&bytes);
             if snapshot.get(key).is_some() {
                 return;
             }
@@ -106,7 +131,7 @@ async fn restart_replays_retained_graph_from_the_event_log_without_a_peer() {
     node1.submit_transaction(tx).await;
     wait_for_state(&node1, b"k", DEADLINE).await;
     let storage1 = Storage::new(&data1).expect("storage reopens");
-    wait_for_persisted_state(&storage1, b"k", DEADLINE).await;
+    wait_for_persisted_state(&storage1, &net.state_dbs[0], b"k", DEADLINE).await;
 
     // Flush any pending ordering updates into the log, then stop node 1.
     node1.process_finalized_rounds().await;
@@ -126,12 +151,14 @@ async fn restart_replays_retained_graph_from_the_event_log_without_a_peer() {
     drop(event_log1);
 
     // Rebuild node 1 purely from disk — checkpoint + event log — with no
-    // live peer and no `request_reconnect`.
+    // live peer and no `request_reconnect`. The state snapshot comes from the
+    // state database's `snap` keyspace.
     let event_log1 = Arc::new(EventLog::open(&data1).expect("event log reopens"));
     let expected_key = ed25519_dalek::SigningKey::from_bytes(&consensus_seed(1)).verifying_key();
-    let response = latest_for_restart_with_log(&storage1, &event_log1, 1, &expected_key)
-        .expect("restart data loads")
-        .expect("a restart response exists");
+    let response =
+        latest_for_restart_with_log(&storage1, &event_log1, &net.state_dbs[0], 1, &expected_key)
+            .expect("restart data loads")
+            .expect("a restart response exists");
     assert!(!response.retained.is_empty(), "the log must carry the retained window");
     assert_eq!(
         response.retained.len(),
@@ -145,9 +172,9 @@ async fn restart_replays_retained_graph_from_the_event_log_without_a_peer() {
             ed25519_dalek::SigningKey::from_bytes(&consensus_seed(1)),
             net.identities[0].clone(),
             net.peers_for(0),
-            SYNC_INTERVAL,
-            SYNC_TIMEOUT,
+            SyncTiming::new(SYNC_INTERVAL, SYNC_TIMEOUT),
             response,
+            net.state_dbs[0].clone(),
         )
         .await
         .expect("node rebuilt from checkpoint + event log"),
@@ -156,9 +183,14 @@ async fn restart_replays_retained_graph_from_the_event_log_without_a_peer() {
 
     // The executor state is restored exactly from the checkpoint snapshot.
     let persisted = storage1.latest().expect("latest").expect("a persisted checkpoint");
-    let expected_state = State::from_bytes(&persisted.state_bytes).expect("state decodes");
+    let expected_state = state_from_bytes(
+        &net.state_dbs[0]
+            .snapshot_for(persisted.checkpoint.payload.round)
+            .expect("snapshot")
+            .expect("a snapshot for the checkpoint round"),
+    );
     assert_eq!(node1b.executor_state().await, expected_state);
-    assert_eq!(node1b.executor_state().await.get(b"k"), Some(&b"v"[..]));
+    assert_eq!(node1b.executor_state().await.get(b"k"), Some(b"v".to_vec()));
 
     // The rebuilt graph matches the pre-restart graph exactly — same event
     // set, same ordering — without ever talking to a peer.

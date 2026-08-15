@@ -1,14 +1,13 @@
 //! Phase 3 — signed state checkpoints.
 //!
 //! A [`CheckpointPayload`] is the unsigned commitment every node makes once a
-//! round is decided: the round, the SHA-256 of the deterministic `State`
-//! (`State::to_bytes()`), and the SHA-256 of the canonical roster active at
-//! that round. Each node signs [`CheckpointPayload::signing_bytes`] — a fixed
-//! 72 bytes — and the resulting [`CheckpointSig`]s are gossiped. A
-//! [`CheckpointAccumulator`] collects them per round and yields a
-//! [`SignedCheckpoint`] the first time the signers exceed 2/3 of the roster
-//! active at that round. That accepted form authorises pruning old history
-//! from the live `Hashgraph`.
+//! round is decided: the round, the Merkle root of the deterministic `State`,
+//! and the SHA-256 of the canonical roster active at that round. Each node
+//! signs [`CheckpointPayload::signing_bytes`] — a fixed 72 bytes — and the
+//! resulting [`CheckpointSig`]s are gossiped. A [`CheckpointAccumulator`]
+//! collects them per round and yields a [`SignedCheckpoint`] the first time
+//! the signers exceed 2/3 of the roster active at that round. That accepted
+//! form authorises pruning old history from the live `Hashgraph`.
 
 use std::collections::HashMap;
 
@@ -34,8 +33,8 @@ pub const RETENTION_ROUNDS: u64 = 2;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CheckpointPayload {
     pub round: u64,
-    /// SHA-256 of `State::to_bytes()` as it stood when the round's events
-    /// were finalized.
+    /// The Merkle root of the state as it stood when the round's events were
+    /// finalized.
     pub state_hash: [u8; 32],
     /// SHA-256 of the canonical roster bytes active at `round`.
     pub roster_hash: [u8; 32],

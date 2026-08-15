@@ -41,6 +41,7 @@ use gossip::{
     GossipNode,
     PeerInfo,
     Result,
+    SyncTiming,
     SyncTransport,
     TcpTransport,
     TlsIdentity,
@@ -55,10 +56,6 @@ use primitives::{
     Timestamp,
     Transaction,
     UnsignedEvent,
-};
-use sha2::{
-    Digest,
-    Sha256,
 };
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
@@ -285,8 +282,8 @@ async fn wrong_spki_fingerprint_blocks_sync() {
         registry,
         identity2.clone(),
         Vec::new(),
-        SYNC_INTERVAL,
-        SYNC_TIMEOUT,
+        SyncTiming::new(SYNC_INTERVAL, SYNC_TIMEOUT),
+        temp_state_db(),
     ));
     let stop = Arc::new(AtomicBool::new(false));
     let spawn = node.clone();
@@ -326,8 +323,8 @@ async fn malformed_frame_over_wire_does_not_crash_node() {
         registry_for_ids(&[1, 2]),
         identity2.clone(),
         Vec::new(),
-        SYNC_INTERVAL,
-        SYNC_TIMEOUT,
+        SyncTiming::new(SYNC_INTERVAL, SYNC_TIMEOUT),
+        temp_state_db(),
     ));
     let stop = Arc::new(AtomicBool::new(false));
     let spawn = node.clone();
@@ -402,8 +399,8 @@ async fn tampered_signature_event_rejected_over_wire() {
         registry_for_ids(&[1, 2]),
         identity2.clone(),
         Vec::new(),
-        SYNC_INTERVAL,
-        SYNC_TIMEOUT,
+        SyncTiming::new(SYNC_INTERVAL, SYNC_TIMEOUT),
+        temp_state_db(),
     ));
     let stop = Arc::new(AtomicBool::new(false));
     let spawn = node.clone();
@@ -605,8 +602,8 @@ async fn unreachable_peer_is_skipped_gracefully() {
         registry_for(&keys),
         identities[0].clone(),
         peers_a,
-        SYNC_INTERVAL,
-        SYNC_TIMEOUT,
+        SyncTiming::new(SYNC_INTERVAL, SYNC_TIMEOUT),
+        temp_state_db(),
     ));
     let node_b = Arc::new(GossipNode::new(
         NodeId::new(2),
@@ -614,8 +611,8 @@ async fn unreachable_peer_is_skipped_gracefully() {
         registry_for(&keys),
         identities[1].clone(),
         peers_b,
-        SYNC_INTERVAL,
-        SYNC_TIMEOUT,
+        SyncTiming::new(SYNC_INTERVAL, SYNC_TIMEOUT),
+        temp_state_db(),
     ));
 
     let stop_a = Arc::new(AtomicBool::new(false));
@@ -719,8 +716,8 @@ async fn reconnect_joining_node_skips_full_replay() {
             registry.clone(),
             identities[i].clone(),
             peers,
-            SYNC_INTERVAL,
-            SYNC_TIMEOUT,
+            SyncTiming::new(SYNC_INTERVAL, SYNC_TIMEOUT),
+            temp_state_db(),
         ));
         let stop = Arc::new(AtomicBool::new(false));
         let spawn = node.clone();
@@ -768,9 +765,9 @@ async fn reconnect_joining_node_skips_full_replay() {
             keys[3].1.clone(),
             identity4,
             peers4,
-            SYNC_INTERVAL,
-            SYNC_TIMEOUT,
+            SyncTiming::new(SYNC_INTERVAL, SYNC_TIMEOUT),
             response,
+            temp_state_db(),
         )
         .await
         .expect("node built from checkpoint"),
@@ -895,8 +892,8 @@ async fn reconnect_existing_node_catches_up() {
             registry.clone(),
             identities[i].clone(),
             peers,
-            SYNC_INTERVAL,
-            SYNC_TIMEOUT,
+            SyncTiming::new(SYNC_INTERVAL, SYNC_TIMEOUT),
+            temp_state_db(),
         ));
         let stop = Arc::new(AtomicBool::new(false));
         let spawn = node.clone();
@@ -928,8 +925,8 @@ async fn reconnect_existing_node_catches_up() {
         registry.clone(),
         identity4,
         peers4,
-        SYNC_INTERVAL,
-        SYNC_TIMEOUT,
+        SyncTiming::new(SYNC_INTERVAL, SYNC_TIMEOUT),
+        temp_state_db(),
     ));
     let stop4 = Arc::new(AtomicBool::new(false));
     let spawn4 = node4.clone();
@@ -1127,16 +1124,16 @@ async fn reconnect_serves_state_at_checkpoint_round() {
     // Regression for two reconnect bugs. Before this fix the teacher served
     // its LIVE state while the checkpoint's `state_hash` committed the state
     // at the checkpoint round, so any finalized transaction in
-    // `(cp_round, tip]` made `Sha256(state) != state_hash` and every
-    // reconnect failed; even with that check weakened, the learner replayed
-    // the retained window onto a state that already contained it (double
-    // execution). The earlier reconnect tests never exercised either path
-    // because their clusters only ever produced empty-payload events, so the
-    // state never changed. This test uses a decided graph whose transactions
-    // land in a later round than the checkpoint, and asserts (a) the served
-    // state hashes to the committed `state_hash`, and (b) after the learner
-    // loads the checkpoint and replays the retained window, its state at the
-    // replay-window top matches the teacher's.
+    // `(cp_round, tip]` made the rebuilt root diverge from `state_hash` and
+    // every reconnect failed; even with that check weakened, the learner
+    // replayed the retained window onto a state that already contained it
+    // (double execution). The earlier reconnect tests never exercised either
+    // path because their clusters only ever produced empty-payload events, so
+    // the state never changed. This test uses a decided graph whose
+    // transactions land in a later round than the checkpoint, and asserts (a)
+    // the served state rebuilds to the committed `state_hash`, and (b) after
+    // the learner loads the checkpoint and replays the retained window, its
+    // state at the replay-window top matches the teacher's.
     let registry = registry_for_ids(&[1, 2, 3, 4]);
 
     // Node 1 holds the decided clique and serves reconnects.
@@ -1151,8 +1148,8 @@ async fn reconnect_serves_state_at_checkpoint_round() {
         registry.clone(),
         identity1.clone(),
         Vec::new(),
-        SYNC_INTERVAL,
-        SYNC_TIMEOUT,
+        SyncTiming::new(SYNC_INTERVAL, SYNC_TIMEOUT),
+        temp_state_db(),
     ));
 
     for event in build_stateful_clique() {
@@ -1184,7 +1181,7 @@ async fn reconnect_serves_state_at_checkpoint_round() {
             .await;
     });
 
-    // Fetch the checkpoint. The served state must hash to the committed
+    // Fetch the checkpoint. The served state must rebuild to the committed
     // state_hash — the direct regression for the "reconnect always fails" bug.
     let node4_id = NodeId::new(4);
     let identity4 = TlsIdentity::from_seed(tls_seed(4), 4).expect("identity");
@@ -1194,9 +1191,11 @@ async fn reconnect_serves_state_at_checkpoint_round() {
         .await
         .expect("fetch checkpoint from node 1");
     assert!(gossip::verify_signed_checkpoint(&response.signed_checkpoint));
+    let rebuilt = state::State::from_bytes(temp_state_db().state_keyspace(), &response.state_bytes)
+        .expect("state decodes");
     assert_eq!(
-        Sha256::digest(&response.state_bytes).as_slice(),
-        response.signed_checkpoint.payload.state_hash.as_slice(),
+        rebuilt.root(),
+        response.signed_checkpoint.payload.state_hash,
         "served state must be the state at the checkpoint round"
     );
     assert_eq!(response.signed_checkpoint.payload.round, cp_round);
@@ -1221,9 +1220,9 @@ async fn reconnect_serves_state_at_checkpoint_round() {
             SigningKey::from_bytes(&consensus_seed(4)),
             identity4,
             Vec::new(),
-            SYNC_INTERVAL,
-            SYNC_TIMEOUT,
+            SyncTiming::new(SYNC_INTERVAL, SYNC_TIMEOUT),
             response,
+            temp_state_db(),
         )
         .await
         .expect("node built from checkpoint"),

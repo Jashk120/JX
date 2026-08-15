@@ -5,15 +5,32 @@ Deterministic transaction execution for JKain.
 Implements Phase 8 of `ROADMAP.md`: a pure executor that consumes events in
 the finalized consensus order produced by `consensus` and folds each
 transaction's payload into a key-value `State`. Depends on `primitives` for
-the value types (`Event`, `Transaction`) and on `consensus` for the
-hashgraph whose `consensus_order` yields the input sequence.
+the value types (`Event`, `Transaction`), on `consensus` for the
+hashgraph whose `consensus_order` yields the input sequence, and on `fjall`
+for the state's LSM backing.
 
 ## Contents
 
-- `State` — the executor's key-value state. A `BTreeMap` from byte string
-  to byte string, mutated only through the pure, deterministic `apply`
-  function and serialized canonically by `to_bytes` (ascending key order,
-  `u32` big-endian length prefixes matching `crypto`'s canonical encoding).
+- `State` — the executor's key-value state. A Fjall LSM partition (raw byte
+  keys to raw byte values, with a write-ahead log) whose entries are mutated
+  only through the deterministic `apply` function and serialized canonically
+  by `to_bytes` (ascending key order, `u32` big-endian length prefixes
+  matching `crypto`'s canonical encoding). A sparse Merkle tree over the same
+  keys is maintained incrementally in memory; its root is `State::root()`,
+  the commitment a checkpoint signs as its `state_hash`.
+- `StateDb` (in `state_db.rs`) — the on-disk state database under
+  `<data>/statedb/`: the live `state` partition plus a `snap` keyspace
+  holding the exact state bytes of every accepted checkpoint round. The
+  `snap` entries replace the old per-round `.snap` files: restart recovery
+  restores and verifies the checkpoint-round state from here.
+- `SparseMerkleTree` / `MerkleProof` (in `merkle.rs`) — the Merkle tree over
+  the KV state. Node hashing is Hiero-style domain-separated SHA-256:
+  `empty = SHA256(0x00)`, `leaf = SHA256(0x00 || len(key) || key || len(value)
+  || value)`, `internal = SHA256(0x02 || left || right)`, `singleton =
+  SHA256(0x01 || child)`. A `Put`/`Delete` recomputes only the O(depth) nodes
+  on the affected path, so per-round checkpoint roots are cheap. `MerkleProof`
+  is a per-key inclusion proof (`verify`, `encode`/`decode`) that a mirror can
+  check without shipping the whole state.
 - `Op` — the pure-KV transaction payload: one opcode byte plus
   length-prefixed fields. `0x00` `Put { key, value }`, `0x01`
   `Delete { key }`. `DecodedOp` is the top-level decode result: KV ops go to
@@ -34,9 +51,15 @@ hashgraph whose `consensus_order` yields the input sequence.
 
 ## Design
 
-- Execution is pure and deterministic: no wall-clock reads, no randomness,
-  no I/O inside `apply`/`execute_*`. The same finalized event order and the
-  same starting state produce bit-identical resulting state on every node.
+- Execution is deterministic: no wall-clock reads, no randomness, and no
+  *non-deterministic* I/O inside `apply`/`execute_*`. Partition writes carry
+  deterministic content (the same op sequence always writes the same bytes);
+  a storage error is logged and dropped, so the consensus-hot path never
+  fails on storage hiccups. The durable truth for restart/verification is the
+  `snap` keyspace, not the live partition, so a dropped write is healed by
+  the next accepted checkpoint snapshot. The same finalized event order and
+  the same starting state produce bit-identical resulting state on every
+  node.
 - Membership changes ride the consensus ordering as `0x02` payloads. They are
   never applied to `State`: the gossip layer collects them from the side
   channel and drives activation through `RosterHistory` /

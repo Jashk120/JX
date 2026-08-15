@@ -488,6 +488,7 @@ dependencies = [
  "sha2",
  "state",
  "storage",
+ "tempfile",
  "thiserror",
  "tokio",
  "tokio-rustls",
@@ -1122,7 +1123,11 @@ dependencies = [
  "consensus",
  "crypto",
  "ed25519-dalek",
+ "fjall",
  "primitives",
+ "sha2",
+ "tempfile",
+ "thiserror",
 ]
 
 [[package]]

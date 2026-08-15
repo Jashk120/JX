@@ -3,9 +3,11 @@
 //! A restarting node does not replay history: it loads its latest accepted
 //! [`SignedCheckpoint`] plus the state snapshot that hashes to its committed
 //! `state_hash`, verifies both, and rebuilds a [`gossip::ReconnectResponse`]
-//! that [`gossip::GossipNode::from_checkpoint`] can consume. The retained
-//! event graph is deliberately not persisted — the restarting node then
-//! `request_reconnect()`s from a live peer for the event window. A
+//! that [`gossip::GossipNode::from_checkpoint`] can consume. The state
+//! snapshot for the checkpoint round is served from the Fjall state
+//! database's `snap` keyspace (`state::StateDb`) — the `.snap` files are gone.
+//! The retained event graph is deliberately not persisted — the restarting
+//! node then `request_reconnect()`s from a live peer for the event window. A
 //! simultaneous full-cluster restart re-geneses above the restored state,
 //! which is acceptable for the smoke-test scope of a static 2-node cluster.
 
@@ -21,21 +23,32 @@ use crypto::{
 };
 use ed25519_dalek::VerifyingKey;
 use primitives::NodeId;
-use sha2::{
-    Digest,
-    Sha256,
-};
+use state::StateDb;
 
 use crate::storage::PersistedCheckpoint;
 
+/// Rebuilds the executor state from `bytes` — canonical `State::to_bytes()`
+/// for the checkpoint round — into `state_db`'s live partition, resetting any
+/// prior contents first. Returns `None` on truncation or storage failure.
+pub fn restore_state(state_db: &StateDb, bytes: &[u8]) -> Option<state::State> {
+    state_db.clear_state().ok()?;
+    state::State::from_bytes(state_db.state_keyspace(), bytes)
+}
+
 /// Verifies a persisted checkpoint: the signature quorum must hold, and the
-/// state bytes must hash to the committed `state_hash`.
-pub fn verify_persisted(state: &PersistedCheckpoint) -> bool {
+/// state snapshot persisted for the checkpoint round must rebuild to the
+/// committed Merkle root.
+pub fn verify_persisted(state: &PersistedCheckpoint, state_db: &StateDb) -> bool {
     if !gossip::verify_signed_checkpoint(&state.checkpoint) {
         return false;
     }
-    let computed = Sha256::digest(&state.state_bytes);
-    computed.as_slice() == state.checkpoint.payload.state_hash.as_slice()
+    let Some(bytes) = state_db.snapshot_for(state.checkpoint.payload.round).ok().flatten() else {
+        return false;
+    };
+    let Some(rebuilt) = restore_state(state_db, &bytes) else {
+        return false;
+    };
+    rebuilt.root() == state.checkpoint.payload.state_hash
 }
 
 /// The persisted roster must agree with the node's current `expected_key`:
@@ -69,23 +82,26 @@ fn check_own_key(
 }
 
 /// Builds the [`gossip::ReconnectResponse`] that reconstructs a node from a
-/// verified persisted checkpoint. The roster history is seeded from the
-/// checkpoint's embedded roster snapshot (static cluster scope), `retained`
-/// is empty (the graph is not persisted), and `decided_round` is the
-/// checkpoint round — `Hashgraph::from_checkpoint` already marks everything
-/// at or below it decided.
+/// verified persisted checkpoint. The state snapshot for the checkpoint round
+/// comes from the state database's `snap` keyspace, the roster history is
+/// seeded from the checkpoint's embedded roster snapshot (static cluster
+/// scope), `retained` is empty (the graph is not persisted), and
+/// `decided_round` is the checkpoint round — `Hashgraph::from_checkpoint`
+/// already marks everything at or below it decided.
 pub fn build_reconnect_response(
     state: PersistedCheckpoint,
+    state_db: &StateDb,
     node_id: u64,
     expected_key: &VerifyingKey,
 ) -> Result<gossip::ReconnectResponse> {
     let checkpoint = &state.checkpoint;
     check_own_key(checkpoint, node_id, expected_key)?;
+    let bytes = snapshot_for_round(state_db, checkpoint.payload.round)?;
     let roster_history = RosterHistory::new(checkpoint.payload.roster_snapshot.clone());
     let roster_history_bytes = consensus::encode_roster_history(&roster_history);
     Ok(gossip::ReconnectResponse {
         signed_checkpoint: checkpoint.clone(),
-        state_bytes: state.state_bytes,
+        state_bytes: bytes,
         roster_history_bytes,
         decided_round: checkpoint.payload.round,
         retained: Vec::new(),
@@ -104,15 +120,18 @@ pub fn build_reconnect_response(
 ///
 /// `decided_round` is the checkpoint round; the replayed records already
 /// carry their `roundReceived` (recorded by the previous run), so ordering
-/// is reproduced exactly instead of being re-derived.
+/// is reproduced exactly instead of being re-derived. The state bytes for the
+/// checkpoint round come from the state database's `snap` keyspace.
 pub fn replay_response(
     state: PersistedCheckpoint,
+    state_db: &StateDb,
     node_id: u64,
     expected_key: &VerifyingKey,
     event_log: &storage::EventLog,
 ) -> Result<gossip::ReconnectResponse> {
     let checkpoint = &state.checkpoint;
     check_own_key(checkpoint, node_id, expected_key)?;
+    let bytes = snapshot_for_round(state_db, checkpoint.payload.round)?;
     let roster_history = match event_log.roster_history()? {
         Some(bytes) => consensus::decode_roster_history(&bytes)
             .with_context(|| "decoding persisted roster history from the event log")?,
@@ -134,11 +153,19 @@ pub fn replay_response(
 
     Ok(gossip::ReconnectResponse {
         signed_checkpoint: checkpoint.clone(),
-        state_bytes: state.state_bytes,
+        state_bytes: bytes,
         roster_history_bytes: consensus::encode_roster_history(&roster_history),
         decided_round: checkpoint.payload.round,
         retained,
     })
+}
+
+/// The persisted state snapshot for an accepted checkpoint `round`, or an
+/// error when the state database holds no snapshot for it.
+fn snapshot_for_round(state_db: &StateDb, round: u64) -> Result<Vec<u8>> {
+    state_db
+        .snapshot_for(round)?
+        .ok_or_else(|| anyhow::anyhow!("no state snapshot for checkpoint round {round}"))
 }
 
 /// Loads, verifies, and wraps the latest persisted checkpoint for
@@ -148,19 +175,20 @@ pub fn replay_response(
 /// regenerated over.
 pub fn latest_for_restart(
     storage: &crate::storage::Storage,
+    state_db: &StateDb,
     node_id: u64,
     expected_key: &VerifyingKey,
 ) -> Result<Option<gossip::ReconnectResponse>> {
     let Some(state) = storage.latest()? else {
         return Ok(None);
     };
-    if !verify_persisted(&state) {
+    if !verify_persisted(&state, state_db) {
         bail!(
             "persisted checkpoint for round {} failed verification (quorum or state hash)",
             state.checkpoint.payload.round
         );
     }
-    let response = build_reconnect_response(state, node_id, expected_key)?;
+    let response = build_reconnect_response(state, state_db, node_id, expected_key)?;
     Ok(Some(response))
 }
 
@@ -170,19 +198,20 @@ pub fn latest_for_restart(
 pub fn latest_for_restart_with_log(
     storage: &crate::storage::Storage,
     event_log: &storage::EventLog,
+    state_db: &StateDb,
     node_id: u64,
     expected_key: &VerifyingKey,
 ) -> Result<Option<gossip::ReconnectResponse>> {
     let Some(state) = storage.latest()? else {
         return Ok(None);
     };
-    if !verify_persisted(&state) {
+    if !verify_persisted(&state, state_db) {
         bail!(
             "persisted checkpoint for round {} failed verification (quorum or state hash)",
             state.checkpoint.payload.round
         );
     }
-    let response = replay_response(state, node_id, expected_key, event_log)?;
+    let response = replay_response(state, state_db, node_id, expected_key, event_log)?;
     Ok(Some(response))
 }
 
@@ -202,8 +231,25 @@ mod tests {
         SigningKey,
     };
     use primitives::Signature;
+    use state::StateDb;
+    use tempfile::TempDir;
 
     use super::*;
+
+    /// A `StateDb` in a tempdir plus the directory guard, so the directory
+    /// outlives the database.
+    struct TestDb {
+        _dir: TempDir,
+        db: StateDb,
+    }
+
+    impl TestDb {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let db = StateDb::open(dir.path()).expect("state db opens");
+            Self { _dir: dir, db }
+        }
+    }
 
     fn cluster_of(ids: &[u64]) -> (MembershipRegistry, Vec<(u64, SigningKey)>) {
         let mut registry = MembershipRegistry::new();
@@ -238,31 +284,57 @@ mod tests {
         accepted.expect("2-node cluster reaches quorum with both sigs")
     }
 
+    /// An empty state's serialization plus its Merkle root — the smallest
+    /// valid checkpoint state commitment.
+    fn empty_state_bytes_and_root() -> (Vec<u8>, [u8; 32]) {
+        let db = TestDb::new();
+        let state = state::State::new(db.db.state_keyspace());
+        (state.to_bytes(), state.root())
+    }
+
     #[test]
     fn verify_persisted_accepts_valid_state() {
-        let state_bytes = vec![0u8; 32];
-        let state_hash: [u8; 32] = Sha256::digest(&state_bytes).into();
+        let (state_bytes, state_hash) = empty_state_bytes_and_root();
         let checkpoint = quorum_checkpoint(3, state_hash, &[1, 2]);
-        let state = PersistedCheckpoint { checkpoint, state_bytes };
-        assert!(verify_persisted(&state), "state bytes must hash to state_hash");
+        let db = TestDb::new();
+        db.db.snapshot(3, &state_bytes).expect("snapshot");
+        let state = PersistedCheckpoint { checkpoint };
+        assert!(verify_persisted(&state, &db.db), "state bytes must rebuild to state_hash");
     }
 
     #[test]
     fn verify_persisted_rejects_wrong_state_bytes() {
-        let checkpoint = quorum_checkpoint(3, [7u8; 32], &[1, 2]);
-        let state = PersistedCheckpoint { checkpoint, state_bytes: vec![9u8; 32] };
-        assert!(!verify_persisted(&state), "mismatched state bytes must fail");
+        let (_, empty_root) = empty_state_bytes_and_root();
+        let checkpoint = quorum_checkpoint(3, empty_root, &[1, 2]);
+        // A non-empty state whose root cannot equal the empty-state root.
+        let db = TestDb::new();
+        let mut other = state::State::new(db.db.state_keyspace());
+        other.apply(&state::Op::Put { key: b"k".to_vec(), value: b"v".to_vec() });
+        db.db.snapshot(3, &other.to_bytes()).expect("snapshot");
+        let state = PersistedCheckpoint { checkpoint };
+        assert!(!verify_persisted(&state, &db.db), "mismatched state bytes must fail");
+    }
+
+    #[test]
+    fn verify_persisted_missing_snapshot_fails() {
+        let (_, state_hash) = empty_state_bytes_and_root();
+        let checkpoint = quorum_checkpoint(3, state_hash, &[1, 2]);
+        let db = TestDb::new();
+        let state = PersistedCheckpoint { checkpoint };
+        assert!(!verify_persisted(&state, &db.db), "no snapshot means no verification");
     }
 
     #[test]
     fn response_builds_with_expected_fields() {
-        let state_bytes = vec![0u8; 32];
-        let state_hash: [u8; 32] = Sha256::digest(&state_bytes).into();
+        let (state_bytes, state_hash) = empty_state_bytes_and_root();
         let checkpoint = quorum_checkpoint(4, state_hash, &[1, 2]);
-        let state = PersistedCheckpoint { checkpoint: checkpoint.clone(), state_bytes };
+        let db = TestDb::new();
+        db.db.snapshot(4, &state_bytes).expect("snapshot");
+        let state = PersistedCheckpoint { checkpoint: checkpoint.clone() };
         let key = SigningKey::from_bytes(&[1u8; 32]).verifying_key();
-        let response = build_reconnect_response(state, 1, &key).expect("builds");
+        let response = build_reconnect_response(state, &db.db, 1, &key).expect("builds");
         assert_eq!(response.signed_checkpoint, checkpoint);
+        assert_eq!(response.state_bytes, state_bytes, "snapshot bytes served verbatim");
         assert_eq!(response.decided_round, 4);
         assert!(response.retained.is_empty());
         assert!(!response.roster_history_bytes.is_empty());
@@ -270,27 +342,30 @@ mod tests {
 
     #[test]
     fn rejects_key_mismatch_in_persisted_roster() {
-        let state_bytes = vec![0u8; 32];
-        let state_hash: [u8; 32] = Sha256::digest(&state_bytes).into();
+        let (state_bytes, state_hash) = empty_state_bytes_and_root();
         let checkpoint = quorum_checkpoint(4, state_hash, &[1, 2]);
-        let state = PersistedCheckpoint { checkpoint, state_bytes };
+        let db = TestDb::new();
+        db.db.snapshot(4, &state_bytes).expect("snapshot");
+        let state = PersistedCheckpoint { checkpoint };
         // The checkpoint roster holds `[1u8; 32]`'s key for node 1; restoring
         // with a different secret (e.g. after `jkaind init --force`) must be
         // rejected up front instead of silently stalling consensus.
         let rotated_key = SigningKey::from_bytes(&[9u8; 32]).verifying_key();
-        let err =
-            build_reconnect_response(state, 1, &rotated_key).expect_err("mismatched key must fail");
+        let err = build_reconnect_response(state, &db.db, 1, &rotated_key)
+            .expect_err("mismatched key must fail");
         assert!(err.to_string().contains("secret key does not match"), "unexpected error: {err}");
     }
 
     #[test]
     fn rejects_node_absent_from_persisted_roster() {
-        let state_bytes = vec![0u8; 32];
-        let state_hash: [u8; 32] = Sha256::digest(&state_bytes).into();
+        let (state_bytes, state_hash) = empty_state_bytes_and_root();
         let checkpoint = quorum_checkpoint(4, state_hash, &[1, 2]);
-        let state = PersistedCheckpoint { checkpoint, state_bytes };
+        let db = TestDb::new();
+        db.db.snapshot(4, &state_bytes).expect("snapshot");
+        let state = PersistedCheckpoint { checkpoint };
         let key = SigningKey::from_bytes(&[3u8; 32]).verifying_key();
-        let err = build_reconnect_response(state, 3, &key).expect_err("absent node must fail");
+        let err =
+            build_reconnect_response(state, &db.db, 3, &key).expect_err("absent node must fail");
         assert!(
             err.to_string().contains("key is not in the checkpoint roster"),
             "unexpected error: {err}"
@@ -306,10 +381,11 @@ mod tests {
         let tmp = tempfile::tempdir().expect("temp dir");
         let event_log = storage::EventLog::open(tmp.path()).expect("event log opens");
 
-        let state_bytes = vec![0u8; 32];
-        let state_hash: [u8; 32] = Sha256::digest(&state_bytes).into();
+        let (state_bytes, state_hash) = empty_state_bytes_and_root();
         let checkpoint = quorum_checkpoint(1, state_hash, &[1, 2]);
-        let state = PersistedCheckpoint { checkpoint, state_bytes };
+        let db = TestDb::new();
+        db.db.snapshot(1, &state_bytes).expect("snapshot");
+        let state = PersistedCheckpoint { checkpoint };
 
         let bogus = primitives::UnsignedEvent::new(
             primitives::NodeId::new(9),
@@ -330,7 +406,8 @@ mod tests {
             .expect("append");
 
         let key = SigningKey::from_bytes(&[1u8; 32]).verifying_key();
-        let err = replay_response(state, 1, &key, &event_log).expect_err("corrupt log must fail");
+        let err =
+            replay_response(state, &db.db, 1, &key, &event_log).expect_err("corrupt log must fail");
         assert!(err.to_string().contains("failed verification"), "unexpected error: {err}");
     }
 
@@ -341,10 +418,11 @@ mod tests {
         let tmp = tempfile::tempdir().expect("temp dir");
         let event_log = storage::EventLog::open(tmp.path()).expect("event log opens");
 
-        let state_bytes = vec![0u8; 32];
-        let state_hash: [u8; 32] = Sha256::digest(&state_bytes).into();
+        let (state_bytes, state_hash) = empty_state_bytes_and_root();
         let checkpoint = quorum_checkpoint(1, state_hash, &[1, 2]);
-        let state = PersistedCheckpoint { checkpoint, state_bytes };
+        let db = TestDb::new();
+        db.db.snapshot(1, &state_bytes).expect("snapshot");
+        let state = PersistedCheckpoint { checkpoint };
 
         let key1 = SigningKey::from_bytes(&[1u8; 32]);
         let valid = primitives::UnsignedEvent::new(
@@ -366,7 +444,7 @@ mod tests {
             .expect("append");
 
         let response =
-            replay_response(state, 1, &key1.verifying_key(), &event_log).expect("replays");
+            replay_response(state, &db.db, 1, &key1.verifying_key(), &event_log).expect("replays");
         assert_eq!(response.retained.len(), 1);
         assert_eq!(response.retained[0].round_received, Some(1));
     }

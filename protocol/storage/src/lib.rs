@@ -2,7 +2,7 @@
 //!
 //! `event_log` implements the Fjall-backed append-only event log: every
 //! verified event is appended on insert, keyed by `EventHash`, decoupled from
-//! the checkpoint (`.cp`/`.snap`) files. A restarting node replays the log to
+//! the checkpoint (`.cp`) files. A restarting node replays the log to
 //! rebuild its retained graph independently, instead of
 //! `request_reconnect()`ing from a live peer.
 

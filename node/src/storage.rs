@@ -1,12 +1,16 @@
 //! Checkpoint persistence for a running node.
 //!
-//! Every accepted [`SignedCheckpoint`] plus its per-round state snapshot is
-//! written under `<data>/checkpoints/` as two files:
+//! Every accepted [`SignedCheckpoint`] is written under `<data>/checkpoints/`
+//! as:
 //!
 //! ```text
 //! checkpoint-<round>.cp    consensus::encode_signed_checkpoint(checkpoint)
-//! checkpoint-<round>.snap  State::to_bytes() for the checkpoint round
 //! ```
+//!
+//! The per-round state snapshot that used to live in a `.snap` file next to
+//! the checkpoint now lives in the Fjall state database's `snap` keyspace
+//! (`<data>/statedb/`, see `state::StateDb`) — the exact state bytes at the
+//! checkpoint round are restored and verified from there on restart.
 //!
 //! Writes are atomic (temp file + `sync_all` + rename), so a crash mid-write
 //! never leaves a torn file. Older rounds are pruned alongside in-memory
@@ -41,12 +45,12 @@ pub const CHECKPOINT_SUBDIR: &str = "checkpoints";
 /// are pruned, mirroring `consensus::RETENTION_ROUNDS`.
 pub const PRUNE_RETENTION_ROUNDS: u64 = consensus::RETENTION_ROUNDS;
 
-/// A persisted checkpoint together with the state bytes that hash to its
-/// committed `state_hash`.
+/// A persisted checkpoint. The state bytes that hash to its committed
+/// `state_hash` are not stored here — they live in the state database's
+/// `snap` keyspace, keyed by this round.
 #[derive(Clone, Debug)]
 pub struct PersistedCheckpoint {
     pub checkpoint: SignedCheckpoint,
-    pub state_bytes: Vec<u8>,
 }
 
 /// Filesystem-backed checkpoint storage rooted at a data directory.
@@ -63,20 +67,17 @@ impl Storage {
         Ok(Self { dir })
     }
 
-    /// Atomically persists `checkpoint` and its state snapshot.
-    pub fn persist(&self, checkpoint: &SignedCheckpoint, snapshot: &[u8]) -> Result<()> {
+    /// Atomically persists `checkpoint`.
+    pub fn persist(&self, checkpoint: &SignedCheckpoint) -> Result<()> {
         let round = checkpoint.payload.round;
         let checkpoint_path = self.checkpoint_path(round);
-        let snapshot_path = self.snapshot_path(round);
         atomic_write(&checkpoint_path, &encode_signed_checkpoint(checkpoint))
             .with_context(|| format!("writing checkpoint {round}"))?;
-        atomic_write(&snapshot_path, snapshot)
-            .with_context(|| format!("writing state snapshot {round}"))?;
         Ok(())
     }
 
-    /// Deletes every checkpoint (and snapshot) file for a round strictly
-    /// below `keep_from_round`. Idempotent; missing files are fine.
+    /// Deletes every checkpoint file for a round strictly below
+    /// `keep_from_round`. Idempotent; missing files are fine.
     pub fn prune_before(&self, keep_from_round: u64) -> Result<()> {
         for round in self.rounds()? {
             if round < keep_from_round {
@@ -97,14 +98,11 @@ impl Storage {
     /// The persisted checkpoint for `round`, if any.
     pub fn load_round(&self, round: u64) -> Result<PersistedCheckpoint> {
         let checkpoint_path = self.checkpoint_path(round);
-        let snapshot_path = self.snapshot_path(round);
         let checkpoint_bytes = fs::read(&checkpoint_path)
             .with_context(|| format!("reading checkpoint {}", checkpoint_path.display()))?;
         let checkpoint = consensus::decode_signed_checkpoint(&checkpoint_bytes)
             .with_context(|| format!("decoding checkpoint {}", checkpoint_path.display()))?;
-        let state_bytes = fs::read(&snapshot_path)
-            .with_context(|| format!("reading snapshot {}", snapshot_path.display()))?;
-        Ok(PersistedCheckpoint { checkpoint, state_bytes })
+        Ok(PersistedCheckpoint { checkpoint })
     }
 
     /// The rounds that have a persisted checkpoint file, ascending.
@@ -133,13 +131,11 @@ impl Storage {
         self.dir.join(format!("checkpoint-{round}.cp"))
     }
 
-    fn snapshot_path(&self, round: u64) -> PathBuf {
-        self.dir.join(format!("checkpoint-{round}.snap"))
-    }
-
     fn remove_round(&self, round: u64) {
         let _ = fs::remove_file(self.checkpoint_path(round));
-        let _ = fs::remove_file(self.snapshot_path(round));
+        // Remove any legacy `.snap` file from a pre-Fjall-state data dir, so
+        // pruning also cleans up the old per-round serialized state blobs.
+        let _ = fs::remove_file(self.dir.join(format!("checkpoint-{round}.snap")));
     }
 }
 
@@ -148,12 +144,12 @@ impl Storage {
 /// a [`gossip::GossipNode`] via `set_checkpoint_sink`.
 ///
 /// The node invokes `persist` synchronously on its async task, so I/O here is
-/// deliberately small (two small files per accept); failures are logged by
-/// the caller, which swallows them rather than failing the sync loop.
+/// deliberately small (one small file per accept); failures are logged by the
+/// caller, which swallows them rather than failing the sync loop.
 impl CheckpointSink for Storage {
-    fn persist(&self, checkpoint: &SignedCheckpoint, snapshot: &[u8]) {
+    fn persist(&self, checkpoint: &SignedCheckpoint) {
         let round = checkpoint.payload.round;
-        if let Err(e) = Storage::persist(self, checkpoint, snapshot) {
+        if let Err(e) = Storage::persist(self, checkpoint) {
             eprintln!("[jkaind] failed to persist checkpoint {round}: {e:#}");
             return;
         }
@@ -226,12 +222,10 @@ mod tests {
         let tmp = temp_dir();
         let storage = Storage::new(tmp.path()).expect("storage opens");
         let checkpoint = signed_checkpoint(3, &[1, 2]);
-        let snapshot = vec![1, 2, 3];
-        storage.persist(&checkpoint, &snapshot).expect("persist");
+        storage.persist(&checkpoint).expect("persist");
 
         let loaded = storage.latest().expect("latest").expect("a checkpoint");
         assert_eq!(loaded.checkpoint, checkpoint);
-        assert_eq!(loaded.state_bytes, snapshot);
     }
 
     #[test]
@@ -239,7 +233,7 @@ mod tests {
         let tmp = temp_dir();
         let storage = Storage::new(tmp.path()).expect("storage opens");
         for round in [1, 5, 3] {
-            storage.persist(&signed_checkpoint(round, &[1, 2]), &[round as u8]).expect("persist");
+            storage.persist(&signed_checkpoint(round, &[1, 2])).expect("persist");
         }
         let latest = storage.latest().expect("latest").expect("a checkpoint");
         assert_eq!(latest.checkpoint.payload.round, 5);
@@ -257,7 +251,7 @@ mod tests {
         let tmp = temp_dir();
         let storage = Storage::new(tmp.path()).expect("storage opens");
         for round in [1, 2, 3, 4] {
-            storage.persist(&signed_checkpoint(round, &[1, 2]), &[round as u8]).expect("persist");
+            storage.persist(&signed_checkpoint(round, &[1, 2])).expect("persist");
         }
         storage.prune_before(3).expect("prune");
         assert_eq!(storage.rounds().expect("rounds"), vec![3, 4]);
@@ -272,7 +266,7 @@ mod tests {
         let tmp = temp_dir();
         let storage = Storage::new(tmp.path()).expect("storage opens");
         let checkpoint = signed_checkpoint(2, &[1, 2]);
-        storage.persist(&checkpoint, &[7]).expect("persist");
+        storage.persist(&checkpoint).expect("persist");
         let entries: Vec<String> = fs::read_dir(storage.dir.clone())
             .expect("read dir")
             .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())

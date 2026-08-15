@@ -21,15 +21,17 @@ a process lifecycle. It adds no consensus logic of its own.
 - `src/config.rs` — the `cluster.toml` file format and its conversion to
   `gossip::ClusterConfig`.
 - `src/storage.rs` — atomic checkpoint persistence under the `--data`
-  directory. `Storage` implements `gossip::CheckpointSink`, so the daemon
-  just hands a `Storage` to the node.
+  directory (`checkpoint-<round>.cp` files only; the per-round state snapshot
+  lives in the state database's `snap` keyspace). `Storage` implements
+  `gossip::CheckpointSink`, so the daemon just hands a `Storage` to the node.
 - `src/restart.rs` — loads the latest persisted checkpoint, verifies its
-  signature quorum and state hash, checks that its embedded roster still holds
-  this node's current key (refusing to restore a checkpoint written under
-  rotated keys), and rebuilds a node via `GossipNode::from_checkpoint`. When
-  the durable event log (Phase 8) is present, the retained graph is replayed
-  from it — independently, with no live peer; otherwise the node reconnects
-  for the event window.
+  signature quorum and state hash (against the `snap`-keyspace snapshot),
+  checks that its embedded roster still holds this node's current key
+  (refusing to restore a checkpoint written under rotated keys), and rebuilds
+  a node via `GossipNode::from_checkpoint`. When the durable event log
+  (Phase 8) is present, the retained graph is replayed from it —
+  independently, with no live peer; otherwise the node reconnects for the
+  event window.
 - `tests/` — config/CLI round-trips, the single-seed pin-match regression,
   control-socket protocol tests, storage round-trips, transaction propagation,
   a restart-recovery end-to-end test, an event-log no-peer restart test, and
@@ -42,10 +44,10 @@ key/config copy steps, and the add-a-third-member flow.
 
 ## Boundaries
 
-- A restarting node reloads state and roster from its checkpoint and replays
-  the retained event window from the local event log (`<data>/eventlog/`,
-  Fjall), so it recovers independently; when the log is empty it reconnects
-  from a live peer instead.
+- A restarting node reloads state and roster from its checkpoint (state from
+  the Fjall state database's `snap` keyspace) and replays the retained event
+  window from the local event log (`<data>/eventlog/`, Fjall), so it recovers
+  independently; when the log is empty it reconnects from a live peer instead.
 - `MembershipOp::Remove` is not implemented; membership only grows.
 - The control socket trusts Unix file permissions (`0600`), not a shared
   secret or client certificate.

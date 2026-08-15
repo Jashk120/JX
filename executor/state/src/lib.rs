@@ -1,10 +1,11 @@
 //! Deterministic transaction execution for JKain (Phase 8).
 //!
 //! Consumes events in finalized consensus order and applies each transaction's
-//! payload to a key-value [`State`] through a pure, deterministic function.
-//! Execution reads no wall clock, uses no randomness, and performs no I/O:
-//! given the same finalized event order and the same starting state, every
-//! node derives the same resulting state.
+//! payload to a key-value [`State`] through a deterministic function. The
+//! state is backed by a Fjall LSM partition with a write-ahead log
+//! ([`StateDb`]); execution reads no wall clock, uses no randomness, and
+//! performs no non-deterministic I/O: given the same finalized event order
+//! and the same starting state, every node derives the same resulting state.
 //!
 //! Transaction payloads are decoded from a tiny, explicit binary format — see
 //! [`op`] for the spec. Membership operations (`0x02`) never touch `State`:
@@ -19,19 +20,27 @@
 
 mod error;
 mod executor;
+mod merkle;
 mod op;
 mod state;
+mod state_db;
 
 pub use error::{
     ExecutorError,
     Result,
+    StateDbError,
 };
 pub use executor::{
     Executor,
     finalized_events,
+};
+pub use merkle::{
+    MerkleProof,
+    SparseMerkleTree,
 };
 pub use op::{
     DecodedOp,
     Op,
 };
 pub use state::State;
+pub use state_db::StateDb;

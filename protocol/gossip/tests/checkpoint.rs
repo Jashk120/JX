@@ -32,6 +32,7 @@ use ed25519_dalek::{
 use gossip::{
     GossipNode,
     ReconnectResponse,
+    SyncTiming,
     TlsIdentity,
 };
 use primitives::{
@@ -40,10 +41,6 @@ use primitives::{
     NodeId,
     Timestamp,
     UnsignedEvent,
-};
-use sha2::{
-    Digest,
-    Sha256,
 };
 
 fn registry_for_ids(ids: &[u64]) -> MembershipRegistry {
@@ -132,8 +129,8 @@ async fn checkpoint_accepted_requires_two_thirds_weight_at_that_round() {
         registry.clone(),
         identity,
         Vec::new(),
-        SYNC_INTERVAL,
-        SYNC_TIMEOUT,
+        SyncTiming::new(SYNC_INTERVAL, SYNC_TIMEOUT),
+        temp_state_db(),
     ));
 
     for event in build_deep_clique() {
@@ -229,8 +226,9 @@ async fn pruning_old_events_does_not_break_ordering_after_checkpoint() {
 #[tokio::test]
 async fn from_checkpoint_rejects_roster_key_mismatched_to_the_learner() {
     let roster = registry_for_ids(&[1, 4]);
-    let state_bytes = state::State::new().to_bytes();
-    let state_hash: [u8; 32] = Sha256::digest(&state_bytes).into();
+    let state = state::State::new(temp_state_db().state_keyspace());
+    let state_bytes = state.to_bytes();
+    let state_hash = state.root();
     let payload = CheckpointPayload::new(1, state_hash, roster.clone());
 
     // Both members sign: the 2-node roster's quorum is all of them.
@@ -256,9 +254,9 @@ async fn from_checkpoint_rejects_roster_key_mismatched_to_the_learner() {
         SigningKey::from_bytes(&consensus_seed(4)),
         identity4.clone(),
         Vec::new(),
-        SYNC_INTERVAL,
-        SYNC_TIMEOUT,
+        SyncTiming::new(SYNC_INTERVAL, SYNC_TIMEOUT),
         response.clone(),
+        temp_state_db(),
     )
     .await;
     assert!(correct.is_ok(), "a matching secret restores");
@@ -269,9 +267,9 @@ async fn from_checkpoint_rejects_roster_key_mismatched_to_the_learner() {
         SigningKey::from_bytes(&[9u8; 32]),
         identity4,
         Vec::new(),
-        SYNC_INTERVAL,
-        SYNC_TIMEOUT,
+        SyncTiming::new(SYNC_INTERVAL, SYNC_TIMEOUT),
         response,
+        temp_state_db(),
     )
     .await;
     assert!(rotated.is_err(), "a rotated secret is rejected before restoring");

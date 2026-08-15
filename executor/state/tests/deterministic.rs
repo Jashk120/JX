@@ -35,11 +35,21 @@ use state::{
     Executor,
     ExecutorError,
     Op,
+    StateDb,
     finalized_events,
 };
 
 fn key_for(id: u64) -> SigningKey {
     SigningKey::from_bytes(&[id as u8; 32])
+}
+
+/// A fresh executor over its own independent tempdir state database, so the
+/// determinism tests compare two genuinely independent states (separate LSM
+/// partitions) rather than two handles to one partition.
+fn new_executor() -> Executor {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = StateDb::open(dir.path()).expect("state db opens");
+    Executor::new(db.state_keyspace())
 }
 
 fn registry_for(ids: &[u64]) -> MembershipRegistry {
@@ -145,8 +155,8 @@ fn same_transaction_order_yields_bit_identical_state() {
         put(b"carol", b"50"),
     ];
 
-    let mut left = Executor::new();
-    let mut right = Executor::new();
+    let mut left = new_executor();
+    let mut right = new_executor();
     for tx in &order {
         let event = event_with(vec![tx.clone()]);
         assert!(left.execute_event(&event).0.is_empty());
@@ -156,9 +166,9 @@ fn same_transaction_order_yields_bit_identical_state() {
     assert_eq!(left.state(), right.state());
     assert_eq!(left.state().to_bytes(), right.state().to_bytes());
 
-    assert_eq!(left.state().get(b"alice"), Some(&b"300"[..]));
-    assert_eq!(left.state().get(b"bob"), Some(&b"200"[..]));
-    assert_eq!(left.state().get(b"carol"), Some(&b"50"[..]));
+    assert_eq!(left.state().get(b"alice"), Some(b"300".to_vec()));
+    assert_eq!(left.state().get(b"bob"), Some(b"200".to_vec()));
+    assert_eq!(left.state().get(b"carol"), Some(b"50".to_vec()));
     assert_eq!(left.state().len(), 3);
 }
 
@@ -171,8 +181,8 @@ fn same_finalized_order_yields_bit_identical_state() {
     let events = finalized_events(&clique.hg);
     assert!(!events.is_empty(), "the clique must produce finalized order");
 
-    let mut left = Executor::new();
-    let mut right = Executor::new();
+    let mut left = new_executor();
+    let mut right = new_executor();
     for event in &events {
         left.execute_event(event);
         right.execute_event(event);
@@ -213,8 +223,8 @@ fn malformed_payloads_fail_deterministically() {
         Transaction::from_bytes(vec![0x00, 0, 0, 0, 1, b'k']),
     ];
 
-    let mut left = Executor::new();
-    let mut right = Executor::new();
+    let mut left = new_executor();
+    let mut right = new_executor();
     let left_errors: Vec<ExecutorError> = order
         .iter()
         .map(|tx| event_with(vec![tx.clone()]))
@@ -236,5 +246,5 @@ fn malformed_payloads_fail_deterministically() {
             ExecutorError::Truncated,
         ]
     );
-    assert_eq!(left.state().get(b"ok"), Some(&b"1"[..]));
+    assert_eq!(left.state().get(b"ok"), Some(b"1".to_vec()));
 }

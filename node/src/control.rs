@@ -355,9 +355,14 @@ mod tests {
             registry,
             gossip::TlsIdentity::from_seed(seed, 1).expect("identity builds"),
             Vec::new(),
-            Duration::from_millis(25),
-            Duration::from_millis(500),
+            gossip::SyncTiming::new(Duration::from_millis(25), Duration::from_millis(500)),
+            temp_state_db(),
         ))
+    }
+
+    fn temp_state_db() -> Arc<state::StateDb> {
+        let dir = tempfile::tempdir().expect("temp dir");
+        Arc::new(state::StateDb::open(dir.path()).expect("state db opens"))
     }
 
     async fn serve_on(path: &Path, node: Arc<GossipNode>) -> Arc<AtomicBool> {

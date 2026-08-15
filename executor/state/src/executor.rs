@@ -8,9 +8,11 @@
 //! state yield the same resulting state on every node.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use consensus::Hashgraph;
 use crypto::MembershipOp;
+use fjall::Keyspace;
 use primitives::Event;
 
 use crate::error::ExecutorError;
@@ -22,14 +24,14 @@ use crate::state::State;
 /// An [`Executor`] never invents an ordering: it only processes the sequence
 /// it is given, so the caller (e.g. [`finalized_events`]) owns the consensus
 /// ordering and this type owns the deterministic application.
-#[derive(Clone, Debug, Default)]
+#[derive(Debug)]
 pub struct Executor {
     state: State,
 }
 
 impl Executor {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(kv: Arc<Keyspace>) -> Self {
+        Self { state: State::new(kv) }
     }
 
     /// Wraps an existing `State`, restoring an executor to a previously
@@ -137,9 +139,23 @@ mod tests {
         Transaction,
         UnsignedEvent,
     };
+    use tempfile::tempdir;
 
     use super::*;
+    use crate::StateDb;
     use crate::op::Op;
+
+    fn new_executor() -> Executor {
+        let dir = tempdir().expect("temp dir");
+        let db = StateDb::open(dir.path()).expect("opens");
+        Executor::new(db.state_keyspace())
+    }
+
+    fn new_state() -> State {
+        let dir = tempdir().expect("temp dir");
+        let db = StateDb::open(dir.path()).expect("opens");
+        State::new(db.state_keyspace())
+    }
 
     fn event_with(payload: Vec<Transaction>) -> Event {
         UnsignedEvent::new(NodeId::new(1), None, None, Timestamp::new(1), payload)
@@ -163,17 +179,17 @@ mod tests {
         let put = Op::Put { key: b"k".to_vec(), value: b"v".to_vec() }.encode();
         let event = event_with(vec![Transaction::from_bytes(put)]);
 
-        let mut executor = Executor::new();
+        let mut executor = new_executor();
         let (errors, membership_ops) = executor.execute_event(&event);
 
         assert!(errors.is_empty());
         assert!(membership_ops.is_empty());
-        assert_eq!(executor.state().get(b"k"), Some(&b"v"[..]));
+        assert_eq!(executor.state().get(b"k"), Some(b"v".to_vec()));
     }
 
     #[test]
     fn from_state_restores_exactly_the_given_state() {
-        let mut state = State::new();
+        let mut state = new_state();
         state.apply(&Op::Put { key: b"k".to_vec(), value: b"v".to_vec() });
         let executor = Executor::from_state(state.clone());
         assert_eq!(executor.state(), &state);
@@ -185,7 +201,7 @@ mod tests {
         let malformed = vec![0x7f];
         let event = event_with(vec![Transaction::from_bytes(malformed)]);
 
-        let mut executor = Executor::new();
+        let mut executor = new_executor();
         let (errors, _membership_ops) = executor.execute_event(&event);
 
         assert_eq!(errors, vec![ExecutorError::UnknownOpcode(0x7f)]);
@@ -199,11 +215,11 @@ mod tests {
         let event =
             event_with(vec![Transaction::from_bytes(malformed), Transaction::from_bytes(put)]);
 
-        let mut executor = Executor::new();
+        let mut executor = new_executor();
         let (errors, _membership_ops) = executor.execute_event(&event);
 
         assert_eq!(errors, vec![ExecutorError::UnknownOpcode(0x7f)]);
-        assert_eq!(executor.state().get(b"k"), Some(&b"v"[..]));
+        assert_eq!(executor.state().get(b"k"), Some(b"v".to_vec()));
     }
 
     #[test]
@@ -211,13 +227,13 @@ mod tests {
         let put = Op::Put { key: b"k".to_vec(), value: b"v".to_vec() }.encode();
         let event = event_with(vec![Transaction::from_bytes(put), membership_tx()]);
 
-        let mut executor = Executor::new();
+        let mut executor = new_executor();
         let (errors, membership_ops) = executor.execute_event(&event);
 
         assert!(errors.is_empty());
         assert_eq!(membership_ops.len(), 1);
         // The membership op never touches State.
-        assert_eq!(executor.state().get(b"k"), Some(&b"v"[..]));
+        assert_eq!(executor.state().get(b"k"), Some(b"v".to_vec()));
         assert_eq!(executor.state().len(), 1);
     }
 
@@ -229,14 +245,14 @@ mod tests {
             (event_with(vec![membership_tx()]), 2),
         ];
 
-        let mut executor = Executor::new();
+        let mut executor = new_executor();
         let mut pending: BTreeMap<u64, Vec<MembershipOp>> = BTreeMap::new();
         let mut processed_through_round = 0u64;
 
         executor.bucket_finalized(&mut pending, &mut processed_through_round, &finalized);
         assert_eq!(processed_through_round, 2);
         assert_eq!(pending.get(&2).map(Vec::len), Some(1));
-        assert_eq!(executor.state().get(b"k"), Some(&b"v"[..]));
+        assert_eq!(executor.state().get(b"k"), Some(b"v".to_vec()));
 
         // The same batch again must not re-bucket or re-apply anything.
         executor.bucket_finalized(&mut pending, &mut processed_through_round, &finalized);
@@ -248,7 +264,7 @@ mod tests {
     #[test]
     fn bucket_finalized_skips_rounds_below_the_watermark() {
         let finalized = vec![(event_with(vec![membership_tx()]), 3)];
-        let mut executor = Executor::new();
+        let mut executor = new_executor();
         let mut pending: BTreeMap<u64, Vec<MembershipOp>> = BTreeMap::new();
         let mut processed_through_round = 5u64;
 

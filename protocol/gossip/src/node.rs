@@ -34,10 +34,6 @@ use primitives::{
     NodeId,
     Transaction,
 };
-use sha2::{
-    Digest,
-    Sha256,
-};
 use tokio::net::{
     TcpListener,
     TcpStream,
@@ -66,6 +62,21 @@ use crate::transport::{
     SyncTransport,
     TcpTransport,
 };
+
+/// The sync driver's timing parameters.
+#[derive(Clone, Copy, Debug)]
+pub struct SyncTiming {
+    /// How often the driver picks a uniform-random peer and runs a sync round.
+    pub sync_interval: Duration,
+    /// How long a single sync round may block waiting for a silent peer.
+    pub sync_timeout: Duration,
+}
+
+impl SyncTiming {
+    pub const fn new(sync_interval: Duration, sync_timeout: Duration) -> Self {
+        Self { sync_interval, sync_timeout }
+    }
+}
 
 /// The membership-op activation queue plus the processed-event and
 /// checkpoint watermarks.
@@ -96,9 +107,12 @@ pub struct GossipNode {
     registry: Mutex<MembershipRegistry>,
     identity: TlsIdentity,
     peers: Mutex<PeerManager>,
-    sync_interval: Duration,
-    sync_timeout: Duration,
+    sync_timing: SyncTiming,
     executor: Mutex<state::Executor>,
+    /// The durable Fjall state database backing the executor's `State` (the
+    /// live LSM partition) plus the per-accepted-round snapshots a restart or
+    /// reconnect learner restores state from (replacing the `.snap` files).
+    state_db: Arc<state::StateDb>,
     activation: Mutex<ActivationState>,
     /// One in-flight [`CheckpointAccumulator`] per round whose checkpoint
     /// this node has produced but not yet accepted. Removed on acceptance.
@@ -108,10 +122,11 @@ pub struct GossipNode {
     /// Per-round serialized state (`State::to_bytes()`), keyed by round,
     /// captured when that round's checkpoint is produced. A reconnect learner
     /// is served the snapshot for the checkpoint round — not the live state,
-    /// which has advanced past it — so the served bytes hash to the committed
-    /// `state_hash` and the learner's replay of the retained window is
-    /// exactly-once. Evicted in `accept_checkpoint` alongside pruning, keeping
-    /// every snapshot still servable by `select_checkpoint_for_learner`.
+    /// which has advanced past it — so the served bytes rebuild to the
+    /// committed `state_hash` and the learner's replay of the retained window
+    /// is exactly-once. Evicted in `accept_checkpoint` alongside pruning,
+    /// keeping every snapshot still servable by
+    /// `select_checkpoint_for_learner`.
     state_snapshots: Mutex<BTreeMap<u64, Vec<u8>>>,
     /// This node's own signatures, gossiped after every successful sync round.
     outbound_checkpoint_sigs: Mutex<Vec<CheckpointSig>>,
@@ -149,8 +164,8 @@ impl GossipNode {
         registry: MembershipRegistry,
         identity: TlsIdentity,
         peers: Vec<PeerInfo>,
-        sync_interval: Duration,
-        sync_timeout: Duration,
+        sync_timing: SyncTiming,
+        state_db: Arc<state::StateDb>,
     ) -> Self {
         let peers: Vec<PeerInfo> =
             peers.into_iter().filter(|peer| peer.node_id != node_id).collect();
@@ -162,9 +177,9 @@ impl GossipNode {
             registry: Mutex::new(registry),
             identity,
             peers: Mutex::new(PeerManager::new(peers)),
-            sync_interval,
-            sync_timeout,
-            executor: Mutex::new(state::Executor::new()),
+            sync_timing,
+            executor: Mutex::new(state::Executor::new(state_db.state_keyspace())),
+            state_db,
             activation: Mutex::new(ActivationState::default()),
             checkpoint_accumulators: Mutex::new(HashMap::new()),
             signed_checkpoints: Mutex::new(Vec::new()),
@@ -184,8 +199,10 @@ impl GossipNode {
         hg.is_member(&node)
     }
 
-    /// A clone of the executor's current deterministic state (observability
+    /// A handle to the executor's current deterministic state (observability
     /// helper; the daemon and tests read the committed state through this).
+    /// The returned `State` shares the node's backing partition, so reads see
+    /// the live state.
     pub async fn executor_state(&self) -> state::State {
         self.executor.lock().await.state().clone()
     }
@@ -308,7 +325,7 @@ impl GossipNode {
             if stop.load(Ordering::Acquire) {
                 break;
             }
-            tokio::time::sleep(self.sync_interval).await;
+            tokio::time::sleep(self.sync_timing.sync_interval).await;
             if stop.load(Ordering::Acquire) {
                 break;
             }
@@ -369,7 +386,7 @@ impl GossipNode {
             let registry = self.registry.lock().await.clone();
             let payload = self.drain_pending_transactions().await;
             let round = tokio::time::timeout(
-                self.sync_timeout,
+                self.sync_timing.sync_timeout,
                 run_sync(
                     transport,
                     &self.hashgraph,
@@ -386,7 +403,7 @@ impl GossipNode {
                 Ok(result) => result,
                 Err(_) => Err(GossipError::Sync(format!(
                     "sync round with peer {peer:?} timed out after {:?}",
-                    self.sync_timeout
+                    self.sync_timing.sync_timeout
                 ))),
             };
 
@@ -489,23 +506,22 @@ impl GossipNode {
 
         if !finalized.is_empty() {
             // Phase B: execute finalized events one round at a time,
-            // capturing the deterministic state hash after each round's
-            // events. Hashing per round — rather than hashing the state once
+            // capturing the deterministic Merkle root after each round's
+            // events. Rooting per round — rather than rooting the state once
             // at the end of the batch — is what makes every node compute the
-            // *identical* state hash for a given round's checkpoint
-            // regardless of how many later rounds landed in the same batch;
-            // without it, two nodes producing a checkpoint for the same round
-            // at different finalization points would sign different bytes and
-            // their signatures would never verify against each other. The
+            // *identical* root for a given round's checkpoint regardless of
+            // how many later rounds landed in the same batch; without it, two
+            // nodes producing a checkpoint for the same round at different
+            // finalization points would sign different bytes and their
+            // signatures would never verify against each other. The
             // serialized state is captured at the same point, so a reconnect
             // learner can be served the state exactly as it stood at the
             // checkpoint round.
             let (state_hashes, snapshots) = {
-                let pre_batch_bytes = {
+                let (pre_batch_hash, pre_batch_bytes) = {
                     let executor = self.executor.lock().await;
-                    executor.state().to_bytes()
+                    (executor.state().root(), executor.state().to_bytes())
                 };
-                let pre_batch_hash: [u8; 32] = Sha256::digest(&pre_batch_bytes).into();
                 let mut activation = self.activation.lock().await;
                 let mut executor = self.executor.lock().await;
                 let mut by_round: BTreeMap<u64, Vec<(Event, u64)>> = BTreeMap::new();
@@ -513,7 +529,7 @@ impl GossipNode {
                     by_round.entry(pair.1).or_default().push(pair.clone());
                 }
                 // Round 0 never exists as an event round; it is the sentinel
-                // holding the state hash before this batch, which is the
+                // holding the state root before this batch, which is the
                 // correct value for any decided round that ordered no events.
                 let mut hashes: BTreeMap<u64, [u8; 32]> = BTreeMap::new();
                 let mut snapshots: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
@@ -526,7 +542,7 @@ impl GossipNode {
                     }
                     executor.bucket_finalized(pending, processed_through_round, &events);
                     let bytes = executor.state().to_bytes();
-                    hashes.insert(round, Sha256::digest(&bytes).into());
+                    hashes.insert(round, executor.state().root());
                     snapshots.insert(round, bytes);
                 }
                 (hashes, snapshots)
@@ -619,11 +635,11 @@ impl GossipNode {
             // No newly finalized events: no rounds were newly ordered, but a
             // round may still have just been decided. The empty hash map's
             // round-0 sentinel falls back to the current (unchanged) state.
-            let bytes = {
+            let (bytes, root) = {
                 let executor = self.executor.lock().await;
-                executor.state().to_bytes()
+                (executor.state().to_bytes(), executor.state().root())
             };
-            let state_hashes = BTreeMap::from([(0, Sha256::digest(&bytes).into())]);
+            let state_hashes = BTreeMap::from([(0, root)]);
             self.state_snapshots.lock().await.insert(0, bytes);
             self.produce_pending_checkpoints(&state_hashes).await;
         }
@@ -766,7 +782,12 @@ impl GossipNode {
             snapshots.range(..=round).next_back().map(|(_, bytes)| bytes.clone())
         };
         if let Some(snapshot) = snapshot {
-            self.notify_checkpoint_accepted(&accepted, &snapshot).await;
+            // Durable copy: the `.snap` file is gone; a restart restores the
+            // exact checkpoint-round state from this `snap` keyspace entry.
+            if let Err(e) = self.state_db.snapshot(round, &snapshot) {
+                eprintln!("[jkaind] failed to persist state snapshot for round {round}: {e}");
+            }
+            self.notify_checkpoint_accepted(&accepted).await;
         }
         {
             let mut signed = self.signed_checkpoints.lock().await;
@@ -778,25 +799,31 @@ impl GossipNode {
             let mut snapshots = self.state_snapshots.lock().await;
             snapshots.retain(|&snap_round, _| snap_round >= prune_before_round);
         }
+        if let Err(e) = self.state_db.prune_snapshots_before(prune_before_round) {
+            eprintln!("[jkaind] failed to prune state snapshots below {prune_before_round}: {e}");
+        }
         let pruned = {
             let mut hg = self.hashgraph.lock().await;
             hg.prune_before_round(prune_before_round)
         };
-        // Mirror the in-memory prune in the durable log (Phase 8) and make
-        // everything up to this checkpoint durable.
+        // Mirror the in-memory prune in the durable log and state database
+        // (Phase 8) and make everything up to this checkpoint durable.
         let sink = self.event_sink.lock().await.clone();
         if let Some(sink) = &sink {
             sink.prune(&pruned);
             sink.flush();
         }
+        if let Err(e) = self.state_db.flush() {
+            eprintln!("[jkaind] failed to flush the state database: {e}");
+        }
     }
 
-    /// Feeds an accepted checkpoint plus its state snapshot to the registered
-    /// [`CheckpointSink`], if any.
-    async fn notify_checkpoint_accepted(&self, checkpoint: &SignedCheckpoint, snapshot: &[u8]) {
+    /// Feeds an accepted checkpoint to the registered [`CheckpointSink`], if
+    /// any.
+    async fn notify_checkpoint_accepted(&self, checkpoint: &SignedCheckpoint) {
         let sink = self.checkpoint_sink.lock().await.clone();
         if let Some(sink) = sink {
-            sink.persist(checkpoint, snapshot);
+            sink.persist(checkpoint);
         }
     }
 
@@ -945,9 +972,9 @@ impl GossipNode {
         signing_key: SigningKey,
         identity: TlsIdentity,
         peers: Vec<PeerInfo>,
-        sync_interval: Duration,
-        sync_timeout: Duration,
+        sync_timing: SyncTiming,
         response: ReconnectResponse,
+        state_db: Arc<state::StateDb>,
     ) -> Result<Self> {
         let shell = Self::new(
             node_id,
@@ -955,8 +982,8 @@ impl GossipNode {
             MembershipRegistry::new(),
             identity,
             peers,
-            sync_interval,
-            sync_timeout,
+            sync_timing,
+            state_db,
         );
         if !shell.apply_checkpoint(response).await {
             return Err(GossipError::Reconnect("checkpoint could not be applied".into()));
@@ -978,12 +1005,26 @@ impl GossipNode {
         let cp_round = checkpoint.payload.round;
         let sink = self.event_sink.lock().await.clone();
 
-        // 1. State bytes must hash to the committed state_hash. The teacher
-        //    serves the state exactly as it stood at the checkpoint round, so
-        //    this holds; the learner replays only the retained events newer
-        //    than the checkpoint (step 7's watermark).
-        let computed = Sha256::digest(&response.state_bytes);
-        if computed.as_slice() != checkpoint.payload.state_hash.as_slice() {
+        // 1. The served state bytes must rebuild to the committed Merkle
+        //    root. The teacher serves the state exactly as it stood at the
+        //    checkpoint round, so this holds; the learner replays only the
+        //    retained events newer than the checkpoint (step 7's watermark).
+        //    The live partition is reset first so the rebuilt state is exactly
+        //    the served bytes, not a merge with any prior contents.
+        let state = {
+            if let Err(e) = self.state_db.clear_state() {
+                eprintln!("reconnect: failed to reset the state partition: {e}");
+                return false;
+            }
+            let Some(state) =
+                state::State::from_bytes(self.state_db.state_keyspace(), &response.state_bytes)
+            else {
+                eprintln!("reconnect: invalid state bytes from peer");
+                return false;
+            };
+            state
+        };
+        if state.root() != checkpoint.payload.state_hash {
             eprintln!("reconnect: state hash mismatch; rejecting checkpoint");
             return false;
         }
@@ -1034,13 +1075,15 @@ impl GossipNode {
         // 4. Restore the executor from the checkpoint state — the state
         //    exactly at the checkpoint round, so replaying the retained
         //    window in `process_finalized_rounds` is exactly-once. The served
-        //    bytes are retained as this node's own snapshot for that round,
-        //    so it can serve the same checkpoint to a future learner.
-        let Some(state) = state::State::from_bytes(&response.state_bytes) else {
-            eprintln!("reconnect: invalid state bytes from peer");
-            return false;
-        };
+        //    bytes are retained as this node's own snapshot for that round —
+        //    in memory (for reconnect serving) and in the state database's
+        //    `snap` keyspace (so a future restart restores and verifies the
+        //    same round) — so it can serve the same checkpoint to a future
+        //    learner.
         *self.executor.lock().await = state::Executor::from_state(state);
+        if let Err(e) = self.state_db.snapshot(cp_round, &response.state_bytes) {
+            eprintln!("reconnect: failed to persist state snapshot for round {cp_round}: {e}");
+        }
         self.state_snapshots.lock().await.insert(cp_round, response.state_bytes.clone());
 
         // 5. Rebuild the hashgraph scaffold and load the teacher's retained
@@ -1107,8 +1150,10 @@ impl GossipNode {
         //    `signed_checkpoint_for` and future reconnects.
         self.signed_checkpoints.lock().await.push(checkpoint.clone());
 
-        // 9. Persist to durable storage via the registered sink, if any.
-        self.notify_checkpoint_accepted(checkpoint, &response.state_bytes).await;
+        // 9. Persist to durable storage via the registered sink, if any. The
+        //    checkpoint-round state snapshot was already written to the state
+        //    database's `snap` keyspace in step 4.
+        self.notify_checkpoint_accepted(checkpoint).await;
         true
     }
 
@@ -1242,13 +1287,13 @@ fn verify_checkpoint_sig(
     key.verify_strict(signing_bytes, &signature).is_ok()
 }
 
-/// Persists an accepted [`SignedCheckpoint`] plus its serialized state
-/// snapshot. Implemented by the embedding application (e.g. the `jkaind`
-/// daemon's `storage` module); `GossipNode` only invokes it.
+/// Persists an accepted [`SignedCheckpoint`]. Implemented by the embedding
+/// application (e.g. the `jkaind` daemon's `storage` module); `GossipNode`
+/// only invokes it. The checkpoint-round state snapshot is no longer handed
+/// to the sink — it lives in the state database's `snap` keyspace, which the
+/// node itself writes in `accept_checkpoint`.
 pub trait CheckpointSink {
-    /// `snapshot` is `State::to_bytes()` for the checkpoint round — the bytes
-    /// whose SHA-256 equals `checkpoint.payload.state_hash`. Called
-    /// synchronously on the node's async task; implementations must not block
-    /// for long.
-    fn persist(&self, checkpoint: &SignedCheckpoint, snapshot: &[u8]);
+    /// Called synchronously on the node's async task; implementations must
+    /// not block for long.
+    fn persist(&self, checkpoint: &SignedCheckpoint);
 }

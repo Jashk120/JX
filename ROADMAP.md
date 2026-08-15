@@ -217,15 +217,15 @@ separate Go project) is downstream of this phase.
 
 ### Merkle tree state
 
-- [ ] Sparse Merkle tree over the KV state; `state_hash` in `.cp` becomes
+- [x] Sparse Merkle tree over the KV state; `state_hash` in `.cp` becomes
       the Merkle root
-- [ ] Incremental root updates (a `Put`/`Delete` touches O(depth) nodes) for
+- [x] Incremental root updates (a `Put`/`Delete` touches O(depth) nodes) for
       cheap per-round checkpoint hashing
-- [ ] Per-key proof of inclusion without shipping the whole state
+- [x] Per-key proof of inclusion without shipping the whole state
       (mirror-friendly)
-- [ ] Restart/reconnect verification switches from hashing serialized bytes
+- [x] Restart/reconnect verification switches from hashing serialized bytes
       to tree rebuild + root compare
-- [ ] Fjall as the KV state backend: `State`'s `BTreeMap` moves to an LSM
+- [x] Fjall as the KV state backend: `State`'s `BTreeMap` moves to an LSM
       partition with WAL; the `.snap` file disappears
 
 ### New file types (mirror consumption)
@@ -255,8 +255,19 @@ separate Go project) is downstream of this phase.
 > against the roster active at its birth round — so `request_reconnect()` is
 > only a fallback for pre-event-log data. Verified with `cargo test`: codec
 > round-trips, append dedup, replay equivalence, prune, and a no-peer restart
-> integration test. Remaining in Phase 8: Merkle state (point 2), event/
-> record stream files (point 3), and parallel execution (point 4).
+> integration test. The Merkle tree state (point 2) is also implemented: a
+> sparse Merkle tree over the KV state (Hiero-style domain-separated SHA-256
+> nodes) replaces the flat `Sha256(State::to_bytes())` as the checkpoint
+> `state_hash`, with incremental O(depth) root updates, per-key inclusion
+> proofs, and tree-rebuild root comparison on restart/reconnect; a
+> `data/FORMAT_VERSION` stamp makes the commitment change a loud, self-enforcing
+> wipe. The last item of point 2 is done too: `State`'s `BTreeMap` moved to a
+> Fjall LSM partition with WAL (`state::StateDb`, `<data>/statedb/`), and the
+> per-round `.snap` files disappeared — each accepted checkpoint's state now
+> lives in the state database's `snap` keyspace, which restart recovery,
+> verification, and reconnect serving read from (`FORMAT_VERSION` bumped to 3).
+> Remaining in Phase 8: event/record stream files (point 3), and parallel
+> execution (point 4).
 
 ---
 

@@ -54,6 +54,7 @@ use ed25519_dalek::{
 use gossip::{
     GossipNode,
     PeerInfo,
+    SyncTiming,
     TlsIdentity,
 };
 use node::config::{
@@ -72,7 +73,10 @@ use node::storage::Storage;
 use primitives::NodeId;
 use rand::RngCore;
 use rand::rngs::OsRng;
-use state::Op;
+use state::{
+    Op,
+    StateDb,
+};
 use storage::EventLog;
 use tokio::net::{
     TcpListener,
@@ -450,8 +454,16 @@ async fn run_node(opts: &RunOptions) -> Result<()> {
     let cluster = config.to_cluster_config()?;
     let registry = cluster.registry();
     let peers: Vec<PeerInfo> = cluster.peers_for(NodeId::new(opts.node_id));
+
+    // Refuse to open any storage against a data dir written by an
+    // incompatible binary version (self-enforcing wipe on breaking format
+    // changes, e.g. the Merkle-root checkpoint commitment).
+    node::format::check_or_init_data_dir(&opts.data_dir)
+        .with_context(|| format!("checking data dir {}", opts.data_dir.display()))?;
+
     let storage = Storage::new(&opts.data_dir)?;
     let event_log = Arc::new(EventLog::open(&opts.data_dir)?);
+    let state_db = Arc::new(StateDb::open(&opts.data_dir)?);
 
     match reconnect_port {
         Some(port) => eprintln!(
@@ -474,6 +486,7 @@ async fn run_node(opts: &RunOptions) -> Result<()> {
     let node = match latest_for_restart_with_log(
         &storage,
         &event_log,
+        &state_db,
         opts.node_id,
         &signing_key.verifying_key(),
     )? {
@@ -490,9 +503,9 @@ async fn run_node(opts: &RunOptions) -> Result<()> {
                 signing_key,
                 identity,
                 peers,
-                opts.sync_interval,
-                opts.sync_timeout,
+                SyncTiming::new(opts.sync_interval, opts.sync_timeout),
                 response,
+                state_db.clone(),
             )
             .await?;
             if !replay_has_events {
@@ -508,8 +521,8 @@ async fn run_node(opts: &RunOptions) -> Result<()> {
                 registry,
                 identity,
                 peers,
-                opts.sync_interval,
-                opts.sync_timeout,
+                SyncTiming::new(opts.sync_interval, opts.sync_timeout),
+                state_db.clone(),
             )
         }
     };

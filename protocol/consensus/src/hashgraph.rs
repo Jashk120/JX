@@ -732,10 +732,10 @@ impl Hashgraph {
     }
 
     /// Phase 3 — the checkpoint payload for `round`, once that round is fully
-    /// decided. The caller supplies the SHA-256 of the deterministic state
-    /// (`State::to_bytes()`); the roster snapshot and its hash are taken from
-    /// this node's roster history at that round. Returns `None` while `round`
-    /// is not yet decided.
+    /// decided. The caller supplies the Merkle root of the deterministic
+    /// state; the roster snapshot and its hash are taken from this node's
+    /// roster history at that round. Returns `None` while `round` is not yet
+    /// decided.
     pub fn checkpoint_payload(
         &self,
         round: u64,

@@ -34,6 +34,7 @@ pub use error::{
 pub use node::{
     CheckpointSink,
     GossipNode,
+    SyncTiming,
 };
 pub use peer::PeerInfo;
 pub use peer_manager::PeerManager;

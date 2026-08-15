@@ -74,9 +74,9 @@ pub struct ReconnectResponse {
     /// active at its round, plus the signatures over its signing bytes).
     pub signed_checkpoint: consensus::SignedCheckpoint,
     /// Raw `State::to_bytes()` exactly as it stood at the checkpoint round, so
-    /// `Sha256(state_bytes)` equals `signed_checkpoint.payload.state_hash` and
-    /// the learner's replay of the retained events newer than the checkpoint
-    /// is exactly-once.
+    /// rebuilding the Merkle tree from it yields a root equal to
+    /// `signed_checkpoint.payload.state_hash` and the learner's replay of the
+    /// retained events newer than the checkpoint is exactly-once.
     pub state_bytes: Vec<u8>,
     /// Encoded [`consensus::RosterHistory`] (see `consensus::reconnect`).
     pub roster_history_bytes: Vec<u8>,

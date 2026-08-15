@@ -17,7 +17,10 @@ use std::sync::atomic::{
 use std::time::Duration;
 
 use common::*;
-use gossip::GossipNode;
+use gossip::{
+    GossipNode,
+    SyncTiming,
+};
 use node::restart::{
     latest_for_restart,
     verify_persisted,
@@ -27,6 +30,7 @@ use primitives::NodeId;
 use state::{
     Op,
     State,
+    StateDb,
 };
 use tokio::net::TcpListener;
 use tokio::time::{
@@ -34,17 +38,39 @@ use tokio::time::{
     timeout,
 };
 
-/// Waits until the persisted checkpoint's snapshot includes `key` — i.e. the
-/// stored checkpoint round ordered the transaction — so a restart is
-/// guaranteed to resume with the submitted state already present.
-async fn wait_for_persisted_state(storage: &Storage, key: &[u8], deadline: Duration) {
+/// Decodes the canonical `State::to_bytes()` snapshot into a `State` over a
+/// fresh tempdir keyspace (kept readable by the `Arc<Keyspace>` the state
+/// holds).
+fn state_from_bytes(bytes: &[u8]) -> State {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = StateDb::open(dir.path()).expect("state db opens");
+    State::from_bytes(db.state_keyspace(), bytes).expect("state decodes")
+}
+
+/// Waits until the persisted checkpoint's state snapshot includes `key` —
+/// i.e. the stored checkpoint round ordered the transaction — so a restart is
+/// guaranteed to resume with the submitted state already present. The
+/// snapshot is read from the state database's `snap` keyspace (the `.snap`
+/// files are gone).
+async fn wait_for_persisted_state(
+    storage: &Storage,
+    state_db: &StateDb,
+    key: &[u8],
+    deadline: Duration,
+) {
     timeout(deadline, async {
         loop {
             let Some(persisted) = storage.latest().expect("latest") else {
                 sleep(Duration::from_millis(25)).await;
                 continue;
             };
-            let snapshot = State::from_bytes(&persisted.state_bytes).expect("state decodes");
+            let Some(bytes) =
+                state_db.snapshot_for(persisted.checkpoint.payload.round).expect("snapshot")
+            else {
+                sleep(Duration::from_millis(25)).await;
+                continue;
+            };
+            let snapshot = state_from_bytes(&bytes);
             if snapshot.get(key).is_some() {
                 return;
             }
@@ -106,8 +132,9 @@ async fn restart_from_persisted_checkpoint_restores_state_and_resumes() {
     wait_for_state(&node2, b"k", DEADLINE).await;
 
     // Wait until the persisted checkpoint itself covers the transaction, so
-    // the restart resumes with the submitted state already present.
-    wait_for_persisted_state(&storage1, b"k", DEADLINE).await;
+    // the restart resumes with the submitted state already present. The state
+    // snapshot lives in the node's state database `snap` keyspace.
+    wait_for_persisted_state(&storage1, &net.state_dbs[0], b"k", DEADLINE).await;
 
     // Stop node 1 (driver exits, runtime drops, accept loops die, ports free).
     node1_stop.store(true, Ordering::Release);
@@ -117,7 +144,10 @@ async fn restart_from_persisted_checkpoint_restores_state_and_resumes() {
     // write: this is exactly what a restarting process would read.
     let storage1 = Storage::new(&data1).expect("storage reopens");
     let persisted = storage1.latest().expect("latest").expect("a persisted checkpoint");
-    assert!(verify_persisted(&persisted), "persisted checkpoint passes quorum + state-hash checks");
+    assert!(
+        verify_persisted(&persisted, &net.state_dbs[0]),
+        "persisted checkpoint passes quorum + state-hash checks"
+    );
     assert_eq!(
         persisted.checkpoint.payload.round,
         storage1.latest().expect("latest").expect("still there").checkpoint.payload.round,
@@ -126,7 +156,7 @@ async fn restart_from_persisted_checkpoint_restores_state_and_resumes() {
 
     // Rebuild node 1 from the persisted checkpoint with its original peers.
     let expected_key = ed25519_dalek::SigningKey::from_bytes(&consensus_seed(1)).verifying_key();
-    let response = latest_for_restart(&storage1, 1, &expected_key)
+    let response = latest_for_restart(&storage1, &net.state_dbs[0], 1, &expected_key)
         .expect("restart data loads")
         .expect("a restart response exists");
     assert_eq!(response.signed_checkpoint.payload.round, persisted.checkpoint.payload.round);
@@ -136,17 +166,22 @@ async fn restart_from_persisted_checkpoint_restores_state_and_resumes() {
             ed25519_dalek::SigningKey::from_bytes(&consensus_seed(1)),
             net.identities[0].clone(),
             net.peers_for(0),
-            SYNC_INTERVAL,
-            SYNC_TIMEOUT,
+            SyncTiming::new(SYNC_INTERVAL, SYNC_TIMEOUT),
             response,
+            net.state_dbs[0].clone(),
         )
         .await
         .expect("node rebuilt from persisted checkpoint"),
     );
 
     // The executor state must be restored exactly from the persisted
-    // snapshot — the bytes whose SHA-256 the checkpoint commits.
-    let expected = State::from_bytes(&persisted.state_bytes).expect("state decodes");
+    // snapshot — the bytes whose Merkle root the checkpoint commits.
+    let expected = state_from_bytes(
+        &net.state_dbs[0]
+            .snapshot_for(persisted.checkpoint.payload.round)
+            .expect("snapshot")
+            .expect("a snapshot for the checkpoint round"),
+    );
     assert_eq!(
         node1b.executor_state().await,
         expected,
@@ -154,7 +189,7 @@ async fn restart_from_persisted_checkpoint_restores_state_and_resumes() {
     );
     assert_eq!(
         node1b.executor_state().await.get(b"k"),
-        expected.get(b"k"),
+        Some(b"v".to_vec()),
         "submitted key survived the restart"
     );
 

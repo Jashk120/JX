@@ -7,10 +7,14 @@ This umbrella directory holds one crate:
 
 - `state/` — a pure, deterministic executor. Consumes events in the
   finalized consensus order and folds each transaction's payload into a
-  key-value `State` through a side-effect-free `apply` function. The same
-  finalized order and starting state yield bit-identical state on every
-  node, which is what makes `State::to_bytes()` a valid checkpoint
-  commitment.
+  key-value `State` backed by a Fjall LSM partition (with a write-ahead log)
+  through a deterministic `apply` function. The same finalized order and
+  starting state yield bit-identical state on every node, which is what makes
+  `State::root()` (the Merkle root over the state) a valid checkpoint
+  commitment. The state database (`StateDb`, `<data>/statedb/`) also persists
+  a per-accepted-checkpoint-round snapshot (the `snap` keyspace) that restart
+  recovery and reconnect serving restore state from — replacing the old `.snap`
+  files.
 
 ## How it fits
 

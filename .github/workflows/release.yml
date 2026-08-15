@@ -1,0 +1,73 @@
+# Release pipeline.
+#
+# Triggered by a `v*` tag push (e.g. `v0.1.0`). Builds the `jkaind` daemon
+# for the supported platforms, computes SHA-256 checksums, and attaches
+# everything to a GitHub release for that tag.
+#
+# Uses GitHub-hosted runners; each matrix entry builds natively on its target
+# (no cross-compilation): linux x86_64 + aarch64 and macOS arm64.
+
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build-binaries:
+    name: build ${{ matrix.artifact }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: jkaind-linux-x86_64
+          - os: ubuntu-24.04-arm
+            artifact: jkaind-linux-aarch64
+          - os: macos-latest
+            artifact: jkaind-macos-aarch64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: true
+
+      - name: Build jkaind (release)
+        run: cargo build --release --locked -p node --bin jkaind
+
+      - name: Stage binary
+        run: |
+          mkdir -p dist
+          cp target/release/jkaind "dist/${{ matrix.artifact }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish-release:
+    name: publish GitHub release
+    needs: build-binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Compute checksums
+        run: |
+          cd artifacts
+          sha256sum jkaind-* > SHA256SUMS
+          cat SHA256SUMS
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/*

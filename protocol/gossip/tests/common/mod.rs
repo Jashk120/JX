@@ -22,6 +22,7 @@ use ed25519_dalek::SigningKey;
 use gossip::{
     GossipNode,
     PeerInfo,
+    SyncTiming,
     TlsIdentity,
 };
 use primitives::{
@@ -32,6 +33,7 @@ use primitives::{
     Transaction,
     UnsignedEvent,
 };
+use state::StateDb;
 use tokio::net::TcpListener;
 use tokio::time::{
     sleep,
@@ -41,6 +43,12 @@ use tokio::time::{
 pub const SYNC_INTERVAL: Duration = Duration::from_millis(25);
 pub const SYNC_TIMEOUT: Duration = Duration::from_millis(500);
 pub const DEADLINE: Duration = Duration::from_secs(15);
+
+/// A fresh `StateDb` in a tempdir — the test stand-in for `<data>/statedb/`.
+pub fn temp_state_db() -> Arc<StateDb> {
+    let dir = tempfile::tempdir().expect("temp dir");
+    Arc::new(StateDb::open(dir.path()).expect("state db opens"))
+}
 
 pub fn consensus_seed(id: u64) -> [u8; 32] {
     [id as u8; 32]
@@ -105,8 +113,8 @@ pub async fn spawn_cluster(ids: &[u64]) -> Vec<TestNode> {
             registry_for(&keys),
             identities[index].clone(),
             peers,
-            SYNC_INTERVAL,
-            SYNC_TIMEOUT,
+            SyncTiming::new(SYNC_INTERVAL, SYNC_TIMEOUT),
+            temp_state_db(),
         ));
         let stop = Arc::new(AtomicBool::new(false));
         let spawn_node = node.clone();

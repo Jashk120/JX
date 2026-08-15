@@ -18,6 +18,7 @@ use ed25519_dalek::SigningKey;
 use gossip::{
     GossipNode,
     PeerInfo,
+    SyncTiming,
     TlsIdentity,
 };
 use primitives::NodeId;
@@ -67,8 +68,8 @@ async fn diverged_node_rejoins_and_reconciles() {
         registry_for(&keys),
         identities[0].clone(),
         vec![PeerInfo::new(NodeId::new(2), addrs[1], identities[1].spki_fingerprint())],
-        SYNC_INTERVAL,
-        SYNC_TIMEOUT,
+        SyncTiming::new(SYNC_INTERVAL, SYNC_TIMEOUT),
+        temp_state_db(),
     ));
     let node_b = Arc::new(GossipNode::new(
         NodeId::new(2),
@@ -76,8 +77,8 @@ async fn diverged_node_rejoins_and_reconciles() {
         registry_for(&keys),
         identities[1].clone(),
         vec![PeerInfo::new(NodeId::new(1), addrs[0], identities[0].spki_fingerprint())],
-        SYNC_INTERVAL,
-        SYNC_TIMEOUT,
+        SyncTiming::new(SYNC_INTERVAL, SYNC_TIMEOUT),
+        temp_state_db(),
     ));
 
     let stop_a = Arc::new(AtomicBool::new(false));

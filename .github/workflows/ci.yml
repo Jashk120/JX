@@ -1,0 +1,59 @@
+# CI for the JKain workspace.
+#
+# Gates every push to the default branch and every pull request on the three
+# checks AGENTS.md mandates:
+#   - formatting with the nightly formatter (`cargo +nightly fmt --all`)
+#   - clippy with warnings denied
+#   - the full workspace test suite
+#
+# rust-toolchain.toml pins stable for building; nightly is installed only as
+# the formatter, since the project formats with the nightly rustfmt.
+
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Installs the stable toolchain from rust-toolchain.toml (rustfmt +
+      # clippy components) and caches the cargo registry / target dir.
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: rustfmt, clippy
+          cache: true
+
+      - name: Install nightly formatter
+        run: rustup toolchain install nightly --profile minimal --component rustfmt
+
+      - name: Format check (nightly)
+        run: cargo +nightly fmt --all -- --check
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+  # macOS coverage: the daemon uses Unix sockets, so it is a unix-only
+  # codebase; macos-latest exercises that alongside Linux.
+  test-macos:
+    name: test (macos)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: true
+      - name: Test
+        run: cargo test --workspace --locked

@@ -23,9 +23,11 @@ use ed25519_dalek::SigningKey;
 use gossip::{
     GossipNode,
     PeerInfo,
+    SyncTiming,
     TlsIdentity,
 };
 use primitives::NodeId;
+use state::StateDb;
 use tokio::net::TcpListener;
 use tokio::time::{
     sleep,
@@ -35,6 +37,12 @@ use tokio::time::{
 pub const SYNC_INTERVAL: Duration = Duration::from_millis(25);
 pub const SYNC_TIMEOUT: Duration = Duration::from_millis(500);
 pub const DEADLINE: Duration = Duration::from_secs(30);
+
+/// A fresh `StateDb` in a tempdir — the test stand-in for `<data>/statedb/`.
+pub fn temp_state_db() -> Arc<StateDb> {
+    let dir = tempfile::tempdir().expect("temp dir");
+    Arc::new(StateDb::open(dir.path()).expect("state db opens"))
+}
 
 pub fn consensus_seed(id: u64) -> [u8; 32] {
     [id as u8; 32]
@@ -74,6 +82,7 @@ pub struct ClusterNet {
     pub gossip_addrs: Vec<SocketAddr>,
     pub reconnect_addrs: Vec<SocketAddr>,
     pub identities: Vec<TlsIdentity>,
+    pub state_dbs: Vec<Arc<StateDb>>,
 }
 
 impl ClusterNet {
@@ -110,6 +119,7 @@ pub async fn net_for(ids: &[u64]) -> ClusterNet {
         reconnect_listeners.iter().map(|l| l.local_addr().expect("local addr")).collect();
     let identities: Vec<TlsIdentity> =
         ids.iter().map(|&id| TlsIdentity::from_seed(tls_seed(id), id).expect("identity")).collect();
+    let state_dbs: Vec<Arc<StateDb>> = ids.iter().map(|_| temp_state_db()).collect();
     ClusterNet {
         ids: ids.to_vec(),
         gossip_listeners,
@@ -117,6 +127,7 @@ pub async fn net_for(ids: &[u64]) -> ClusterNet {
         gossip_addrs,
         reconnect_addrs,
         identities,
+        state_dbs,
     }
 }
 
@@ -129,8 +140,8 @@ pub fn fresh_node(net: &ClusterNet, index: usize) -> Arc<GossipNode> {
         registry_for(&net.ids),
         net.identities[index].clone(),
         net.peers_for(index),
-        SYNC_INTERVAL,
-        SYNC_TIMEOUT,
+        SyncTiming::new(SYNC_INTERVAL, SYNC_TIMEOUT),
+        net.state_dbs[index].clone(),
     ))
 }
 
@@ -167,7 +178,7 @@ pub async fn wait_for_state(node: &GossipNode, key: &[u8], deadline: Duration) -
         loop {
             let state = node.executor_state().await;
             if let Some(value) = state.get(key) {
-                return Some(value.to_vec());
+                return Some(value);
             }
             sleep(Duration::from_millis(25)).await;
         }

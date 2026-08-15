@@ -14,7 +14,7 @@
 //! restart can verify each replayed event against the roster active at its
 //! birth round.
 //!
-//! The log is decoupled from the checkpoint (`.cp`/`.snap`) files: the
+//! The log is decoupled from the checkpoint (`.cp`) files: the
 //! checkpoint commits state and roster at a round; the log carries the
 //! complete retained event set since the prune floor.
 

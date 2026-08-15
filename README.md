@@ -15,7 +15,7 @@ protocol/     consensus-critical network layer
   storage/      Fjall-backed durable event log + roster history
   gossip/       pinned-TLS gossip network + GossipNode runtime
 executor/     deterministic execution layer
-  state/        pure executor over the consensus order
+  state/        Fjall-backed KV executor over the consensus order
 node/         the jkaind daemon: config, persistence, restart recovery
 ```
 

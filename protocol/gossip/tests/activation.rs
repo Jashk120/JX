@@ -26,6 +26,7 @@ use crypto::{
 use ed25519_dalek::SigningKey;
 use gossip::{
     GossipNode,
+    SyncTiming,
     TlsIdentity,
 };
 use primitives::{
@@ -36,6 +37,12 @@ use primitives::{
     Transaction,
     UnsignedEvent,
 };
+use state::StateDb;
+
+fn temp_state_db() -> Arc<StateDb> {
+    let dir = tempfile::tempdir().expect("temp dir");
+    Arc::new(StateDb::open(dir.path()).expect("state db opens"))
+}
 
 fn key_for(id: u64) -> SigningKey {
     SigningKey::from_bytes(&[id as u8; 32])
@@ -137,8 +144,8 @@ async fn finalized_membership_op_activates_new_member_idempotently() {
         registry.clone(),
         identity,
         Vec::new(),
-        Duration::from_millis(25),
-        Duration::from_millis(500),
+        SyncTiming::new(Duration::from_millis(25), Duration::from_millis(500)),
+        temp_state_db(),
     ));
 
     // Insert the finalized clique directly into the node's hashgraph.

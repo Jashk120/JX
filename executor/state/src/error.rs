@@ -1,5 +1,7 @@
 use std::fmt;
 
+use thiserror::Error;
+
 /// Errors produced while decoding or applying a transaction payload.
 ///
 /// Every variant is a *deterministic* outcome: identical payload bytes decode
@@ -36,3 +38,14 @@ impl fmt::Display for ExecutorError {
 }
 
 impl std::error::Error for ExecutorError {}
+
+/// Errors produced by the Fjall-backed state database (`StateDb`).
+#[derive(Debug, Error)]
+pub enum StateDbError {
+    /// A Fjall storage error (I/O, corrupt journal, etc.).
+    #[error("state database I/O error: {0}")]
+    Io(#[from] fjall::Error),
+}
+
+/// Result alias for [`StateDbError`].
+pub type StateDbResult<T> = std::result::Result<T, StateDbError>;
