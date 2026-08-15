@@ -832,6 +832,18 @@ impl Hashgraph {
             }
         }
 
+        // Drop pruned events from the witness bookkeeping: a later insert's
+        // `finalize_round` / `vote_as_witness` walks `witnesses_of_round` and
+        // `undecided_witnesses`, and a hash that is no longer in `events`
+        // would make `strongly_see` fail with `UnknownEvent`. Border anchors
+        // and other survivors stay listed because they are still present.
+        for hash in &pruned {
+            self.undecided_witnesses.remove(hash);
+        }
+        for hashes in self.witnesses_by_round.values_mut() {
+            hashes.retain(|h| self.events.contains_key(h));
+        }
+
         self.roster_history.prune_before(threshold);
         pruned.into_iter().collect()
     }

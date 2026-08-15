@@ -154,6 +154,34 @@ pub async fn wait_for_pruned_checkpoint(
     .expect("cluster accepts a checkpoint and pruning fires")
 }
 
+/// Waits until `node` has ordered at least one round, returning the lowest
+/// ordered round. Ordering is insert-driven and round 1's fame election
+/// needs several rounds of gossip to resolve, so a fixed warmup can return
+/// before any order exists under CI load. Must be called while the node's
+/// sync driver is still running: once `stop()` freezes the graph, ordering
+/// can no longer advance.
+#[allow(dead_code)]
+pub async fn wait_for_ordered_round(
+    node: &Arc<GossipNode>,
+    max_round: u64,
+    deadline: Duration,
+) -> u64 {
+    timeout(deadline, async {
+        loop {
+            let ordered = {
+                let hg = node.hashgraph.lock().await;
+                (1..=max_round).find(|&r| !hg.consensus_order(r).is_empty())
+            };
+            if let Some(round) = ordered {
+                return round;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("cluster orders at least one round")
+}
+
 /// Lets the cluster gossip for `warmup`, stops every node's sync driver,
 /// and waits for in-flight syncs to settle. Returns per-node event counts
 /// and per-node latest seq per creator.

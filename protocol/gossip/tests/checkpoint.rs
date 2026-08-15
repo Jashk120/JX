@@ -163,6 +163,12 @@ async fn pruning_old_events_does_not_break_ordering_after_checkpoint() {
     let refs: Vec<&TestNode> = nodes.iter().collect();
     let registry = registry_for_ids(&[1, 2, 3, 4]);
 
+    const MAX_ROUND: u64 = 64;
+    // Ordering is insert-driven, so wait for the first ordered round while
+    // the cluster is still gossiping — once `stop_and_settle` freezes the
+    // graph, round 1's fame election may not have resolved yet under load.
+    wait_for_ordered_round(&nodes[0].node, MAX_ROUND, DEADLINE).await;
+
     let (counts, lates) = stop_and_settle(&refs, Duration::from_secs(2)).await;
     assert_converged(&counts, &lates, "checkpoint ordering");
 
@@ -173,7 +179,6 @@ async fn pruning_old_events_does_not_break_ordering_after_checkpoint() {
     // throughout the settle window, so old ordered rounds may already be
     // gone. Record the surviving order, then prune again at the lowest
     // ordered round and verify nothing at or above it changes.
-    const MAX_ROUND: u64 = 64;
     let ordered: Vec<u64> =
         (1..=MAX_ROUND).filter(|&r| !hg.consensus_order(r).is_empty()).collect();
     assert!(!ordered.is_empty(), "cluster orders at least one round: {ordered:?}");

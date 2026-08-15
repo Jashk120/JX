@@ -131,9 +131,15 @@ impl Hashgraph {
             if self.see(&hash, y)? {
                 return Ok(true);
             }
-            current = self.get(&hash).and_then(|r| r.event().self_parent().copied());
+            // Follow the self-parent chain, but stop when the parent was
+            // pruned below the retained window (a border anchor's own parent
+            // is intentionally dropped): a missing edge is a hard stop, not
+            // an error.
+            current = self.get(&hash).and_then(|r| {
+                let parent = r.event().self_parent().copied()?;
+                self.get(&parent).map(|_| parent)
+            });
         }
-
         Ok(false)
     }
 
@@ -151,7 +157,10 @@ impl Hashgraph {
                 continue;
             }
 
-            let rec = self.get(&current).ok_or(AncestryError::UnknownEvent(current))?;
+            // A pruned ancestor (below the retained window) is a hard stop:
+            // its own parents were dropped, so this branch cannot contain
+            // the target event.
+            let Some(rec) = self.get(&current) else { continue };
             if rec.event().creator() == creator && rec.seq() == seq {
                 return Ok(Some(current));
             }
@@ -177,7 +186,7 @@ impl Hashgraph {
             if !visited.insert(current) {
                 continue;
             }
-            let rec = self.get(&current).ok_or(AncestryError::UnknownEvent(current))?;
+            let Some(rec) = self.get(&current) else { continue };
 
             for parent in
                 [rec.event().self_parent(), rec.event().other_parent()].into_iter().flatten()
@@ -202,7 +211,7 @@ impl Hashgraph {
             if !visited.insert(current) {
                 continue;
             }
-            let rec = self.get(&current).ok_or(AncestryError::UnknownEvent(current))?;
+            let Some(rec) = self.get(&current) else { continue };
 
             if rec.event().creator() == creator {
                 match seen_seqs.get(&rec.seq()) {
