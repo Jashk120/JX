@@ -84,8 +84,8 @@
 
 - The hashgraph stores events and maintains incremental per-member ancestor sequence metadata.
 - Fork detection is implemented with observer-relative `see` checks and a first-seen branch policy.
-- `strongly_see` is correct and tested, but still uses per-member self-chain walks; the witness-specific optimization is deferred to round-assignment work.
-- Gossip/network event propagation (Phase 5), round assignment, fame voting, and final ordering (Phase 4) are now implemented. Persistent storage is not implemented yet — the hashgraph is held in memory for the life of a process.
+- `strongly_see` is correct and tested, but still uses per-member self-chain walks; the witness-specific optimization from §7.5 (precompute earliest descendant-per-creator per witness) is still unimplemented.
+- Gossip/network event propagation (Phase 5), round assignment, fame voting, and final ordering (Phase 4) are now implemented. The live graph is held in memory, but the full event set is durable through the Fjall event log (Phase 8): a restarting node replays the log to rebuild its retained graph without a live peer.
 
 ---
 
@@ -113,8 +113,12 @@
 
 > **Phase 4 status**: rounds, witnesses, virtual voting (fame), and order
 > finalization (`roundReceived` / `consensusTimestamp` / final order) are all
-> implemented and tested against fixed hand-constructed hashgraphs. Dynamic
-> membership and transaction execution remain future work (Phases 6/8).
+> implemented and tested against fixed hand-constructed hashgraphs, and are
+> exercised live by the gossip integration suites (Phase 5). Dynamic
+> membership is implemented too — `MembershipOp::Add` orders through consensus
+> and activates via the roster history at the round after `roundReceived`,
+> covered by `protocol/consensus/tests/membership_transition.rs`; deterministic
+> transaction execution landed in Phase 7.
 
 ---
 
@@ -156,12 +160,7 @@
 > **Phase 6 status**: gossip-level integration on localhost is done — a lone
 > node serves syncs (single-node), and 2- and 4-node clusters exchange
 > transactions, converge on identical event sets, and finalize the same
-> consensus order (`protocol/gossip/tests/gossip_integration.rs` and `e2e.rs`). What
-> remains is real-machine networking: manual `PeerInfo` configuration
-> (address + SPKI fingerprint), firewall/open-port setup, and a VPS ↔ local
-> pair. A NAT'd home node can only initiate dials, but that still converges —
-> each sync round is a full bidirectional exchange over one connection.
-> Full-system integration with transaction execution is Phase 8.
+> consensus order (`protocol/gossip/tests/gossip_integration.rs` and `e2e.rs`).
 
 ---
 
@@ -184,8 +183,10 @@
 > order through two independently-constructed `State`/`Executor` instances
 > and asserts identical state both by equality and by canonical bytes; it
 > also verifies finalized order follows consensus order and that malformed
-> payloads fail identically on every instance. Membership remains static;
-> add/remove-member transactions are deferred. Verified with `cargo fmt`,
+> payloads fail identically on every instance. Membership is now dynamic:
+> add-member transactions (`MembershipOp::Add`) order through consensus and
+> activate through the roster history (Phase 8), with the executor applying
+> KV ops only. Verified with `cargo fmt`,
 > `cargo clippy`, and `cargo test --workspace`.
 
 ---
@@ -233,7 +234,7 @@ separate Go project) is downstream of this phase.
 - [x] Event stream file: append-only, chained, every gossip event — the
       offline DAG source; a mirror stores all events and points from each
       event to its transactions
-- [x] Record stream file (`.rcd`): ordered finalized transactions per round
+- [x] Record stream file (`.rsf`): ordered finalized transactions per round
 - [x] Record stream anchored to the threshold-signed checkpoint state root,
       so a mirror verifies consensus output cryptographically rather than
       trusting any single node (source-agnostic)
@@ -277,8 +278,8 @@ separate Go project) is downstream of this phase.
 > signature files, and enforces the embedded checkpoint quorum
 > (`valid * 3 > total * 2`) against the embedded roster — what the Go mirror
 > does from the files alone; determinism, chain-integrity, mirror-consumer,
-> and live-wiring tests verify it. Remaining in Phase 8: parallel execution
-> (point 4).
+> and live-wiring tests verify it. Phase 8 is complete; parallel execution is
+> tracked in Phase 9.
 
 ---
 
@@ -286,11 +287,83 @@ separate Go project) is downstream of this phase.
 - [ ] HCS
 - [ ] HTS
 - [ ] DID
+
+### Services
+
+**Account / Crypto Service**
+- [ ] Accounts
+- [ ] Keys
+- [ ] Signatures
+- [ ] Transfers
+- [ ] Key rotation
+- [ ] Account recovery
+- [ ] Threshold/multisig authorization
+
+**Consensus Service**
+- [ ] Ordered messages/events
+- [ ] Consensus timestamps
+- [ ] Event streams
+- [ ] Application-defined state machines
+
+**Token / Asset Service**
+- [ ] Fungible assets
+- [ ] NFTs
+- [ ] Ownership
+- [ ] Transfers
+- [ ] Mint/burn
+- [ ] Provenance
+- [ ] Asset lifecycle
+
+**Data / File Service**
+- [ ] Immutable files
+- [ ] Content-addressed data
+- [ ] Metadata
+- [ ] Data availability primitives
+
+**Identity Service**
+- [ ] DID creation
+- [ ] DID Documents
+- [ ] Verification methods
+- [ ] Authentication relationships
+- [ ] Key rotation
+- [ ] DID lifecycle
+
+**Credential Service**
+- [ ] Verifiable Credential issuance
+- [ ] Credential verification
+- [ ] Credential status
+- [ ] Revocation
+- [ ] Expiration
+- [ ] Credential schemas
+
+**Attestation Service**
+- [ ] Signed claims
+- [ ] Issuer → subject relationships
+- [ ] Attestation creation/revocation
+- [ ] Timestamping
+- [ ] Proof references
+
+**Naming Service**
+- [ ] Human-readable names
+- [ ] Name → account/DID/asset/service resolution
+- [ ] Ownership
+- [ ] Name transfer
+- [ ] Name expiry
+
+**Capability / Authorization Service**
+- [ ] Permissions
+- [ ] Delegation
+- [ ] Capabilities
+- [ ] Scoped access
+- [ ] Expiration
+- [ ] Revocation
+
 ### Parallel execution
 
 - [ ] Batch transaction execution across finalized rounds
 - [ ] Deterministic parallelism: result independent of thread scheduling
 - [ ] Parallel signature verification
+
 ---
 
 ## Phase 10 — Future
@@ -298,67 +371,7 @@ separate Go project) is downstream of this phase.
 - [ ] Privacy
 - [ ] Compute layer
 
-Parallel state database / lock-free scheduler 
-Aggressive gossip optimization (QUIC, batching, compression) 
+Parallel state database / lock-free scheduler
+Aggressive gossip optimization (QUIC, batching, compression)
 Sliding-window DAG in RAM with snapshots
-Efficient LSM + Merkle state storage 
-
-Account / Crypto Service
-Accounts
-Keys
-Signatures
-Transfers
-Key rotation
-Account recovery
-Threshold/multisig authorization
-Consensus Service
-Ordered messages/events
-Consensus timestamps
-Event streams
-Application-defined state machines
-Token / Asset Service
-Fungible assets
-NFTs
-Ownership
-Transfers
-Mint/burn
-Provenance
-Asset lifecycle
-Data / File Service
-Immutable files
-Content-addressed data
-Metadata
-Data availability primitives
-Identity Service
-DID creation
-DID Documents
-Verification methods
-Authentication relationships
-Key rotation
-DID lifecycle
-Credential Service
-Verifiable Credential issuance
-Credential verification
-Credential status
-Revocation
-Expiration
-Credential schemas
-Attestation Service
-Signed claims
-Issuer → subject relationships
-Attestation creation/revocation
-Timestamping
-Proof references
-Naming Service
-Human-readable names
-Name → account/DID/asset/service resolution
-Ownership
-Name transfer
-Name expiry
-Capability / Authorization Service
-Permissions
-Delegation
-Capabilities
-Scoped access
-Expiration
-Revocation
+Efficient LSM + Merkle state storage
