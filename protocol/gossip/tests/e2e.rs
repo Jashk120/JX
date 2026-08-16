@@ -219,14 +219,30 @@ async fn live_cluster_finalizes_identical_consensus_order() {
     let min_finalized = rounds_by_node.iter().map(Vec::len).min().expect("at least one node");
     assert!(min_finalized >= 1, "no node ordered a single event: ordered={ordered_by_node:?}");
 
-    for round in 0..min_finalized {
-        let baseline = &rounds_by_node[0][round];
-        for node_rounds in &rounds_by_node[1..] {
+    // Each node accepts checkpoints at its own pace and prunes history
+    // below its own latest checkpoint, so the surviving round vectors are
+    // NOT index-aligned across nodes: index 0 on one node may be round 2
+    // while another still holds round 1. Align on the round number rather
+    // than the vector position, and only compare rounds a node still holds.
+    let baseline_by_round: Vec<(u64, Vec<EventHash>)> = {
+        let hashgraph = nodes[0].node.hashgraph.lock().await;
+        (1..=MAX_ORDERED_ROUND)
+            .map(|round| (round, hashgraph.consensus_order(round)))
+            .filter(|(_, order)| !order.is_empty())
+            .collect()
+    };
+    for (round, baseline) in &baseline_by_round {
+        for node in &refs[1..] {
+            let this_node_round = {
+                let hashgraph = node.node.hashgraph.lock().await;
+                hashgraph.consensus_order(*round)
+            };
+            if this_node_round.is_empty() {
+                continue; // this node pruned the round; nothing to compare
+            }
             assert_eq!(
-                node_rounds[round],
-                *baseline,
-                "consensus order for round {} differs across nodes",
-                round + 1
+                this_node_round, *baseline,
+                "consensus order for round {round} differs across nodes"
             );
         }
     }

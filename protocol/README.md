@@ -15,6 +15,8 @@ consensus    in-memory Hashgraph: rounds, fame voting, order, checkpoints
     ↑
 storage      Fjall-backed durable event log + roster history (Phase 8)
     ↑
+stream       mirror stream files: `.esf` events + `.rsf` records (Phase 8)
+    ↑
 gossip       pinned-TLS gossip network + GossipNode runtime
 ```
 
@@ -31,6 +33,12 @@ gossip       pinned-TLS gossip network + GossipNode runtime
 - `storage/` — the durable event log: a Fjall database appending every
   verified event on insert (Phase 8), so a restarting node replays its
   retained graph instead of reconnecting from a peer.
+- `stream/` — the mirror-facing stream files (Phase 8): append-only, running-
+  hash-chained `.esf` event files (every gossip event, the offline DAG source)
+  and `.rsf` record files (one per decided round, anchored to the threshold-
+  signed checkpoint state root), plus the mirror-side verifier. Protobuf on
+  disk; the schema is vendored and will move to a shared schema repo with the
+  Go mirror.
 - `gossip/` — the gossip-about-gossip network: TLS identities, sync
   transport, delta exchange, the reconnect protocol, and the long-running
   `GossipNode`.

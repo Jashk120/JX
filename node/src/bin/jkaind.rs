@@ -78,6 +78,10 @@ use state::{
     StateDb,
 };
 use storage::EventLog;
+use stream::{
+    EventStreamWriter,
+    RecordStreamWriter,
+};
 use tokio::net::{
     TcpListener,
     UnixListener,
@@ -465,6 +469,10 @@ async fn run_node(opts: &RunOptions) -> Result<()> {
     let event_log = Arc::new(EventLog::open(&opts.data_dir)?);
     let state_db = Arc::new(StateDb::open(&opts.data_dir)?);
 
+    // Mirror streams (Phase 8): the stream files need their own copy of the
+    // consensus signing key — the one handed to `GossipNode` is moved in.
+    let stream_signing_key = signing_key.clone();
+
     match reconnect_port {
         Some(port) => eprintln!(
             "[jkaind] node {}: gossip on 0.0.0.0:{gossip_port}, reconnect on 0.0.0.0:{port}, data in {}",
@@ -530,6 +538,24 @@ async fn run_node(opts: &RunOptions) -> Result<()> {
 
     node.set_checkpoint_sink(Arc::new(storage)).await;
     node.set_event_sink(event_log.clone()).await;
+    // Mirror streams (Phase 8): open `<data>/streams/` and register both
+    // writers. The record writer needs the live hashgraph to assemble each
+    // round's finalized items; the event writer is a second event sink that
+    // records every inserted event in topological order. Both write on their
+    // own background tasks, so the consensus hot path never blocks on disk.
+    let streams_dir = opts.data_dir.join(stream::STREAMS_SUBDIR);
+    let event_stream = Arc::new(EventStreamWriter::open(
+        &streams_dir,
+        stream_signing_key.clone(),
+        stream::DEFAULT_EVENTS_PER_FILE,
+    )?);
+    let record_stream = Arc::new(RecordStreamWriter::open(
+        &streams_dir,
+        stream_signing_key,
+        node.hashgraph.clone(),
+    )?);
+    node.set_event_stream_sink(event_stream).await;
+    node.set_record_sink(record_stream).await;
     // Keep the current roster history durable (Phase 8) so a future restart
     // can replay the log and verify each event against the roster active at
     // its birth round. Idempotent — membership changes overwrite it via the

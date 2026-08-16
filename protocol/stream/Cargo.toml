@@ -1,0 +1,23 @@
+[package]
+name = "stream"
+version.workspace = true
+edition.workspace = true
+build = "build.rs"
+
+[dependencies]
+primitives     = { workspace = true }
+crypto         = { workspace = true }
+consensus      = { workspace = true }
+storage        = { workspace = true }
+tokio          = { workspace = true }
+prost          = { workspace = true }
+sha2           = { workspace = true }
+ed25519-dalek  = { workspace = true }
+thiserror      = { workspace = true }
+
+[build-dependencies]
+prost-build    = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+rand     = { workspace = true }

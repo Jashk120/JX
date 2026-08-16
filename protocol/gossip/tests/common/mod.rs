@@ -42,6 +42,7 @@ use tokio::time::{
 
 pub const SYNC_INTERVAL: Duration = Duration::from_millis(25);
 pub const SYNC_TIMEOUT: Duration = Duration::from_millis(500);
+#[allow(dead_code)]
 pub const DEADLINE: Duration = Duration::from_secs(15);
 
 /// A fresh `StateDb` in a tempdir — the test stand-in for `<data>/statedb/`.
@@ -71,6 +72,7 @@ pub fn registry_for(keys: &[(u64, SigningKey)]) -> MembershipRegistry {
 }
 
 pub struct TestNode {
+    #[allow(dead_code)]
     pub key: SigningKey,
     pub node: Arc<GossipNode>,
     pub stop: Arc<AtomicBool>,
@@ -78,6 +80,7 @@ pub struct TestNode {
 }
 
 impl TestNode {
+    #[allow(dead_code)]
     pub fn stop(&self) {
         self.stop.store(true, Ordering::Release);
     }
@@ -191,6 +194,7 @@ pub async fn wait_for_ordered_round(
 /// in-flight window of the newest few events. So convergence is asserted as
 /// "no islands" (every node holds events from every creator) plus a small,
 /// bounded count gap, rather than exact set equality.
+#[allow(dead_code)]
 pub async fn stop_and_settle(
     nodes: &[&TestNode],
     warmup: Duration,
@@ -228,6 +232,7 @@ pub async fn stop_and_settle(
     .expect("nodes quiesce")
 }
 
+#[allow(dead_code)]
 pub fn assert_converged(counts: &[usize], lates: &[Vec<Option<u64>>], label: &str) {
     let no_island = lates
         .iter()
@@ -263,6 +268,7 @@ pub fn drop_nodes(nodes: Vec<TestNode>) {
 }
 
 /// Builds a signed event carrying `payload` for the given creator.
+#[allow(dead_code)]
 pub fn make_event_with_payload(
     key: &SigningKey,
     creator_id: u64,
@@ -283,6 +289,7 @@ pub fn make_event_with_payload(
 /// Inserts an already-signed event directly into one node's hashgraph,
 /// simulating state the node holds that its peers have never seen
 /// (partition). Returns the event's hash.
+#[allow(dead_code)]
 pub async fn insert_event(
     node: &TestNode,
     registry: &MembershipRegistry,
@@ -295,6 +302,7 @@ pub async fn insert_event(
     hash
 }
 
+#[allow(dead_code)]
 pub fn now_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

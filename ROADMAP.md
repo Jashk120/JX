@@ -230,20 +230,16 @@ separate Go project) is downstream of this phase.
 
 ### New file types (mirror consumption)
 
-- [ ] Event stream file: append-only, chained, every gossip event — the
+- [x] Event stream file: append-only, chained, every gossip event — the
       offline DAG source; a mirror stores all events and points from each
       event to its transactions
-- [ ] Record stream file (`.rcd`): ordered finalized transactions per round
-- [ ] Record stream anchored to the threshold-signed checkpoint state root,
+- [x] Record stream file (`.rcd`): ordered finalized transactions per round
+- [x] Record stream anchored to the threshold-signed checkpoint state root,
       so a mirror verifies consensus output cryptographically rather than
       trusting any single node (source-agnostic)
-- [ ] Cross-language record format decodable by the Go mirror
+- [x] Cross-language record format decodable by the Go mirror
 
-### Parallel execution
 
-- [ ] Batch transaction execution across finalized rounds
-- [ ] Deterministic parallelism: result independent of thread scheduling
-- [ ] Parallel signature verification
 
 > **Phase 8 status**: the Fjall event log (point 1) is implemented — a new
 > `protocol/storage` crate appends every verified event into a two-keyspace
@@ -266,8 +262,23 @@ separate Go project) is downstream of this phase.
 > per-round `.snap` files disappeared — each accepted checkpoint's state now
 > lives in the state database's `snap` keyspace, which restart recovery,
 > verification, and reconnect serving read from (`FORMAT_VERSION` bumped to 3).
-> Remaining in Phase 8: event/record stream files (point 3), and parallel
-> execution (point 4).
+> The mirror stream files (point 3) are implemented too — a new
+> `protocol/stream` crate emits, into `<data>/streams/`, the two protobuf file
+> types a mirror consumes: `events-<n>.esf` (every gossip event this node
+> inserted, in topological order — the offline DAG source, registered as a
+> second event sink next to the event log) and `round-<r>.rsf` (one file per
+> decided round, the round's finalized transactions in `consensus_order` plus
+> its threshold-signed `SignedCheckpoint` as the state-root anchor, emitted
+> from `accept_checkpoint`). Both are chained by a running hash (Hiero-style,
+> domain-separated SHA-256) and signed per-file (`.esf_sig`/`.rsf_sig`,
+> Ed25519 over the whole file + the metadata). Both writers run on background
+> tasks over an ordered channel, so the consensus hot path never blocks on
+> disk. The verifier (`stream::verify`) recomputes the chain, checks the
+> signature files, and enforces the embedded checkpoint quorum
+> (`valid * 3 > total * 2`) against the embedded roster — what the Go mirror
+> does from the files alone; determinism, chain-integrity, mirror-consumer,
+> and live-wiring tests verify it. Remaining in Phase 8: parallel execution
+> (point 4).
 
 ---
 
@@ -275,7 +286,11 @@ separate Go project) is downstream of this phase.
 - [ ] HCS
 - [ ] HTS
 - [ ] DID
+### Parallel execution
 
+- [ ] Batch transaction execution across finalized rounds
+- [ ] Deterministic parallelism: result independent of thread scheduling
+- [ ] Parallel signature verification
 ---
 
 ## Phase 10 — Future
@@ -287,4 +302,63 @@ Parallel state database / lock-free scheduler
 Aggressive gossip optimization (QUIC, batching, compression) 
 Sliding-window DAG in RAM with snapshots
 Efficient LSM + Merkle state storage 
-Batch/GPU signature verification
+
+Account / Crypto Service
+Accounts
+Keys
+Signatures
+Transfers
+Key rotation
+Account recovery
+Threshold/multisig authorization
+Consensus Service
+Ordered messages/events
+Consensus timestamps
+Event streams
+Application-defined state machines
+Token / Asset Service
+Fungible assets
+NFTs
+Ownership
+Transfers
+Mint/burn
+Provenance
+Asset lifecycle
+Data / File Service
+Immutable files
+Content-addressed data
+Metadata
+Data availability primitives
+Identity Service
+DID creation
+DID Documents
+Verification methods
+Authentication relationships
+Key rotation
+DID lifecycle
+Credential Service
+Verifiable Credential issuance
+Credential verification
+Credential status
+Revocation
+Expiration
+Credential schemas
+Attestation Service
+Signed claims
+Issuer → subject relationships
+Attestation creation/revocation
+Timestamping
+Proof references
+Naming Service
+Human-readable names
+Name → account/DID/asset/service resolution
+Ownership
+Name transfer
+Name expiry
+Capability / Authorization Service
+Permissions
+Delegation
+Capabilities
+Scoped access
+Expiration
+Revocation

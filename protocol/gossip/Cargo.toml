@@ -9,6 +9,7 @@ crypto         = { workspace = true }
 consensus      = { workspace = true }
 state          = { workspace = true }
 storage        = { workspace = true }
+stream         = { workspace = true }
 tokio          = { workspace = true }
 thiserror      = { workspace = true }
 ed25519-dalek  = { workspace = true, features = ["pkcs8"] }

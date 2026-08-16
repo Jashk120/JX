@@ -148,6 +148,16 @@ pub struct GossipNode {
     /// appended, ordering updates and roster-history changes are recorded,
     /// and prunes are mirrored. `None` means no event persistence.
     event_sink: Mutex<Option<Arc<dyn storage::EventSink + Send + Sync>>>,
+    /// Second event sink (Phase 8, mirror streams): the event stream file
+    /// writer, receiving every freshly inserted event in topological order.
+    /// Unlike the event log, ordering updates, roster-history changes, and
+    /// prunes are deliberately not forwarded — event files are append-only
+    /// and carry ordering only when the appended record already knows it.
+    event_stream_sink: Mutex<Option<Arc<dyn storage::EventSink + Send + Sync>>>,
+    /// Sink for the record stream file writer (Phase 8, mirror streams):
+    /// notified with every newly accepted checkpoint, so each decided round's
+    /// record file is emitted. `None` means no record stream.
+    record_sink: Mutex<Option<Arc<dyn stream::RecordSink + Send + Sync>>>,
 }
 
 impl GossipNode {
@@ -190,6 +200,8 @@ impl GossipNode {
             pending_transactions: Mutex::new(VecDeque::new()),
             checkpoint_sink: Mutex::new(None),
             event_sink: Mutex::new(None),
+            event_stream_sink: Mutex::new(None),
+            record_sink: Mutex::new(None),
         }
     }
 
@@ -278,23 +290,47 @@ impl GossipNode {
         *self.event_sink.lock().await = Some(sink);
     }
 
+    /// Registers `sink` as the event stream file writer (Phase 8, mirror
+    /// streams). It is invoked with every freshly inserted event in
+    /// topological order; ordering/roster-history changes and prunes are not
+    /// forwarded (event files are append-only and mirror the append hook
+    /// only). Replacing the sink at runtime is allowed but unusual.
+    pub async fn set_event_stream_sink(&self, sink: Arc<dyn storage::EventSink + Send + Sync>) {
+        *self.event_stream_sink.lock().await = Some(sink);
+    }
+
+    /// Registers `sink` as the record stream file writer (Phase 8, mirror
+    /// streams). It is invoked with every newly accepted checkpoint, so each
+    /// decided round's `.rsf` is emitted from the threshold-signed anchor.
+    pub async fn set_record_sink(&self, sink: Arc<dyn stream::RecordSink + Send + Sync>) {
+        *self.record_sink.lock().await = Some(sink);
+    }
+
     /// Appends every freshly inserted event in `fresh` to the durable event
     /// log (Phase 8), reading each event's record metadata from the graph.
     /// Called right after insertion, before any pruning can remove the
-    /// events, so the log and the live graph stay in lockstep.
+    /// events, so the log and the live graph stay in lockstep. The same
+    /// records feed the event stream file writer, so the mirror-facing event
+    /// stream sees exactly the inserted events in topological order.
     async fn log_fresh_inserts(&self, fresh: &[EventHash]) {
         let sink = self.event_sink.lock().await.clone();
-        let Some(sink) = sink else { return };
+        let stream_sink = self.event_stream_sink.lock().await.clone();
         let hg = self.hashgraph.lock().await;
         for hash in fresh {
             if let Some(record) = hg.get(hash) {
-                sink.append(&consensus::RetainedEvent {
+                let retained = consensus::RetainedEvent {
                     event: record.event().clone(),
                     seq: record.seq(),
                     round: record.round(),
                     ancestor_seqs: record.ancestor_seqs().to_vec(),
                     round_received: None,
-                });
+                };
+                if let Some(sink) = &sink {
+                    sink.append(&retained);
+                }
+                if let Some(stream_sink) = &stream_sink {
+                    stream_sink.append(&retained);
+                }
             }
         }
     }
@@ -788,6 +824,17 @@ impl GossipNode {
                 eprintln!("[jkaind] failed to persist state snapshot for round {round}: {e}");
             }
             self.notify_checkpoint_accepted(&accepted).await;
+            // Mirror streams (Phase 8): emit the round's record stream file
+            // from the threshold-signed anchor. The writer assembles the
+            // items from `consensus_order(round)` — final and immutable by
+            // now — and writes the `.rsf` on its background task, so the
+            // hot path never blocks on disk. Runs before pruning below, and
+            // pruning only removes rounds already ordered, so the assembly
+            // is race-free even when it runs concurrently.
+            let record_sink = self.record_sink.lock().await.clone();
+            if let Some(record_sink) = record_sink {
+                record_sink.persist(&accepted).await;
+            }
         }
         {
             let mut signed = self.signed_checkpoints.lock().await;
@@ -1095,6 +1142,7 @@ impl GossipNode {
         //    signature-verified against the checkpoint roster first: a
         //    malicious teacher must not be able to poison the learner's
         //    graph with forged events.
+        let stream_sink = self.event_stream_sink.lock().await.clone();
         {
             let mut hg = self.hashgraph.lock().await;
             *hg = consensus::Hashgraph::from_checkpoint(&checkpoint.payload, roster_history);
@@ -1119,6 +1167,9 @@ impl GossipNode {
                 }
                 if let Some(sink) = &sink {
                     sink.append(retained);
+                }
+                if let Some(stream_sink) = &stream_sink {
+                    stream_sink.append(retained);
                 }
             }
             // Rounds the teacher already finalized stay finalized here, so
