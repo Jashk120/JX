@@ -299,14 +299,27 @@ async fn live_cluster_finalizes_identical_consensus_order() {
     let min_finalized = rounds_by_node.iter().map(Vec::len).min().expect("at least one node");
     assert!(min_finalized >= 1, "no node ordered a single event: ordered={ordered_by_node:?}");
 
-    // Each node accepts checkpoints at its own pace and prunes history
-    // below its own latest checkpoint, so the surviving round vectors are
-    // NOT index-aligned across nodes: index 0 on one node may be round 2
-    // while another still holds round 1. Align on the round number rather
-    // than the vector position, and only compare rounds a node still holds.
+    // Each node accepts checkpoints at its own pace and prunes every event
+    // with round_received < accepted - RETENTION_ROUNDS, keeping only border
+    // anchors of older rounds. So a round that one node still holds in full
+    // may be down to a subset on another, even though both nodes ordered the
+    // identical set. Only rounds at or above every node's prune floor are
+    // comparable: for those, no node has pruned any of the round's events, so
+    // `consensus_order(round)` is complete on every node that decided it.
+    let mut compare_from = 0u64;
+    for node in &refs {
+        let floor = node
+            .node
+            .latest_accepted_checkpoint_round()
+            .await
+            .unwrap_or(0)
+            .saturating_sub(consensus::RETENTION_ROUNDS);
+        compare_from = compare_from.max(floor);
+    }
+    let compare_from = compare_from.max(1);
     let baseline_by_round: Vec<(u64, Vec<EventHash>)> = {
         let hashgraph = nodes[0].node.hashgraph.lock().await;
-        (1..=MAX_ORDERED_ROUND)
+        (compare_from..=MAX_ORDERED_ROUND)
             .map(|round| (round, hashgraph.consensus_order(round)))
             .filter(|(_, order)| !order.is_empty())
             .collect()
@@ -318,7 +331,7 @@ async fn live_cluster_finalizes_identical_consensus_order() {
                 hashgraph.consensus_order(*round)
             };
             if this_node_round.is_empty() {
-                continue; // this node pruned the round; nothing to compare
+                continue; // this node has not decided the round; nothing to compare
             }
             assert_eq!(
                 this_node_round, *baseline,
@@ -347,7 +360,10 @@ async fn live_cluster_finalizes_identical_consensus_order() {
                     .into_iter()
                     .flatten()
                 {
-                    let parent_record = hashgraph.get(parent).expect("parent is present");
+                    // A retained event may be a border anchor whose own parent
+                    // was pruned below the node's checkpoint floor; a pruned
+                    // parent was necessarily ordered earlier, so skip it.
+                    let Some(parent_record) = hashgraph.get(parent) else { continue };
                     if let Some(parent_round) = parent_record.round_received() {
                         assert!(
                             parent_round <= round,
