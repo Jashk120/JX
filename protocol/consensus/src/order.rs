@@ -21,14 +21,19 @@
 //! # When a round is finalized
 //!
 //! A round `r` is *decided* once every witness of `r` has a final, immutable
-//! fame decision. At that point round `r`'s famous-witness set is final (a
-//! witness's fame never changes once decided), so `assignOrder(r)` can be
-//! run immediately. `Hashgraph::order_decided_rounds` processes decided
-//! rounds in strictly increasing order, each exactly once. Note that a round
-//! is not decided until the election has run *past* it — a round-`r`
-//! witness's fame is produced by round-`(r+1)` voters — so by the time round
-//! `r` is decided, the information needed to compute its ordering is already
-//! present.
+//! fame decision **and** this node's view of `r` is complete: every member
+//! active at `r` has contributed an event born after `r`
+//! ([`Hashgraph::round_view_complete`]). The view-completeness gate exists
+//! because a fame-complete round against a partial witness set would produce an
+//! order that a better-synced peer computes differently for the same round —
+//! and ordering is immutable, so the divergence would never heal. At that point
+//! round `r`'s famous-witness set is final (a witness's fame never changes once
+//! decided), so `assignOrder(r)` can be run immediately.
+//! `Hashgraph::order_decided_rounds` processes decided rounds in strictly
+//! increasing order, each exactly once. Note that a round is not decided until
+//! the election has run *past* it — a round-`r` witness's fame is produced by
+//! round-`(r+1)` voters — so by the time round `r` is decided, the information
+//! needed to compute its ordering is already present.
 //!
 //! # Eager, incremental, no full rescans
 //!

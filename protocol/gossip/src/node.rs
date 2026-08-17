@@ -683,8 +683,9 @@ impl GossipNode {
 
     /// Emits a checkpoint for every round decided since the last pass, in
     /// ascending order. A round is decided when all its witnesses have a
-    /// final fame decision (`is_round_decided`), which is exactly the point
-    /// at which its ordering can no longer change.
+    /// final fame decision *and* this node's view of the round is complete
+    /// (`is_round_decided`), which is exactly the point at which its ordering
+    /// can no longer change.
     async fn produce_pending_checkpoints(&self, state_hashes: &BTreeMap<u64, [u8; 32]>) {
         loop {
             let round = self.activation.lock().await.checkpoint_watermark + 1;

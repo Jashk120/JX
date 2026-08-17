@@ -365,6 +365,13 @@ impl Hashgraph {
             self.vote_as_witness(hash)?;
         }
 
+        // A round whose fame completed earlier but whose view was incomplete
+        // may only now be safe to finalize: this insert advanced the frontier,
+        // so retry the lowest unfinalized round. Cheap to skip when that round
+        // is still fame-undecided or view-incomplete (see
+        // `note_round_decided_if_complete`).
+        self.note_round_decided_if_complete(self.next_round_to_order);
+
         Ok(hash)
     }
 
@@ -463,11 +470,12 @@ impl Hashgraph {
             .collect()
     }
 
-    /// Phase 4 — the highest round whose fame is fully decided (every
-    /// witness has a final decision), or 0 if none. The reconnect teacher
-    /// sends this so the learner can seed `fully_decided_rounds` up to the
-    /// same point and continue producing checkpoints without re-deciding
-    /// history it already holds.
+    /// Phase 4 — the highest round that is fully decided (every witness has a
+    /// final fame decision and this node's view of the round is complete —
+    /// see [`Self::note_round_decided_if_complete`]), or 0 if none. The
+    /// reconnect teacher sends this so the learner can seed
+    /// `fully_decided_rounds` up to the same point and continue producing
+    /// checkpoints without re-deciding history it already holds.
     pub fn highest_decided_round(&self) -> u64 {
         self.fully_decided_rounds.last().copied().unwrap_or(0)
     }
@@ -563,8 +571,9 @@ impl Hashgraph {
     /// Decisions are immutable: nothing in the codebase calls this twice.
     ///
     /// If `candidate`'s round has now no undecided witnesses left, every
-    /// witness of that round has a final fame decision — the round is
-    /// "decided" and `order.rs` may finalize it (§4).
+    /// witness of that round has a final fame decision — the round may be
+    /// "decided" (§4), subject to the view-completeness gate in
+    /// `note_round_decided_if_complete`.
     pub(crate) fn decide_fame(&mut self, candidate: &EventHash, status: FameStatus) {
         if let Some(record) = self.events.get_mut(candidate) {
             record.fame_status = status;
@@ -574,17 +583,47 @@ impl Hashgraph {
         self.note_round_decided_if_complete(round);
     }
 
+    /// Whether this node's view of `round` is complete enough to finalize:
+    /// every member active at `round` has contributed an event born in round
+    /// `>= round + 1` to this node's graph.
+    ///
+    /// Because an inserted event always carries its full self-parent chain,
+    /// having a member's first event *past* `round` means the node holds that
+    /// member's entire round-`<=round` history — in particular its round-`round`
+    /// witness and every event `assignOrder(round)` could order. Without this
+    /// gate, a poorly-synced node could finalize a round against a witness set
+    /// smaller than the one that objectively exists, producing an order that a
+    /// better-synced peer computes differently for the same round — and
+    /// ordering is immutable, so the divergence never heals.
+    fn round_view_complete(&self, round: u64) -> bool {
+        self.roster_history.roster_for_round(round).member_ids().into_iter().all(|member| {
+            self.latest_by_creator
+                .get(&member)
+                .and_then(|hash| self.get(hash))
+                .is_some_and(|record| record.round() > round)
+        })
+    }
+
     /// Crate-internal (§4): if `round` still has undecided witnesses it is
     /// not decided; otherwise it joins the decided set and every round that
     /// can now be finalized is finalized in order. Hooked from
     /// `decide_fame`, so it fires at whatever recursion depth a fame
     /// decision was actually produced — not just for the round of whatever
     /// witness triggered the election.
+    ///
+    /// A round is only decided once this node has *actually received* every
+    /// witness that objectively exists for it ([`Self::round_view_complete`]),
+    /// not just the ones it happens to know. When the view is still
+    /// incomplete, the round stays undecided; a later insert that advances
+    /// the frontier retries via `insert`.
     pub(crate) fn note_round_decided_if_complete(&mut self, round: u64) {
         if round == 0 {
             return;
         }
         if self.undecided_witnesses.values().any(|&witness_round| witness_round == round) {
+            return;
+        }
+        if !self.round_view_complete(round) {
             return;
         }
         self.fully_decided_rounds.insert(round);
@@ -862,9 +901,10 @@ impl Hashgraph {
     }
 
     /// Whether round `round` is fully decided — every witness of `round` has
-    /// a final fame decision. Same set that drives `order_decided_rounds` /
-    /// `assign_order`, i.e. the same finality notion `finalized_events`
-    /// relies on.
+    /// a final fame decision *and* this node's view of the round is complete
+    /// ([`Self::round_view_complete`]). Same set that drives
+    /// `order_decided_rounds` / `assign_order`, i.e. the same finality notion
+    /// `finalized_events` relies on.
     pub fn is_round_decided(&self, round: u64) -> bool {
         self.fully_decided_rounds.contains(&round)
     }
