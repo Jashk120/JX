@@ -27,7 +27,8 @@ use std::time::Duration;
 use common::*;
 use crypto::{
     Hashable,
-    MembershipRegistry,
+    MembershipOp,
+    RosterHistory,
     Signable,
     Verifiable,
 };
@@ -70,17 +71,6 @@ const MAX_ORDERED_ROUND: u64 = 32;
 
 // --- E2E-specific helpers -------------------------------------------------------
 
-/// Builds the shared member registry from the deterministic per-id seeds,
-/// matching the registry `spawn_cluster` constructs internally.
-fn registry_for_ids(ids: &[u64]) -> MembershipRegistry {
-    let mut registry = MembershipRegistry::new();
-    for &id in ids {
-        let key = SigningKey::from_bytes(&consensus_seed(id));
-        registry.register(NodeId::new(id), key.verifying_key());
-    }
-    registry
-}
-
 /// Waits (bounded) until `hash` appears in `node`'s hashgraph. The gossip
 /// protocol sends an `Event` frame and returns without an acknowledgement, so
 /// the receiving node may not have processed it yet when the sender's
@@ -96,6 +86,89 @@ async fn wait_for_event(node: &Arc<GossipNode>, hash: EventHash, deadline: Durat
     })
     .await
     .expect("event appears in the node's hashgraph");
+}
+
+/// Waits until `node`'s hashgraph registers `id` as a structural member
+/// (i.e. the `MembershipOp::Add` ordering it has activated).
+async fn wait_for_member(node: &Arc<GossipNode>, id: NodeId, deadline: Duration) {
+    timeout(deadline, async {
+        loop {
+            if node.is_consensus_member(id).await {
+                return;
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("membership activates on the node");
+}
+
+/// The transaction payload encoding for a `MembershipOp::Add`: the `0x02`
+/// executor tag followed by the op's own encoding (same bytes the daemon's
+/// control socket produces via `node::control::membership_op_payload`).
+fn membership_add_payload(op: &MembershipOp) -> Vec<u8> {
+    let mut payload = vec![0x02u8];
+    payload.extend_from_slice(&op.encode());
+    payload
+}
+
+/// Spawns `ids` nodes on ephemeral gossip + reconnect listeners, returning the
+/// nodes plus the gossip addresses, TLS identities, and reconnect addresses so
+/// a test can construct a membership op / peer list for a node added later.
+async fn spawn_cluster_with_reconnect(
+    ids: &[u64],
+) -> (Vec<TestNode>, Vec<SocketAddr>, Vec<TlsIdentity>, Vec<SocketAddr>) {
+    let keys: Vec<(u64, SigningKey)> =
+        ids.iter().map(|&id| (id, SigningKey::from_bytes(&consensus_seed(id)))).collect();
+    let mut gossip_listeners = Vec::new();
+    let mut reconnect_listeners = Vec::new();
+    for _ in 0..ids.len() {
+        gossip_listeners.push(bind_ephemeral().await);
+        reconnect_listeners.push(bind_ephemeral().await);
+    }
+    let gossip_addrs: Vec<SocketAddr> =
+        gossip_listeners.iter().map(|l| l.local_addr().expect("local addr")).collect();
+    let reconnect_addrs: Vec<SocketAddr> =
+        reconnect_listeners.iter().map(|l| l.local_addr().expect("local addr")).collect();
+    let identities: Vec<TlsIdentity> =
+        ids.iter().map(|&id| TlsIdentity::from_seed(tls_seed(id), id).expect("identity")).collect();
+
+    let mut nodes = Vec::new();
+    for (index, (gossip_listener, reconnect_listener)) in
+        gossip_listeners.into_iter().zip(reconnect_listeners).enumerate()
+    {
+        let node_id = NodeId::new(ids[index]);
+        let peers: Vec<PeerInfo> = (0..ids.len())
+            .filter(|&j| j != index)
+            .map(|j| {
+                PeerInfo::new(
+                    NodeId::new(ids[j]),
+                    gossip_addrs[j],
+                    identities[j].spki_fingerprint(),
+                )
+                .with_reconnect(reconnect_addrs[j])
+            })
+            .collect();
+        let node = Arc::new(GossipNode::new(
+            node_id,
+            keys[index].1.clone(),
+            registry_for(&keys),
+            identities[index].clone(),
+            peers,
+            SyncTiming::new(SYNC_INTERVAL, SYNC_TIMEOUT),
+            temp_state_db(),
+        ));
+        let stop = Arc::new(AtomicBool::new(false));
+        let spawn = node.clone();
+        let stop_handle = stop.clone();
+        let handle = tokio::spawn(async move {
+            let _ = spawn
+                .run_until_stopped_with_reconnect(gossip_listener, reconnect_listener, stop_handle)
+                .await;
+        });
+        nodes.push(TestNode { key: keys[index].1.clone(), node, stop, handle });
+    }
+    (nodes, gossip_addrs, identities, reconnect_addrs)
 }
 
 /// Establishes a raw (non-`TcpTransport`) TLS stream to `addr`, pinned to
@@ -193,6 +266,13 @@ async fn live_cluster_finalizes_identical_consensus_order() {
     // respect parent/child roundReceived monotonicity.
     let nodes = spawn_cluster(&[1, 2, 3, 4]).await;
     let refs: Vec<&TestNode> = nodes.iter().collect();
+
+    // Ordering is insert-driven and the round-completeness gate only opens
+    // once every member's frontier has passed a round, so a fixed warmup can
+    // return before any order exists under CI load. Wait for the first ordered
+    // round while the cluster is still gossiping, then settle.
+    wait_for_ordered_round(&nodes[0].node, MAX_ORDERED_ROUND, DEADLINE).await;
+
     let (counts, lates) = stop_and_settle(&refs, Duration::from_secs(2)).await;
     assert_converged(&counts, &lates, "ordering");
 
@@ -688,83 +768,49 @@ async fn wait_for_new_own_event(
 // --- Phase 4: reconnect ----------------------------------------------------
 
 #[tokio::test]
-async fn reconnect_joining_node_skips_full_replay() {
-    // A 4-node genesis registry; nodes 1-3 run a normal cluster, node 4 is
-    // brought up late from a checkpoint served by node 1's reconnect port
-    // instead of replaying history from genesis.
-    let keys: Vec<(u64, SigningKey)> =
-        (1..=4).map(|id| (id, SigningKey::from_bytes(&consensus_seed(id)))).collect();
-    let registry = registry_for(&keys);
+async fn membership_added_node_joins_live_cluster() {
+    // A 3-node genesis cluster (no phantom 4th member). Node 4 is admitted via
+    // a `MembershipOp::Add` — a real activation round, not silent preloading —
+    // and joins as a live member once its membership activates, catching up
+    // and participating in consensus.
+    let (nodes, gossip_addrs, identities, _) = spawn_cluster_with_reconnect(&[1, 2, 3]).await;
+    let refs: Vec<&TestNode> = nodes.iter().collect();
 
-    let mut gossip_listeners = Vec::new();
-    let mut reconnect_listeners = Vec::new();
-    for _ in 0..3 {
-        gossip_listeners.push(bind_ephemeral().await);
-        reconnect_listeners.push(bind_ephemeral().await);
-    }
-    let gossip_addrs: Vec<SocketAddr> =
-        gossip_listeners.iter().map(|l| l.local_addr().expect("local addr")).collect();
-    let reconnect_addrs: Vec<SocketAddr> =
-        reconnect_listeners.iter().map(|l| l.local_addr().expect("local addr")).collect();
-    let identities: Vec<TlsIdentity> = (0..3)
-        .map(|i| TlsIdentity::from_seed(tls_seed(i as u64 + 1), i as u64 + 1).expect("identity"))
-        .collect();
-
-    let mut nodes = Vec::new();
-    for (i, (gossip_listener, reconnect_listener)) in
-        gossip_listeners.into_iter().zip(reconnect_listeners).enumerate()
-    {
-        let node_id = NodeId::new(i as u64 + 1);
-        let peers: Vec<PeerInfo> = (0..3)
-            .filter(|&j| j != i)
-            .map(|j| {
-                PeerInfo::new(
-                    NodeId::new(j as u64 + 1),
-                    gossip_addrs[j],
-                    identities[j].spki_fingerprint(),
-                )
-                .with_reconnect(reconnect_addrs[j])
-            })
-            .collect();
-        let node = Arc::new(GossipNode::new(
-            node_id,
-            keys[i].1.clone(),
-            registry.clone(),
-            identities[i].clone(),
-            peers,
-            SyncTiming::new(SYNC_INTERVAL, SYNC_TIMEOUT),
-            temp_state_db(),
-        ));
-        let stop = Arc::new(AtomicBool::new(false));
-        let spawn = node.clone();
-        let stop_handle = stop.clone();
-        let handle = tokio::spawn(async move {
-            let _ = spawn
-                .run_until_stopped_with_reconnect(gossip_listener, reconnect_listener, stop_handle)
-                .await;
-        });
-        nodes.push(TestNode { key: keys[i].1.clone(), node, stop, handle });
-    }
-
-    // Let the cluster run until node 1 has accepted a checkpoint (and, by
-    // round >= 4, pruned some history).
-    let t_genesis = std::time::Instant::now();
-    let cp_round = wait_for_pruned_checkpoint(&nodes[0].node, 4, Duration::from_secs(25)).await;
-    let genesis_elapsed = t_genesis.elapsed();
-
-    // Bring up node 4 from a checkpoint served by node 1's reconnect port.
+    // Node 4's consensus key and TLS identity derive from the SAME seed, so
+    // the SPKI pin the teachers derive from its consensus key (in
+    // `add_peer_from_key`) matches the certificate its identity produces.
     let node4_id = NodeId::new(4);
-    let identity4 = TlsIdentity::from_seed(tls_seed(4), 4).expect("identity");
-    let peer1 = PeerInfo::new(NodeId::new(1), gossip_addrs[0], identities[0].spki_fingerprint())
-        .with_reconnect(reconnect_addrs[0]);
-    let t0 = std::time::Instant::now();
-    let response = fetch_checkpoint(&identity4, &peer1, reconnect_addrs[0], node4_id)
-        .await
-        .expect("fetch checkpoint from node 1");
-    assert!(gossip::verify_signed_checkpoint(&response.signed_checkpoint));
-    let retained_count = response.retained.len();
-    let decided_round = response.decided_round;
+    let key4 = SigningKey::from_bytes(&consensus_seed(4));
+    let identity4 = TlsIdentity::from_seed(consensus_seed(4), 4).expect("identity");
 
+    // Bind node 4's listener before the op, so the op carries a real address.
+    let listener4 = bind_ephemeral().await;
+    let addr4 = listener4.local_addr().expect("local addr");
+
+    // Admit node 4 through consensus. Submitted on every teacher so the op
+    // enters the first events regardless of which sync partner is picked —
+    // the earlier it orders, the sooner it activates and the safer node 4's
+    // first delta-sync is (before the teachers have accepted any checkpoint).
+    let op = MembershipOp::Add {
+        node: node4_id,
+        key: Box::new(key4.verifying_key()),
+        addr: addr4,
+        reconnect_addr: None,
+    };
+    let payload = membership_add_payload(&op);
+    for node in &refs {
+        node.node.submit_transaction(payload.clone()).await;
+    }
+    for node in &refs {
+        wait_for_member(&node.node, node4_id, DEADLINE).await;
+    }
+
+    // Start node 4 as a live member: its registry includes itself (it knows
+    // its own membership is active), so its events verify everywhere. The
+    // n=3 -> n=4 quorum thresholds coincide (both need >= 3 of the witnesses
+    // it can see), so its round/witness/fame bookkeeping stays consistent with
+    // the teachers' for the pre-activation history it catches up on.
+    let registry4 = registry_for_ids(&[1, 2, 3, 4]);
     let peers4: Vec<PeerInfo> = (0..3)
         .map(|j| {
             PeerInfo::new(
@@ -772,68 +818,27 @@ async fn reconnect_joining_node_skips_full_replay() {
                 gossip_addrs[j],
                 identities[j].spki_fingerprint(),
             )
-            .with_reconnect(reconnect_addrs[j])
         })
         .collect();
-    let node4 = Arc::new(
-        GossipNode::from_checkpoint(
-            node4_id,
-            keys[3].1.clone(),
-            identity4,
-            peers4,
-            SyncTiming::new(SYNC_INTERVAL, SYNC_TIMEOUT),
-            response,
-            temp_state_db(),
-        )
-        .await
-        .expect("node built from checkpoint"),
-    );
-
-    // The scaffold is correctly sized and holds exactly the teacher's
-    // retained graph — full chains, not per-creator heads — so node 4's
-    // known-summary is honest and no history was replayed.
-    {
-        let hashgraph = node4.hashgraph.lock().await;
-        assert_eq!(hashgraph.member_count(), 4, "roster from the checkpoint snapshot");
-        assert_eq!(
-            hashgraph.all_event_hashes().len(),
-            retained_count,
-            "node 4 holds exactly the transferred retained graph, nothing replayed"
-        );
-        // Rounds the teacher had already decided stay decided on the learner.
-        assert!(hashgraph.is_round_decided(decided_round), "decided round is seeded");
-        // The full chains anchor the known-summary; node 4 itself has no
-        // events yet.
-        for creator in 1..=3 {
-            assert!(
-                hashgraph.latest_event_by(&NodeId::new(creator)).is_some(),
-                "creator {creator} chain must be anchored"
-            );
-        }
-        assert!(hashgraph.latest_event_by(&node4_id).is_none(), "node 4 has no own events yet");
-    }
-
-    let listener4 = bind_ephemeral().await;
-    let reconnect4 = bind_ephemeral().await;
+    let node4 = Arc::new(GossipNode::new(
+        node4_id,
+        key4,
+        registry4,
+        identity4,
+        peers4,
+        SyncTiming::new(SYNC_INTERVAL, SYNC_TIMEOUT),
+        temp_state_db(),
+    ));
     let stop4 = Arc::new(AtomicBool::new(false));
     let spawn4 = node4.clone();
     let stop_handle4 = stop4.clone();
     let handle4 = tokio::spawn(async move {
-        let _ = spawn4.run_until_stopped_with_reconnect(listener4, reconnect4, stop_handle4).await;
+        let _ = spawn4.run_until_stopped(listener4, stop_handle4).await;
     });
 
-    // Node 4 must resume event production from the checkpoint within a
-    // bounded wall-clock window — a small multiple of the sync interval, not
-    // proportional to cluster age (`genesis_elapsed`).
-    let excluded = HashSet::new();
-    wait_for_new_own_event(&node4, node4_id, &excluded, Duration::from_secs(25)).await;
-    let t1 = t0.elapsed();
-    eprintln!(
-        "joining node: cluster age {genesis_elapsed:?}, checkpoint-to-first-event {t1:?} \
-         (cp_round={cp_round})"
-    );
-
-    // Node 4's first event is a new chain head: self_parent None.
+    // Node 4 catches up on the pre-join history and creates its first event —
+    // a new chain head whose self-parent is None.
+    wait_for_new_own_event(&node4, node4_id, &HashSet::new(), DEADLINE).await;
     let first = {
         let hashgraph = node4.hashgraph.lock().await;
         let mut own: Vec<EventHash> = hashgraph
@@ -848,83 +853,79 @@ async fn reconnect_joining_node_skips_full_replay() {
     assert_eq!(first.self_parent(), None, "first event starts a new chain");
     assert!(first.other_parent().is_some(), "first event references the sync partner");
 
-    // Nodes 1-3 verify and insert node 4's events.
+    // Every teacher verifies and inserts node 4's events.
     let first_hash = first.hash();
-    for node in &nodes {
+    for node in &refs {
         wait_for_event(&node.node, first_hash, Duration::from_secs(10)).await;
     }
 
+    // Node 4 has caught up on the shared history from every pre-existing
+    // creator, so it participates on equal footing.
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let hashgraph = node4.hashgraph.lock().await;
+            let caught_up = (1..=3).all(|id| hashgraph.latest_event_by(&NodeId::new(id)).is_some());
+            drop(hashgraph);
+            if caught_up {
+                return;
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("node 4 catches up on the shared history");
+
+    // The 4-member cluster continues to converge after node 4 joins.
     stop4.store(true, Ordering::Release);
+    sleep(Duration::from_millis(100)).await;
+    let (counts, lates) = stop_and_settle(&refs, Duration::from_secs(1)).await;
+    assert_converged(&counts, &lates, "membership-added node");
+
     let _ = handle4.await;
     drop_nodes(nodes);
 }
 
 #[tokio::test]
 async fn reconnect_existing_node_catches_up() {
-    // A 4-node genesis registry. Teachers 1-3 form a dense gossip clique and
-    // deliberately do NOT list node 4 as a peer, so their round advancement
-    // is not degraded when node 4 is later frozen. Node 4's peers are the
-    // teachers. Node 4 is frozen immediately (before creating events, so it
-    // is maximally behind once the teachers prune), resumes later, detects it
-    // is behind, reconnects from a checkpoint, and resumes producing events.
-    let keys: Vec<(u64, SigningKey)> =
-        (1..=4).map(|id| (id, SigningKey::from_bytes(&consensus_seed(id)))).collect();
-    let registry = registry_for(&keys);
+    // A 4th member is admitted via a `MembershipOp::Add` and participates until
+    // the teachers accept a checkpoint and prune. It then loses its local graph
+    // (the restart-from-nothing case: a node rebuilt from a lost/stale
+    // checkpoint holds only the checkpointed state and must fetch the live
+    // event window). Its frontier is below the teachers' retained window, so
+    // its first delta-sync gaps and the driver reconnects from a checkpoint,
+    // then resumes producing events.
+    let (teachers, gossip_addrs, identities, reconnect_addrs) =
+        spawn_cluster_with_reconnect(&[1, 2, 3]).await;
+    let refs: Vec<&TestNode> = teachers.iter().collect();
 
-    let mut gossip_listeners = Vec::new();
-    let mut reconnect_listeners = Vec::new();
-    for _ in 0..4 {
-        gossip_listeners.push(bind_ephemeral().await);
-        reconnect_listeners.push(bind_ephemeral().await);
-    }
-    let gossip_addrs: Vec<SocketAddr> =
-        gossip_listeners.iter().map(|l| l.local_addr().expect("local addr")).collect();
-    let reconnect_addrs: Vec<SocketAddr> =
-        reconnect_listeners.iter().map(|l| l.local_addr().expect("local addr")).collect();
-    let identities: Vec<TlsIdentity> = (0..4)
-        .map(|i| TlsIdentity::from_seed(tls_seed(i as u64 + 1), i as u64 + 1).expect("identity"))
-        .collect();
-
-    // Teachers 1-3: peers are the other teachers only.
-    let teacher_pairs: Vec<(tokio::net::TcpListener, tokio::net::TcpListener)> =
-        gossip_listeners.drain(0..3).zip(reconnect_listeners.drain(0..3)).collect();
-    let mut teachers = Vec::new();
-    for (i, (gossip_listener, reconnect_listener)) in teacher_pairs.into_iter().enumerate() {
-        let node_id = NodeId::new(i as u64 + 1);
-        let peers: Vec<PeerInfo> = (0..3)
-            .filter(|&j| j != i)
-            .map(|j| {
-                PeerInfo::new(
-                    NodeId::new(j as u64 + 1),
-                    gossip_addrs[j],
-                    identities[j].spki_fingerprint(),
-                )
-                .with_reconnect(reconnect_addrs[j])
-            })
-            .collect();
-        let node = Arc::new(GossipNode::new(
-            node_id,
-            keys[i].1.clone(),
-            registry.clone(),
-            identities[i].clone(),
-            peers,
-            SyncTiming::new(SYNC_INTERVAL, SYNC_TIMEOUT),
-            temp_state_db(),
-        ));
-        let stop = Arc::new(AtomicBool::new(false));
-        let spawn = node.clone();
-        let stop_handle = stop.clone();
-        let handle = tokio::spawn(async move {
-            let _ = spawn
-                .run_until_stopped_with_reconnect(gossip_listener, reconnect_listener, stop_handle)
-                .await;
-        });
-        teachers.push(TestNode { key: keys[i].1.clone(), node, stop, handle });
-    }
-
-    // Node 4: peers are the teachers.
+    // Node 4's consensus key and TLS identity share one seed, so the SPKI pin
+    // the teachers derive from its consensus key matches its certificate.
     let node4_id = NodeId::new(4);
-    let identity4 = identities[3].clone();
+    let key4 = SigningKey::from_bytes(&consensus_seed(4));
+    let identity4 = TlsIdentity::from_seed(consensus_seed(4), 4).expect("identity");
+    let listener4 = bind_ephemeral().await;
+    let reconnect4 = bind_ephemeral().await;
+    let addr4 = listener4.local_addr().expect("local addr");
+
+    // Admit node 4 through consensus; it orders and activates on every teacher.
+    let op = MembershipOp::Add {
+        node: node4_id,
+        key: Box::new(key4.verifying_key()),
+        addr: addr4,
+        reconnect_addr: Some(reconnect4.local_addr().expect("local addr")),
+    };
+    let payload = membership_add_payload(&op);
+    for node in &refs {
+        node.node.submit_transaction(payload.clone()).await;
+    }
+    for node in &refs {
+        wait_for_member(&node.node, node4_id, DEADLINE).await;
+    }
+
+    // Node 4 joins live and participates, so the cluster (now 4 members) can
+    // advance past its activation round and accept checkpoints that carry it
+    // in the roster.
+    let registry4 = registry_for_ids(&[1, 2, 3, 4]);
     let peers4: Vec<PeerInfo> = (0..3)
         .map(|j| {
             PeerInfo::new(
@@ -937,8 +938,8 @@ async fn reconnect_existing_node_catches_up() {
         .collect();
     let node4 = Arc::new(GossipNode::new(
         node4_id,
-        keys[3].1.clone(),
-        registry.clone(),
+        key4,
+        registry4.clone(),
         identity4,
         peers4,
         SyncTiming::new(SYNC_INTERVAL, SYNC_TIMEOUT),
@@ -947,100 +948,98 @@ async fn reconnect_existing_node_catches_up() {
     let stop4 = Arc::new(AtomicBool::new(false));
     let spawn4 = node4.clone();
     let stop_handle4 = stop4.clone();
-    let gossip_listener4 = gossip_listeners.into_iter().next().expect("one listener left");
-    let reconnect_listener4 = reconnect_listeners.into_iter().next().expect("one listener left");
     let handle4 = tokio::spawn(async move {
-        let _ = spawn4
-            .run_until_stopped_with_reconnect(gossip_listener4, reconnect_listener4, stop_handle4)
-            .await;
+        let _ = spawn4.run_until_stopped_with_reconnect(listener4, reconnect4, stop_handle4).await;
     });
-    let node4_ = TestNode {
-        key: keys[3].1.clone(),
-        node: node4.clone(),
-        stop: stop4.clone(),
 
-        handle: handle4,
-    };
-
-    // Freeze node 4 immediately, before its sync driver can create any events:
-    // with an empty (seq-0) frontier it is deterministically below the
-    // teachers' retained window once they prune, so the reconnect path is
-    // guaranteed to trigger.
-    node4_.stop();
-    sleep(Duration::from_millis(200)).await;
-
-    // Record node 4's frozen position: the highest checkpoint it holds and
-    // every hash in its graph (both empty — it never participated).
-    let frozen_cp = node4.latest_accepted_checkpoint_round().await;
-    let frozen_hashes: HashSet<EventHash> = {
-        let hashgraph = node4.hashgraph.lock().await;
-        hashgraph.all_event_hashes().into_iter().collect()
-    };
-
-    // Let the teachers accept a checkpoint at round >= 5 and prune well past
-    // node 4's frozen position. The cluster's round progression is variable
-    // (a pre-existing liveness stall around rounds 5-10), so poll all three
-    // teachers with a generous timeout. Once accepted round >= 5, the
-    // retained window (border anchors end at round floor-1 = 3) is strictly
-    // above node 4's round-1 frontier, so its first delta-sync after
-    // resuming cannot succeed — it must reconnect.
-    let cp_round = timeout(Duration::from_secs(60), async {
+    // Every teacher accepts a checkpoint at round >= 4, so each has pruned
+    // history and can serve node 4 a checkpoint whose roster includes it.
+    timeout(Duration::from_secs(60), async {
         loop {
-            for teacher in &teachers {
-                if let Some(round) = teacher.node.latest_accepted_checkpoint_round().await
-                    && round >= 5
-                {
-                    return round;
+            let mut all = true;
+            for teacher in &refs {
+                if teacher.node.latest_accepted_checkpoint_round().await.unwrap_or(0) < 4 {
+                    all = false;
+                    break;
                 }
+            }
+            if all {
+                return;
             }
             sleep(Duration::from_millis(50)).await;
         }
     })
     .await
-    .expect("teachers accept a round-5 checkpoint and prune");
-    eprintln!("teachers reached checkpoint round {cp_round}");
+    .expect("teachers accept a round-4 checkpoint and prune");
 
-    // Force node 4 to be genuinely beyond the teachers' retained history: a
-    // dense clique's border-anchor protection keeps chains contiguous down to
-    // genesis, so natural pruning never leaves a delta gap. Pruning the
-    // teachers down to round 4 guarantees node 4's empty frontier is below
-    // the retained window.
-    for teacher in &teachers {
-        teacher.node.hashgraph.lock().await.prune_before_round(4);
+    // Freeze node 4 and record its position. Its own early events sit below
+    // the teachers' retained floor, so once its graph is gone it cannot
+    // cleanly catch up.
+    let frozen_cp = node4.latest_accepted_checkpoint_round().await;
+    let frozen_own: HashSet<EventHash> = {
+        let hashgraph = node4.hashgraph.lock().await;
+        hashgraph
+            .all_event_hashes()
+            .into_iter()
+            .filter(|h| hashgraph.get(h).is_some_and(|r| r.event().creator() == &node4_id))
+            .collect()
+    };
+    stop4.store(true, Ordering::Release);
+    let _ = handle4.await;
+
+    // Node 4 loses its graph (restart from nothing). The scaffold is empty but
+    // correctly sized; identity and key are unchanged.
+    {
+        let mut hashgraph = node4.hashgraph.lock().await;
+        *hashgraph = consensus::Hashgraph::from_checkpoint(
+            &consensus::CheckpointPayload::new(0, [0u8; 32], registry4.clone()),
+            RosterHistory::new(registry4.clone()),
+        );
     }
 
-    // Resume node 4 on a fresh listener (its original task ended when
-    // stopped). Its peers still point at the teachers' live addresses.
-    let listener4 = bind_ephemeral().await;
-    let reconnect4 = bind_ephemeral().await;
+    // Backstop: force every teacher's retained window strictly above node 4's
+    // empty frontier, so the delta-gap is deterministic no matter how far past
+    // round 4 the cluster actually got before node 4 froze.
+    for teacher in &refs {
+        let mut hg = teacher.node.hashgraph.lock().await;
+        if hg.next_round_to_order() > 4 {
+            hg.prune_before_round(4);
+        }
+    }
+
+    // Resume node 4 on fresh listeners (its original task ended when stopped).
+    // Its peers still point at the teachers' live addresses. The first
+    // delta-sync gaps, the driver reconnects from a checkpoint, and node 4
+    // resumes producing events.
+    let listener4b = bind_ephemeral().await;
+    let reconnect4b = bind_ephemeral().await;
     let stop4b = Arc::new(AtomicBool::new(false));
     let spawn4b = node4.clone();
     let stop_handle4b = stop4b.clone();
     let handle4b = tokio::spawn(async move {
         let _ =
-            spawn4b.run_until_stopped_with_reconnect(listener4, reconnect4, stop_handle4b).await;
+            spawn4b.run_until_stopped_with_reconnect(listener4b, reconnect4b, stop_handle4b).await;
     });
 
-    // Node 4 must detect it is behind, reconnect, load a checkpoint, and
-    // resume producing events (a new own event not in the pre-freeze set)
-    // within a bounded number of sync intervals.
-    wait_for_new_own_event(&node4, node4_id, &frozen_hashes, Duration::from_secs(25)).await;
+    wait_for_new_own_event(&node4, node4_id, &frozen_own, Duration::from_secs(25)).await;
 
-    // The reconnect's apply_checkpoint pushed the served checkpoint, which is
-    // beyond anything node 4 held pre-freeze — and which it could never reach
-    // by clean catch-up, since its frontier is below the peers' retained
-    // window (every delta-sync to a caught-up peer gaps).
+    // The reconnect's apply_checkpoint restored node 4 from a served
+    // checkpoint at or beyond the teachers' accepted floor. Node 4 had wiped
+    // its graph empty, so the new event it produced just now is only reachable
+    // by having applied that checkpoint — a clean catch-up always gaps against
+    // the pruned retained window.
     let applied = node4.latest_accepted_checkpoint_round().await;
     assert!(
-        applied.is_some_and(|round| round > frozen_cp.unwrap_or(0)),
-        "node 4 must have applied a checkpoint beyond its frozen position \
-         (frozen_cp={frozen_cp:?}, applied={applied:?})"
+        applied.is_some_and(|round| round >= 4),
+        "node 4 must have reconnected and applied a checkpoint at or beyond the \
+         teachers' accepted floor (frozen_cp={frozen_cp:?}, applied={applied:?})"
     );
+    let restored = node4.hashgraph.lock().await.all_event_hashes().len();
+    assert!(restored > 0, "node 4's graph was restored from the transferred retained graph");
 
     stop4b.store(true, Ordering::Release);
     let _ = handle4b.await;
     drop_nodes(teachers);
-    drop_nodes(vec![node4_]);
 }
 
 // --- Phase 4: reconnect with a non-empty state ------------------------------

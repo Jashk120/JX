@@ -71,6 +71,20 @@ pub fn registry_for(keys: &[(u64, SigningKey)]) -> MembershipRegistry {
     registry
 }
 
+/// Builds the shared member registry from the deterministic per-id seeds,
+/// matching the registry `spawn_cluster` constructs internally. Not every test
+/// binary uses it, hence the `dead_code` allowance (same pattern as the other
+/// shared helpers).
+#[allow(dead_code)]
+pub fn registry_for_ids(ids: &[u64]) -> MembershipRegistry {
+    let mut registry = MembershipRegistry::new();
+    for &id in ids {
+        let key = SigningKey::from_bytes(&consensus_seed(id));
+        registry.register(NodeId::new(id), key.verifying_key());
+    }
+    registry
+}
+
 pub struct TestNode {
     #[allow(dead_code)]
     pub key: SigningKey,
@@ -185,9 +199,48 @@ pub async fn wait_for_ordered_round(
     .expect("cluster orders at least one round")
 }
 
+/// Whether every node's per-creator frontier is within `bound` of every other
+/// node's — the same condition `assert_converged` checks. A missing creator on
+/// any node (a frontier of `None`) counts as not-yet-converged.
+async fn frontiers_within_bound(nodes: &[&TestNode], bound: usize) -> bool {
+    let mut lates: Vec<Vec<Option<u64>>> = Vec::new();
+    for node in nodes {
+        let hashgraph = node.node.hashgraph.lock().await;
+        let per_creator: Vec<Option<u64>> = (1..=nodes.len() as u64)
+            .map(|id| {
+                hashgraph
+                    .latest_event_by(&NodeId::new(id))
+                    .and_then(|h| hashgraph.get(h))
+                    .map(|record| record.seq())
+            })
+            .collect();
+        lates.push(per_creator);
+    }
+    let width = lates.first().map_or(0, Vec::len);
+    for creator in 0..width {
+        let seqs: Vec<Option<u64>> = lates.iter().map(|per_creator| per_creator[creator]).collect();
+        if seqs.iter().any(Option::is_none) {
+            return false; // a node is missing this creator entirely
+        }
+        let seqs: Vec<u64> = seqs.into_iter().flatten().collect();
+        let (min, max) = (seqs.iter().min().expect("present"), seqs.iter().max().expect("present"));
+        if max - min > bound as u64 {
+            return false;
+        }
+    }
+    true
+}
+
 /// Lets the cluster gossip for `warmup`, stops every node's sync driver,
 /// and waits for in-flight syncs to settle. Returns per-node event counts
 /// and per-node latest seq per creator.
+///
+/// The warmup is a floor, not a deadline: after `warmup` the driver keeps
+/// polling until every creator's frontier is within the `assert_converged`
+/// bound before freezing (bounded by [`DEADLINE`]). Under CI load a fixed
+/// warmup can freeze a lagging node mid-gap, and once frozen the gap can
+/// never close — so the convergence check runs while the cluster is still
+/// live, making the subsequent `assert_converged` deterministic.
 ///
 /// Note: because a node creates a new event every sync interval, a live
 /// cluster's snapshots are never momentarily identical — there is always an
@@ -200,6 +253,17 @@ pub async fn stop_and_settle(
     warmup: Duration,
 ) -> (Vec<usize>, Vec<Vec<Option<u64>>>) {
     sleep(warmup).await;
+    let bound = 2 * nodes.len().max(1);
+    timeout(DEADLINE, async {
+        loop {
+            if frontiers_within_bound(nodes, bound).await {
+                return;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("cluster frontiers converge within the bound");
     for node in nodes {
         node.stop();
     }

@@ -11,7 +11,6 @@ use std::time::Duration;
 use common::*;
 use crypto::{
     Hashable,
-    MembershipRegistry,
     Signable,
     Verifiable,
 };
@@ -38,15 +37,6 @@ use stream::{
     RecordStreamWriter,
     verify,
 };
-
-fn registry_for_ids(ids: &[u64]) -> MembershipRegistry {
-    let mut registry = MembershipRegistry::new();
-    for &id in ids {
-        registry
-            .register(NodeId::new(id), SigningKey::from_bytes(&consensus_seed(id)).verifying_key());
-    }
-    registry
-}
 
 /// Signs the node's checkpoint signing bytes for `round` with `signer`'s key.
 fn checkpoint_sig_for(
