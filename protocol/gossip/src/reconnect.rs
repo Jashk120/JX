@@ -94,10 +94,8 @@ pub fn verify_signed_checkpoint(checkpoint: &SignedCheckpoint) -> bool {
             continue;
         };
         let signature = ed25519_dalek::Signature::from_bytes(sig.sig.as_bytes());
-        if key.verify_strict(&signing_bytes, &signature).is_ok() {
-            if seen.insert(sig.signer) {
-                valid += 1;
-            }
+        if key.verify_strict(&signing_bytes, &signature).is_ok() && seen.insert(sig.signer) {
+            valid += 1;
         }
     }
     valid * 3 > total * 2

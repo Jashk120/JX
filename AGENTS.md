@@ -49,7 +49,7 @@ Never use stable `cargo fmt` unless explicitly instructed.
 Run Clippy before considering work complete.
 
 ```bash
-cargo clippy --workspace --all-targets
+cargo clippy --workspace --all-targets --locked -- -D warnings
 ```
 
 Fix warnings whenever practical.
@@ -208,7 +208,7 @@ Always run:
 
 ```bash
 cargo +nightly fmt --all
-cargo clippy --workspace --all-targets
+cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace
 ```
 
