@@ -8,6 +8,7 @@ pub enum ConsensusError {
     MissingParent(EventHash),
     UnknownCreator,
     UnknownEvent(EventHash),
+    AncestorSeqsMismatch { expected: usize, got: usize },
 }
 
 pub type Result<T> = std::result::Result<T, ConsensusError>;
@@ -23,6 +24,9 @@ impl fmt::Display for ConsensusError {
             }
             Self::UnknownCreator => write!(f, "event creator is not a registered member"),
             Self::UnknownEvent(hash) => write!(f, "event {hash:?} is not present in the hashgraph"),
+            Self::AncestorSeqsMismatch { expected, got } => {
+                write!(f, "ancestor_seqs length {got} does not match member count {expected}")
+            }
         }
     }
 }

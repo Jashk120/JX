@@ -411,9 +411,13 @@ impl Hashgraph {
         }
         let creator = *event.creator();
         let creator_idx = *self.member_index.get(&creator).ok_or(InsertError::UnknownCreator)?;
-        if ancestor_seqs.len() != self.member_count {
-            ancestor_seqs.resize(self.member_count, 0);
+        if ancestor_seqs.len() > self.member_count {
+            return Err(InsertError::AncestorSeqsMismatch {
+                expected: self.member_count,
+                got: ancestor_seqs.len(),
+            });
         }
+        ancestor_seqs.resize(self.member_count, 0);
         ancestor_seqs[creator_idx] = seq;
 
         self.by_creator_seq.entry((creator, seq)).or_insert(hash);
@@ -1547,6 +1551,23 @@ mod tests {
         assert_eq!(
             hg.insert_accepted(event, 1, 1, vec![1], Some(1)),
             Err(InsertError::UnknownCreator)
+        );
+    }
+
+    #[test]
+    fn insert_accepted_rejects_ancestor_seqs_too_long() {
+        let key = SigningKey::generate(&mut OsRng);
+        let node = NodeId::new(1);
+        let registry = registry_of(&[(node, &key)]);
+        let checkpoint = CheckpointPayload::new(1, [0u8; 32], registry.clone());
+        let mut hg = Hashgraph::from_checkpoint(&checkpoint, RosterHistory::new(registry));
+
+        let event =
+            UnsignedEvent::new(node, None, None, Timestamp::new(100), Vec::new()).sign(&key);
+        // ancestor_seqs has 2 entries but the hashgraph only has 1 member.
+        assert_eq!(
+            hg.insert_accepted(event, 1, 1, vec![1, 0], Some(1)),
+            Err(InsertError::AncestorSeqsMismatch { expected: 1, got: 2 })
         );
     }
 
