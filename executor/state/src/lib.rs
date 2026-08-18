@@ -18,6 +18,7 @@
 //! then consensusTimestamp, then the signature-derived tie-break), so this
 //! crate never invents its own ordering rule.
 
+mod did;
 mod error;
 mod executor;
 mod merkle;
@@ -25,12 +26,19 @@ mod op;
 mod state;
 mod state_db;
 
+pub use did::{
+    DidDocument,
+    DidId,
+    DidOp,
+};
 pub use error::{
+    DidError,
     ExecutorError,
     Result,
     StateDbError,
 };
 pub use executor::{
+    ExecuteResult,
     Executor,
     finalized_events,
 };

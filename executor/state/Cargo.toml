@@ -4,13 +4,13 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-primitives = { workspace = true }
-consensus  = { workspace = true }
-crypto     = { workspace = true }
-sha2       = { workspace = true }
-fjall      = { workspace = true }
-thiserror  = { workspace = true }
+primitives   = { workspace = true }
+consensus    = { workspace = true }
+crypto       = { workspace = true }
+ed25519-dalek = { workspace = true }
+sha2         = { workspace = true }
+fjall        = { workspace = true }
+thiserror    = { workspace = true }
 
 [dev-dependencies]
-ed25519-dalek = { workspace = true }
-tempfile      = "3"
+tempfile = "3"

@@ -15,6 +15,7 @@
 //! | `0x00` | `Put`    | key, value   |
 //! | `0x01` | `Delete` | key          |
 //! | `0x02` | `MembershipOp` | decoded by `crypto::MembershipOp::decode` (body only, no `0x02` prefix) |
+//! | `0x03` | `DidOp` | decoded by `DidOp::decode` (body only, no `0x03` prefix) |
 //!
 //! A `Put` writes (or overwrites) `value` under `key`; a `Delete` removes
 //! `key` (a no-op if absent). A `MembershipOp` never touches `State` — the
@@ -27,6 +28,7 @@
 
 use crypto::MembershipOp;
 
+use crate::did::DidOp;
 use crate::error::{
     ExecutorError,
     Result,
@@ -35,6 +37,7 @@ use crate::error::{
 const OP_PUT: u8 = 0x00;
 const OP_DELETE: u8 = 0x01;
 const OP_MEMBERSHIP: u8 = 0x02;
+const OP_DID: u8 = 0x03;
 
 /// A single state transition decoded from a `Transaction` payload.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -96,6 +99,7 @@ impl Op {
 pub enum DecodedOp {
     Kv(Op),
     Membership(MembershipOp),
+    Did(DidOp),
 }
 
 impl DecodedOp {
@@ -127,6 +131,12 @@ impl DecodedOp {
                 MembershipOp::decode(cursor)
                     .map(DecodedOp::Membership)
                     .map_err(|_| ExecutorError::MalformedMembershipOp)
+            }
+            OP_DID => {
+                // `cursor` is already the body slice — the outer 0x03 type
+                // tag was consumed above. `DidOp::decode` receives the DID
+                // body (network, alias, uuid, document, signature, signed_by).
+                DidOp::decode(cursor).map(DecodedOp::Did).map_err(|_| ExecutorError::MalformedDidOp)
             }
             _ => Err(ExecutorError::UnknownOpcode(opcode)),
         }

@@ -21,6 +21,8 @@ pub enum ExecutorError {
     TrailingBytes,
     /// The `0x02` membership-op body did not decode cleanly.
     MalformedMembershipOp,
+    /// The `0x03` DID-op body did not decode cleanly.
+    MalformedDidOp,
 }
 
 pub type Result<T> = std::result::Result<T, ExecutorError>;
@@ -33,6 +35,7 @@ impl fmt::Display for ExecutorError {
             Self::UnknownOpcode(opcode) => write!(f, "unknown transaction opcode {opcode:#04x}"),
             Self::TrailingBytes => write!(f, "transaction payload has trailing bytes"),
             Self::MalformedMembershipOp => write!(f, "malformed membership-op payload"),
+            Self::MalformedDidOp => write!(f, "malformed DID-op payload"),
         }
     }
 }
@@ -49,3 +52,35 @@ pub enum StateDbError {
 
 /// Result alias for [`StateDbError`].
 pub type StateDbResult<T> = std::result::Result<T, StateDbError>;
+
+/// Semantic errors from applying a DID operation (post-decode).
+///
+/// Unlike [`ExecutorError`], which is deterministic and tied to the payload
+/// bytes, these errors arise from state-dependent signature verification and
+/// identifier existence checks.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DidError {
+    /// The `signed_by` index is out of range for the authorizing document's
+    /// verification methods.
+    UnknownSigner,
+    /// The Ed25519 signature did not verify against the expected key.
+    InvalidSignature,
+    /// A creation was attempted, but the identifier already exists in state.
+    IdentifierAlreadyExists,
+    /// An update or deactivation was attempted, but the identifier does not
+    /// exist in state.
+    UnknownIdentifier,
+}
+
+impl fmt::Display for DidError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownSigner => write!(f, "signed_by index out of range"),
+            Self::InvalidSignature => write!(f, "DID signature verification failed"),
+            Self::IdentifierAlreadyExists => write!(f, "DID identifier already exists"),
+            Self::UnknownIdentifier => write!(f, "DID identifier not found"),
+        }
+    }
+}
+
+impl std::error::Error for DidError {}

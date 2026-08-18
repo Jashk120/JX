@@ -159,8 +159,8 @@ fn same_transaction_order_yields_bit_identical_state() {
     let mut right = new_executor();
     for tx in &order {
         let event = event_with(vec![tx.clone()]);
-        assert!(left.execute_event(&event).0.is_empty());
-        assert!(right.execute_event(&event).0.is_empty());
+        assert!(left.execute_event(&event).errors.is_empty());
+        assert!(right.execute_event(&event).errors.is_empty());
     }
 
     assert_eq!(left.state(), right.state());
@@ -228,12 +228,12 @@ fn malformed_payloads_fail_deterministically() {
     let left_errors: Vec<ExecutorError> = order
         .iter()
         .map(|tx| event_with(vec![tx.clone()]))
-        .flat_map(|event| left.execute_event(&event).0)
+        .flat_map(|event| left.execute_event(&event).errors)
         .collect();
     let right_errors: Vec<ExecutorError> = order
         .iter()
         .map(|tx| event_with(vec![tx.clone()]))
-        .flat_map(|event| right.execute_event(&event).0)
+        .flat_map(|event| right.execute_event(&event).errors)
         .collect();
 
     assert_eq!(left_errors, right_errors);
