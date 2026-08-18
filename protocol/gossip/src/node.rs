@@ -577,9 +577,8 @@ impl GossipNode {
                         continue;
                     }
                     executor.bucket_finalized(pending, processed_through_round, &events);
-                    let bytes = executor.state().to_bytes();
                     hashes.insert(round, executor.state().root());
-                    snapshots.insert(round, bytes);
+                    snapshots.insert(round, executor.state().to_bytes());
                 }
                 (hashes, snapshots)
             };
@@ -818,24 +817,29 @@ impl GossipNode {
             let snapshots = self.state_snapshots.lock().await;
             snapshots.range(..=round).next_back().map(|(_, bytes)| bytes.clone())
         };
-        if let Some(snapshot) = snapshot {
-            // Durable copy: the `.snap` file is gone; a restart restores the
-            // exact checkpoint-round state from this `snap` keyspace entry.
-            if let Err(e) = self.state_db.snapshot(round, &snapshot) {
-                eprintln!("[jkaind] failed to persist state snapshot for round {round}: {e}");
-            }
-            self.notify_checkpoint_accepted(&accepted).await;
-            // Mirror streams (Phase 8): emit the round's record stream file
-            // from the threshold-signed anchor. The writer assembles the
-            // items from `consensus_order(round)` — final and immutable by
-            // now — and writes the `.rsf` on its background task, so the
-            // hot path never blocks on disk. Runs before pruning below, and
-            // pruning only removes rounds already ordered, so the assembly
-            // is race-free even when it runs concurrently.
-            let record_sink = self.record_sink.lock().await.clone();
-            if let Some(record_sink) = record_sink {
-                record_sink.persist(&accepted).await;
-            }
+        let Some(snapshot) = snapshot else {
+            eprintln!(
+                "[jkaind] refusing to accept checkpoint for round {round}: \
+                 no state snapshot available"
+            );
+            return;
+        };
+        // Durable copy: the `.snap` file is gone; a restart restores the
+        // exact checkpoint-round state from this `snap` keyspace entry.
+        if let Err(e) = self.state_db.snapshot(round, &snapshot) {
+            eprintln!("[jkaind] failed to persist state snapshot for round {round}: {e}");
+        }
+        self.notify_checkpoint_accepted(&accepted).await;
+        // Mirror streams (Phase 8): emit the round's record stream file
+        // from the threshold-signed anchor. The writer assembles the
+        // items from `consensus_order(round)` — final and immutable by
+        // now — and writes the `.rsf` on its background task, so the
+        // hot path never blocks on disk. Runs before pruning below, and
+        // pruning only removes rounds already ordered, so the assembly
+        // is race-free even when it runs concurrently.
+        let record_sink = self.record_sink.lock().await.clone();
+        if let Some(record_sink) = record_sink {
+            record_sink.persist(&accepted).await;
         }
         {
             let mut signed = self.signed_checkpoints.lock().await;
