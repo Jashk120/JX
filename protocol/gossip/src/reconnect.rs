@@ -90,15 +90,14 @@ pub fn verify_signed_checkpoint(checkpoint: &SignedCheckpoint) -> bool {
         if sig.round != checkpoint.payload.round {
             continue;
         }
-        if !seen.insert(sig.signer) {
-            continue;
-        }
         let Ok(key) = checkpoint.payload.roster_snapshot.key_for(&sig.signer) else {
             continue;
         };
         let signature = ed25519_dalek::Signature::from_bytes(sig.sig.as_bytes());
         if key.verify_strict(&signing_bytes, &signature).is_ok() {
-            valid += 1;
+            if seen.insert(sig.signer) {
+                valid += 1;
+            }
         }
     }
     valid * 3 > total * 2

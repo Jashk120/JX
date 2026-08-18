@@ -219,6 +219,10 @@ impl Frame {
                 let roster_history_bytes = cursor.read(rh_len)?.to_vec();
                 let decided_round = cursor.read_u64()?;
                 let retained_count = cursor.read_u32()? as usize;
+                const MIN_RETAINED: usize = 8 + 8 + 1 + 4 + 4 + 86; // seq + round + rr_tag + ancestor_count + event_len + event
+                if retained_count > cursor.remaining() / MIN_RETAINED {
+                    return Err(GossipError::framing("declared count exceeds remaining buffer"));
+                }
                 let mut retained = Vec::with_capacity(retained_count);
                 for _ in 0..retained_count {
                     let seq = cursor.read_u64()?;
@@ -233,6 +237,12 @@ impl Frame {
                         }
                     };
                     let ancestor_count = cursor.read_u32()? as usize;
+                    const MIN_ANCESTOR_SEQ: usize = 8; // u64
+                    if ancestor_count > cursor.remaining() / MIN_ANCESTOR_SEQ {
+                        return Err(GossipError::framing(
+                            "declared count exceeds remaining buffer",
+                        ));
+                    }
                     let mut ancestor_seqs = Vec::with_capacity(ancestor_count);
                     for _ in 0..ancestor_count {
                         ancestor_seqs.push(cursor.read_u64()?);
@@ -284,6 +294,10 @@ impl SyncRequest {
         let mut cursor = Cursor::new(bytes);
         let from = decode_node_id(&mut cursor)?;
         let count = cursor.read_u32()? as usize;
+        const MIN_KNOWN_ENTRY: usize = 8 + 8; // NodeId + u64 seq
+        if count > cursor.remaining() / MIN_KNOWN_ENTRY {
+            return Err(GossipError::framing("declared count exceeds remaining buffer"));
+        }
         let mut known = Vec::with_capacity(count);
         for _ in 0..count {
             let node = decode_node_id(&mut cursor)?;
@@ -308,6 +322,10 @@ impl SyncResponse {
     fn decode(bytes: &[u8]) -> Result<Self> {
         let mut cursor = Cursor::new(bytes);
         let count = cursor.read_u32()? as usize;
+        const MIN_EVENT: usize = 8 + 1 + 1 + 8 + 4 + 64; // creator + 2 opt hashes + timestamp + payload_len + sig
+        if count > cursor.remaining() / MIN_EVENT {
+            return Err(GossipError::framing("declared count exceeds remaining buffer"));
+        }
         let mut events = Vec::with_capacity(count);
         for _ in 0..count {
             events.push(decode_event(&mut cursor)?);
@@ -328,6 +346,10 @@ impl<'a> Cursor<'a> {
         Self { bytes, pos: 0 }
     }
 
+    fn remaining(&self) -> usize {
+        self.bytes.len() - self.pos
+    }
+
     fn read(&mut self, len: usize) -> Result<&'a [u8]> {
         let end =
             self.pos.checked_add(len).ok_or_else(|| GossipError::framing("cursor overflow"))?;
@@ -341,12 +363,18 @@ impl<'a> Cursor<'a> {
 
     fn read_u32(&mut self) -> Result<u32> {
         let bytes = self.read(4)?;
-        Ok(u32::from_be_bytes(bytes.try_into().expect("read(4) returns 4 bytes")))
+        let arr: [u8; 4] = bytes
+            .try_into()
+            .map_err(|_| GossipError::framing("internal cursor read length mismatch"))?;
+        Ok(u32::from_be_bytes(arr))
     }
 
     fn read_u64(&mut self) -> Result<u64> {
         let bytes = self.read(8)?;
-        Ok(u64::from_be_bytes(bytes.try_into().expect("read(8) returns 8 bytes")))
+        let arr: [u8; 8] = bytes
+            .try_into()
+            .map_err(|_| GossipError::framing("internal cursor read length mismatch"))?;
+        Ok(u64::from_be_bytes(arr))
     }
 
     fn finish(&self) -> Result<()> {
@@ -374,6 +402,10 @@ fn decode_event(cursor: &mut Cursor<'_>) -> Result<Event> {
     let other_parent = decode_optional_hash(cursor)?;
     let timestamp = cursor.read_u64()?;
     let payload_count = cursor.read_u32()? as usize;
+    const MIN_TX: usize = 4; // tx_len prefix
+    if payload_count > cursor.remaining() / MIN_TX {
+        return Err(GossipError::framing("declared count exceeds remaining buffer"));
+    }
     let mut payload = Vec::with_capacity(payload_count);
     for _ in 0..payload_count {
         let tx_len = cursor.read_u32()? as usize;
