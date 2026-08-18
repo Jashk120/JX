@@ -3,7 +3,7 @@
 Virtual-voting hashgraph consensus for JKain.
 
 Implements the Hashgraph consensus algorithm described in
-`JKain_Consensus_Spec.md`: an in-memory `Hashgraph` that stores verified
+`docs/JKain_Consensus_Spec.md`: an in-memory `Hashgraph` that stores verified
 events and derives ordering through round assignment, virtual voting, and
 order finalization. Depends on `primitives` for the value types and
 `crypto` for hashing, signatures, and membership.

@@ -21,11 +21,11 @@ node/         the jkaind daemon: config, persistence, restart recovery
 
 ## Documents
 
-- `JKain_Whitepaper.md` — the design whitepaper.
-- `JKain_Consensus_Spec.md` — the consensus algorithm specification
+- [`docs/JKain_Whitepaper.md`](docs/JKain_Whitepaper.md) — the design whitepaper.
+- [`docs/JKain_Consensus_Spec.md`](docs/JKain_Consensus_Spec.md) — the consensus algorithm specification
   (`protocol/consensus` implements it).
 - `ROADMAP.md` — phased roadmap (Phase 8 = deterministic executor).
-- `V3_Compute_Layer_Notes.md` — compute-layer design notes.
+- [`docs/V3_Compute_Layer_Notes.md`](docs/V3_Compute_Layer_Notes.md) — compute-layer design notes.
 - `AGENTS.md` — development rules for contributors and AI agents.
 
 ## Building and testing

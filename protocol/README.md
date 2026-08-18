@@ -47,5 +47,5 @@ gossip       pinned-TLS gossip network + GossipNode runtime
 
 The `executor/` layer consumes the total order `consensus` produces and the
 `node/` layer (the `jkaind` daemon) drives a live cluster with `gossip`.
-See `JKain_Consensus_Spec.md` at the repo root for the algorithm this layer
+See `docs/JKain_Consensus_Spec.md` for the algorithm this layer
 implements.
