@@ -737,4 +737,83 @@ mod tests {
         assert_eq!(median_timestamp(&mut [10, 10, 40, 40]), Timestamp::new(25));
         assert_eq!(median_timestamp(&mut [5]), Timestamp::new(5));
     }
+
+    /// `assign_order` is structurally idempotent: `pending_order_events`
+    /// excludes events with `round_received != None`, so a second call on
+    /// the same round is a no-op. This documents the property and guards
+    /// against refactors that might break it.
+    #[test]
+    fn assign_order_is_idempotent_on_same_round() {
+        let mut g = build_deep_clique();
+
+        // Find the first round that actually has ordered events.
+        // Genesis witnesses can't all see each other, so round 1 is
+        // typically empty — ordering starts at round 2+.
+        let mut ordered_round = 0u64;
+        for round in 1..=4 {
+            if !g.hg.consensus_order(round).is_empty() {
+                ordered_round = round;
+                break;
+            }
+        }
+        assert!(ordered_round > 0, "deep clique must have at least one ordered round");
+
+        let first_order = g.hg.consensus_order(ordered_round);
+
+        let first_details: Vec<_> = first_order
+            .iter()
+            .map(|h| {
+                let r = g.hg.get(h).unwrap();
+                (*h, r.round_received(), r.consensus_timestamp())
+            })
+            .collect();
+
+        // Re-assigning the same round is a structural no-op.
+        g.hg.assign_order(ordered_round);
+
+        assert_eq!(g.hg.consensus_order(ordered_round), first_order);
+        for (hash, rr, ts) in &first_details {
+            assert_eq!(g.hg.round_received(hash), *rr);
+            assert_eq!(g.hg.consensus_timestamp(hash), *ts);
+        }
+    }
+
+    /// Events ordered by `assign_order(round)` must not be reordered when
+    /// a later round's `assign_order` runs. Regression guard: the
+    /// `pending_order_events` filter excludes events with an assigned
+    /// `roundReceived`, so earlier-round events are invisible to later
+    /// rounds' scans.
+    #[test]
+    fn already_ordered_events_not_reordered_by_later_assign_order() {
+        let mut g = build_deep_clique();
+
+        // Find a round with ordered events.
+        let mut ordered_round = 0u64;
+        for round in 1..=4 {
+            if !g.hg.consensus_order(round).is_empty() {
+                ordered_round = round;
+                break;
+            }
+        }
+        assert!(ordered_round > 0, "deep clique must have ordered events");
+
+        let round_a_order = g.hg.consensus_order(ordered_round);
+        let round_a_details: Vec<_> = round_a_order
+            .iter()
+            .map(|h| {
+                let r = g.hg.get(h).unwrap();
+                (*h, r.round_received(), r.consensus_timestamp())
+            })
+            .collect();
+
+        // Assign a higher round (which may or may not have events).
+        // Earlier-round events must be untouched.
+        g.hg.assign_order(ordered_round + 1);
+
+        assert_eq!(g.hg.consensus_order(ordered_round), round_a_order);
+        for (hash, rr, ts) in &round_a_details {
+            assert_eq!(g.hg.round_received(hash), *rr);
+            assert_eq!(g.hg.consensus_timestamp(hash), *ts);
+        }
+    }
 }

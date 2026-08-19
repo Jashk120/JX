@@ -288,4 +288,17 @@ mod tests {
         assert!(g.hg.witnesses_of_round(2).contains(&d2));
         assert_eq!(g.hg.get(&d1).unwrap().round(), 1);
     }
+
+    /// `base_round` is the max of the two parent rounds, or 1 for genesis.
+    /// Non-monotonic parents (self_parent_round != other_parent_round) must
+    /// resolve to the higher value.
+    #[test]
+    fn base_round_picks_max_of_parent_rounds() {
+        assert_eq!(base_round(None, None), 1, "genesis defaults to round 1");
+        assert_eq!(base_round(Some(3), None), 3, "self-parent only");
+        assert_eq!(base_round(None, Some(4)), 4, "other-parent only");
+        assert_eq!(base_round(Some(3), Some(1)), 3, "self-parent newer");
+        assert_eq!(base_round(Some(1), Some(3)), 3, "other-parent newer");
+        assert_eq!(base_round(Some(5), Some(5)), 5, "equal rounds");
+    }
 }

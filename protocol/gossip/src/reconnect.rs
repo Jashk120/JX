@@ -156,6 +156,7 @@ mod tests {
         CheckpointPayload,
         CheckpointSig,
     };
+    use crypto::Hashable;
     use ed25519_dalek::{
         Signer,
         SigningKey,
@@ -293,5 +294,61 @@ mod tests {
         assert!(!verify_signed_checkpoint(&checkpoint, Some(altered)));
         // The correct hash passes.
         assert!(verify_signed_checkpoint(&checkpoint, Some(wrong_hash)));
+    }
+
+    /// The exact attack from commit 3ec6744: a peer fabricates a roster
+    /// snapshot where it controls all seats, creates a checkpoint with a
+    /// valid self-referential quorum (3-of-3 attacker-controlled nodes),
+    /// and serves it to a learner that trusts a different roster.
+    /// The trusted_roster_hash check must reject this before any
+    /// signature verification runs.
+    #[test]
+    fn fabricated_roster_with_attacker_quorum_rejected_by_trusted_hash() {
+        // The legitimate roster the learner trusts.
+        let legitimate = Cluster::of(&[1, 2, 3, 4]);
+        let trusted_hash = legitimate.registry.hash();
+
+        // The attacker fabricates its own roster and signs a checkpoint
+        // with it — 3-of-3 attacker-controlled nodes is a self-referential
+        // supermajority that would pass without the hash anchor.
+        let attacker = Cluster::of(&[99, 98, 97]);
+        let checkpoint = attacker.checkpoint(5, &[99, 98, 97]);
+
+        // Rejected: the fabricated roster's hash disagrees with the
+        // trusted anchor. This must return false before any Ed25519
+        // verification runs (the roster hash check is at lines 117-120).
+        assert!(
+            !verify_signed_checkpoint(&checkpoint, Some(trusted_hash)),
+            "fabricated roster with attacker quorum must be rejected against a trusted hash"
+        );
+    }
+
+    /// Same fabricated checkpoint, but with no trusted hash (bootstrap
+    /// case). The self-referential quorum passes — this is the documented
+    /// risk in the TODO at lines 47-55: without a trust anchor, a
+    /// malicious peer can serve an arbitrary roster.
+    #[test]
+    fn fabricated_roster_passes_when_no_trusted_hash() {
+        let attacker = Cluster::of(&[99, 98, 97]);
+        let checkpoint = attacker.checkpoint(5, &[99, 98, 97]);
+
+        assert!(
+            verify_signed_checkpoint(&checkpoint, None),
+            "fabricated roster passes with no trusted hash (bootstrap case)"
+        );
+    }
+
+    /// The fabricated checkpoint verified against its own roster hash —
+    /// caller explicitly trusts this roster, so it passes.
+    #[test]
+    fn fabricated_roster_passes_when_trusted_hash_matches() {
+        let attacker = Cluster::of(&[99, 98, 97]);
+        let checkpoint = attacker.checkpoint(5, &[99, 98, 97]);
+        let attacker_hash = checkpoint.payload.roster_hash;
+
+        assert!(
+            verify_signed_checkpoint(&checkpoint, Some(attacker_hash)),
+            "fabricated roster passes when its own hash is the trust anchor"
+        );
     }
 }
