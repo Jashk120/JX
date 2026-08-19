@@ -16,9 +16,12 @@ use std::sync::Arc;
 
 use common::{
     node_key,
+    registry_of,
     sample_record,
     signed_checkpoint,
 };
+use crypto::Hashable;
+use ed25519_dalek::Signer;
 use prost::Message;
 use storage::EventSink;
 use stream::record::read_record_stream_file;
@@ -175,5 +178,92 @@ async fn mirror_readers_reject_corruption() {
     assert!(
         verify::verify_record_stream_dir(record_dir.path(), primitives::NodeId::new(1), None)
             .is_err()
+    );
+}
+
+/// A mirror service that supplies a trusted roster hash must reject a record
+/// stream whose embedded checkpoints carry a forged roster — even when the
+/// attacker holds a quorum in that forged roster.
+///
+/// Attack scenario: an attacker controls nodes 10, 11, 12 and compromises
+/// node 1's signing key.  They rewrite every `.rsf` file's checkpoint to
+/// embed a roster `{1, 10, 11, 12}` where 3 of 4 signatures reach quorum.
+/// Without a trust root the forgery passes (the known weakness); with the
+/// correct `trusted_roster_hash` the mismatch is caught before signatures
+/// are checked.
+#[tokio::test]
+async fn forged_roster_rejected_with_trusted_hash() {
+    let (record_dir, _) = setup().await;
+
+    // The correct roster hash: the real network's {1, 2, 3, 4} roster.
+    let correct_roster = registry_of(&[1, 2, 3, 4]);
+    let correct_roster_hash = correct_roster.hash();
+
+    // Tamper every record file: replace its checkpoint with a forged one.
+    let files = stream::record::record_files_in(record_dir.path()).expect("files");
+    assert_eq!(files.len(), 3);
+    for (round, path) in &files {
+        let file_bytes = fs::read(path).expect("read");
+        let mut file = pb::RecordStreamFile::decode(file_bytes.as_slice()).expect("decode");
+
+        // Forged roster: attacker keys 10, 11, 12 plus the compromised
+        // node 1.  3-of-4 = quorum in the attacker's own roster.
+        let forged_roster = registry_of(&[1, 10, 11, 12]);
+        let forged_payload = consensus::CheckpointPayload::new(*round, [0xaa; 32], forged_roster);
+        let signing_bytes = forged_payload.signing_bytes();
+        let forged_sigs: Vec<_> = [1, 10, 11]
+            .iter()
+            .map(|&signer| {
+                let sig = node_key(signer).sign(&signing_bytes);
+                consensus::CheckpointSig {
+                    round: *round,
+                    signer: primitives::NodeId::new(signer),
+                    sig: primitives::Signature::new(sig.to_bytes()),
+                }
+            })
+            .collect();
+        let forged_checkpoint =
+            consensus::SignedCheckpoint { payload: forged_payload, sigs: forged_sigs };
+
+        // Swap the checkpoint inside the protobuf message.
+        file.checkpoint = Some(stream::convert::signed_checkpoint_to_proto(&forged_checkpoint));
+
+        // Re-encode the stream file.
+        let new_file_bytes = file.encode_to_vec();
+
+        // Re-sign with node 1's key (node 1 is in the forged roster, so
+        // checkpoint_member_key will find it during verification).
+        let start =
+            stream::convert::hash_object_digest(file.start_running_hash.as_ref().expect("start"))
+                .expect("start hash");
+        let end = stream::convert::hash_object_digest(file.end_running_hash.as_ref().expect("end"))
+            .expect("end hash");
+        let metadata =
+            stream::signature::metadata_bytes(stream::STREAM_VERSION, &start, &end, Some(*round));
+        let sig_file =
+            stream::signature::build_signature_file(&new_file_bytes, &metadata, &node_key(1));
+        let sig_path = path.with_file_name(stream::signature_file_name(
+            path.file_name().and_then(|n| n.to_str()).unwrap(),
+        ));
+        stream::signature::write_signature_file(&sig_path, &sig_file).expect("write sig");
+        fs::write(path, new_file_bytes).expect("write forged file");
+    }
+
+    // Without a trust root the forgery passes — the known weakness.
+    assert!(
+        verify::verify_record_stream_dir(record_dir.path(), primitives::NodeId::new(1), None)
+            .is_ok(),
+        "forged roster passes without a trust root (the known weakness)"
+    );
+
+    // With the correct trusted hash the forged roster is rejected.
+    assert!(
+        verify::verify_record_stream_dir(
+            record_dir.path(),
+            primitives::NodeId::new(1),
+            Some(correct_roster_hash),
+        )
+        .is_err(),
+        "forged roster must fail when the caller supplies a trusted roster hash"
     );
 }
