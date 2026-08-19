@@ -136,9 +136,41 @@ async fn restart_from_persisted_checkpoint_restores_state_and_resumes() {
     // snapshot lives in the node's state database `snap` keyspace.
     wait_for_persisted_state(&storage1, &net.state_dbs[0], b"k", DEADLINE).await;
 
+    // Ensure the live peer has also accepted the same checkpoint round before
+    // we stop node 1. `wait_for_persisted_state` only guarantees node 1
+    // accepted quorum (its sink wrote). For a 2-node cluster quorum requires
+    // both signatures; node 1 accepts when it receives node 2's sig, but node
+    // 2 may still be one sync round behind. If we restart while the peer's
+    // latest accepted checkpoint is stale, `request_reconnect` will fetch an
+    // older checkpoint (or no checkpoint) and the learner's reconnect loop
+    // stalls — delta-sync is skipped while `needs_reconnect` stays set — so
+    // the post-restart liveness check times out on starved / low-vCPU CI
+    // runners. Waiting here makes the restart deterministic.
+    let persisted_round =
+        storage1.latest().expect("latest").expect("persisted checkpoint").checkpoint.payload.round;
+    timeout(DEADLINE, async {
+        loop {
+            if let Some(round) = node2.latest_accepted_checkpoint_round().await
+                && round >= persisted_round
+            {
+                return;
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("live peer catches up to the persisted checkpoint round");
+
     // Stop node 1 (driver exits, runtime drops, accept loops die, ports free).
     node1_stop.store(true, Ordering::Release);
     node1_thread.join().expect("node1 thread exits");
+    // Give the OS a moment to release the ports before we rebind on the
+    // same addresses. On heavily loaded CI runners the `TcpListener` close
+    // can lag the thread join by a few milliseconds and a tight rebind
+    // races `EADDRINUSE` (the test would panic on "rebind gossip port"
+    // rather than time out, but the retry makes the restart phase
+    // deterministic under vCPU starvation as well).
+    sleep(Duration::from_millis(100)).await;
 
     // Load the latest persisted checkpoint now that node 1 can no longer
     // write: this is exactly what a restarting process would read.
@@ -194,10 +226,42 @@ async fn restart_from_persisted_checkpoint_restores_state_and_resumes() {
     );
 
     // Node 1 restarts on its ORIGINAL addresses — freed by the runtime drop —
-    // so node 2's peer entry still resolves.
-    let gossip_listener = TcpListener::bind(net.gossip_addrs[0]).await.expect("rebind gossip port");
-    let reconnect_listener =
-        TcpListener::bind(net.reconnect_addrs[0]).await.expect("rebind reconnect port");
+    // so node 2's peer entry still resolves. Retry briefly on `EADDRINUSE`
+    // to tolerate the close->rebind race on slow CI runners.
+    let gossip_listener = {
+        let mut listener = None;
+        for _ in 0..20 {
+            match TcpListener::bind(net.gossip_addrs[0]).await {
+                Ok(l) => {
+                    listener = Some(l);
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                    sleep(Duration::from_millis(50)).await;
+                    continue;
+                }
+                Err(e) => panic!("rebind gossip port: {e}"),
+            }
+        }
+        listener.expect("rebind gossip port after retries")
+    };
+    let reconnect_listener = {
+        let mut listener = None;
+        for _ in 0..20 {
+            match TcpListener::bind(net.reconnect_addrs[0]).await {
+                Ok(l) => {
+                    listener = Some(l);
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                    sleep(Duration::from_millis(50)).await;
+                    continue;
+                }
+                Err(e) => panic!("rebind reconnect port: {e}"),
+            }
+        }
+        listener.expect("rebind reconnect port after retries")
+    };
     let stop1b = Arc::new(AtomicBool::new(false));
     let spawn_node = node1b.clone();
     let stop_handle = stop1b.clone();

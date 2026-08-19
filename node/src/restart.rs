@@ -38,6 +38,12 @@ pub fn restore_state(state_db: &StateDb, bytes: &[u8]) -> Option<state::State> {
 /// Verifies a persisted checkpoint: the signature quorum must hold, and the
 /// state snapshot persisted for the checkpoint round must rebuild to the
 /// committed Merkle root.
+///
+/// Verification is side-effect free: the snapshot bytes are decoded over a
+/// temporary `StateDb` so the live `state` partition is never cleared. The
+/// previous implementation cleared the live partition via `restore_state`,
+/// which mutated the shared `StateDb` used by the running executor and made
+/// concurrent verification destructive.
 pub fn verify_persisted(state: &PersistedCheckpoint, state_db: &StateDb) -> bool {
     if !gossip::verify_signed_checkpoint(&state.checkpoint, state.checkpoint.payload.roster_hash) {
         return false;
@@ -45,7 +51,13 @@ pub fn verify_persisted(state: &PersistedCheckpoint, state_db: &StateDb) -> bool
     let Some(bytes) = state_db.snapshot_for(state.checkpoint.payload.round).ok().flatten() else {
         return false;
     };
-    let Some(rebuilt) = restore_state(state_db, &bytes) else {
+    let Ok(dir) = tempfile::tempdir() else {
+        return false;
+    };
+    let Ok(tmp_db) = StateDb::open(dir.path()) else {
+        return false;
+    };
+    let Some(rebuilt) = state::State::from_bytes(tmp_db.state_keyspace(), &bytes) else {
         return false;
     };
     rebuilt.root() == state.checkpoint.payload.state_hash
