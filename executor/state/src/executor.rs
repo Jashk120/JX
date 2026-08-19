@@ -133,14 +133,15 @@ impl Executor {
 
     /// Applies a DID operation to the state after verifying the signature.
     ///
-    /// The single mandatory state lookup doubles as the create-vs-update
-    /// branch:
+    /// The `is_creation` flag on the operation determines the expected state:
     ///
-    /// - **No prior document** (creation): the signature must verify against
+    /// - **Creation** (`is_creation == true`): the identifier must *not*
+    ///   already exist in state. The signature must verify against
     ///   `document.verification_methods[signed_by]` — the operation is
     ///   self-signed.
-    /// - **Prior document found** (update / deactivation): the signature must
-    ///   verify against the prior document's `verification_methods[signed_by]`.
+    /// - **Update / deactivation** (`is_creation == false`): the identifier
+    ///   *must* already exist in state. The signature must verify against the
+    ///   prior document's `verification_methods[signed_by]`.
     ///
     /// On success the document is written to state via `Op::Put`, reusing the
     /// existing KV path unchanged.
@@ -151,8 +152,14 @@ impl Executor {
         let signed_payload = did_op.signed_payload();
         let dalek_sig = ed25519_dalek::Signature::from_bytes(did_op.signature().as_bytes());
 
-        match self.state.get(&key) {
-            None => {
+        match (did_op.is_creation(), self.state.get(&key)) {
+            (true, Some(_)) => {
+                return Err(DidError::IdentifierAlreadyExists);
+            }
+            (false, None) => {
+                return Err(DidError::UnknownIdentifier);
+            }
+            (true, None) => {
                 // Creation: verify self-signed by the new document's own key.
                 let idx = did_op.signed_by() as usize;
                 let verifying_key: &VerifyingKey = did_op
@@ -164,7 +171,7 @@ impl Executor {
                     .verify(&signed_payload, &dalek_sig)
                     .map_err(|_| DidError::InvalidSignature)?;
             }
-            Some(encoded_doc) => {
+            (false, Some(encoded_doc)) => {
                 // Update / deactivation: verify against the prior document.
                 let mut cursor = &encoded_doc[..];
                 let prior_doc =
@@ -385,14 +392,20 @@ mod tests {
     ///
     /// `authorizer_seed` is the signing key index. `doc_keys` are the
     /// verification method key indices for the new document.
-    fn did_tx(alias: &str, authorizer_seed: u8, doc_keys: &[u8], deactivated: bool) -> Transaction {
+    fn did_tx(
+        alias: &str,
+        authorizer_seed: u8,
+        doc_keys: &[u8],
+        deactivated: bool,
+        is_creation: bool,
+    ) -> Transaction {
         let id = did_id(alias);
         let methods: Vec<_> = doc_keys.iter().map(|&s| verifying_key(s)).collect();
         let doc = DidDocument::new(methods, deactivated).expect("valid doc");
         let mut payload_to_sign = id.encode();
         payload_to_sign.extend_from_slice(&doc.encode());
         let sig = signing_key(authorizer_seed).sign(&payload_to_sign);
-        let op = DidOp::new(id, doc, primitives::Signature::new(sig.to_bytes()), 0);
+        let op = DidOp::new(id, doc, primitives::Signature::new(sig.to_bytes()), 0, is_creation);
         let mut payload = vec![0x03];
         payload.extend_from_slice(&op.encode());
         Transaction::from_bytes(payload)
@@ -400,7 +413,7 @@ mod tests {
 
     #[test]
     fn did_creation_self_signed_succeeds() {
-        let tx = did_tx("alice", 1, &[1], false);
+        let tx = did_tx("alice", 1, &[1], false, true);
         let event = event_with(vec![tx]);
 
         let mut executor = new_executor();
@@ -415,7 +428,7 @@ mod tests {
     #[test]
     fn did_creation_rejects_bad_signature() {
         // Sign with key 2 but the document only has key 1.
-        let tx = did_tx("alice", 2, &[1], false);
+        let tx = did_tx("alice", 2, &[1], false, true);
         let event = event_with(vec![tx]);
 
         let mut executor = new_executor();
@@ -428,17 +441,18 @@ mod tests {
 
     #[test]
     fn did_creation_rejects_duplicate_identifier() {
-        let tx1 = did_tx("alice", 1, &[1], false);
-        let tx2 = did_tx("alice", 2, &[2], false);
+        // First creation succeeds.
+        let tx1 = did_tx("alice", 1, &[1], false, true);
+        // Second creation for the same identifier is rejected at the
+        // operation-type check before signature verification.
+        let tx2 = did_tx("alice", 1, &[1], false, true);
         let event = event_with(vec![tx1, tx2]);
 
         let mut executor = new_executor();
         let result = executor.execute_event(&event);
 
         assert!(result.errors.is_empty());
-        // First succeeds, second fails: prior doc exists (key 1), signed_by=0
-        // points at prior doc's key 1, but signature was made with key 2.
-        assert_eq!(result.did_errors, vec![DidError::InvalidSignature]);
+        assert_eq!(result.did_errors, vec![DidError::IdentifierAlreadyExists]);
         // Only the first document is in state.
         assert_eq!(executor.state().len(), 1);
     }
@@ -446,9 +460,9 @@ mod tests {
     #[test]
     fn did_update_succeeds_with_current_verification_method() {
         // Create with key 1.
-        let create = did_tx("alice", 1, &[1], false);
+        let create = did_tx("alice", 1, &[1], false, true);
         // Update: rotate to key 2, signed by key 1 (current authorizer).
-        let update = did_tx("alice", 1, &[2], false);
+        let update = did_tx("alice", 1, &[2], false, false);
         let event = event_with(vec![create, update]);
 
         let mut executor = new_executor();
@@ -462,9 +476,9 @@ mod tests {
     #[test]
     fn did_update_rejects_signature_from_non_current_key() {
         // Create with key 1.
-        let create = did_tx("alice", 1, &[1], false);
+        let create = did_tx("alice", 1, &[1], false, true);
         // Update: signed by key 2 (rotated-out key can't sign).
-        let update = did_tx("alice", 2, &[2], false);
+        let update = did_tx("alice", 2, &[2], false, false);
         let event = event_with(vec![create, update]);
 
         let mut executor = new_executor();
@@ -478,8 +492,8 @@ mod tests {
 
     #[test]
     fn did_deactivation_is_tombstone_not_delete() {
-        let create = did_tx("alice", 1, &[1], false);
-        let deactivate = did_tx("alice", 1, &[1], true);
+        let create = did_tx("alice", 1, &[1], false, true);
+        let deactivate = did_tx("alice", 1, &[1], true, false);
         let event = event_with(vec![create, deactivate]);
 
         let mut executor = new_executor();
@@ -498,13 +512,25 @@ mod tests {
     }
 
     #[test]
-    fn did_op_rejects_more_than_five_verification_methods() {
+    fn did_op_accepts_exactly_five_verification_methods() {
+        let tx = did_tx("alice", 1, &[1, 0, 2, 3, 4], false, true);
+        let event = event_with(vec![tx]);
+
+        let mut executor = new_executor();
+        let result = executor.execute_event(&event);
+
+        assert!(result.errors.is_empty());
+        assert!(result.did_errors.is_empty());
+        assert_eq!(executor.state().len(), 1);
+    }
+
+    #[test]
+    fn did_op_rejects_six_verification_methods() {
         // Build a raw DID payload with 6 verification methods, bypassing
         // DidDocument::new which would reject at construction time.
         let id = did_id("alice");
         let mut payload = Vec::new();
         payload.extend_from_slice(&id.encode());
-        // 6 keys — exceeds MAX_VERIFICATION_METHODS.
         payload.push(6);
         for i in 0..6u8 {
             payload.extend_from_slice(&verifying_key(i).to_bytes());
@@ -512,6 +538,7 @@ mod tests {
         payload.push(0); // deactivated = false
         payload.extend_from_slice(&[0u8; 64]); // signature
         payload.push(0); // signed_by
+        payload.push(1); // is_creation
 
         let mut outer = vec![0x03];
         outer.extend_from_slice(&payload);
@@ -534,6 +561,7 @@ mod tests {
         payload.push(0); // deactivated
         payload.extend_from_slice(&[0u8; 64]); // signature
         payload.push(0); // signed_by
+        payload.push(1); // is_creation
 
         let mut outer = vec![0x03];
         outer.extend_from_slice(&payload);
@@ -548,8 +576,8 @@ mod tests {
 
     #[test]
     fn did_deactivation_revival_is_rejected() {
-        let create = did_tx("alice", 1, &[1], false);
-        let deactivate = did_tx("alice", 1, &[1], true);
+        let create = did_tx("alice", 1, &[1], false, true);
+        let deactivate = did_tx("alice", 1, &[1], true, false);
         let event = event_with(vec![create, deactivate]);
 
         let mut executor = new_executor();
@@ -559,8 +587,16 @@ mod tests {
         assert!(result.did_errors.is_empty());
 
         // Attempt to revive the deactivated DID.
-        let revive = did_tx("alice", 1, &[1], false);
+        let revive = did_tx("alice", 1, &[1], false, false);
         let event = event_with(vec![revive]);
+        let result = executor.execute_event(&event);
+
+        assert!(result.errors.is_empty());
+        assert_eq!(result.did_errors, vec![DidError::AlreadyDeactivated]);
+
+        // Rotating keys on a deactivated document is also rejected.
+        let rotate = did_tx("alice", 1, &[2], false, false);
+        let event = event_with(vec![rotate]);
         let result = executor.execute_event(&event);
 
         assert!(result.errors.is_empty());
@@ -569,19 +605,16 @@ mod tests {
 
     #[test]
     fn did_update_rejects_unknown_identifier() {
-        // Try to update "alice" which doesn't exist — signed by key 2,
-        // document has key 1, signed_by=0. No prior doc exists so this
-        // is treated as a creation attempt. signed_by=0 is in range for
-        // the new doc, but the signature was made with key 2 while the
-        // doc's key 0 is key 1 → InvalidSignature.
-        let tx = did_tx("alice", 2, &[1], false);
+        // Try to update "alice" which doesn't exist — the operation-type
+        // check rejects before signature verification.
+        let tx = did_tx("alice", 1, &[1], false, false);
         let event = event_with(vec![tx]);
 
         let mut executor = new_executor();
         let result = executor.execute_event(&event);
 
         assert!(result.errors.is_empty());
-        assert_eq!(result.did_errors, vec![DidError::InvalidSignature]);
+        assert_eq!(result.did_errors, vec![DidError::UnknownIdentifier]);
         assert!(executor.state().is_empty());
     }
 }

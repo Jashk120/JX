@@ -24,10 +24,13 @@
 //! [deactivated: u8 (0 or 1)]
 //! [signature: 64 bytes]
 //! [signed_by: u8]
+//! [is_creation: u8 (0 or 1)]
 //! ```
 //!
 //! `num_keys` must be in 1..=5; `signed_by` is an index into the
-//! authorizing document's verification methods. The signed payload is
+//! authorizing document's verification methods. `is_creation` distinguishes
+//! a DID creation (must target an absent identifier) from an update or
+//! deactivation (must target an existing identifier). The signed payload is
 //! `DidId::encode() || DidDocument::encode()`.
 //!
 //! Decode-time deterministic rejects: more than 5 verification methods,
@@ -180,11 +183,18 @@ pub struct DidOp {
     document: DidDocument,
     signature: Signature,
     signed_by: u8,
+    is_creation: bool,
 }
 
 impl DidOp {
-    pub fn new(id: DidId, document: DidDocument, signature: Signature, signed_by: u8) -> Self {
-        Self { id, document, signature, signed_by }
+    pub fn new(
+        id: DidId,
+        document: DidDocument,
+        signature: Signature,
+        signed_by: u8,
+        is_creation: bool,
+    ) -> Self {
+        Self { id, document, signature, signed_by, is_creation }
     }
 
     pub fn id(&self) -> &DidId {
@@ -203,6 +213,10 @@ impl DidOp {
         self.signed_by
     }
 
+    pub fn is_creation(&self) -> bool {
+        self.is_creation
+    }
+
     /// Decodes `payload` (the body after the `0x03` opcode) into a `DidOp`.
     pub fn decode(payload: &[u8]) -> Result<DidOp> {
         let mut cursor = payload;
@@ -213,8 +227,9 @@ impl DidOp {
         sig_arr.copy_from_slice(sig_bytes);
         let signature = Signature::new(sig_arr);
         let signed_by = take_exact(&mut cursor, 1)?[0];
+        let is_creation = take_exact(&mut cursor, 1)?[0] != 0;
         reject_trailing(cursor)?;
-        Ok(Self { id, document, signature, signed_by })
+        Ok(Self { id, document, signature, signed_by, is_creation })
     }
 
     /// The canonical encoding of this operation — the inverse of
@@ -225,6 +240,7 @@ impl DidOp {
         buf.extend_from_slice(&self.document.encode());
         buf.extend_from_slice(self.signature.as_bytes());
         buf.push(self.signed_by);
+        buf.push(u8::from(self.is_creation));
         buf
     }
 
@@ -333,7 +349,13 @@ mod tests {
             buf
         };
         let sig = signing_key(1).sign(&payload);
-        DidOp { id, document: doc, signature: Signature::new(sig.to_bytes()), signed_by: 0 }
+        DidOp {
+            id,
+            document: doc,
+            signature: Signature::new(sig.to_bytes()),
+            signed_by: 0,
+            is_creation: true,
+        }
     }
 
     // --- DidId round-trip ---
