@@ -189,4 +189,85 @@ mod tests {
         ]);
         assert_eq!(MembershipRegistry::from_bytes(&bad), None);
     }
+
+    #[test]
+    fn registering_duplicate_node_overwrites_key() {
+        let key1 = SigningKey::generate(&mut OsRng).verifying_key();
+        let key2 = SigningKey::generate(&mut OsRng).verifying_key();
+
+        let mut registry = MembershipRegistry::new();
+        registry.register(NodeId::new(1), key1);
+        assert_eq!(registry.key_for(&NodeId::new(1)), Ok(&key1));
+
+        registry.register(NodeId::new(1), key2);
+        assert_eq!(registry.key_for(&NodeId::new(1)), Ok(&key2));
+        assert_eq!(registry.len(), 1, "duplicate register should not increase member count");
+    }
+
+    #[test]
+    fn member_ids_returns_sorted_order() {
+        let mut registry = MembershipRegistry::new();
+        for id in [5, 1, 3, 2, 4] {
+            registry.register(NodeId::new(id), SigningKey::generate(&mut OsRng).verifying_key());
+        }
+        let ids = registry.member_ids();
+        assert_eq!(
+            ids,
+            vec![NodeId::new(1), NodeId::new(2), NodeId::new(3), NodeId::new(4), NodeId::new(5)]
+        );
+    }
+
+    #[test]
+    fn len_and_is_empty_reflect_actual_members() {
+        let mut registry = MembershipRegistry::new();
+        assert!(registry.is_empty());
+        assert_eq!(registry.len(), 0);
+
+        registry.register(NodeId::new(1), SigningKey::generate(&mut OsRng).verifying_key());
+        assert!(!registry.is_empty());
+        assert_eq!(registry.len(), 1);
+
+        registry.register(NodeId::new(2), SigningKey::generate(&mut OsRng).verifying_key());
+        assert_eq!(registry.len(), 2);
+    }
+
+    #[test]
+    fn from_bytes_rejects_non_aligned_input() {
+        // 41 bytes is not a multiple of 40 (the per-member record size).
+        let bytes = vec![0u8; 41];
+        assert_eq!(MembershipRegistry::from_bytes(&bytes), None);
+    }
+
+    #[test]
+    fn from_bytes_with_duplicate_node_ids_uses_last_key() {
+        // Manually construct bytes with two records for the same NodeId.
+        let key1 = SigningKey::generate(&mut OsRng).verifying_key();
+        let key2 = SigningKey::generate(&mut OsRng).verifying_key();
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1u64.to_be_bytes());
+        bytes.extend_from_slice(&key1.to_bytes());
+        bytes.extend_from_slice(&1u64.to_be_bytes());
+        bytes.extend_from_slice(&key2.to_bytes());
+
+        let registry = MembershipRegistry::from_bytes(&bytes).expect("valid bytes");
+        assert_eq!(registry.len(), 1, "duplicate NodeId should produce single member");
+        assert_eq!(registry.key_for(&NodeId::new(1)), Ok(&key2));
+    }
+
+    #[test]
+    fn lookup_after_clear_and_re_register() {
+        let mut registry = MembershipRegistry::new();
+        let key = SigningKey::generate(&mut OsRng).verifying_key();
+        registry.register(NodeId::new(1), key);
+        assert!(registry.contains(&NodeId::new(1)));
+
+        // Remove the entry and re-register with a new key.
+        registry.keys.remove(&NodeId::new(1));
+        assert!(!registry.contains(&NodeId::new(1)));
+
+        let new_key = SigningKey::generate(&mut OsRng).verifying_key();
+        registry.register(NodeId::new(1), new_key);
+        assert_eq!(registry.key_for(&NodeId::new(1)), Ok(&new_key));
+    }
 }

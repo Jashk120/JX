@@ -621,5 +621,163 @@ mod tests {
         fn from_snapshots_rejects_empty_list() {
             assert!(RosterHistory::from_snapshots(Vec::new()).is_none());
         }
+
+        #[test]
+        fn roster_for_round_panics_on_zero() {
+            let history = RosterHistory::new(registry_with(&[1]));
+            let result = std::panic::catch_unwind(|| {
+                let _ = history.roster_for_round(0);
+            });
+            assert!(result.is_err(), "roster_for_round(0) must panic");
+        }
+
+        #[test]
+        fn empty_genesis_registry_is_valid() {
+            let history = RosterHistory::new(MembershipRegistry::new());
+            assert_eq!(history.roster_for_round(1).len(), 0);
+            assert!(history.roster_for_round(1).is_empty());
+        }
+
+        #[test]
+        fn schedule_at_round_one_overwrites_genesis() {
+            let mut history = RosterHistory::new(registry_with(&[1]));
+            assert_eq!(history.roster_for_round(1).len(), 1);
+
+            history.schedule(1, registry_with(&[1, 2, 3]));
+            assert_eq!(history.roster_for_round(1).len(), 3);
+        }
+
+        #[test]
+        fn large_round_numbers_work() {
+            let mut history = RosterHistory::new(registry_with(&[1]));
+            let large_round = u64::MAX - 1;
+            history.schedule(large_round, registry_with(&[1, 2]));
+            assert_eq!(history.roster_for_round(large_round).len(), 2);
+            assert_eq!(history.roster_for_round(u64::MAX).len(), 2);
+        }
+
+        #[test]
+        fn prune_before_with_single_snapshot_keeps_it() {
+            let mut history = RosterHistory::new(registry_with(&[1]));
+            history.prune_before(100);
+            let mut remaining = history.snapshots.keys().copied();
+            assert_eq!(remaining.next(), Some(1));
+            assert!(remaining.next().is_none());
+        }
+
+        #[test]
+        fn prune_before_exact_activation_round_keeps_it() {
+            let mut history = RosterHistory::new(registry_with(&[1]));
+            history.schedule(5, registry_with(&[1, 2]));
+            history.prune_before(5);
+            let mut remaining = history.snapshots.keys().copied();
+            assert_eq!(remaining.next(), Some(1));
+            assert_eq!(remaining.next(), Some(5));
+            assert!(remaining.next().is_none());
+        }
+    }
+
+    mod malformed_op_negative_tests {
+        use super::*;
+
+        #[test]
+        fn add_with_all_ones_node_id_round_trips() {
+            let signing_key = SigningKey::generate(&mut OsRng);
+            let verifying_key = signing_key.verifying_key();
+            let op = MembershipOp::Add {
+                node: NodeId::new(u64::MAX),
+                key: Box::new(verifying_key),
+                addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 1),
+                reconnect_addr: None,
+            };
+            assert_eq!(MembershipOp::decode(&op.encode()), Ok(op));
+        }
+
+        #[test]
+        fn remove_max_node_id_round_trips() {
+            let op = MembershipOp::Remove { node: NodeId::new(u64::MAX) };
+            assert_eq!(MembershipOp::decode(&op.encode()), Ok(op));
+        }
+
+        #[test]
+        fn add_with_zero_port_round_trips() {
+            let op = add_op(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0));
+            assert_eq!(MembershipOp::decode(&op.encode()), Ok(op));
+        }
+
+        #[test]
+        fn add_with_max_port_round_trips() {
+            let op = add_op(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), u16::MAX));
+            assert_eq!(MembershipOp::decode(&op.encode()), Ok(op));
+        }
+
+        #[test]
+        fn single_byte_payload_is_rejected() {
+            assert_eq!(
+                MembershipOp::decode(&[0xFF]),
+                Err(CryptoError::UnknownMembershipOpcode(0xFF))
+            );
+        }
+
+        #[test]
+        fn remove_truncated_after_opcode() {
+            let mut payload = vec![MEMBERSHIP_REMOVE];
+            payload.extend_from_slice(&[0u8; 4]);
+            assert_eq!(MembershipOp::decode(&payload), Err(CryptoError::MalformedOp));
+        }
+
+        #[test]
+        fn add_with_empty_addr_blob_is_rejected() {
+            let mut payload = Vec::new();
+            payload.push(MEMBERSHIP_ADD);
+            payload.extend_from_slice(&1u64.to_be_bytes());
+            payload.extend_from_slice(&SigningKey::generate(&mut OsRng).verifying_key().to_bytes());
+            payload.extend_from_slice(&0u32.to_be_bytes());
+            payload.push(RECONNECT_ABSENT);
+            assert_eq!(MembershipOp::decode(&payload), Err(CryptoError::MalformedOp));
+        }
+
+        #[test]
+        fn add_with_invalid_addr_tag_is_rejected() {
+            let mut payload = Vec::new();
+            payload.push(MEMBERSHIP_ADD);
+            payload.extend_from_slice(&1u64.to_be_bytes());
+            payload.extend_from_slice(&SigningKey::generate(&mut OsRng).verifying_key().to_bytes());
+            let bad_addr = vec![0xFF, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+            write_bytes(&mut payload, &bad_addr);
+            payload.push(RECONNECT_ABSENT);
+            assert_eq!(MembershipOp::decode(&payload), Err(CryptoError::MalformedOp));
+        }
+
+        #[test]
+        fn add_with_trailing_byte_after_reconnect_absent_is_rejected() {
+            let mut payload =
+                add_op(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 8080)).encode();
+            payload.push(0x00);
+            assert_eq!(MembershipOp::decode(&payload), Err(CryptoError::MalformedOp));
+        }
+
+        #[test]
+        fn remove_with_extra_bytes_is_rejected() {
+            let mut payload = MembershipOp::Remove { node: NodeId::new(42) }.encode();
+            payload.extend_from_slice(&[0, 0, 0, 0]);
+            assert_eq!(MembershipOp::decode(&payload), Err(CryptoError::MalformedOp));
+        }
+
+        #[test]
+        fn duplicate_add_op_round_trips_independently() {
+            let signing_key = SigningKey::generate(&mut OsRng);
+            let verifying_key = signing_key.verifying_key();
+            let op = MembershipOp::Add {
+                node: NodeId::new(999),
+                key: Box::new(verifying_key),
+                addr: SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 443),
+                reconnect_addr: Some(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 444)),
+            };
+            let encoded = op.encode();
+            let decoded1 = MembershipOp::decode(&encoded).expect("first decode");
+            let decoded2 = MembershipOp::decode(&encoded).expect("second decode");
+            assert_eq!(decoded1, decoded2);
+        }
     }
 }
