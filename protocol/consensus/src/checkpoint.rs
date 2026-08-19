@@ -123,12 +123,11 @@ impl CheckpointAccumulator {
         self.payload.signing_bytes()
     }
 
-    /// Adds one *already-verified* signature (the caller checks the Ed25519
-    /// signature against the roster active at `sig.round`). Returns
-    /// `Some(SignedCheckpoint)` the first time the collected signers exceed
-    /// 2/3 of `registry`'s members — the roster active at the checkpoint
-    /// round, not the live roster — and `None` otherwise. A duplicate signer
-    /// counts once.
+    /// Adds one signature. The signer **must** be a member of `registry`;
+    /// non-members are silently rejected. Returns `Some(SignedCheckpoint)`
+    /// the first time the collected signers exceed 2/3 of `registry`'s
+    /// members — the roster active at the checkpoint round, not the live
+    /// roster — and `None` otherwise. A duplicate signer counts once.
     ///
     /// Weight model: all nodes currently have unit stake, so the threshold is
     /// `sigs.len() * 3 > total_members * 2`, matching `finalize_round`. When
@@ -140,6 +139,9 @@ impl CheckpointAccumulator {
         registry: &MembershipRegistry,
     ) -> Option<SignedCheckpoint> {
         if sig.round != self.payload.round {
+            return None;
+        }
+        if !registry.contains(&sig.signer) {
             return None;
         }
         let total = registry.len();
@@ -285,5 +287,15 @@ mod tests {
         let mut accumulator =
             CheckpointAccumulator::new(CheckpointPayload::new(1, [0u8; 32], registry.clone()));
         assert!(accumulator.add_sig(sig(2, 1), &registry).is_none());
+    }
+
+    #[test]
+    fn non_member_sig_is_ignored() {
+        let registry = registry_of(&[1, 2, 3, 4]);
+        let mut accumulator =
+            CheckpointAccumulator::new(CheckpointPayload::new(1, [0u8; 32], registry.clone()));
+        // Node 5 is not in the registry.
+        assert!(accumulator.add_sig(sig(1, 5), &registry).is_none());
+        assert!(accumulator.sigs.is_empty());
     }
 }

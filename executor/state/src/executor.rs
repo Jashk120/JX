@@ -173,6 +173,9 @@ impl Executor {
                 if !cursor.is_empty() {
                     return Err(DidError::InvalidSignature);
                 }
+                if prior_doc.deactivated() {
+                    return Err(DidError::AlreadyDeactivated);
+                }
                 let idx = did_op.signed_by() as usize;
                 let verifying_key: &VerifyingKey =
                     prior_doc.verification_methods().get(idx).ok_or(DidError::UnknownSigner)?;
@@ -541,6 +544,27 @@ mod tests {
 
         assert_eq!(result.errors, vec![ExecutorError::MalformedDidOp]);
         assert!(executor.state().is_empty());
+    }
+
+    #[test]
+    fn did_deactivation_revival_is_rejected() {
+        let create = did_tx("alice", 1, &[1], false);
+        let deactivate = did_tx("alice", 1, &[1], true);
+        let event = event_with(vec![create, deactivate]);
+
+        let mut executor = new_executor();
+        let result = executor.execute_event(&event);
+
+        assert!(result.errors.is_empty());
+        assert!(result.did_errors.is_empty());
+
+        // Attempt to revive the deactivated DID.
+        let revive = did_tx("alice", 1, &[1], false);
+        let event = event_with(vec![revive]);
+        let result = executor.execute_event(&event);
+
+        assert!(result.errors.is_empty());
+        assert_eq!(result.did_errors, vec![DidError::AlreadyDeactivated]);
     }
 
     #[test]

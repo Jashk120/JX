@@ -70,6 +70,9 @@ pub enum DidError {
     /// An update or deactivation was attempted, but the identifier does not
     /// exist in state.
     UnknownIdentifier,
+    /// The document is already deactivated and cannot be updated or
+    /// re-activated.
+    AlreadyDeactivated,
 }
 
 impl fmt::Display for DidError {
@@ -79,6 +82,7 @@ impl fmt::Display for DidError {
             Self::InvalidSignature => write!(f, "DID signature verification failed"),
             Self::IdentifierAlreadyExists => write!(f, "DID identifier already exists"),
             Self::UnknownIdentifier => write!(f, "DID identifier not found"),
+            Self::AlreadyDeactivated => write!(f, "DID document is already deactivated"),
         }
     }
 }
