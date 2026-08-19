@@ -214,4 +214,34 @@ mod tests {
         assert!(identity.server_config().is_ok());
         assert!(identity.client_config(identity.spki_fingerprint()).is_ok());
     }
+
+    #[test]
+    fn spki_fingerprint_rejects_garbage_der() {
+        // An attacker could send a crafted TLS certificate whose DER bytes
+        // are not a valid X.509 structure. The SPKI fingerprint computation
+        // must fail with a CertificateVerification error rather than panicking
+        // or returning a meaningless fingerprint.
+        let garbage: Vec<u8> = vec![0xFF; 64];
+        let result = TlsIdentity::spki_fingerprint_of(&CertificateDer::from(garbage));
+        assert!(result.is_err(), "garbage DER must not produce a valid fingerprint");
+    }
+
+    #[test]
+    fn spki_fingerprint_rejects_empty_der() {
+        let empty: Vec<u8> = Vec::new();
+        let result = TlsIdentity::spki_fingerprint_of(&CertificateDer::from(empty));
+        assert!(result.is_err(), "empty DER must not produce a valid fingerprint");
+    }
+
+    #[test]
+    fn spki_fingerprint_rejects_truncated_der() {
+        // A valid certificate truncated to just its first few bytes.
+        let identity = test_identity(1);
+        let cert_bytes = identity.cert_der.as_ref();
+        if cert_bytes.len() > 10 {
+            let truncated: Vec<u8> = cert_bytes[..10].to_vec();
+            let result = TlsIdentity::spki_fingerprint_of(&CertificateDer::from(truncated));
+            assert!(result.is_err(), "truncated DER must not produce a valid fingerprint");
+        }
+    }
 }

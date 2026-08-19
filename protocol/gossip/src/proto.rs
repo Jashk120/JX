@@ -621,4 +621,219 @@ mod tests {
             assert!(Frame::from_bytes(&bytes[..cut]).is_err(), "cut at {cut}");
         }
     }
+
+    #[test]
+    fn sync_request_oversized_count_rejected() {
+        // A SyncRequest whose declared `count` of known entries vastly exceeds
+        // the remaining buffer. The capacity guard from commit b6a53a5 must
+        // reject this before any allocation or loop iteration.
+        let mut payload = Vec::new();
+        // NodeId (8 bytes)
+        payload.extend_from_slice(&1u64.to_be_bytes());
+        // count = u32::MAX — only 4 bytes of payload remain after the NodeId.
+        payload.extend_from_slice(&u32::MAX.to_be_bytes());
+        let mut frame = vec![MessageType::SyncRequest as u8];
+        frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&payload);
+        assert!(
+            matches!(Frame::from_bytes(&frame), Err(GossipError::Framing(msg)) if msg == "declared count exceeds remaining buffer"),
+            "SyncRequest with bogus count must be rejected"
+        );
+    }
+
+    #[test]
+    fn sync_response_oversized_count_rejected() {
+        // A SyncResponse whose declared `count` of events exceeds what the
+        // buffer could possibly contain. Must trigger the capacity guard
+        // from commit b6a53a5.
+        let mut frame = vec![MessageType::SyncResponse as u8];
+        frame.extend_from_slice(&(4u32).to_be_bytes()); // len = 4
+        frame.extend_from_slice(&u32::MAX.to_be_bytes()); // count = u32::MAX
+        assert!(
+            matches!(Frame::from_bytes(&frame), Err(GossipError::Framing(msg)) if msg == "declared count exceeds remaining buffer"),
+            "SyncResponse with bogus count must be rejected"
+        );
+    }
+
+    #[test]
+    fn reconnect_response_oversized_retained_count_rejected() {
+        // A ReconnectResponse whose declared `retained_count` exceeds what
+        // the buffer can hold. The capacity guard (commit b6a53a5) must
+        // reject before allocation.
+        let response = sample_reconnect_response();
+        let mut payload = Vec::new();
+        // Checkpoint encoded bytes.
+        let cp_bytes = consensus::reconnect::encode_signed_checkpoint(&response.signed_checkpoint);
+        payload.extend_from_slice(&(cp_bytes.len() as u32).to_be_bytes());
+        payload.extend_from_slice(&cp_bytes);
+        // State bytes.
+        payload.extend_from_slice(&(response.state_bytes.len() as u32).to_be_bytes());
+        payload.extend_from_slice(&response.state_bytes);
+        // Roster history bytes.
+        payload.extend_from_slice(&(response.roster_history_bytes.len() as u32).to_be_bytes());
+        payload.extend_from_slice(&response.roster_history_bytes);
+        // Decided round.
+        payload.extend_from_slice(&response.decided_round.to_be_bytes());
+        // Retained count — absurdly large, no real entries follow.
+        payload.extend_from_slice(&u32::MAX.to_be_bytes());
+
+        let mut frame = vec![MessageType::ReconnectResponse as u8];
+        frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&payload);
+        assert!(
+            matches!(Frame::from_bytes(&frame), Err(GossipError::Framing(msg)) if msg == "declared count exceeds remaining buffer"),
+            "ReconnectResponse with bogus retained_count must be rejected"
+        );
+    }
+
+    #[test]
+    fn reconnect_response_oversized_ancestor_count_rejected() {
+        // A ReconnectResponse with a valid retained_count of 1, but the
+        // single entry declares an ancestor_count that exceeds the buffer.
+        // The inner capacity guard (commit b6a53a5) must catch this.
+        let response = sample_reconnect_response();
+        let mut payload = Vec::new();
+        let cp_bytes = consensus::reconnect::encode_signed_checkpoint(&response.signed_checkpoint);
+        payload.extend_from_slice(&(cp_bytes.len() as u32).to_be_bytes());
+        payload.extend_from_slice(&cp_bytes);
+        payload.extend_from_slice(&(response.state_bytes.len() as u32).to_be_bytes());
+        payload.extend_from_slice(&response.state_bytes);
+        payload.extend_from_slice(&(response.roster_history_bytes.len() as u32).to_be_bytes());
+        payload.extend_from_slice(&response.roster_history_bytes);
+        payload.extend_from_slice(&response.decided_round.to_be_bytes());
+        // retained_count = 1
+        payload.extend_from_slice(&1u32.to_be_bytes());
+        // seq (u64)
+        payload.extend_from_slice(&0u64.to_be_bytes());
+        // round (u64)
+        payload.extend_from_slice(&1u64.to_be_bytes());
+        // round_received tag = 0x00 (None)
+        payload.push(0x00);
+        // ancestor_count = u32::MAX — far more than the buffer can hold.
+        payload.extend_from_slice(&u32::MAX.to_be_bytes());
+
+        let mut frame = vec![MessageType::ReconnectResponse as u8];
+        frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&payload);
+        assert!(
+            matches!(Frame::from_bytes(&frame), Err(GossipError::Framing(msg)) if msg == "declared count exceeds remaining buffer"),
+            "ReconnectResponse with oversized ancestor_count must be rejected"
+        );
+    }
+
+    #[test]
+    fn event_oversized_payload_count_rejected() {
+        // An Event frame whose payload_count exceeds the remaining buffer.
+        // The capacity guard in decode_event (commit b6a53a5) must reject.
+        let mut event_payload = Vec::new();
+        // creator (NodeId, u64)
+        event_payload.extend_from_slice(&1u64.to_be_bytes());
+        // self_parent tag = 0x00 (None)
+        event_payload.push(0x00);
+        // other_parent tag = 0x00 (None)
+        event_payload.push(0x00);
+        // timestamp (u64)
+        event_payload.extend_from_slice(&100u64.to_be_bytes());
+        // payload_count = u32::MAX — the buffer is only ~21 bytes.
+        event_payload.extend_from_slice(&u32::MAX.to_be_bytes());
+
+        let mut frame = vec![MessageType::Event as u8];
+        frame.extend_from_slice(&(event_payload.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&event_payload);
+        assert!(
+            matches!(Frame::from_bytes(&frame), Err(GossipError::Framing(msg)) if msg == "declared count exceeds remaining buffer"),
+            "Event with oversized payload_count must be rejected"
+        );
+    }
+
+    #[test]
+    fn event_invalid_optional_hash_tag_rejected() {
+        // An Event frame whose self_parent tag is neither 0x00 nor 0x01.
+        // decode_optional_hash must return a framing error.
+        let mut event_payload = Vec::new();
+        event_payload.extend_from_slice(&1u64.to_be_bytes()); // creator
+        event_payload.push(0xFF); // invalid self_parent tag
+        event_payload.push(0x00); // other_parent tag
+        event_payload.extend_from_slice(&100u64.to_be_bytes()); // timestamp
+        event_payload.extend_from_slice(&0u32.to_be_bytes()); // payload_count
+        event_payload.extend_from_slice(&[0u8; 64]); // signature
+
+        let mut frame = vec![MessageType::Event as u8];
+        frame.extend_from_slice(&(event_payload.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&event_payload);
+        assert!(
+            matches!(Frame::from_bytes(&frame), Err(GossipError::Framing(msg)) if msg.contains("invalid optional-hash tag")),
+            "Event with invalid optional-hash tag must be rejected"
+        );
+    }
+
+    #[test]
+    fn reconnect_response_invalid_round_received_tag_rejected() {
+        // A ReconnectResponse with a retained entry whose round_received
+        // tag is neither 0x00 nor 0x01.
+        let response = sample_reconnect_response();
+        let mut payload = Vec::new();
+        let cp_bytes = consensus::reconnect::encode_signed_checkpoint(&response.signed_checkpoint);
+        payload.extend_from_slice(&(cp_bytes.len() as u32).to_be_bytes());
+        payload.extend_from_slice(&cp_bytes);
+        payload.extend_from_slice(&(response.state_bytes.len() as u32).to_be_bytes());
+        payload.extend_from_slice(&response.state_bytes);
+        payload.extend_from_slice(&(response.roster_history_bytes.len() as u32).to_be_bytes());
+        payload.extend_from_slice(&response.roster_history_bytes);
+        payload.extend_from_slice(&response.decided_round.to_be_bytes());
+        // retained_count = 1
+        payload.extend_from_slice(&1u32.to_be_bytes());
+        // seq (u64)
+        payload.extend_from_slice(&0u64.to_be_bytes());
+        // round (u64)
+        payload.extend_from_slice(&1u64.to_be_bytes());
+        // round_received tag = 0xFF (invalid)
+        payload.push(0xFF);
+        // Pad so the retained_count guard (MIN_RETAINED = 111) passes.
+        payload.extend_from_slice(&[0u8; 200]);
+
+        let mut frame = vec![MessageType::ReconnectResponse as u8];
+        frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&payload);
+        let result = Frame::from_bytes(&frame);
+        assert!(result.is_err(), "must reject invalid round_received tag");
+        let msg = match result.unwrap_err() {
+            GossipError::Framing(m) => m,
+            other => panic!("expected Framing error, got: {other:?}"),
+        };
+        assert!(
+            msg.contains("round-received"),
+            "error must mention round-received tag, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn sync_response_truncated_mid_event_rejected() {
+        // A SyncResponse whose event payload is cut short — the cursor hits
+        // EOF before the event is fully decoded. The "truncated frame
+        // payload" error from Cursor::read must surface.
+        let event = sample_event(32);
+        let mut event_bytes = Vec::new();
+        event.encode_canonical(&mut event_bytes);
+        // SyncResponse: count=1, then only the first 10 bytes of the event.
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&1u32.to_be_bytes());
+        payload.extend_from_slice(&event_bytes[..10]);
+
+        let mut frame = vec![MessageType::SyncResponse as u8];
+        frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&payload);
+        let result = Frame::from_bytes(&frame);
+        assert!(result.is_err(), "SyncResponse truncated mid-event must be rejected");
+        let msg = match result.unwrap_err() {
+            GossipError::Framing(m) => m,
+            other => panic!("expected Framing error, got: {other:?}"),
+        };
+        assert!(
+            msg.contains("truncated")
+                || msg.contains("cursor overflow")
+                || msg.contains("remaining"),
+            "error must indicate truncated/overflow, got: {msg}"
+        );
+    }
 }

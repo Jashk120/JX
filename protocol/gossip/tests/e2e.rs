@@ -1276,6 +1276,94 @@ async fn reconnect_serves_state_at_checkpoint_round() {
     let _ = handle1.await;
 }
 
+/// End-to-end test that a peer serving a checkpoint whose roster the caller
+/// does not trust gets rejected through the actual `fetch_checkpoint` code
+/// path (commit 3ec6744). This exercises the same scenario as the unit-level
+/// `fabricated_roster_with_attacker_quorum_rejected_by_trusted_hash` test,
+/// but through the real network + TLS + reconnect path.
+#[tokio::test]
+async fn fetch_checkpoint_rejects_untrusted_roster_over_network() {
+    // Server: a 4-node cluster with registry_A = {1, 2, 3, 4}.
+    let server_registry = registry_for_ids(&[1, 2, 3, 4]);
+    let identity1 = TlsIdentity::from_seed(tls_seed(1), 1).expect("identity");
+    let gossip_listener = bind_ephemeral().await;
+    let reconnect_listener = bind_ephemeral().await;
+    let gossip_addr = gossip_listener.local_addr().expect("local addr");
+    let reconnect_addr = reconnect_listener.local_addr().expect("local addr");
+
+    let server = Arc::new(GossipNode::new(
+        NodeId::new(1),
+        SigningKey::from_bytes(&consensus_seed(1)),
+        server_registry.clone(),
+        identity1.clone(),
+        Vec::new(),
+        SyncTiming::new(SYNC_INTERVAL, SYNC_TIMEOUT),
+        temp_state_db(),
+    ));
+
+    // Seed with a decided clique so round 1 is ordered.
+    for event in build_stateful_clique() {
+        let verified = event.clone().verify(&server_registry).expect("valid signature");
+        let mut hg = server.hashgraph.lock().await;
+        hg.insert(verified).expect("insert");
+    }
+    server.process_finalized_rounds().await;
+
+    let cp_round = 1u64;
+    let signing_bytes_1 =
+        server.checkpoint_signing_bytes(cp_round).await.expect("checkpoint produced");
+    server.submit_checkpoint_sig(checkpoint_sig_for(2, cp_round, &signing_bytes_1)).await;
+    server.submit_checkpoint_sig(checkpoint_sig_for(3, cp_round, &signing_bytes_1)).await;
+    assert!(server.signed_checkpoint_for(cp_round).await.is_some(), "round 1 reaches quorum");
+
+    // Start the server's reconnect listener.
+    let stop = Arc::new(AtomicBool::new(false));
+    let spawn = server.clone();
+    let stop_handle = stop.clone();
+    let handle = tokio::spawn(async move {
+        let _ = spawn
+            .run_until_stopped_with_reconnect(gossip_listener, reconnect_listener, stop_handle)
+            .await;
+    });
+
+    // Client: trusts a DIFFERENT roster (registry_B = {97, 98, 99}).
+    let client_trusted_registry = registry_for_ids(&[97, 98, 99]);
+    let client_trusted_hash = Some(client_trusted_registry.hash());
+
+    let client_identity = TlsIdentity::from_seed(tls_seed(4), 4).expect("identity");
+    let peer1 = PeerInfo::new(NodeId::new(1), gossip_addr, identity1.spki_fingerprint())
+        .with_reconnect(reconnect_addr);
+
+    // The client calls fetch_checkpoint with a trusted roster hash that does
+    // NOT match the server's roster. The roster_hash check at the top of
+    // verify_signed_checkpoint must reject this before any signature
+    // verification runs.
+    let result = fetch_checkpoint(
+        &client_identity,
+        &peer1,
+        reconnect_addr,
+        NodeId::new(4),
+        client_trusted_hash,
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "fetch_checkpoint must reject a checkpoint whose roster the caller does not trust"
+    );
+    match result.unwrap_err() {
+        GossipError::Reconnect(msg) => {
+            assert!(
+                msg.contains("quorum verification"),
+                "error must mention quorum verification, got: {msg}"
+            );
+        }
+        other => panic!("expected Reconnect error, got: {other:?}"),
+    }
+
+    stop.store(true, Ordering::Release);
+    let _ = handle.await;
+}
+
 /// A `SyncTransport` that answers `run_sync`'s request with a fixed queue of
 /// frames, so a test can feed protocol violations without a real network.
 struct ResponseForbidden {
