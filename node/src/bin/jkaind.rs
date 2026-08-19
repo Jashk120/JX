@@ -86,6 +86,7 @@ use tokio::net::{
     TcpListener,
     UnixListener,
 };
+use tracing_subscriber::EnvFilter;
 
 const SECRET_LEN: usize = 64;
 const SINGLE_SEED_LEN: usize = 32;
@@ -101,6 +102,14 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     match args[0].as_str() {
+        "--version" | "-V" => {
+            println!("jkaind {} ({})", env!("CARGO_PKG_VERSION"), env!("JKAIN_GIT_HASH"));
+            return Ok(());
+        }
+        "--help" | "-h" => {
+            print_usage();
+            return Ok(());
+        }
         "init" => init(&args[1..]),
         "run" => run(&args[1..]).await,
         "status" => status_cmd(&args[1..]).await,
@@ -167,17 +176,15 @@ fn init(args: &[String]) -> Result<()> {
                 );
             }
             Some(hazard) => {
-                eprintln!(
-                    "WARNING: persisted checkpoints found at {} will be incompatible with the \
-                     regenerated keys. Wipe `data/` on every node before restarting.",
-                    hazard.display()
+                tracing::warn!(
+                    hazard = %hazard.display(),
+                    "persisted checkpoints found; regenerated keys will be incompatible — wipe data/ on every node before restarting"
                 );
             }
             None => {
-                eprintln!(
-                    "WARNING: regenerating cluster keys invalidates any persisted checkpoints \
-                     on running nodes (none found on this machine, but check each VPS's data \
-                     dir). Wipe `data/` on every node before restarting."
+                tracing::warn!(
+                    "regenerating cluster keys invalidates any persisted checkpoints \
+                     on running nodes (none found locally). Wipe data/ on every node before restarting."
                 );
             }
         }
@@ -249,19 +256,20 @@ fn print_init_summary(
     config_path: &Path,
     members: &[(u64, std::net::SocketAddr, Option<std::net::SocketAddr>)],
 ) {
-    println!("Wrote cluster config: {}", config_path.display());
-    println!("Secret files (keep each one only on its own node):");
+    tracing::info!(config = %config_path.display(), "wrote cluster config");
     for (node_id, _, _) in members {
-        println!("  {}", out_dir.join(format!("secret-{node_id}.bin")).display());
+        tracing::info!(
+            secret = %out_dir.join(format!("secret-{node_id}.bin")).display(),
+            "secret file written"
+        );
     }
-    println!();
-    println!("Copy plan (two VPSes, node 1 = VPS A, node 2 = VPS B):");
     for (node_id, _, _) in members {
         let secret = out_dir.join(format!("secret-{node_id}.bin"));
-        println!(
-            "  scp {} user@vps{node_id}:jkaind/ && scp {} user@vps{node_id}:jkaind/",
-            secret.display(),
-            config_path.display()
+        tracing::info!(
+            node_id,
+            secret = %secret.display(),
+            config = %config_path.display(),
+            "copy to VPS"
         );
     }
 }
@@ -306,6 +314,8 @@ async fn run(args: &[String]) -> Result<()> {
     let mut control_socket: Option<PathBuf> = None;
     let mut sync_interval = DEFAULT_SYNC_INTERVAL;
     let mut sync_timeout = DEFAULT_SYNC_TIMEOUT;
+    let mut log_level = "info".to_string();
+    let mut log_file: Option<String> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -347,6 +357,12 @@ async fn run(args: &[String]) -> Result<()> {
                 let value = next_value(args, &mut i, "--sync-timeout")?;
                 sync_timeout = Duration::from_millis(parse_ms(&value, "--sync-timeout")?);
             }
+            "--log-level" => {
+                log_level = next_value(args, &mut i, "--log-level")?;
+            }
+            "--log-file" => {
+                log_file = Some(next_value(args, &mut i, "--log-file")?);
+            }
             other => bail!("run: unknown argument '{other}'"),
         }
     }
@@ -364,6 +380,8 @@ async fn run(args: &[String]) -> Result<()> {
         control_socket,
         sync_interval,
         sync_timeout,
+        log_level,
+        log_file,
     };
     run_node(&opts).await
 }
@@ -380,9 +398,48 @@ struct RunOptions {
     control_socket: Option<PathBuf>,
     sync_interval: Duration,
     sync_timeout: Duration,
+    log_level: String,
+    log_file: Option<String>,
 }
 
 async fn run_node(opts: &RunOptions) -> Result<()> {
+    let default_log_path = opts.data_dir.join("logs").join("jkaind.log");
+    let log_path = match opts.log_file.as_deref() {
+        Some("-") => None,
+        Some(p) => Some(PathBuf::from(p)),
+        None => Some(default_log_path),
+    };
+    if let Some(ref path) = log_path
+        && let Some(parent) = path.parent()
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating log dir {}", parent.display()))?;
+    }
+    let filter = EnvFilter::try_new(&opts.log_level).context("invalid log level")?;
+    let _guard = match log_path {
+        Some(path) => {
+            let file_appender = tracing_appender::rolling::daily(
+                path.parent().unwrap_or(&PathBuf::from(".")),
+                path.file_name().unwrap_or_default(),
+            );
+            let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+            let subscriber = tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_writer(non_blocking)
+                .finish();
+            let _ = tracing::subscriber::set_global_default(subscriber);
+            Some(guard)
+        }
+        None => {
+            let subscriber = tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_writer(std::io::stderr)
+                .finish();
+            let _ = tracing::subscriber::set_global_default(subscriber);
+            None
+        }
+    };
+
     let config = ClusterConfigFile::load(&opts.cluster_path)?;
     let member = config
         .member_for(opts.node_id)
@@ -459,6 +516,16 @@ async fn run_node(opts: &RunOptions) -> Result<()> {
     let registry = cluster.registry();
     let peers: Vec<PeerInfo> = cluster.peers_for(NodeId::new(opts.node_id));
 
+    let roster_ids: Vec<u64> = config.members.iter().map(|m| m.node_id).collect();
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        git_hash = env!("JKAIN_GIT_HASH"),
+        node_id = opts.node_id,
+        roster_count = roster_ids.len(),
+        roster_ids = ?roster_ids,
+        "jkaind starting"
+    );
+
     // Refuse to open any storage against a data dir written by an
     // incompatible binary version (self-enforcing wipe on breaking format
     // changes, e.g. the Merkle-root checkpoint commitment).
@@ -474,15 +541,19 @@ async fn run_node(opts: &RunOptions) -> Result<()> {
     let stream_signing_key = signing_key.clone();
 
     match reconnect_port {
-        Some(port) => eprintln!(
-            "[jkaind] node {}: gossip on 0.0.0.0:{gossip_port}, reconnect on 0.0.0.0:{port}, data in {}",
-            opts.node_id,
-            opts.data_dir.display()
+        Some(port) => tracing::info!(
+            node_id = opts.node_id,
+            gossip_port,
+            reconnect_port = port,
+            data_dir = %opts.data_dir.display(),
+            "node configured"
         ),
-        None => eprintln!(
-            "[jkaind] node {}: gossip on 0.0.0.0:{gossip_port}, reconnect disabled (gossip-only member), data in {}",
-            opts.node_id,
-            opts.data_dir.display()
+        None => tracing::info!(
+            node_id = opts.node_id,
+            gossip_port,
+            reconnect_disabled = true,
+            data_dir = %opts.data_dir.display(),
+            "node configured (gossip-only member)"
         ),
     }
 
@@ -500,11 +571,10 @@ async fn run_node(opts: &RunOptions) -> Result<()> {
     )? {
         Some(response) => {
             let replay_has_events = !response.retained.is_empty();
-            eprintln!(
-                "[jkaind] restoring from persisted checkpoint at round {} ({} retained events \
-                 replayed from the event log)",
-                response.signed_checkpoint.payload.round,
-                response.retained.len()
+            tracing::info!(
+                round = response.signed_checkpoint.payload.round,
+                retained_events = response.retained.len(),
+                "restoring from persisted checkpoint"
             );
             let node = GossipNode::from_checkpoint(
                 NodeId::new(opts.node_id),
@@ -522,7 +592,7 @@ async fn run_node(opts: &RunOptions) -> Result<()> {
             node
         }
         None => {
-            eprintln!("[jkaind] fresh start (no persisted checkpoint)");
+            tracing::info!("fresh start (no persisted checkpoint)");
             GossipNode::new(
                 NodeId::new(opts.node_id),
                 signing_key,
@@ -590,10 +660,10 @@ async fn run_node(opts: &RunOptions) -> Result<()> {
         opts.control_socket.clone().unwrap_or_else(|| opts.data_dir.join("jkaind.sock"));
     let control_listener = control::bind(&control_socket_path).await?;
 
-    eprintln!(
-        "[jkaind] node {}: listening, control socket {} (waiting for SIGINT/SIGTERM)",
-        opts.node_id,
-        control_socket_path.display()
+    tracing::info!(
+        node_id = opts.node_id,
+        control_socket = %control_socket_path.display(),
+        "listening, waiting for SIGINT/SIGTERM"
     );
     run_until_shutdown(
         node,
@@ -636,7 +706,7 @@ async fn run_until_shutdown(
     let _ = std::fs::remove_file(&control_socket_path);
     match result {
         Ok(()) => {
-            eprintln!("[jkaind] shutdown requested; sync driver drained, exiting");
+            tracing::info!("shutdown requested; sync driver drained, exiting");
             Ok(())
         }
         Err(e) => Err(e).with_context(|| "node run failed"),
@@ -667,24 +737,31 @@ async fn wait_for_shutdown_signal() {
 async fn status_cmd(args: &[String]) -> Result<()> {
     let socket = parse_socket_flag(args)?;
     let report = fetch_status(&socket).await?;
-    println!(
-        "node {}: ordered round {}, decided round {}, latest checkpoint round {:?}",
-        report.node_id, report.ordered_round, report.decided_round, report.latest_checkpoint_round
+    tracing::info!(
+        node_id = report.node_id,
+        ordered_round = report.ordered_round,
+        decided_round = report.decided_round,
+        latest_checkpoint_round = ?report.latest_checkpoint_round,
+        "node status"
     );
-    println!("members:");
     for member in &report.members {
-        println!("  node {}  key {}", member.node_id, member.verifying_key);
+        tracing::info!(
+            node_id = member.node_id,
+            key = %member.verifying_key,
+            "member"
+        );
     }
-    println!("checkpoint roster:");
     if report.checkpoint_roster.is_empty() {
-        println!("  (no accepted checkpoint yet)");
+        tracing::info!("checkpoint roster: (no accepted checkpoint yet)");
     } else {
         for member in &report.checkpoint_roster {
-            println!("  node {}  key {}", member.node_id, member.verifying_key);
+            tracing::info!(
+                node_id = member.node_id,
+                key = %member.verifying_key,
+                "checkpoint roster member"
+            );
         }
     }
-    // A restored checkpoint whose roster disagrees with the live registry is
-    // the silent-consensus-stall signal: the node's events no longer verify.
     let live = report
         .members
         .iter()
@@ -697,24 +774,28 @@ async fn status_cmd(args: &[String]) -> Result<()> {
         .map(|m| m.verifying_key.as_str());
     match (live, checkpoint) {
         (Some(live_key), Some(checkpoint_key)) if live_key != checkpoint_key => {
-            println!(
-                "WARNING: checkpoint roster key for this node does not match the live member \
-                 key — consensus may be silently stalled. Restore the original secret or wipe \
+            tracing::warn!(
+                "checkpoint roster key for this node does not match the live member key — \
+                 consensus may be silently stalled. Restore the original secret or wipe \
                  data/ and re-genesis."
             );
         }
         (Some(_), None) if !report.checkpoint_roster.is_empty() => {
-            println!(
-                "WARNING: this node is not in the latest checkpoint roster — it may have \
+            tracing::warn!(
+                "this node is not in the latest checkpoint roster — it may have \
                  restored an incompatible checkpoint."
             );
         }
         _ => {}
     }
-    println!("peers:");
     for peer in &report.peers {
         let reconnect = peer.reconnect_addr.as_deref().unwrap_or("-");
-        println!("  node {} @ {} (reconnect {reconnect})", peer.node_id, peer.gossip_addr);
+        tracing::info!(
+            node_id = peer.node_id,
+            gossip_addr = %peer.gossip_addr,
+            reconnect,
+            "peer"
+        );
     }
     Ok(())
 }
@@ -746,7 +827,7 @@ async fn tx_put(args: &[String]) -> Result<()> {
     let value = value.context("tx put: --value <v> is required")?;
     let op = Op::Put { key: key.into_bytes(), value: value.into_bytes() };
     submit_payload(&socket, &control::kv_op_payload(&op)).await?;
-    println!("put queued on {}", socket.display());
+    tracing::info!(socket = %socket.display(), "put queued");
     Ok(())
 }
 
@@ -764,7 +845,7 @@ async fn tx_delete(args: &[String]) -> Result<()> {
     let key = key.context("tx delete: --key <k> is required")?;
     let op = Op::Delete { key: key.into_bytes() };
     submit_payload(&socket, &control::kv_op_payload(&op)).await?;
-    println!("delete queued on {}", socket.display());
+    tracing::info!(socket = %socket.display(), "delete queued");
     Ok(())
 }
 
@@ -818,9 +899,7 @@ async fn add_member(args: &[String]) -> Result<()> {
     };
     let payload = control::membership_op_payload(&op);
     submit_payload(&socket, &payload).await?;
-    println!(
-        "node {node_id} add-member submitted; it activates one round after the op is ordered."
-    );
+    tracing::info!(node_id, "add-member submitted; activates one round after the op is ordered");
 
     // Firewall convenience: print the copy/paste ufw commands for both
     // directions, using the existing peers' addresses from status.
@@ -947,25 +1026,29 @@ fn member_init(args: &[String]) -> Result<()> {
     let config_path = out_dir.join(format!("cluster-{node_id}.toml"));
     config.save(&config_path).with_context(|| format!("writing {}", config_path.display()))?;
 
-    println!("Wrote node {node_id} local cluster config: {}", config_path.display());
-    println!("Secret (keep on node {node_id} only): {}", secret_path.display());
-    println!();
-    println!("This local config is for node {node_id} ONLY — the genesis cluster.toml");
-    println!("on nodes 1 and 2 is left untouched and must not be replaced with this file.");
-    println!();
-    println!("On an existing node, add this member with:");
-    println!(
-        "  jkaind add-member --node-id {node_id} --gossip {gossip} --reconnect {reconnect} --key {}",
-        encode_hex(&signing_key.verifying_key().to_bytes())
+    tracing::info!(
+        node_id,
+        config = %config_path.display(),
+        "wrote local cluster config"
     );
-    println!();
-    println!("Copy plan (run on the new member's VPS):");
-    println!(
-        "  scp {} user@vps:jkaind/ && scp {} user@vps:jkaind/",
-        secret_path.display(),
-        config_path.display()
+    tracing::info!(
+        node_id,
+        secret = %secret_path.display(),
+        "secret file written"
     );
-    println!();
+    tracing::info!(
+        node_id,
+        gossip = %gossip,
+        reconnect = %reconnect,
+        key = encode_hex(&signing_key.verifying_key().to_bytes()),
+        "add-member command"
+    );
+    tracing::info!(
+        node_id,
+        secret = %secret_path.display(),
+        config = %config_path.display(),
+        "copy to VPS"
+    );
 
     let existing: Vec<(u64, SocketAddr, Option<SocketAddr>)> = genesis
         .members
@@ -997,44 +1080,50 @@ async fn submit_payload(socket: &Path, payload: &[u8]) -> Result<()> {
 /// in both directions. The node cannot configure another VPS's firewall; this
 /// is a convenience for the operator.
 fn print_firewall_plan(
-    new_node: u64,
+    _new_node: u64,
     new_gossip: SocketAddr,
     new_reconnect: SocketAddr,
     existing: &[(u64, SocketAddr, Option<SocketAddr>)],
 ) {
     let new_ip = new_gossip.ip();
-    println!("Firewall (run on the VPSes — these are the ports to open in both directions):");
-    println!();
-    println!(
-        "  On the new member's VPS (node {new_node}), allow the existing members to reach it:"
-    );
     for (id, gossip, _) in existing {
-        println!(
-            "    sudo ufw allow from {} to any port {} proto tcp   # node {id} gossip",
-            gossip.ip(),
-            new_gossip.port()
+        tracing::info!(
+            from = %gossip.ip(),
+            to_port = new_gossip.port(),
+            proto = "tcp",
+            rule = "ufw allow",
+            comment = format!("node {id} gossip"),
+            "firewall rule"
         );
-        println!(
-            "    sudo ufw allow from {} to any port {} proto tcp   # node {id} reconnect",
-            gossip.ip(),
-            new_reconnect.port()
+        tracing::info!(
+            from = %gossip.ip(),
+            to_port = new_reconnect.port(),
+            proto = "tcp",
+            rule = "ufw allow",
+            comment = format!("node {id} reconnect"),
+            "firewall rule"
         );
     }
-    println!();
-    println!("  On each existing member's VPS, allow the new member (IP {new_ip}) to reach it:");
     for (id, gossip, reconnect) in existing {
-        println!(
-            "    sudo ufw allow from {new_ip} to any port {} proto tcp   # node {id} gossip",
-            gossip.port()
+        tracing::info!(
+            from = %new_ip,
+            to_port = gossip.port(),
+            proto = "tcp",
+            rule = "ufw allow",
+            comment = format!("node {id} gossip"),
+            "firewall rule"
         );
         if let Some(reconnect) = reconnect {
-            println!(
-                "    sudo ufw allow from {new_ip} to any port {} proto tcp   # node {id} reconnect",
-                reconnect.port()
+            tracing::info!(
+                from = %new_ip,
+                to_port = reconnect.port(),
+                proto = "tcp",
+                rule = "ufw allow",
+                comment = format!("node {id} reconnect"),
+                "firewall rule"
             );
         }
     }
-    println!();
 }
 
 fn default_socket() -> PathBuf {
@@ -1078,7 +1167,7 @@ fn parse_ms(value: &str, flag: &str) -> Result<u64> {
 
 fn print_usage() {
     println!(
-        "jkaind — JKain node daemon\n\
+        "jkaind {} ({}) — JKain node daemon\n\
          \n\
          Usage:\n\
          \x20 jkaind init --member <id>:<gossip-addr>[:<reconnect-addr>] [--member ...] \\\n\
@@ -1092,7 +1181,8 @@ fn print_usage() {
          \n\
          \x20 jkaind run  --cluster <cluster.toml> --node-id <id> --secret <secret-<id>.bin> \\\n\
          \x20            [--gossip-port <port>] [--reconnect-port <port>] [--data <dir>] \\\n\
-         \x20            [--control-socket <path>] [--sync-interval <ms>] [--sync-timeout <ms>]\n\
+         \x20            [--control-socket <path>] [--sync-interval <ms>] [--sync-timeout <ms>] \\\n\
+         \x20            [--log-level <trace|debug|info|warn|error>] [--log-file <path>| -]\n\
          \n\
          Control (talk to a running node over its Unix socket):\n\
          \x20 jkaind status  [--socket <path>]\n\
@@ -1113,6 +1203,8 @@ fn print_usage() {
          \x20 jkaind status\n\
          \x20 jkaind tx put --key balance --value 100\n\
          \x20 jkaind add-member --node-id 3 --gossip 203.0.113.7:7000 \\\n\
-         \x20                 --reconnect 203.0.113.7:7001 --key <hex-from-member-init>"
+         \x20                 --reconnect 203.0.113.7:7001 --key <hex-from-member-init>",
+        env!("CARGO_PKG_VERSION"),
+        env!("JKAIN_GIT_HASH"),
     );
 }

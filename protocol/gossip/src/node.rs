@@ -377,17 +377,18 @@ impl GossipNode {
                     && let Some(reconnect_addr) = peer.reconnect_addr
                 {
                     attempted = true;
+                    tracing::info!(peer = ?peer.node_id, "reconnect attempt starting");
                     match fetch_checkpoint(&self.identity, &peer, reconnect_addr, self.node_id)
                         .await
                     {
                         Ok(response) => {
                             if self.apply_checkpoint(response).await {
                                 self.needs_reconnect.store(false, Ordering::Release);
+                                tracing::info!(peer = ?peer.node_id, "reconnect succeeded");
                             }
                         }
                         Err(e) => {
-                            // Log and retry next interval; don't clear the flag.
-                            eprintln!("reconnect attempt failed: {e}");
+                            tracing::warn!(error = %e, "reconnect attempt failed");
                         }
                     }
                 }
@@ -408,9 +409,11 @@ impl GossipNode {
                     if let Err(e) = transport.connect(&peer).await {
                         consecutive_failures += 1;
                         if consecutive_failures == 1 || consecutive_failures.is_multiple_of(10) {
-                            eprintln!(
-                                "[jkaind] sync: connect to peer {peer:?} failed \
-                                 ({consecutive_failures} consecutive failures): {e}"
+                            tracing::warn!(
+                                peer = ?peer.node_id,
+                                consecutive_failures,
+                                error = %e,
+                                "sync connect failed"
                             );
                         }
                         continue;
@@ -447,15 +450,22 @@ impl GossipNode {
                 Err(e) => {
                     consecutive_failures += 1;
                     if consecutive_failures == 1 || consecutive_failures.is_multiple_of(10) {
-                        eprintln!(
-                            "[jkaind] sync: round with peer {peer:?} failed \
-                             ({consecutive_failures} consecutive failures): {e}"
+                        tracing::warn!(
+                            peer = ?peer.node_id,
+                            consecutive_failures,
+                            error = %e,
+                            "sync round failed"
                         );
                     }
                     outbound.remove(&peer.node_id);
                 }
                 Ok(fresh) => {
                     consecutive_failures = 0;
+                    tracing::debug!(
+                        peer = ?peer.node_id,
+                        fresh_events = fresh.len(),
+                        "sync round succeeded"
+                    );
                     // Append every freshly inserted event to the durable log
                     // (Phase 8), then piggyback any pending checkpoint
                     // signatures on this sync round (Phase 3). Sigs are
@@ -491,7 +501,7 @@ impl GossipNode {
             };
             if decided > decided_watermark {
                 decided_watermark = decided;
-                eprintln!("[jkaind] sync: decided round advanced to {decided}");
+                tracing::info!(decided_round = decided, "round decided");
             }
         }
         Ok(())
@@ -818,16 +828,13 @@ impl GossipNode {
             snapshots.range(..=round).next_back().map(|(_, bytes)| bytes.clone())
         };
         let Some(snapshot) = snapshot else {
-            eprintln!(
-                "[jkaind] refusing to accept checkpoint for round {round}: \
-                 no state snapshot available"
-            );
+            tracing::warn!(round, "refusing to accept checkpoint: no state snapshot available");
             return;
         };
         // Durable copy: the `.snap` file is gone; a restart restores the
         // exact checkpoint-round state from this `snap` keyspace entry.
         if let Err(e) = self.state_db.snapshot(round, &snapshot) {
-            eprintln!("[jkaind] failed to persist state snapshot for round {round}: {e}");
+            tracing::error!(round, error = %e, "failed to persist state snapshot");
         }
         self.notify_checkpoint_accepted(&accepted).await;
         // Mirror streams (Phase 8): emit the round's record stream file
@@ -852,7 +859,7 @@ impl GossipNode {
             snapshots.retain(|&snap_round, _| snap_round >= prune_before_round);
         }
         if let Err(e) = self.state_db.prune_snapshots_before(prune_before_round) {
-            eprintln!("[jkaind] failed to prune state snapshots below {prune_before_round}: {e}");
+            tracing::warn!(prune_before_round, error = %e, "failed to prune state snapshots");
         }
         let pruned = {
             let mut hg = self.hashgraph.lock().await;
@@ -866,7 +873,7 @@ impl GossipNode {
             sink.flush();
         }
         if let Err(e) = self.state_db.flush() {
-            eprintln!("[jkaind] failed to flush the state database: {e}");
+            tracing::error!(error = %e, "failed to flush the state database");
         }
     }
 
@@ -1065,26 +1072,26 @@ impl GossipNode {
         //    the served bytes, not a merge with any prior contents.
         let state = {
             if let Err(e) = self.state_db.clear_state() {
-                eprintln!("reconnect: failed to reset the state partition: {e}");
+                tracing::error!(error = %e, "reconnect: failed to reset state partition");
                 return false;
             }
             let Some(state) =
                 state::State::from_bytes(self.state_db.state_keyspace(), &response.state_bytes)
             else {
-                eprintln!("reconnect: invalid state bytes from peer");
+                tracing::error!("reconnect: invalid state bytes from peer");
                 return false;
             };
             state
         };
         if state.root() != checkpoint.payload.state_hash {
-            eprintln!("reconnect: state hash mismatch; rejecting checkpoint");
+            tracing::error!("reconnect: state hash mismatch; rejecting checkpoint");
             return false;
         }
 
         // 2. Decode the roster history.
         let Some(roster_history) = consensus::decode_roster_history(&response.roster_history_bytes)
         else {
-            eprintln!("reconnect: invalid roster history from peer");
+            tracing::error!("reconnect: invalid roster history from peer");
             return false;
         };
 
@@ -1092,7 +1099,7 @@ impl GossipNode {
         //    committed roster_hash.
         let roster_at_cp = roster_history.roster_for_round(cp_round);
         if roster_at_cp.hash() != checkpoint.payload.roster_hash {
-            eprintln!("reconnect: roster hash mismatch; rejecting checkpoint");
+            tracing::error!("reconnect: roster hash mismatch; rejecting checkpoint");
             return false;
         }
 
@@ -1106,18 +1113,16 @@ impl GossipNode {
         let own_key = self.signing_key.verifying_key();
         match checkpoint.payload.roster_snapshot.key_for(&self.node_id) {
             Err(_) => {
-                eprintln!(
-                    "reconnect: node {} is not in the served checkpoint roster; rejecting \
-                     checkpoint",
-                    self.node_id.get()
+                tracing::error!(
+                    node_id = self.node_id.get(),
+                    "node not in served checkpoint roster; rejecting checkpoint"
                 );
                 return false;
             }
             Ok(key) if key.as_bytes() != own_key.as_bytes() => {
-                eprintln!(
-                    "reconnect: served checkpoint roster key for node {} does not match this \
-                     node's secret; rejecting checkpoint",
-                    self.node_id.get()
+                tracing::error!(
+                    node_id = self.node_id.get(),
+                    "served checkpoint roster key does not match this node's secret; rejecting checkpoint"
                 );
                 return false;
             }
@@ -1134,7 +1139,7 @@ impl GossipNode {
         //    learner.
         *self.executor.lock().await = state::Executor::from_state(state);
         if let Err(e) = self.state_db.snapshot(cp_round, &response.state_bytes) {
-            eprintln!("reconnect: failed to persist state snapshot for round {cp_round}: {e}");
+            tracing::error!(round = cp_round, error = %e, "reconnect: failed to persist state snapshot");
         }
         self.state_snapshots.lock().await.insert(cp_round, response.state_bytes.clone());
 
@@ -1152,14 +1157,17 @@ impl GossipNode {
             let mut hg = self.hashgraph.lock().await;
             *hg = consensus::Hashgraph::from_checkpoint(&checkpoint.payload, roster_history);
             for retained in &response.retained {
-                let verified =
-                    match retained.event.clone().verify(&checkpoint.payload.roster_snapshot) {
-                        Ok(verified) => verified,
-                        Err(e) => {
-                            eprintln!("reconnect: retained event failed verification: {e}");
-                            return false;
-                        }
-                    };
+                let verified = match retained
+                    .event
+                    .clone()
+                    .verify(&checkpoint.payload.roster_snapshot)
+                {
+                    Ok(verified) => verified,
+                    Err(e) => {
+                        tracing::error!(error = %e, "reconnect: retained event failed verification");
+                        return false;
+                    }
+                };
                 if let Err(e) = hg.insert_accepted(
                     verified.into_inner(),
                     retained.seq,
@@ -1167,7 +1175,7 @@ impl GossipNode {
                     retained.ancestor_seqs.clone(),
                     retained.round_received,
                 ) {
-                    eprintln!("reconnect: retained event rejected: {e}");
+                    tracing::error!(error = %e, "reconnect: retained event rejected");
                     return false;
                 }
                 if let Some(sink) = &sink {
