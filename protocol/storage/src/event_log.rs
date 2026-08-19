@@ -431,4 +431,229 @@ mod tests {
         let reopened = EventLog::open(dir.path()).expect("reopens");
         assert_eq!(reopened.event_count().expect("count"), 1);
     }
+
+    // ── Negative / corruption tests ────────────────────────────────────
+
+    #[test]
+    fn decode_value_rejects_short_input() {
+        assert!(decode_value(&[]).is_none());
+        assert!(decode_value(&[0u8; 7]).is_none());
+        assert!(decode_value(&[0u8; 8]).is_none());
+    }
+
+    #[test]
+    fn decode_value_rejects_truncated_record() {
+        let record = sample_record(1, 1, 1);
+        let encoded = encode_value(42, &record);
+        for cut in [9, 17, encoded.len() / 2, encoded.len() - 1] {
+            assert!(decode_value(&encoded[..cut]).is_none(), "cut at {cut}");
+        }
+    }
+
+    #[test]
+    fn replay_errors_on_corrupt_stored_record() {
+        let dir = tempdir().expect("temp dir");
+        let log = EventLog::open(dir.path()).expect("opens");
+        let r1 = sample_record(1, 1, 1);
+        let r2 = sample_record(2, 2, 1);
+        log.append(&r1).expect("append r1");
+        log.append(&r2).expect("append r2");
+        log.flush().expect("flush");
+
+        // Inject a 4-byte value at seq=1 — too short for the 8-byte log_seq
+        // prefix, mimicking a partially-written record that survived a crash.
+        log.by_seq.insert(1u64.to_be_bytes(), [0xFF; 4]).expect("inject corrupt value");
+
+        let err = log.replay().expect_err("replay must detect corrupt record");
+        match err {
+            EventLogError::Corrupt(msg) => {
+                assert!(msg.contains("undecodable"), "error should mention decode failure: {msg}");
+            }
+            other => panic!("expected Corrupt, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn replay_errors_on_truncated_stored_record() {
+        let dir = tempdir().expect("temp dir");
+        let log = EventLog::open(dir.path()).expect("opens");
+        let r1 = sample_record(1, 1, 1);
+        log.append(&r1).expect("append");
+
+        // Truncate the encoded value to just the log_seq prefix — the record
+        // payload is missing entirely.
+        log.by_seq.insert(0u64.to_be_bytes(), [0u8; 8]).expect("inject truncated value");
+
+        let err = log.replay().expect_err("replay must detect truncated record");
+        match err {
+            EventLogError::Corrupt(msg) => {
+                assert!(msg.contains("undecodable"), "error should mention decode failure: {msg}");
+            }
+            other => panic!("expected Corrupt, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn append_errors_on_corrupt_existing_hash() {
+        let dir = tempdir().expect("temp dir");
+        let log = EventLog::open(dir.path()).expect("opens");
+        let record = sample_record(1, 1, 1);
+        log.append(&record).expect("append");
+
+        // Corrupt the by_hash entry for this record.
+        log.by_hash
+            .insert(record_hash(&record).as_bytes(), [0xFF; 4])
+            .expect("inject corrupt hash entry");
+
+        let err = log.append(&record).expect_err("append must detect corrupt existing record");
+        match err {
+            EventLogError::Corrupt(msg) => {
+                assert!(msg.contains("undecodable"), "error should mention decode failure: {msg}");
+            }
+            other => panic!("expected Corrupt, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn corrupted_data_file_detected_on_reopen() {
+        let dir = tempdir().expect("temp dir");
+        {
+            let log = EventLog::open(dir.path()).expect("opens");
+            log.append(&sample_record(1, 1, 1)).expect("append");
+            log.append(&sample_record(2, 2, 1)).expect("append");
+            log.flush().expect("flush");
+        }
+
+        // Overwrite every file in the eventlog directory with junk bytes —
+        // simulates disk-level corruption (bit-flip, partial page flush) that
+        // affects both the WAL and data segments.
+        let log_dir = dir.path().join(EVENT_LOG_SUBDIR);
+        for entry in std::fs::read_dir(&log_dir).expect("read log dir") {
+            let entry = entry.expect("dir entry");
+            if entry.file_type().expect("ft").is_file() {
+                let meta = std::fs::metadata(entry.path()).expect("meta");
+                if meta.len() > 8 {
+                    let junk = vec![0xAB_u8; meta.len() as usize];
+                    std::fs::write(entry.path(), &junk).expect("corrupt file");
+                }
+            }
+        }
+
+        // Reopen — either the log errors (best) or it silently loses the
+        // flushed records. Both are detectable: the error case is explicit,
+        // the data-loss case means the log reports fewer events than it had
+        // before the corruption, proving durability is not guaranteed and the
+        // caller must rely on checkpoint + reconnect for recovery.
+        match EventLog::open(dir.path()).and_then(|log| log.replay()) {
+            Err(_) => {} // corruption detected — correct behavior
+            Ok(replayed) => {
+                assert!(
+                    replayed.is_empty(),
+                    "corrupted log must not return phantom records: got {}",
+                    replayed.len()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn concurrent_appends_do_not_lose_records() {
+        use std::sync::Arc;
+
+        let dir = tempdir().expect("temp dir");
+        let log = Arc::new(EventLog::open(dir.path()).expect("opens"));
+
+        let mut handles = vec![];
+        for thread_id in 0..4u64 {
+            let log = Arc::clone(&log);
+            handles.push(std::thread::spawn(move || {
+                for i in 0..50u64 {
+                    let seq = thread_id * 50 + i;
+                    log.append(&sample_record(seq, seq, 1)).expect("append");
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("thread panicked");
+        }
+
+        assert_eq!(log.event_count().expect("count"), 200);
+        let replayed = log.replay().expect("replay");
+        assert_eq!(replayed.len(), 200);
+        let seqs: std::collections::HashSet<u64> = replayed.iter().map(|r| r.seq).collect();
+        assert_eq!(seqs.len(), 200, "all seq keys must be unique");
+    }
+
+    #[test]
+    fn concurrent_appends_idempotent_under_contention() {
+        use std::sync::Arc;
+
+        let dir = tempdir().expect("temp dir");
+        let log = Arc::new(EventLog::open(dir.path()).expect("opens"));
+
+        // All threads append the SAME record — idempotency must hold.
+        let record = sample_record(1, 1, 1);
+        let mut handles = vec![];
+        for _ in 0..8 {
+            let log = Arc::clone(&log);
+            let record = record.clone();
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..20 {
+                    let _ = log.append(&record);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("thread panicked");
+        }
+
+        assert_eq!(log.event_count().expect("count"), 1);
+        let replayed = log.replay().expect("replay");
+        assert_eq!(replayed.len(), 1);
+        assert_eq!(replayed[0], record);
+    }
+
+    #[test]
+    fn read_past_log_length_is_harmless() {
+        let dir = tempdir().expect("temp dir");
+        let log = EventLog::open(dir.path()).expect("opens");
+
+        // Empty log — all queries must return gracefully.
+        assert_eq!(log.event_count().expect("count"), 0);
+        assert!(log.replay().expect("replay empty").is_empty());
+        assert!(!log.contains(&EventHash::new([0xAB; 32])).expect("contains unknown"));
+
+        // Append one record, then query beyond it.
+        let record = sample_record(1, 1, 1);
+        log.append(&record).expect("append");
+        assert_eq!(log.event_count().expect("count"), 1);
+        assert!(!log.contains(&EventHash::new([0xFF; 32])).expect("contains unknown"));
+        assert!(log.contains(&record_hash(&record)).expect("contains known"));
+    }
+
+    #[test]
+    fn set_round_received_on_missing_hash_is_noop() {
+        let dir = tempdir().expect("temp dir");
+        let log = EventLog::open(dir.path()).expect("opens");
+        let missing = EventHash::new([0xDE; 32]);
+        log.set_round_received(&missing, 99).expect("noop for missing hash");
+    }
+
+    #[test]
+    fn prune_after_corruption_does_not_panic() {
+        let dir = tempdir().expect("temp dir");
+        let log = EventLog::open(dir.path()).expect("opens");
+        let r1 = sample_record(1, 1, 1);
+        log.append(&r1).expect("append");
+        log.flush().expect("flush");
+
+        // Corrupt the by_hash entry.
+        log.by_hash.insert(record_hash(&r1).as_bytes(), [0xFF; 4]).expect("inject corrupt");
+
+        // Prune must skip the corrupt entry gracefully (it errors trying to
+        // decode the value to get log_seq, but prune maps that via `?` — so
+        // this returns an error rather than panicking).
+        let result = log.prune(&[record_hash(&r1)]);
+        assert!(result.is_err(), "prune on corrupt entry should error, not panic");
+    }
 }
