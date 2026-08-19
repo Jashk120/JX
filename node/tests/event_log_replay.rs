@@ -130,6 +130,7 @@ async fn restart_replays_retained_graph_from_the_event_log_without_a_peer() {
     let tx = Op::Put { key: b"k".to_vec(), value: b"v".to_vec() }.encode();
     node1.submit_transaction(tx).await;
     wait_for_state(&node1, b"k", DEADLINE).await;
+    wait_for_state(&node2, b"k", DEADLINE).await;
     let storage1 = Storage::new(&data1).expect("storage reopens");
     wait_for_persisted_state(&storage1, &net.state_dbs[0], b"k", DEADLINE).await;
 

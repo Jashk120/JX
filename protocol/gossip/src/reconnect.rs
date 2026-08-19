@@ -43,6 +43,16 @@ use crate::transport::{
 /// Pass `None` only during first bootstrap when no prior roster exists;
 /// the caller **must** validate the roster via a separate channel before
 /// trusting the restored state.
+///
+/// TODO: the separate-channel roster validation mandated above was never
+/// implemented.  Currently `None` is unreachable in production because
+/// the `registry.is_empty()` guard in `node.rs` prevents it — the
+/// registry is always populated before `needs_reconnect` fires.  But
+/// this is an accidental ordering, not a deliberate invariant.  If a
+/// future code path reaches here with `None`, a malicious peer can
+/// serve a fabricated checkpoint whose self-referential quorum trivially
+/// passes (fake roster + fake signers > 2/3).  Track: either implement
+/// the out-of-band roster validation or remove the `None` path entirely.
 pub async fn fetch_checkpoint(
     identity: &TlsIdentity,
     peer: &PeerInfo,
