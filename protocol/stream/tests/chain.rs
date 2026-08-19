@@ -130,7 +130,8 @@ async fn record_verifier_rejects_tampering_and_reordering() {
     }
     writer.barrier().await;
     assert!(
-        stream::verify::verify_record_stream_dir(dir.path(), primitives::NodeId::new(1)).is_ok()
+        stream::verify::verify_record_stream_dir(dir.path(), primitives::NodeId::new(1), None)
+            .is_ok()
     );
 
     // Tamper: flip a byte in the middle of the second file.
@@ -140,7 +141,8 @@ async fn record_verifier_rejects_tampering_and_reordering() {
     tampered[mid] ^= 0xff;
     fs::write(second, tampered).expect("write");
     assert!(
-        stream::verify::verify_record_stream_dir(dir.path(), primitives::NodeId::new(1)).is_err(),
+        stream::verify::verify_record_stream_dir(dir.path(), primitives::NodeId::new(1), None)
+            .is_err(),
         "a tampered record file must fail verification"
     );
 
@@ -157,7 +159,8 @@ async fn record_verifier_rejects_tampering_and_reordering() {
     let round3_bytes = fs::read(&files[2].1).expect("read round 3");
     fs::write(&files[1].1, round3_bytes).expect("clobber round 2");
     assert!(
-        stream::verify::verify_record_stream_dir(dir.path(), primitives::NodeId::new(1)).is_err(),
+        stream::verify::verify_record_stream_dir(dir.path(), primitives::NodeId::new(1), None)
+            .is_err(),
         "a reordered stream must fail chain verification"
     );
 }

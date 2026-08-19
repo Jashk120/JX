@@ -377,9 +377,19 @@ impl GossipNode {
                     && let Some(reconnect_addr) = peer.reconnect_addr
                 {
                     attempted = true;
+                    let trusted_roster_hash = {
+                        let registry = self.registry.lock().await;
+                        if registry.is_empty() { None } else { Some(registry.hash()) }
+                    };
                     tracing::info!(peer = ?peer.node_id, "reconnect attempt starting");
-                    match fetch_checkpoint(&self.identity, &peer, reconnect_addr, self.node_id)
-                        .await
+                    match fetch_checkpoint(
+                        &self.identity,
+                        &peer,
+                        reconnect_addr,
+                        self.node_id,
+                        trusted_roster_hash,
+                    )
+                    .await
                     {
                         Ok(response) => {
                             if self.apply_checkpoint(response).await {

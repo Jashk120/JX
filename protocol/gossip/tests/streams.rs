@@ -152,7 +152,7 @@ async fn record_stream_emitted_on_checkpoint_accept() {
     assert_eq!(round, 1);
 
     // A mirror verifies the emitted stream from the files alone.
-    verify::verify_record_stream_dir(streams_dir.path(), NodeId::new(1))
+    verify::verify_record_stream_dir(streams_dir.path(), NodeId::new(1), None)
         .expect("record stream verifies end-to-end");
 }
 

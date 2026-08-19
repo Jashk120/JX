@@ -1218,10 +1218,10 @@ async fn reconnect_serves_state_at_checkpoint_round() {
     let identity4 = TlsIdentity::from_seed(tls_seed(4), 4).expect("identity");
     let peer1 = PeerInfo::new(NodeId::new(1), gossip_addr, identity1.spki_fingerprint())
         .with_reconnect(reconnect_addr);
-    let response = fetch_checkpoint(&identity4, &peer1, reconnect_addr, node4_id)
+    let response = fetch_checkpoint(&identity4, &peer1, reconnect_addr, node4_id, None)
         .await
         .expect("fetch checkpoint from node 1");
-    assert!(gossip::verify_signed_checkpoint(&response.signed_checkpoint));
+    assert!(gossip::verify_signed_checkpoint(&response.signed_checkpoint, None));
     let rebuilt = state::State::from_bytes(temp_state_db().state_keyspace(), &response.state_bytes)
         .expect("state decodes");
     assert_eq!(

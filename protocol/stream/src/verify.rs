@@ -78,7 +78,18 @@ pub fn verify_event_stream_dir(dir: &Path, node_key: &VerifyingKey) -> Result<()
 /// Verifies a whole record-stream directory exactly as a mirror would: chain
 /// continuity + per-file signature files (against `node_id`'s key in each
 /// file's embedded roster) + the embedded checkpoint quorum.
-pub fn verify_record_stream_dir(dir: &Path, node_id: NodeId) -> Result<()> {
+///
+/// `trusted_roster_hash`, when `Some`, anchors each checkpoint's
+/// `roster_snapshot` against a roster the caller already trusts. A mismatch
+/// is rejected before signature verification — a fabricated roster could
+/// make the self-referential quorum trivially pass. Pass `None` only when
+/// no trusted roster exists; the caller must validate the roster through a
+/// separate channel before trusting the restored state.
+pub fn verify_record_stream_dir(
+    dir: &Path,
+    node_id: NodeId,
+    trusted_roster_hash: Option<[u8; 32]>,
+) -> Result<()> {
     let files = record_files_in(dir)?;
     if files.is_empty() {
         return Err(StreamError::EmptyDirectory);
@@ -96,7 +107,7 @@ pub fn verify_record_stream_dir(dir: &Path, node_id: NodeId) -> Result<()> {
                 "record file for round {round} has no checkpoint anchor"
             ))
         })?;
-        if !checkpoint_quorum(checkpoint) {
+        if !checkpoint_quorum(checkpoint, trusted_roster_hash) {
             return Err(StreamError::BadQuorum);
         }
         let node_key = crate::convert::checkpoint_member_key(checkpoint, node_id.get())
@@ -218,15 +229,31 @@ impl RunningHashCommitments for pb::RecordStreamFile {
 /// distinct, round-matching, roster-valid Ed25519 signature counts, and
 /// `valid * 3 > total * 2` decides. A stale, forged, or duplicate signature
 /// is a no-op — never a rejection.
-pub fn checkpoint_quorum(checkpoint: &pb::SignedCheckpoint) -> bool {
+///
+/// When `expected_roster_hash` is `Some`, the checkpoint's `roster_hash`
+/// is compared against it first. A mismatch means the file embeds a roster
+/// the caller does not recognise — the quorum proof is rejected without
+/// checking signatures. Pass `None` only when no trusted roster exists.
+pub fn checkpoint_quorum(
+    checkpoint: &pb::SignedCheckpoint,
+    expected_roster_hash: Option<[u8; 32]>,
+) -> bool {
     let Some(checkpoint) = proto_to_signed_checkpoint(checkpoint) else { return false };
-    verify_checkpoint_quorum(&checkpoint)
+    verify_checkpoint_quorum(&checkpoint, expected_roster_hash)
 }
 
 /// Quorum verification over the canonical form (same rule as
 /// `gossip::verify_signed_checkpoint`, reimplemented here so a mirror —
 /// which has no gossip dependency — can verify output source-agnostically).
-fn verify_checkpoint_quorum(checkpoint: &SignedCheckpoint) -> bool {
+fn verify_checkpoint_quorum(
+    checkpoint: &SignedCheckpoint,
+    expected_roster_hash: Option<[u8; 32]>,
+) -> bool {
+    if let Some(expected) = expected_roster_hash
+        && checkpoint.payload.roster_hash != expected
+    {
+        return false;
+    }
     let total = checkpoint.payload.roster_snapshot.len();
     let signing_bytes = checkpoint.payload.signing_bytes();
     let mut valid = 0usize;
@@ -272,11 +299,11 @@ mod tests {
             });
         }
         let checkpoint = SignedCheckpoint { payload, sigs };
-        assert!(verify_checkpoint_quorum(&checkpoint));
+        assert!(verify_checkpoint_quorum(&checkpoint, None));
 
         let mut below = checkpoint.clone();
         below.sigs.pop();
-        assert!(!verify_checkpoint_quorum(&below));
+        assert!(!verify_checkpoint_quorum(&below, None));
     }
 
     #[test]
@@ -303,6 +330,6 @@ mod tests {
             signer: NodeId::new(3),
             sig: primitives::Signature::new([0x42; 64]),
         });
-        assert!(!verify_checkpoint_quorum(&checkpoint));
+        assert!(!verify_checkpoint_quorum(&checkpoint, None));
     }
 }

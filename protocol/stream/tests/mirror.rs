@@ -107,12 +107,13 @@ async fn mirror_decodes_and_verifies_record_stream() {
 
     // The mirror's verification: chain + signature files + checkpoint quorum,
     // source-agnostic (the node id is the only trusted input).
-    verify::verify_record_stream_dir(record_dir.path(), primitives::NodeId::new(1))
+    verify::verify_record_stream_dir(record_dir.path(), primitives::NodeId::new(1), None)
         .expect("record stream verifies end-to-end");
 
     // A mirror that doubts the emitting node rejects the stream.
     assert!(
-        verify::verify_record_stream_dir(record_dir.path(), primitives::NodeId::new(2)).is_err(),
+        verify::verify_record_stream_dir(record_dir.path(), primitives::NodeId::new(2), None)
+            .is_err(),
         "verifying under the wrong node identity must fail"
     );
 }
@@ -172,6 +173,7 @@ async fn mirror_readers_reject_corruption() {
     corrupted[mid] ^= 0xff;
     fs::write(path, corrupted).expect("corrupt");
     assert!(
-        verify::verify_record_stream_dir(record_dir.path(), primitives::NodeId::new(1)).is_err()
+        verify::verify_record_stream_dir(record_dir.path(), primitives::NodeId::new(1), None)
+            .is_err()
     );
 }

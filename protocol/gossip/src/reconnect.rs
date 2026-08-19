@@ -34,11 +34,21 @@ use crate::transport::{
 /// [`ReconnectResponse`], and verifies the >2/3 quorum proof before
 /// returning. On any validation failure, returns
 /// `Err(GossipError::Reconnect(..))`.
+///
+/// `trusted_roster_hash`, when `Some`, anchors the checkpoint's
+/// `roster_snapshot` against a roster the caller already trusts (typically
+/// the node's last-known registry). If the served roster hash does not
+/// match, the checkpoint is rejected even if the signatures are internally
+/// consistent — a malicious peer cannot substitute an arbitrary roster.
+/// Pass `None` only during first bootstrap when no prior roster exists;
+/// the caller **must** validate the roster via a separate channel before
+/// trusting the restored state.
 pub async fn fetch_checkpoint(
     identity: &TlsIdentity,
     peer: &PeerInfo,
     reconnect_addr: SocketAddr,
     node_id: primitives::NodeId,
+    trusted_roster_hash: Option<[u8; 32]>,
 ) -> Result<ReconnectResponse> {
     // The TLS pinning and certificate checks come from `peer`; only the
     // destination address differs from the gossip port.
@@ -59,7 +69,7 @@ pub async fn fetch_checkpoint(
         }
     };
 
-    if verify_signed_checkpoint(&response.signed_checkpoint) {
+    if verify_signed_checkpoint(&response.signed_checkpoint, trusted_roster_hash) {
         Ok(response)
     } else {
         Err(GossipError::Reconnect("checkpoint failed quorum verification".into()))
@@ -75,13 +85,30 @@ pub async fn fetch_checkpoint(
 ///    so no external roster lookup is needed.
 /// 3. Count distinct *valid* signers; reject if `signers * 3 <= total * 2`.
 ///
+/// When `expected_roster_hash` is `Some`, the checkpoint's
+/// `roster_hash` is compared against it first. A mismatch means the peer
+/// supplied a roster the caller does not recognise — the quorum proof is
+/// rejected without even checking signatures, because a fabricated roster
+/// could make the self-referential quorum trivially pass. Pass `None` only
+/// when no trusted roster exists (first bootstrap); the caller must
+/// validate the roster through a separate channel before trusting the
+/// restored state.
+///
 /// A signature is a no-op (not evidence against the checkpoint) if its round
 /// disagrees with the payload, its signer is not in the snapshot roster, or
 /// its Ed25519 signature does not verify — exactly like a duplicate signer.
 /// Only the count of distinct, valid signatures determines acceptance, so a
 /// quorum'd checkpoint is not rejected just because an extra stale or forged
 /// signature was appended.
-pub fn verify_signed_checkpoint(checkpoint: &SignedCheckpoint) -> bool {
+pub fn verify_signed_checkpoint(
+    checkpoint: &SignedCheckpoint,
+    expected_roster_hash: Option<[u8; 32]>,
+) -> bool {
+    if let Some(expected) = expected_roster_hash
+        && checkpoint.payload.roster_hash != expected
+    {
+        return false;
+    }
     let total = checkpoint.payload.roster_snapshot.len();
     let signing_bytes = checkpoint.payload.signing_bytes();
     let mut valid = 0usize;
@@ -176,14 +203,14 @@ mod tests {
     fn quorum_passes_at_three_of_four() {
         let cluster = Cluster::of(&[1, 2, 3, 4]);
         let checkpoint = cluster.checkpoint(3, &[1, 2, 3]);
-        assert!(verify_signed_checkpoint(&checkpoint));
+        assert!(verify_signed_checkpoint(&checkpoint, None));
     }
 
     #[test]
     fn quorum_fails_at_two_of_four() {
         let cluster = Cluster::of(&[1, 2, 3, 4]);
         let checkpoint = cluster.checkpoint(3, &[1, 2]);
-        assert!(!verify_signed_checkpoint(&checkpoint));
+        assert!(!verify_signed_checkpoint(&checkpoint, None));
     }
 
     #[test]
@@ -196,7 +223,7 @@ mod tests {
             signer: NodeId::new(3),
             sig: Signature::new([0x42; 64]),
         });
-        assert!(!verify_signed_checkpoint(&checkpoint));
+        assert!(!verify_signed_checkpoint(&checkpoint, None));
     }
 
     #[test]
@@ -211,7 +238,7 @@ mod tests {
             signer: NodeId::new(5),
             sig: Signature::new(rogue_sig.to_bytes()),
         });
-        assert!(!verify_signed_checkpoint(&checkpoint));
+        assert!(!verify_signed_checkpoint(&checkpoint, None));
 
         // A rogue signature appended to a genuine quorum must not reject it.
         let mut checkpoint = cluster.checkpoint(3, &[1, 2, 3]);
@@ -222,7 +249,7 @@ mod tests {
             signer: NodeId::new(6),
             sig: Signature::new(rogue_sig.to_bytes()),
         });
-        assert!(verify_signed_checkpoint(&checkpoint));
+        assert!(verify_signed_checkpoint(&checkpoint, None));
     }
 
     #[test]
@@ -231,7 +258,7 @@ mod tests {
         let mut checkpoint = cluster.checkpoint(3, &[1, 2]);
         checkpoint.sigs.push(cluster.real_sig(3, 2));
         // Still only two distinct valid signers: below quorum.
-        assert!(!verify_signed_checkpoint(&checkpoint));
+        assert!(!verify_signed_checkpoint(&checkpoint, None));
     }
 
     #[test]
@@ -240,6 +267,21 @@ mod tests {
         // A stale sig over a different round appended to a genuine quorum.
         let mut checkpoint = cluster.checkpoint(3, &[1, 2, 3]);
         checkpoint.sigs.push(cluster.real_sig(4, 4));
-        assert!(verify_signed_checkpoint(&checkpoint));
+        assert!(verify_signed_checkpoint(&checkpoint, None));
+    }
+
+    #[test]
+    fn roster_hash_mismatch_rejects_even_with_valid_quorum() {
+        let cluster = Cluster::of(&[1, 2, 3, 4]);
+        let checkpoint = cluster.checkpoint(3, &[1, 2, 3]);
+        // The checkpoint is quorum-valid, but the expected roster hash
+        // disagrees — a peer-supplied roster that does not match our trust
+        // anchor must be rejected.
+        let wrong_hash = checkpoint.payload.roster_hash;
+        let mut altered = wrong_hash;
+        altered[0] ^= 0xff;
+        assert!(!verify_signed_checkpoint(&checkpoint, Some(altered)));
+        // The correct hash passes.
+        assert!(verify_signed_checkpoint(&checkpoint, Some(wrong_hash)));
     }
 }
