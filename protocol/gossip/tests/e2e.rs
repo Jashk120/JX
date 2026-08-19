@@ -1218,10 +1218,11 @@ async fn reconnect_serves_state_at_checkpoint_round() {
     let identity4 = TlsIdentity::from_seed(tls_seed(4), 4).expect("identity");
     let peer1 = PeerInfo::new(NodeId::new(1), gossip_addr, identity1.spki_fingerprint())
         .with_reconnect(reconnect_addr);
-    let response = fetch_checkpoint(&identity4, &peer1, reconnect_addr, node4_id, None)
+    let trusted_hash = registry.hash();
+    let response = fetch_checkpoint(&identity4, &peer1, reconnect_addr, node4_id, trusted_hash)
         .await
         .expect("fetch checkpoint from node 1");
-    assert!(gossip::verify_signed_checkpoint(&response.signed_checkpoint, None));
+    assert!(gossip::verify_signed_checkpoint(&response.signed_checkpoint, trusted_hash));
     let rebuilt = state::State::from_bytes(temp_state_db().state_keyspace(), &response.state_bytes)
         .expect("state decodes");
     assert_eq!(
@@ -1328,7 +1329,7 @@ async fn fetch_checkpoint_rejects_untrusted_roster_over_network() {
 
     // Client: trusts a DIFFERENT roster (registry_B = {97, 98, 99}).
     let client_trusted_registry = registry_for_ids(&[97, 98, 99]);
-    let client_trusted_hash = Some(client_trusted_registry.hash());
+    let client_trusted_hash = client_trusted_registry.hash();
 
     let client_identity = TlsIdentity::from_seed(tls_seed(4), 4).expect("identity");
     let peer1 = PeerInfo::new(NodeId::new(1), gossip_addr, identity1.spki_fingerprint())

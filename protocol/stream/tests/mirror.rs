@@ -110,13 +110,18 @@ async fn mirror_decodes_and_verifies_record_stream() {
 
     // The mirror's verification: chain + signature files + checkpoint quorum,
     // source-agnostic (the node id is the only trusted input).
-    verify::verify_record_stream_dir(record_dir.path(), primitives::NodeId::new(1), None)
+    let trusted_hash = registry_of(&[1, 2, 3, 4]).hash();
+    verify::verify_record_stream_dir(record_dir.path(), primitives::NodeId::new(1), trusted_hash)
         .expect("record stream verifies end-to-end");
 
     // A mirror that doubts the emitting node rejects the stream.
     assert!(
-        verify::verify_record_stream_dir(record_dir.path(), primitives::NodeId::new(2), None)
-            .is_err(),
+        verify::verify_record_stream_dir(
+            record_dir.path(),
+            primitives::NodeId::new(2),
+            trusted_hash
+        )
+        .is_err(),
         "verifying under the wrong node identity must fail"
     );
 }
@@ -175,9 +180,14 @@ async fn mirror_readers_reject_corruption() {
     let mid = corrupted.len() / 2;
     corrupted[mid] ^= 0xff;
     fs::write(path, corrupted).expect("corrupt");
+    let trusted_hash = registry_of(&[1, 2, 3, 4]).hash();
     assert!(
-        verify::verify_record_stream_dir(record_dir.path(), primitives::NodeId::new(1), None)
-            .is_err()
+        verify::verify_record_stream_dir(
+            record_dir.path(),
+            primitives::NodeId::new(1),
+            trusted_hash
+        )
+        .is_err()
     );
 }
 
@@ -188,9 +198,9 @@ async fn mirror_readers_reject_corruption() {
 /// Attack scenario: an attacker controls nodes 10, 11, 12 and compromises
 /// node 1's signing key.  They rewrite every `.rsf` file's checkpoint to
 /// embed a roster `{1, 10, 11, 12}` where 3 of 4 signatures reach quorum.
-/// Without a trust root the forgery passes (the known weakness); with the
-/// correct `trusted_roster_hash` the mismatch is caught before signatures
-/// are checked.
+/// When verified against the forged roster's own hash the forgery passes
+/// (self-trust), but with the correct `trusted_roster_hash` the mismatch is
+/// caught before signatures are checked.
 #[tokio::test]
 async fn forged_roster_rejected_with_trusted_hash() {
     let (record_dir, _) = setup().await;
@@ -249,11 +259,19 @@ async fn forged_roster_rejected_with_trusted_hash() {
         fs::write(path, new_file_bytes).expect("write forged file");
     }
 
-    // Without a trust root the forgery passes — the known weakness.
+    // With the forged roster's own hash the verification passes (the
+    // attacker can self-validate), but with the correct trusted hash the
+    // forged roster is rejected.
+    let forged_roster = registry_of(&[1, 10, 11, 12]);
+    let forged_hash = forged_roster.hash();
     assert!(
-        verify::verify_record_stream_dir(record_dir.path(), primitives::NodeId::new(1), None)
-            .is_ok(),
-        "forged roster passes without a trust root (the known weakness)"
+        verify::verify_record_stream_dir(
+            record_dir.path(),
+            primitives::NodeId::new(1),
+            forged_hash
+        )
+        .is_ok(),
+        "forged roster passes when verified against its own hash (attacker self-trust)"
     );
 
     // With the correct trusted hash the forged roster is rejected.
@@ -261,7 +279,7 @@ async fn forged_roster_rejected_with_trusted_hash() {
         verify::verify_record_stream_dir(
             record_dir.path(),
             primitives::NodeId::new(1),
-            Some(correct_roster_hash),
+            correct_roster_hash,
         )
         .is_err(),
         "forged roster must fail when the caller supplies a trusted roster hash"

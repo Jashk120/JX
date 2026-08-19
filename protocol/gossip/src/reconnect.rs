@@ -35,30 +35,18 @@ use crate::transport::{
 /// returning. On any validation failure, returns
 /// `Err(GossipError::Reconnect(..))`.
 ///
-/// `trusted_roster_hash`, when `Some`, anchors the checkpoint's
-/// `roster_snapshot` against a roster the caller already trusts (typically
-/// the node's last-known registry). If the served roster hash does not
-/// match, the checkpoint is rejected even if the signatures are internally
-/// consistent — a malicious peer cannot substitute an arbitrary roster.
-/// Pass `None` only during first bootstrap when no prior roster exists;
-/// the caller **must** validate the roster via a separate channel before
-/// trusting the restored state.
-///
-/// TODO: the separate-channel roster validation mandated above was never
-/// implemented.  Currently `None` is unreachable in production because
-/// the `registry.is_empty()` guard in `node.rs` prevents it — the
-/// registry is always populated before `needs_reconnect` fires.  But
-/// this is an accidental ordering, not a deliberate invariant.  If a
-/// future code path reaches here with `None`, a malicious peer can
-/// serve a fabricated checkpoint whose self-referential quorum trivially
-/// passes (fake roster + fake signers > 2/3).  Track: either implement
-/// the out-of-band roster validation or remove the `None` path entirely.
+/// `trusted_roster_hash` anchors the checkpoint's `roster_snapshot` against
+/// a roster the caller already trusts (typically the node's last-known
+/// registry). If the served roster hash does not match, the checkpoint is
+/// rejected even if the signatures are internally consistent — a malicious
+/// peer cannot substitute an arbitrary roster. There is no `None` path;
+/// callers must supply a trusted hash and fail-closed if none is available.
 pub async fn fetch_checkpoint(
     identity: &TlsIdentity,
     peer: &PeerInfo,
     reconnect_addr: SocketAddr,
     node_id: primitives::NodeId,
-    trusted_roster_hash: Option<[u8; 32]>,
+    trusted_roster_hash: [u8; 32],
 ) -> Result<ReconnectResponse> {
     // The TLS pinning and certificate checks come from `peer`; only the
     // destination address differs from the gossip port.
@@ -95,14 +83,11 @@ pub async fn fetch_checkpoint(
 ///    so no external roster lookup is needed.
 /// 3. Count distinct *valid* signers; reject if `signers * 3 <= total * 2`.
 ///
-/// When `expected_roster_hash` is `Some`, the checkpoint's
-/// `roster_hash` is compared against it first. A mismatch means the peer
-/// supplied a roster the caller does not recognise — the quorum proof is
-/// rejected without even checking signatures, because a fabricated roster
-/// could make the self-referential quorum trivially pass. Pass `None` only
-/// when no trusted roster exists (first bootstrap); the caller must
-/// validate the roster through a separate channel before trusting the
-/// restored state.
+/// The checkpoint's `roster_hash` is compared against `expected_roster_hash`
+/// first. A mismatch means the peer supplied a roster the caller does not
+/// recognise — the quorum proof is rejected without even checking signatures,
+/// because a fabricated roster could make the self-referential quorum
+/// trivially pass.
 ///
 /// A signature is a no-op (not evidence against the checkpoint) if its round
 /// disagrees with the payload, its signer is not in the snapshot roster, or
@@ -112,11 +97,9 @@ pub async fn fetch_checkpoint(
 /// signature was appended.
 pub fn verify_signed_checkpoint(
     checkpoint: &SignedCheckpoint,
-    expected_roster_hash: Option<[u8; 32]>,
+    expected_roster_hash: [u8; 32],
 ) -> bool {
-    if let Some(expected) = expected_roster_hash
-        && checkpoint.payload.roster_hash != expected
-    {
+    if checkpoint.payload.roster_hash != expected_roster_hash {
         return false;
     }
     let total = checkpoint.payload.roster_snapshot.len();
@@ -214,14 +197,14 @@ mod tests {
     fn quorum_passes_at_three_of_four() {
         let cluster = Cluster::of(&[1, 2, 3, 4]);
         let checkpoint = cluster.checkpoint(3, &[1, 2, 3]);
-        assert!(verify_signed_checkpoint(&checkpoint, None));
+        assert!(verify_signed_checkpoint(&checkpoint, checkpoint.payload.roster_hash));
     }
 
     #[test]
     fn quorum_fails_at_two_of_four() {
         let cluster = Cluster::of(&[1, 2, 3, 4]);
         let checkpoint = cluster.checkpoint(3, &[1, 2]);
-        assert!(!verify_signed_checkpoint(&checkpoint, None));
+        assert!(!verify_signed_checkpoint(&checkpoint, checkpoint.payload.roster_hash));
     }
 
     #[test]
@@ -234,7 +217,7 @@ mod tests {
             signer: NodeId::new(3),
             sig: Signature::new([0x42; 64]),
         });
-        assert!(!verify_signed_checkpoint(&checkpoint, None));
+        assert!(!verify_signed_checkpoint(&checkpoint, checkpoint.payload.roster_hash));
     }
 
     #[test]
@@ -249,7 +232,7 @@ mod tests {
             signer: NodeId::new(5),
             sig: Signature::new(rogue_sig.to_bytes()),
         });
-        assert!(!verify_signed_checkpoint(&checkpoint, None));
+        assert!(!verify_signed_checkpoint(&checkpoint, checkpoint.payload.roster_hash));
 
         // A rogue signature appended to a genuine quorum must not reject it.
         let mut checkpoint = cluster.checkpoint(3, &[1, 2, 3]);
@@ -260,7 +243,7 @@ mod tests {
             signer: NodeId::new(6),
             sig: Signature::new(rogue_sig.to_bytes()),
         });
-        assert!(verify_signed_checkpoint(&checkpoint, None));
+        assert!(verify_signed_checkpoint(&checkpoint, checkpoint.payload.roster_hash));
     }
 
     #[test]
@@ -269,7 +252,7 @@ mod tests {
         let mut checkpoint = cluster.checkpoint(3, &[1, 2]);
         checkpoint.sigs.push(cluster.real_sig(3, 2));
         // Still only two distinct valid signers: below quorum.
-        assert!(!verify_signed_checkpoint(&checkpoint, None));
+        assert!(!verify_signed_checkpoint(&checkpoint, checkpoint.payload.roster_hash));
     }
 
     #[test]
@@ -278,7 +261,7 @@ mod tests {
         // A stale sig over a different round appended to a genuine quorum.
         let mut checkpoint = cluster.checkpoint(3, &[1, 2, 3]);
         checkpoint.sigs.push(cluster.real_sig(4, 4));
-        assert!(verify_signed_checkpoint(&checkpoint, None));
+        assert!(verify_signed_checkpoint(&checkpoint, checkpoint.payload.roster_hash));
     }
 
     #[test]
@@ -291,9 +274,9 @@ mod tests {
         let wrong_hash = checkpoint.payload.roster_hash;
         let mut altered = wrong_hash;
         altered[0] ^= 0xff;
-        assert!(!verify_signed_checkpoint(&checkpoint, Some(altered)));
+        assert!(!verify_signed_checkpoint(&checkpoint, altered));
         // The correct hash passes.
-        assert!(verify_signed_checkpoint(&checkpoint, Some(wrong_hash)));
+        assert!(verify_signed_checkpoint(&checkpoint, wrong_hash));
     }
 
     /// The exact attack from commit 3ec6744: a peer fabricates a roster
@@ -316,25 +299,10 @@ mod tests {
 
         // Rejected: the fabricated roster's hash disagrees with the
         // trusted anchor. This must return false before any Ed25519
-        // verification runs (the roster hash check is at lines 117-120).
+        // verification runs (the roster hash check is at lines 113-115).
         assert!(
-            !verify_signed_checkpoint(&checkpoint, Some(trusted_hash)),
+            !verify_signed_checkpoint(&checkpoint, trusted_hash),
             "fabricated roster with attacker quorum must be rejected against a trusted hash"
-        );
-    }
-
-    /// Same fabricated checkpoint, but with no trusted hash (bootstrap
-    /// case). The self-referential quorum passes — this is the documented
-    /// risk in the TODO at lines 47-55: without a trust anchor, a
-    /// malicious peer can serve an arbitrary roster.
-    #[test]
-    fn fabricated_roster_passes_when_no_trusted_hash() {
-        let attacker = Cluster::of(&[99, 98, 97]);
-        let checkpoint = attacker.checkpoint(5, &[99, 98, 97]);
-
-        assert!(
-            verify_signed_checkpoint(&checkpoint, None),
-            "fabricated roster passes with no trusted hash (bootstrap case)"
         );
     }
 
@@ -347,7 +315,7 @@ mod tests {
         let attacker_hash = checkpoint.payload.roster_hash;
 
         assert!(
-            verify_signed_checkpoint(&checkpoint, Some(attacker_hash)),
+            verify_signed_checkpoint(&checkpoint, attacker_hash),
             "fabricated roster passes when its own hash is the trust anchor"
         );
     }

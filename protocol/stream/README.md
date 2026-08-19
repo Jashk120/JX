@@ -64,10 +64,11 @@ consensus signing key.
 ## Verification
 
 A mirror (or a test acting as one) verifies a directory with
-`verify::verify_record_stream_dir(dir, node_id)` / `verify::verify_event_stream_dir(dir, node_key)`:
-chain continuity across files, the signature files, and — for record files —
-the embedded checkpoint quorum. Truncation, trailing bytes, tampering, and
-reordering are all rejected.
+`verify::verify_record_stream_dir(dir, node_id, trusted_roster_hash)` /
+`verify::verify_event_stream_dir(dir, node_key)`: chain continuity across
+files, the signature files, and — for record files — the embedded checkpoint
+quorum anchored against `trusted_roster_hash`. Truncation, trailing bytes,
+tampering, reordering, and forged rosters are all rejected.
 
 The record stream is byte-identical across the cluster for the rounds a node
 has written: `consensus_order(round)` is deterministic, prost encoding is

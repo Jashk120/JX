@@ -377,17 +377,13 @@ impl GossipNode {
                     && let Some(reconnect_addr) = peer.reconnect_addr
                 {
                     attempted = true;
-                    // TODO: `None` here means bootstrap with no trusted roster,
-                    // but the out-of-band roster validation that `fetch_checkpoint`'s
-                    // doc comment requires was never implemented.  Today this branch
-                    // is unreachable because the registry is always populated before
-                    // `needs_reconnect` fires — treat this guard as a latent bug,
-                    // not a safety net.  If first-bootstrap ever becomes reachable,
-                    // a malicious peer can fabricate a checkpoint whose
-                    // self-referential quorum trivially passes.
                     let trusted_roster_hash = {
                         let registry = self.registry.lock().await;
-                        if registry.is_empty() { None } else { Some(registry.hash()) }
+                        if registry.is_empty() {
+                            tracing::error!("reconnect refused: no trusted roster hash available");
+                            continue;
+                        }
+                        registry.hash()
                     };
                     tracing::info!(peer = ?peer.node_id, "reconnect attempt starting");
                     match fetch_checkpoint(

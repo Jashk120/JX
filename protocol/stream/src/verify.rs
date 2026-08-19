@@ -79,16 +79,15 @@ pub fn verify_event_stream_dir(dir: &Path, node_key: &VerifyingKey) -> Result<()
 /// continuity + per-file signature files (against `node_id`'s key in each
 /// file's embedded roster) + the embedded checkpoint quorum.
 ///
-/// `trusted_roster_hash`, when `Some`, anchors each checkpoint's
-/// `roster_snapshot` against a roster the caller already trusts. A mismatch
-/// is rejected before signature verification — a fabricated roster could
-/// make the self-referential quorum trivially pass. Pass `None` only when
-/// no trusted roster exists; the caller must validate the roster through a
-/// separate channel before trusting the restored state.
+/// `trusted_roster_hash` anchors each checkpoint's `roster_snapshot` against
+/// a roster the caller already trusts. A mismatch is rejected before
+/// signature verification — a fabricated roster could make the
+/// self-referential quorum trivially pass. There is no `None` path; callers
+/// must supply a trusted hash and fail-closed if none is available.
 pub fn verify_record_stream_dir(
     dir: &Path,
     node_id: NodeId,
-    trusted_roster_hash: Option<[u8; 32]>,
+    trusted_roster_hash: [u8; 32],
 ) -> Result<()> {
     let files = record_files_in(dir)?;
     if files.is_empty() {
@@ -230,13 +229,12 @@ impl RunningHashCommitments for pb::RecordStreamFile {
 /// `valid * 3 > total * 2` decides. A stale, forged, or duplicate signature
 /// is a no-op — never a rejection.
 ///
-/// When `expected_roster_hash` is `Some`, the checkpoint's `roster_hash`
-/// is compared against it first. A mismatch means the file embeds a roster
-/// the caller does not recognise — the quorum proof is rejected without
-/// checking signatures. Pass `None` only when no trusted roster exists.
+/// The checkpoint's `roster_hash` is compared against `expected_roster_hash`
+/// first. A mismatch means the file embeds a roster the caller does not
+/// recognise — the quorum proof is rejected without checking signatures.
 pub fn checkpoint_quorum(
     checkpoint: &pb::SignedCheckpoint,
-    expected_roster_hash: Option<[u8; 32]>,
+    expected_roster_hash: [u8; 32],
 ) -> bool {
     let Some(checkpoint) = proto_to_signed_checkpoint(checkpoint) else { return false };
     verify_checkpoint_quorum(&checkpoint, expected_roster_hash)
@@ -245,13 +243,8 @@ pub fn checkpoint_quorum(
 /// Quorum verification over the canonical form (same rule as
 /// `gossip::verify_signed_checkpoint`, reimplemented here so a mirror —
 /// which has no gossip dependency — can verify output source-agnostically).
-fn verify_checkpoint_quorum(
-    checkpoint: &SignedCheckpoint,
-    expected_roster_hash: Option<[u8; 32]>,
-) -> bool {
-    if let Some(expected) = expected_roster_hash
-        && checkpoint.payload.roster_hash != expected
-    {
+fn verify_checkpoint_quorum(checkpoint: &SignedCheckpoint, expected_roster_hash: [u8; 32]) -> bool {
+    if checkpoint.payload.roster_hash != expected_roster_hash {
         return false;
     }
     let total = checkpoint.payload.roster_snapshot.len();
@@ -299,11 +292,12 @@ mod tests {
             });
         }
         let checkpoint = SignedCheckpoint { payload, sigs };
-        assert!(verify_checkpoint_quorum(&checkpoint, None));
+        let hash = checkpoint.payload.roster_hash;
+        assert!(verify_checkpoint_quorum(&checkpoint, hash));
 
         let mut below = checkpoint.clone();
         below.sigs.pop();
-        assert!(!verify_checkpoint_quorum(&below, None));
+        assert!(!verify_checkpoint_quorum(&below, hash));
     }
 
     #[test]
@@ -330,6 +324,6 @@ mod tests {
             signer: NodeId::new(3),
             sig: primitives::Signature::new([0x42; 64]),
         });
-        assert!(!verify_checkpoint_quorum(&checkpoint, None));
+        assert!(!verify_checkpoint_quorum(&checkpoint, checkpoint.payload.roster_hash));
     }
 }
