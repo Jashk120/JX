@@ -7,6 +7,7 @@ use std::collections::{
 use std::sync::Arc;
 use std::sync::atomic::{
     AtomicBool,
+    AtomicU64,
     Ordering,
 };
 use std::time::Duration;
@@ -38,7 +39,10 @@ use tokio::net::{
     TcpListener,
     TcpStream,
 };
-use tokio::sync::Mutex;
+use tokio::sync::{
+    Mutex,
+    Notify,
+};
 
 use crate::error::{
     GossipError,
@@ -138,6 +142,17 @@ pub struct GossipNode {
     /// checkpoint. Only ever set by the sync driver and read on the next loop
     /// iteration, so an `AtomicBool` (no mutex) suffices.
     needs_reconnect: AtomicBool,
+    /// Monotonic last-emitted timestamp (millis since epoch) for this node's
+    /// own events. Used by [`Self::next_timestamp`] to clamp `SystemTime` so
+    /// two successive calls never return equal or decreasing values, even if
+    /// the wall clock stalls or steps backwards. Stored as `AtomicU64` because
+    /// the sync driver mutates it without holding any other lock.
+    last_timestamp: AtomicU64,
+    /// Notified whenever `accept_checkpoint` or `process_finalized_rounds`
+    /// completes, so test helpers waiting for a persisted checkpoint or
+    /// finalized state can wake without polling. Production code does not
+    /// wait on this; it is purely a test synchronization aid.
+    checkpoint_notify: Arc<Notify>,
     /// Raw transaction payloads submitted via [`Self::submit_transaction`],
     /// drained by the sync driver into the next own events.
     pending_transactions: Mutex<VecDeque<Vec<u8>>>,
@@ -197,6 +212,8 @@ impl GossipNode {
             outbound_checkpoint_sigs: Mutex::new(Vec::new()),
             pending_checkpoint_sigs: Mutex::new(BTreeMap::new()),
             needs_reconnect: AtomicBool::new(false),
+            last_timestamp: AtomicU64::new(0),
+            checkpoint_notify: Arc::new(Notify::new()),
             pending_transactions: Mutex::new(VecDeque::new()),
             checkpoint_sink: Mutex::new(None),
             event_sink: Mutex::new(None),
@@ -263,6 +280,23 @@ impl GossipNode {
     /// a peer before resuming normal delta-sync.
     pub fn request_reconnect(&self) {
         self.needs_reconnect.store(true, Ordering::Release);
+    }
+
+    /// Returns the next timestamp for this node's own event, monotonically
+    /// clamped against this node's last emitted value so wall-clock
+    /// regression or low resolution (e.g. 15.6 ms on Windows) can never
+    /// produce equal or decreasing timestamps from this creator. This is
+    /// scoped narrowly to *this node's* emissions, not a Lamport merge of
+    /// peer timestamps.
+    pub fn next_timestamp(&self) -> primitives::Timestamp {
+        crate::sync::next_timestamp(&self.last_timestamp)
+    }
+
+    /// Returns a clone of the checkpoint `Notify`, which is signaled
+    /// whenever `accept_checkpoint` completes or `process_finalized_rounds`
+    /// finishes a batch. Test helpers use this to avoid `sleep`-polling.
+    pub fn checkpoint_notify(&self) -> Arc<Notify> {
+        Arc::clone(&self.checkpoint_notify)
     }
 
     /// Drains up to [`TX_PER_SYNC`] pending payloads into transactions for
@@ -438,6 +472,7 @@ impl GossipNode {
 
             let registry = self.registry.lock().await.clone();
             let payload = self.drain_pending_transactions().await;
+            let timestamp = self.next_timestamp();
             let round = tokio::time::timeout(
                 self.sync_timing.sync_timeout,
                 run_sync(
@@ -448,6 +483,7 @@ impl GossipNode {
                     &self.signing_key,
                     peer.node_id,
                     payload,
+                    timestamp,
                 ),
             )
             .await;
@@ -702,6 +738,7 @@ impl GossipNode {
             self.state_snapshots.lock().await.insert(0, bytes);
             self.produce_pending_checkpoints(&state_hashes).await;
         }
+        self.checkpoint_notify.notify_waiters();
     }
 
     /// Emits a checkpoint for every round decided since the last pass, in
@@ -847,7 +884,10 @@ impl GossipNode {
         };
         // Durable copy: the `.snap` file is gone; a restart restores the
         // exact checkpoint-round state from this `snap` keyspace entry.
-        if let Err(e) = self.state_db.snapshot(round, &snapshot) {
+        // Flush *before* the checkpoint is recorded as accepted so a crash
+        // cannot leave a checkpoint file that references a missing snapshot
+        // on restart.
+        if let Err(e) = self.state_db.snapshot_and_flush(round, &snapshot) {
             tracing::error!(round, error = %e, "failed to persist state snapshot");
         }
         self.notify_checkpoint_accepted(&accepted).await;
@@ -889,6 +929,7 @@ impl GossipNode {
         if let Err(e) = self.state_db.flush() {
             tracing::error!(error = %e, "failed to flush the state database");
         }
+        self.checkpoint_notify.notify_waiters();
     }
 
     /// Feeds an accepted checkpoint to the registered [`CheckpointSink`], if

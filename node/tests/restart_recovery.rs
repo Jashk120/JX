@@ -41,6 +41,7 @@ use state::{
     StateDb,
 };
 use storage::EventLog;
+use test_support as ts;
 use tokio::time::{
     sleep,
     timeout,
@@ -53,32 +54,36 @@ fn state_from_bytes(bytes: &[u8]) -> state::State {
 }
 
 async fn wait_for_persisted_state(
+    node: &gossip::GossipNode,
     storage: &Storage,
     state_db: &StateDb,
     key: &[u8],
     deadline: Duration,
-) {
+) -> u64 {
+    let notify = node.checkpoint_notify();
     timeout(deadline, async {
         loop {
-            let Some(persisted) = storage.latest().expect("latest") else {
-                sleep(Duration::from_millis(25)).await;
-                continue;
-            };
-            let Some(bytes) =
-                state_db.snapshot_for(persisted.checkpoint.payload.round).expect("snapshot")
-            else {
-                sleep(Duration::from_millis(25)).await;
-                continue;
-            };
-            let snapshot = state_from_bytes(&bytes);
-            if snapshot.get(key).is_some() {
-                return;
+            if let Some(persisted) = storage.latest().expect("latest") {
+                let round = persisted.checkpoint.payload.round;
+                if let Some(bytes) = state_db.snapshot_for(round).expect("snapshot") {
+                    let snapshot = state_from_bytes(&bytes);
+                    if snapshot.get(key).is_some() {
+                        let latest_round =
+                            storage.latest().expect("latest").map(|p| p.checkpoint.payload.round);
+                        if latest_round == Some(round) {
+                            return round;
+                        }
+                    }
+                }
             }
-            sleep(Duration::from_millis(25)).await;
+            tokio::select! {
+                _ = notify.notified() => {},
+                _ = sleep(ts::POLL_INTERVAL) => {},
+            }
         }
     })
     .await
-    .expect("persisted checkpoint snapshot includes the submitted key");
+    .expect("persisted checkpoint snapshot includes the submitted key")
 }
 
 /// Starts a two-node cluster, submits a transaction, waits for it to be
@@ -89,6 +94,10 @@ async fn setup_and_stop() -> (tempfile::TempDir, ClusterNet) {
     let tmp = tempfile::tempdir().expect("temp dir");
     let data1 = tmp.path().join("node1");
     let mut net = net_for(&[1, 2]).await;
+    // Use a StateDb rooted at data1 so wait_for_persisted_state can reopen
+    // it from disk and actually verify durability (not just the live handle).
+    let state_db1 = Arc::new(StateDb::open(&data1).expect("state db opens"));
+    net.state_dbs[0] = state_db1;
 
     let node1 = fresh_node(&net, 0);
     let storage1 = Storage::new(&data1).expect("storage opens");
@@ -131,13 +140,48 @@ async fn setup_and_stop() -> (tempfile::TempDir, ClusterNet) {
     wait_for_state(&node1, b"k", DEADLINE).await;
     wait_for_state(&node2, b"k", DEADLINE).await;
     let storage1 = Storage::new(&data1).expect("storage reopens");
-    wait_for_persisted_state(&storage1, &net.state_dbs[0], b"k", DEADLINE).await;
+    let persisted_round =
+        wait_for_persisted_state(&node1, &storage1, &net.state_dbs[0], b"k", DEADLINE).await;
 
     // Stop node 1 and release all handles so Fjall databases can be reopened.
     node1_stop.store(true, Ordering::Release);
     node1_thread.join().expect("node1 thread exits");
     drop(node1);
     drop(event_log1);
+
+    // Fresh-reopen durability check: Fjall does NOT permit a concurrent
+    // read-only open while the writer holds the directory lock (see
+    // `fjall::Error::Locked`), so the reopen-and-verify branch in
+    // `wait_for_persisted_state` would never execute before the node stops.
+    // Verify here, after the lock is released, that the snapshot is truly
+    // durable on disk — not just visible via the live handle. Assert on the
+    // specific round that was validated before stop (finding 3.1).
+    {
+        // Temporarily drop the live handle so we can reopen the same directory.
+        // `net.state_dbs[0]` is the only remaining handle to `data1/statedb`
+        // after `node1` was dropped; removing it releases the lock.
+        let live = net.state_dbs.remove(0);
+        drop(live);
+        let fresh_db = StateDb::open(&data1).expect("reopen state db after stop");
+        let storage = Storage::new(&data1).expect("storage reopens after stop");
+        let persisted = storage.latest().expect("latest").expect("checkpoint after stop");
+        assert_eq!(
+            persisted.checkpoint.payload.round, persisted_round,
+            "latest round must still be the round validated before stop"
+        );
+        let bytes = fresh_db
+            .snapshot_for(persisted_round)
+            .expect("snapshot")
+            .expect("fresh snapshot must be present on disk");
+        let snapshot = state_from_bytes(&bytes);
+        assert!(
+            snapshot.get(b"k").is_some(),
+            "fresh-reopened snapshot must contain the persisted key"
+        );
+        // Restore the handle for the caller (subsequent tests corrupt via
+        // `net.state_dbs[0]`).
+        net.state_dbs.insert(0, Arc::new(fresh_db));
+    }
 
     (tmp, net)
 }

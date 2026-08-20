@@ -64,6 +64,17 @@ impl StateDb {
         Ok(())
     }
 
+    /// Persists `bytes` as the state snapshot of accepted checkpoint `round`
+    /// and flushes the database so the snapshot is durable before the
+    /// checkpoint file is considered persisted. Used by `accept_checkpoint` to
+    /// ensure a crash between snapshot insert and checkpoint persist cannot
+    /// leave a checkpoint that references a missing snapshot on restart.
+    pub fn snapshot_and_flush(&self, round: u64, bytes: &[u8]) -> StateDbResult<()> {
+        self.snap.insert(round.to_be_bytes(), bytes)?;
+        self.db.persist(PersistMode::SyncAll)?;
+        Ok(())
+    }
+
     /// The persisted state snapshot for accepted checkpoint `round`, if any.
     pub fn snapshot_for(&self, round: u64) -> StateDbResult<Option<Vec<u8>>> {
         Ok(self.snap.get(round.to_be_bytes())?.map(|value| value.as_slice().to_vec()))

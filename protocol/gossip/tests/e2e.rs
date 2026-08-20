@@ -477,6 +477,7 @@ async fn malformed_frame_over_wire_does_not_crash_node() {
         &key1,
         NodeId::new(2),
         Vec::new(),
+        Timestamp::new(now_millis()),
     )
     .await
     .expect("sync after malformed input");
@@ -492,8 +493,6 @@ async fn malformed_frame_over_wire_does_not_crash_node() {
     stop.store(true, Ordering::Release);
     let _ = handle.await;
 }
-
-// --- Negative: event verification and consensus gates --------------------------
 
 #[tokio::test]
 async fn tampered_signature_event_rejected_over_wire() {
@@ -551,6 +550,7 @@ async fn tampered_signature_event_rejected_over_wire() {
         &key1,
         NodeId::new(2),
         Vec::new(),
+        Timestamp::new(now_millis()),
     )
     .await
     .expect("sync after forged event");
@@ -641,6 +641,7 @@ async fn unexpected_frame_type_fails_run_sync() {
         &key1,
         NodeId::new(2),
         Vec::new(),
+        Timestamp::new(now_millis()),
     )
     .await;
     assert!(matches!(
@@ -667,6 +668,7 @@ async fn behind_frame_surfaces_as_reconnect_error() {
         &key1,
         NodeId::new(2),
         Vec::new(),
+        Timestamp::new(now_millis()),
     )
     .await;
     assert!(

@@ -285,6 +285,17 @@ impl Hashgraph {
 /// middle. The spec does not pin this down; averaged-pair is the
 /// conventional definition, and the sub-nanosecond truncation is only ever
 /// a tie that the next sort key resolves deterministically.
+///
+/// Note: this median computation itself is deterministic across honest nodes:
+/// it operates over already-gossiped, already-agreed event data
+/// (`first_seen` timestamps from each famous witness's ancestry, all of which
+/// are present on every node that has decided the round). The consensus risk
+/// is not cross-node divergence *in* the median, but corrupt or duplicate
+/// *input* from a single misbehaving or clock-skewed creator (e.g. duplicate
+/// or `0` timestamps that would skew the median identically on every node —
+/// convergent but wrong). That input risk is mitigated at the source by per-
+/// creator monotonic clamping in `gossip::sync::next_timestamp`; do not
+/// reintroduce wall-clock dependence here.
 fn median_timestamp(first_seen: &mut [u64]) -> Timestamp {
     first_seen.sort_unstable();
     let len = first_seen.len();

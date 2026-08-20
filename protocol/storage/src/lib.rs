@@ -6,6 +6,7 @@
 //! rebuild its retained graph independently, instead of
 //! `request_reconnect()`ing from a live peer.
 
+pub mod atomic;
 mod error;
 pub mod event_log;
 

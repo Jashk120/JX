@@ -34,16 +34,17 @@ use primitives::{
     UnsignedEvent,
 };
 use state::StateDb;
+pub use test_support::{
+    DEADLINE,
+    POLL_INTERVAL,
+    SYNC_INTERVAL,
+    SYNC_TIMEOUT,
+};
 use tokio::net::TcpListener;
 use tokio::time::{
     sleep,
     timeout,
 };
-
-pub const SYNC_INTERVAL: Duration = Duration::from_millis(25);
-pub const SYNC_TIMEOUT: Duration = Duration::from_millis(500);
-#[allow(dead_code)]
-pub const DEADLINE: Duration = Duration::from_secs(15);
 
 /// A fresh `StateDb` in a tempdir — the test stand-in for `<data>/statedb/`.
 pub fn temp_state_db() -> Arc<StateDb> {
@@ -164,7 +165,7 @@ pub async fn wait_for_pruned_checkpoint(
             {
                 return round;
             }
-            sleep(Duration::from_millis(50)).await;
+            sleep(POLL_INTERVAL).await;
         }
     })
     .await
@@ -192,7 +193,7 @@ pub async fn wait_for_ordered_round(
             if let Some(round) = ordered {
                 return round;
             }
-            sleep(Duration::from_millis(50)).await;
+            sleep(POLL_INTERVAL).await;
         }
     })
     .await
@@ -259,7 +260,7 @@ pub async fn stop_and_settle(
             if frontiers_within_bound(nodes, bound).await {
                 return;
             }
-            sleep(Duration::from_millis(50)).await;
+            sleep(POLL_INTERVAL).await;
         }
     })
     .await
@@ -289,7 +290,7 @@ pub async fn stop_and_settle(
                 return (counts, lates);
             }
             last_counts = counts;
-            sleep(Duration::from_millis(100)).await;
+            sleep(POLL_INTERVAL * 10).await;
         }
     })
     .await
@@ -367,9 +368,4 @@ pub async fn insert_event(
 }
 
 #[allow(dead_code)]
-pub fn now_millis() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
+pub use test_support::now_millis;
