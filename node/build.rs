@@ -1,10 +1,10 @@
 use std::process::Command;
 
 fn main() {
-    println!("cargo:rerun-if-changed=../../.git/HEAD");
+    println!("cargo:rerun-if-changed=../.git/HEAD");
 
     let output =
-        Command::new("git").args(["rev-parse", "--short", "HEAD"]).current_dir("../../").output();
+        Command::new("git").args(["rev-parse", "--short", "HEAD"]).current_dir("../").output();
 
     match output {
         Ok(o) if o.status.success() => {

@@ -18,11 +18,7 @@
 //! persisted — a restarting node reloads state and roster from its latest
 //! checkpoint and reconnects from a live peer for the event window.
 
-use std::fs::{
-    self,
-    File,
-};
-use std::io::Write;
+use std::fs;
 use std::path::{
     Path,
     PathBuf,
@@ -160,23 +156,11 @@ impl CheckpointSink for Storage {
     }
 }
 
-/// Writes `bytes` to `path` atomically: a uniquely-named temp file in the
-/// same directory is written, flushed to disk, and renamed over the target.
-/// A crash leaves either the old file or the new file, never a torn one.
+/// Writes `bytes` to `path` atomically via the shared helper which also
+/// fsyncs the containing directory so the rename is durable.
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
-    let dir = path.parent().context("path has no parent directory")?;
-    let tmp = dir.join(format!(
-        ".tmp-{}-{}",
-        std::process::id(),
-        path.file_name().and_then(|n| n.to_str()).unwrap_or("out")
-    ));
-    let mut file =
-        File::create(&tmp).with_context(|| format!("creating temp {}", tmp.display()))?;
-    file.write_all(bytes).with_context(|| format!("writing temp {}", tmp.display()))?;
-    file.sync_all().with_context(|| format!("flushing temp {}", tmp.display()))?;
-    drop(file);
-    fs::rename(&tmp, path).with_context(|| format!("renaming over {}", path.display()))?;
-    Ok(())
+    storage::atomic::atomic_write(path, bytes)
+        .with_context(|| format!("atomic write {}", path.display()))
 }
 
 #[cfg(test)]

@@ -222,7 +222,34 @@ The sync driver calls `GossipNode::process_finalized_rounds()`
   `CheckpointAccumulator`, accept it (`accept_checkpoint`) and prune history
   below `round - RETENTION_ROUNDS`.
 
-## 5. Recovery paths
+## 5. Scaling — gossip and execution (design locked)
+
+Scaling to 100/1,000 nodes is tracked in `docs/OPTIMIZATION.md` (2026-08-20).
+At a high level:
+
+* **Gossip track:** `QUIC + dynamic smart peer selection + bounded concurrent
+  fanout`. `SyncTransport` stays abstract so `TcpTransport`
+  (`protocol/gossip/src/transport.rs:46`) remains as benchmark/fallback.
+  Active QUIC pool 10–30, scored selection (frontier usefulness, success EWMA,
+  latency, freshness, diversity, recent-selection penalty, failure/backoff),
+  adaptive fanout/interval with hard bounds, persistent QUIC for hot peers /
+  resumption for cold, topology-aware diversity, gossip scheduling detached
+  from `Hashgraph` processing. Sequence `G0 instrument → G1 QUIC → G2
+  concurrent fanout → G3 scoring → G4 adaptive → G5 compression/batching →
+  G6 100/500/1,000-node bench`.
+* **Execution track:** optional `access_list` + serial fallback (typed
+  `AccessKey` domains `Account/HtsToken/HcsTopic/ContractStorage/StateKey/
+  Unknown`), deterministic dependency scheduler (`Levels` via Kahn, tie-break
+  by `consensus_order`), `State A (serial oracle) == State B (parallel plan)`
+  invariant before real concurrency, versioned snapshot + deterministic commit
+  in `consensus_order`, batched Merkle/Fjall, then MVCC/sharding and pipeline
+  decoupling. Bounds converge at `state::finalized_events(&hg)` →
+  `process_finalized_rounds`.
+
+Current code below describes the pre-scaling baseline; see `OPTIMIZATION.md`
+for the post-scaling target.
+
+## 6. Recovery paths
 
 - **`Frame::Behind` or `MissingParent`** → the node is behind its peers'
   pruned history; `needs_reconnect` is set, and next interval it calls

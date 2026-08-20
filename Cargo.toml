@@ -8,6 +8,7 @@ members = [
     "protocol/gossip",
     "protocol/storage",
     "protocol/stream",
+    "protocol/test-support",
     "executor/state",
     "node",
 ]
@@ -23,13 +24,14 @@ serde = { version = "1", features = ["derive"] }
 ed25519-dalek = "2.2.0"
 anyhow = "1"
 thiserror = "2"
-primitives = { path = "protocol/primitives" }
-crypto = { path = "protocol/crypto" }
-consensus = { path = "protocol/consensus" }
-gossip = { path = "protocol/gossip" }
-storage = { path = "protocol/storage" }
-stream = { path = "protocol/stream" }
-state = { path = "executor/state" }
+ primitives = { path = "protocol/primitives" }
+ crypto = { path = "protocol/crypto" }
+ consensus = { path = "protocol/consensus" }
+ gossip = { path = "protocol/gossip" }
+ storage = { path = "protocol/storage" }
+ stream = { path = "protocol/stream" }
+ test-support = { path = "protocol/test-support" }
+ state = { path = "executor/state" }
 sha2 = "0.10"
 rand = "0.8"
 toml = "0.8"

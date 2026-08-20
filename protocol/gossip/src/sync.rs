@@ -1,4 +1,8 @@
 use std::sync::Arc;
+use std::sync::atomic::{
+    AtomicU64,
+    Ordering,
+};
 
 use crypto::{
     MembershipRegistry,
@@ -38,6 +42,7 @@ use crate::transport::SyncTransport;
 ///
 /// Returns the hashes of every event that was freshly inserted this round,
 /// so the caller can append them to the durable event log (Phase 8).
+#[allow(clippy::too_many_arguments)]
 pub async fn run_sync(
     transport: &mut (impl SyncTransport + Send),
     hashgraph: &Arc<Mutex<consensus::Hashgraph>>,
@@ -46,6 +51,7 @@ pub async fn run_sync(
     signing_key: &SigningKey,
     peer_id: NodeId,
     payload: Vec<Transaction>,
+    timestamp: Timestamp,
 ) -> Result<Vec<EventHash>> {
     let known = {
         let hashgraph = hashgraph.lock().await;
@@ -86,7 +92,7 @@ pub async fn run_sync(
         (self_parent, other_parent)
     };
 
-    let unsigned = UnsignedEvent::new(node_id, self_parent, other_parent, now_timestamp(), payload);
+    let unsigned = UnsignedEvent::new(node_id, self_parent, other_parent, timestamp, payload);
     let event = unsigned.sign(signing_key);
     if let Some(hash) = insert_verified(hashgraph, registry, event.clone()).await? {
         fresh.push(hash);
@@ -126,10 +132,74 @@ fn frame_name(frame: &Frame) -> &'static str {
     }
 }
 
-fn now_timestamp() -> Timestamp {
-    let millis = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-    Timestamp::new(millis)
+/// Returns the next timestamp for `last`'s node, monotonically clamped
+/// against `last`'s previous value. `SystemTime` is still the physical
+/// source, but `max(clock, last+1)` guarantees successive calls from the
+/// same creator never return equal or decreasing values, even if the wall
+/// clock stalls, has 15.6 ms Windows granularity, or steps backwards.
+/// A clock error (before `UNIX_EPOCH`) is logged and treated as `0`, which
+/// then clamps to `last+1` so `0` never silently enters the event stream —
+/// a `0` would otherwise corrupt every future median that includes its
+/// witness (convergent but wrong, worse than divergent).
+pub fn next_timestamp(last: &AtomicU64) -> Timestamp {
+    let clock_millis = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => d.as_millis() as u64,
+        Err(e) => {
+            tracing::error!(error = %e, "system clock before UNIX_EPOCH, using monotonic fallback");
+            0
+        }
+    };
+    next_timestamp_with_clock(clock_millis, last)
+}
+
+/// Deterministic core of [`next_timestamp`]: `max(clock_millis, last+1)`.
+/// Exposed for unit testing with a mocked clock value.
+pub(crate) fn next_timestamp_with_clock(clock_millis: u64, last: &AtomicU64) -> Timestamp {
+    // `fetch_max` would be racy with two concurrent callers (both read same
+    // `last`, both compute same `next`, one write lost). Use CAS loop.
+    loop {
+        let prev = last.load(Ordering::Relaxed);
+        // `wrapping_add` is safe: `u64::MAX` would wrap to 0, but we never
+        // emit that many events in one process lifetime; still, clamp to MAX
+        // rather than wrap.
+        let candidate = clock_millis.max(prev.saturating_add(1));
+        // Never emit 0: if clock is 0 and prev is 0, candidate is 1.
+        debug_assert!(candidate != 0, "monotonic clamp must never emit 0");
+        match last.compare_exchange_weak(prev, candidate, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return Timestamp::new(candidate),
+            Err(_) => continue,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::AtomicU64;
+
+    use super::*;
+
+    #[test]
+    fn monotonic_clamp_never_equal_or_decreasing_with_stalled_clock() {
+        let last = AtomicU64::new(0);
+        let t1 = next_timestamp_with_clock(100, &last);
+        let t2 = next_timestamp_with_clock(100, &last);
+        assert!(t2.get() > t1.get(), "same clock must still advance: {t1:?} vs {t2:?}");
+        let t3 = next_timestamp_with_clock(100, &last);
+        assert!(t3.get() > t2.get());
+        // Clock goes backwards.
+        let t4 = next_timestamp_with_clock(50, &last);
+        assert!(t4.get() > t3.get(), "backward clock must still advance");
+        // Clock returns 0 (simulated SystemTime error).
+        let t5 = next_timestamp_with_clock(0, &last);
+        assert!(t5.get() > t4.get());
+        assert_ne!(t5.get(), 0, "must never emit 0");
+    }
+
+    #[test]
+    fn monotonic_clamp_initial_zero_clock_emits_one() {
+        let last = AtomicU64::new(0);
+        let t = next_timestamp_with_clock(0, &last);
+        assert_eq!(t.get(), 1);
+        assert_ne!(t.get(), 0);
+    }
 }

@@ -10,8 +10,10 @@ membership, and `consensus` for the hashgraph that stores and orders events.
 
 Transport is raw TCP with TLS 1.3 (rustls) and length-prefixed canonical
 frames — the conservative, well-understood transport the whitepaper (§2.2)
-deliberately chooses for the consensus-hot path. QUIC is deferred to a
-later optimization phase.
+deliberately chooses for the consensus-hot path. `SyncTransport` is abstract
+so `TcpTransport` remains as benchmark/fallback; QUIC is design-locked in
+`docs/OPTIMIZATION.md` (G-track G1–G6, bounded fanout + scoring) and not yet
+implemented.
 
 ## Contents
 

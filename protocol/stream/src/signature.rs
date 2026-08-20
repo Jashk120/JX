@@ -18,8 +18,6 @@
 //! so a crash mid-pair leaves at worst an orphaned signature — never a stream
 //! file without its signature.
 
-use std::fs::File;
-use std::io::Write;
 use std::path::Path;
 
 use ed25519_dalek::{
@@ -184,23 +182,11 @@ pub(crate) fn verify_signature_object(
     key.verify_strict(expected_digest, &signature).is_ok()
 }
 
-/// Writes `bytes` to `path` atomically: a uniquely-named temp file in the
-/// same directory is written, flushed to disk, and renamed over the target.
-/// A crash leaves either the old file or the new file, never a torn one.
+/// Writes `bytes` to `path` atomically via the shared `storage::atomic`
+/// helper which also fsyncs the containing directory so the rename is
+/// durable.
 pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    let dir = path.parent().ok_or_else(|| {
-        StreamError::Malformed(format!("path {} has no parent directory", path.display()))
-    })?;
-    let tmp = dir.join(format!(
-        ".tmp-{}-{}",
-        std::process::id(),
-        path.file_name().and_then(|name| name.to_str()).unwrap_or("out")
-    ));
-    let mut file = File::create(&tmp)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    drop(file);
-    std::fs::rename(&tmp, path)?;
+    storage::atomic::atomic_write(path, bytes)?;
     Ok(())
 }
 

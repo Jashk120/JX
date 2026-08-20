@@ -526,6 +526,7 @@ dependencies = [
  "storage",
  "stream",
  "tempfile",
+ "test-support",
  "thiserror",
  "tokio",
  "tokio-rustls",
@@ -730,6 +731,7 @@ dependencies = [
  "storage",
  "stream",
  "tempfile",
+ "test-support",
  "tokio",
  "toml",
  "tracing",
@@ -1418,6 +1420,13 @@ dependencies = [
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "test-support"
+version = "0.0.1"
+dependencies = [
+ "tokio",
 ]
 
 [[package]]

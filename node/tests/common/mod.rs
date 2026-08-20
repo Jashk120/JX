@@ -28,15 +28,17 @@ use gossip::{
 };
 use primitives::NodeId;
 use state::StateDb;
+pub use test_support::{
+    DEADLINE,
+    POLL_INTERVAL,
+    SYNC_INTERVAL,
+    SYNC_TIMEOUT,
+};
 use tokio::net::TcpListener;
 use tokio::time::{
     sleep,
     timeout,
 };
-
-pub const SYNC_INTERVAL: Duration = Duration::from_millis(25);
-pub const SYNC_TIMEOUT: Duration = Duration::from_millis(500);
-pub const DEADLINE: Duration = Duration::from_secs(30);
 
 /// A fresh `StateDb` in a tempdir — the test stand-in for `<data>/statedb/`.
 pub fn temp_state_db() -> Arc<StateDb> {
@@ -180,7 +182,7 @@ pub async fn wait_for_state(node: &GossipNode, key: &[u8], deadline: Duration) -
             if let Some(value) = state.get(key) {
                 return Some(value);
             }
-            sleep(Duration::from_millis(25)).await;
+            sleep(POLL_INTERVAL).await;
         }
     })
     .await
@@ -197,7 +199,7 @@ pub async fn wait_for_checkpoint(node: &GossipNode, min_round: u64, deadline: Du
             {
                 return round;
             }
-            sleep(Duration::from_millis(25)).await;
+            sleep(POLL_INTERVAL).await;
         }
     })
     .await

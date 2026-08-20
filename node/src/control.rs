@@ -328,7 +328,6 @@ mod tests {
         AtomicBool,
         Ordering,
     };
-    use std::time::Duration;
 
     use crypto::{
         MembershipOp,
@@ -355,7 +354,7 @@ mod tests {
             registry,
             gossip::TlsIdentity::from_seed(seed, 1).expect("identity builds"),
             Vec::new(),
-            gossip::SyncTiming::new(Duration::from_millis(25), Duration::from_millis(500)),
+            gossip::SyncTiming::new(test_support::SYNC_INTERVAL, test_support::SYNC_TIMEOUT),
             temp_state_db(),
         ))
     }

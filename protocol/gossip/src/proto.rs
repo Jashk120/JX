@@ -89,6 +89,11 @@ pub struct ReconnectResponse {
     /// frontier is honest (it holds full chains, not just per-creator heads)
     /// and subsequent delta syncs never reference a parent it lacks.
     pub retained: Vec<consensus::RetainedEvent>,
+    /// Monotonic last-emitted timestamp watermark (millis since epoch) for
+    /// the node's own events. Persisted with the checkpoint and restored on
+    /// `apply_checkpoint` so a restart with a backward wall clock cannot emit
+    /// a timestamp lower than a pre-restart event from the same creator.
+    pub last_timestamp: u64,
 }
 
 /// One unit of wire traffic on a gossip connection.
@@ -140,6 +145,7 @@ impl Frame {
                 payload.extend_from_slice(&(resp.roster_history_bytes.len() as u32).to_be_bytes());
                 payload.extend_from_slice(&resp.roster_history_bytes);
                 payload.extend_from_slice(&resp.decided_round.to_be_bytes());
+                payload.extend_from_slice(&resp.last_timestamp.to_be_bytes());
                 payload.extend_from_slice(&(resp.retained.len() as u32).to_be_bytes());
                 for retained in &resp.retained {
                     payload.extend_from_slice(&retained.seq.to_be_bytes());
@@ -218,6 +224,7 @@ impl Frame {
                 let rh_len = cursor.read_u32()? as usize;
                 let roster_history_bytes = cursor.read(rh_len)?.to_vec();
                 let decided_round = cursor.read_u64()?;
+                let last_timestamp = cursor.read_u64()?;
                 let retained_count = cursor.read_u32()? as usize;
                 const MIN_RETAINED: usize = 8 + 8 + 1 + 4 + 4 + 86; // seq + round + rr_tag + ancestor_count + event_len + event
                 if retained_count > cursor.remaining() / MIN_RETAINED {
@@ -267,6 +274,7 @@ impl Frame {
                     roster_history_bytes,
                     decided_round,
                     retained,
+                    last_timestamp,
                 }))
             }
             MessageType::Behind => {
@@ -597,6 +605,7 @@ mod tests {
                 ancestor_seqs: vec![2, 0, 0],
                 round_received: Some(1),
             }],
+            last_timestamp: 12345,
         }
     }
 
@@ -674,6 +683,8 @@ mod tests {
         payload.extend_from_slice(&response.roster_history_bytes);
         // Decided round.
         payload.extend_from_slice(&response.decided_round.to_be_bytes());
+        // Last timestamp watermark.
+        payload.extend_from_slice(&response.last_timestamp.to_be_bytes());
         // Retained count — absurdly large, no real entries follow.
         payload.extend_from_slice(&u32::MAX.to_be_bytes());
 
@@ -701,6 +712,7 @@ mod tests {
         payload.extend_from_slice(&(response.roster_history_bytes.len() as u32).to_be_bytes());
         payload.extend_from_slice(&response.roster_history_bytes);
         payload.extend_from_slice(&response.decided_round.to_be_bytes());
+        payload.extend_from_slice(&response.last_timestamp.to_be_bytes());
         // retained_count = 1
         payload.extend_from_slice(&1u32.to_be_bytes());
         // seq (u64)
@@ -781,6 +793,7 @@ mod tests {
         payload.extend_from_slice(&(response.roster_history_bytes.len() as u32).to_be_bytes());
         payload.extend_from_slice(&response.roster_history_bytes);
         payload.extend_from_slice(&response.decided_round.to_be_bytes());
+        payload.extend_from_slice(&response.last_timestamp.to_be_bytes());
         // retained_count = 1
         payload.extend_from_slice(&1u32.to_be_bytes());
         // seq (u64)

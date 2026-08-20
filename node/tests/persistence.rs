@@ -32,6 +32,7 @@ use state::{
     State,
     StateDb,
 };
+use test_support as ts;
 use tokio::net::TcpListener;
 use tokio::time::{
     sleep,
@@ -51,34 +52,43 @@ fn state_from_bytes(bytes: &[u8]) -> State {
 /// i.e. the stored checkpoint round ordered the transaction — so a restart is
 /// guaranteed to resume with the submitted state already present. The
 /// snapshot is read from the state database's `snap` keyspace (the `.snap`
-/// files are gone).
+/// files are gone). Returns the specific round that was validated, so the
+/// caller can assert on it rather than re-reading a potentially raced
+/// `storage.latest()`.
 async fn wait_for_persisted_state(
+    node: &GossipNode,
     storage: &Storage,
     state_db: &StateDb,
     key: &[u8],
     deadline: Duration,
-) {
+) -> u64 {
+    let notify = node.checkpoint_notify();
     timeout(deadline, async {
         loop {
-            let Some(persisted) = storage.latest().expect("latest") else {
-                sleep(Duration::from_millis(25)).await;
-                continue;
-            };
-            let Some(bytes) =
-                state_db.snapshot_for(persisted.checkpoint.payload.round).expect("snapshot")
-            else {
-                sleep(Duration::from_millis(25)).await;
-                continue;
-            };
-            let snapshot = state_from_bytes(&bytes);
-            if snapshot.get(key).is_some() {
-                return;
+            if let Some(persisted) = storage.latest().expect("latest") {
+                let round = persisted.checkpoint.payload.round;
+                if let Some(bytes) = state_db.snapshot_for(round).expect("snapshot") {
+                    let snapshot = state_from_bytes(&bytes);
+                    if snapshot.get(key).is_some() {
+                        // Ensure the round we validated is still the latest
+                        // — a second checkpoint racing in must not change
+                        // which round the test actually validated (finding 3.1).
+                        let latest_round =
+                            storage.latest().expect("latest").map(|p| p.checkpoint.payload.round);
+                        if latest_round == Some(round) {
+                            return round;
+                        }
+                    }
+                }
             }
-            sleep(Duration::from_millis(25)).await;
+            tokio::select! {
+                _ = notify.notified() => {},
+                _ = sleep(ts::POLL_INTERVAL) => {},
+            }
         }
     })
     .await
-    .expect("persisted checkpoint snapshot includes the submitted key");
+    .expect("persisted checkpoint snapshot includes the submitted key")
 }
 
 #[tokio::test]
@@ -133,21 +143,10 @@ async fn restart_from_persisted_checkpoint_restores_state_and_resumes() {
 
     // Wait until the persisted checkpoint itself covers the transaction, so
     // the restart resumes with the submitted state already present. The state
-    // snapshot lives in the node's state database `snap` keyspace.
-    wait_for_persisted_state(&storage1, &net.state_dbs[0], b"k", DEADLINE).await;
-
-    // Ensure the live peer has also accepted the same checkpoint round before
-    // we stop node 1. `wait_for_persisted_state` only guarantees node 1
-    // accepted quorum (its sink wrote). For a 2-node cluster quorum requires
-    // both signatures; node 1 accepts when it receives node 2's sig, but node
-    // 2 may still be one sync round behind. If we restart while the peer's
-    // latest accepted checkpoint is stale, `request_reconnect` will fetch an
-    // older checkpoint (or no checkpoint) and the learner's reconnect loop
-    // stalls — delta-sync is skipped while `needs_reconnect` stays set — so
-    // the post-restart liveness check times out on starved / low-vCPU CI
-    // runners. Waiting here makes the restart deterministic.
+    // snapshot lives in the node's state database `snap` keyspace. The
+    // returned round is the specific round that was validated (finding 3.1).
     let persisted_round =
-        storage1.latest().expect("latest").expect("persisted checkpoint").checkpoint.payload.round;
+        wait_for_persisted_state(&node1, &storage1, &net.state_dbs[0], b"k", DEADLINE).await;
     timeout(DEADLINE, async {
         loop {
             if let Some(round) = node2.latest_accepted_checkpoint_round().await
@@ -155,7 +154,7 @@ async fn restart_from_persisted_checkpoint_restores_state_and_resumes() {
             {
                 return;
             }
-            sleep(Duration::from_millis(25)).await;
+            sleep(ts::POLL_INTERVAL).await;
         }
     })
     .await
@@ -170,7 +169,7 @@ async fn restart_from_persisted_checkpoint_restores_state_and_resumes() {
     // races `EADDRINUSE` (the test would panic on "rebind gossip port"
     // rather than time out, but the retry makes the restart phase
     // deterministic under vCPU starvation as well).
-    sleep(Duration::from_millis(100)).await;
+    sleep(ts::POLL_INTERVAL * 10).await;
 
     // Load the latest persisted checkpoint now that node 1 can no longer
     // write: this is exactly what a restarting process would read.
@@ -237,7 +236,7 @@ async fn restart_from_persisted_checkpoint_restores_state_and_resumes() {
                     break;
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-                    sleep(Duration::from_millis(50)).await;
+                    sleep(ts::POLL_INTERVAL * 5).await;
                     continue;
                 }
                 Err(e) => panic!("rebind gossip port: {e}"),
@@ -254,7 +253,7 @@ async fn restart_from_persisted_checkpoint_restores_state_and_resumes() {
                     break;
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-                    sleep(Duration::from_millis(50)).await;
+                    sleep(ts::POLL_INTERVAL * 5).await;
                     continue;
                 }
                 Err(e) => panic!("rebind reconnect port: {e}"),
@@ -284,7 +283,7 @@ async fn restart_from_persisted_checkpoint_restores_state_and_resumes() {
             if let Some(seq) = latest {
                 return seq;
             }
-            sleep(Duration::from_millis(25)).await;
+            sleep(ts::POLL_INTERVAL).await;
         }
     })
     .await
@@ -301,7 +300,7 @@ async fn restart_from_persisted_checkpoint_restores_state_and_resumes() {
             if received {
                 return;
             }
-            sleep(Duration::from_millis(25)).await;
+            sleep(ts::POLL_INTERVAL).await;
         }
     })
     .await

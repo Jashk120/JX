@@ -14,7 +14,6 @@ use std::net::{
     SocketAddr,
 };
 use std::sync::Arc;
-use std::time::Duration;
 
 use crypto::{
     Hashable,
@@ -144,7 +143,7 @@ async fn finalized_membership_op_activates_new_member_idempotently() {
         registry.clone(),
         identity,
         Vec::new(),
-        SyncTiming::new(Duration::from_millis(25), Duration::from_millis(500)),
+        SyncTiming::new(test_support::SYNC_INTERVAL, test_support::SYNC_TIMEOUT),
         temp_state_db(),
     ));
 

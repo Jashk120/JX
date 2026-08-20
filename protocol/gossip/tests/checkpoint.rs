@@ -248,6 +248,7 @@ async fn from_checkpoint_rejects_roster_key_mismatched_to_the_learner() {
         roster_history_bytes: encode_roster_history(&RosterHistory::new(roster)),
         decided_round: 1,
         retained: Vec::new(),
+        last_timestamp: 0,
     };
 
     let node4_id = NodeId::new(4);

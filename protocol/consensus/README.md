@@ -37,5 +37,8 @@ order finalization. Depends on `primitives` for the value types and
   avoid float rounding in supermajority checks.
 - Fork deduplication to a canonical branch is deliberately deferred: it
   requires finalized order, which is what this crate produces.
-- Dynamic membership and transaction execution are future work; the
-  membership registry is fixed for the life of a `Hashgraph`.
+- Dynamic membership is implemented: `MembershipOp::Add` orders through
+  consensus and activates via `RosterHistory` one round after
+  `roundReceived` (see `protocol/gossip/src/node.rs` activation). The
+  membership registry for a `Hashgraph` is still snapshot-scoped; execution
+  (KV + DID) lives in `executor/state`, not here.
