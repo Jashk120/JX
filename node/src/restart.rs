@@ -111,12 +111,14 @@ pub fn build_reconnect_response(
     let bytes = snapshot_for_round(state_db, checkpoint.payload.round)?;
     let roster_history = RosterHistory::new(checkpoint.payload.roster_snapshot.clone());
     let roster_history_bytes = consensus::encode_roster_history(&roster_history);
+    let last_timestamp = state_db.watermark().unwrap_or(None).unwrap_or(0);
     Ok(gossip::ReconnectResponse {
         signed_checkpoint: checkpoint.clone(),
         state_bytes: bytes,
         roster_history_bytes,
         decided_round: checkpoint.payload.round,
         retained: Vec::new(),
+        last_timestamp,
     })
 }
 
@@ -163,12 +165,21 @@ pub fn replay_response(
         retained.push(record);
     }
 
+    let watermark = state_db.watermark().unwrap_or(None).unwrap_or(0);
+    let retained_max = retained
+        .iter()
+        .filter(|r| r.event.creator().get() == node_id)
+        .map(|r| r.event.timestamp().get())
+        .max()
+        .unwrap_or(0);
+    let last_timestamp = watermark.max(retained_max);
     Ok(gossip::ReconnectResponse {
         signed_checkpoint: checkpoint.clone(),
         state_bytes: bytes,
         roster_history_bytes: consensus::encode_roster_history(&roster_history),
         decided_round: checkpoint.payload.round,
         retained,
+        last_timestamp,
     })
 }
 

@@ -886,9 +886,18 @@ impl GossipNode {
         // exact checkpoint-round state from this `snap` keyspace entry.
         // Flush *before* the checkpoint is recorded as accepted so a crash
         // cannot leave a checkpoint file that references a missing snapshot
-        // on restart.
+        // on restart. The monotonic `last_timestamp` watermark is stored
+        // alongside the snapshot so a restart with a backward wall clock
+        // cannot emit a timestamp lower than a pre-restart event from the
+        // same creator.
+        let watermark = self.last_timestamp.load(Ordering::Relaxed);
+        if let Err(e) = self.state_db.set_watermark(watermark) {
+            tracing::error!(round, error = %e, "failed to persist timestamp watermark");
+            return;
+        }
         if let Err(e) = self.state_db.snapshot_and_flush(round, &snapshot) {
             tracing::error!(round, error = %e, "failed to persist state snapshot");
+            return;
         }
         self.notify_checkpoint_accepted(&accepted).await;
         // Mirror streams (Phase 8): emit the round's record stream file
@@ -1195,6 +1204,7 @@ impl GossipNode {
         *self.executor.lock().await = state::Executor::from_state(state);
         if let Err(e) = self.state_db.snapshot(cp_round, &response.state_bytes) {
             tracing::error!(round = cp_round, error = %e, "reconnect: failed to persist state snapshot");
+            return false;
         }
         self.state_snapshots.lock().await.insert(cp_round, response.state_bytes.clone());
 
@@ -1263,6 +1273,29 @@ impl GossipNode {
             let mut activation = self.activation.lock().await;
             activation.processed_through_round = activation.processed_through_round.max(cp_round);
             activation.checkpoint_watermark = activation.checkpoint_watermark.max(cp_round);
+        }
+
+        // 7b. Restore the monotonic timestamp watermark from durable checkpoint
+        //     state. `response.last_timestamp` is the teacher's (or local
+        //     restart's) watermark persisted with the checkpoint. Also consider
+        //     the max timestamp among retained own events to cover events emitted
+        //     after the checkpoint but before a crash. Do not rely solely on
+        //     retained events because pruning can remove the newest own event.
+        {
+            let retained_max = response
+                .retained
+                .iter()
+                .filter(|r| *r.event.creator() == self.node_id)
+                .map(|r| r.event.timestamp().get())
+                .max()
+                .unwrap_or(0);
+            let target = response.last_timestamp.max(retained_max);
+            self.last_timestamp.fetch_max(target, Ordering::Relaxed);
+            // Persist the restored watermark so a subsequent restart sees it.
+            let current = self.last_timestamp.load(Ordering::Relaxed);
+            if let Err(e) = self.state_db.set_watermark(current) {
+                tracing::error!(error = %e, "reconnect: failed to persist timestamp watermark");
+            }
         }
 
         // 8. Record the accepted checkpoint so it is visible to
@@ -1340,6 +1373,12 @@ impl GossipNode {
             let retained = hg.retained_events();
             (roster_history_bytes, decided_round, retained)
         };
+        let last_timestamp = self
+            .state_db
+            .watermark()
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| self.last_timestamp.load(Ordering::Relaxed));
 
         let response = ReconnectResponse {
             signed_checkpoint: checkpoint,
@@ -1347,6 +1386,7 @@ impl GossipNode {
             roster_history_bytes,
             decided_round,
             retained,
+            last_timestamp,
         };
         let _ = transport.send_frame(&Frame::ReconnectResponse(response)).await;
     }

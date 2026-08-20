@@ -34,12 +34,15 @@ pub const STATE_DB_SUBDIR: &str = "statedb";
 
 const STATE: &str = "state";
 const SNAP: &str = "snap";
+const META: &str = "meta";
+const WATERMARK_KEY: &[u8] = b"last_timestamp";
 
 /// The durable KV state of a consensus node.
 pub struct StateDb {
     db: Database,
     state: Keyspace,
     snap: Keyspace,
+    meta: Keyspace,
 }
 
 impl StateDb {
@@ -49,7 +52,8 @@ impl StateDb {
         let db = Database::builder(&dir).open()?;
         let state = db.keyspace(STATE, KeyspaceCreateOptions::default)?;
         let snap = db.keyspace(SNAP, KeyspaceCreateOptions::default)?;
-        Ok(Self { db, state, snap })
+        let meta = db.keyspace(META, KeyspaceCreateOptions::default)?;
+        Ok(Self { db, state, snap, meta })
     }
 
     /// A shared handle to the live state keyspace, for [`crate::State`].
@@ -122,6 +126,31 @@ impl StateDb {
     pub fn flush(&self) -> StateDbResult<()> {
         self.db.persist(PersistMode::SyncAll)?;
         Ok(())
+    }
+
+    /// Persists the monotonic `last_timestamp` watermark (millis since epoch)
+    /// for this node's own events. Stored in the `meta` keyspace so it is
+    /// durable across restarts alongside the checkpoint snapshots. Overwrites
+    /// any earlier value.
+    pub fn set_watermark(&self, watermark: u64) -> StateDbResult<()> {
+        self.meta.insert(WATERMARK_KEY, watermark.to_be_bytes())?;
+        Ok(())
+    }
+
+    /// Persists the watermark and flushes the database so it is durable before
+    /// the checkpoint file is considered persisted.
+    pub fn set_watermark_and_flush(&self, watermark: u64) -> StateDbResult<()> {
+        self.meta.insert(WATERMARK_KEY, watermark.to_be_bytes())?;
+        self.db.persist(PersistMode::SyncAll)?;
+        Ok(())
+    }
+
+    /// The persisted `last_timestamp` watermark, if any.
+    pub fn watermark(&self) -> StateDbResult<Option<u64>> {
+        Ok(self
+            .meta
+            .get(WATERMARK_KEY)?
+            .map(|v| u64::from_be_bytes(v.as_slice().try_into().unwrap_or([0u8; 8]))))
     }
 }
 

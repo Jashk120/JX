@@ -8,9 +8,16 @@
 use std::fs::{
     self,
     File,
+    OpenOptions,
 };
 use std::io::Write;
 use std::path::Path;
+use std::sync::atomic::{
+    AtomicU64,
+    Ordering,
+};
+
+static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Writes `bytes` to `path` atomically: a uniquely-named temp file in the
 /// same directory is written, flushed to disk, renamed over the target, and
@@ -24,17 +31,47 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
             format!("path {} has no parent directory", path.display()),
         )
     })?;
-    let tmp = dir.join(format!(
-        ".tmp-{}-{}",
-        std::process::id(),
-        path.file_name().and_then(|n| n.to_str()).unwrap_or("out")
-    ));
-    let mut file = File::create(&tmp)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    drop(file);
-    fs::rename(&tmp, path)?;
-    sync_dir(dir)
+    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("out");
+    let pid = std::process::id();
+
+    // Try exclusive creation with collision retry so concurrent writers in the
+    // same process do not share the same temporary file. Sharing via
+    // `File::create` can interleave bytes and cause the second `rename` to
+    // fail with `ENOENT` after the first writer has already renamed the file.
+    let (tmp_path, mut file) = loop {
+        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+        // Include thread id and a timestamp-derived suffix for additional
+        // entropy across processes; the atomic counter guarantees uniqueness
+        // within this process even if the timestamp collides.
+        let tmp = dir.join(format!(
+            ".tmp-{}-{}-{:016x}-{:?}",
+            pid,
+            file_name,
+            unique,
+            std::thread::current().id()
+        ));
+        match OpenOptions::new().write(true).create_new(true).open(&tmp) {
+            Ok(f) => break (tmp, f),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    };
+
+    let write_result = (|| -> std::io::Result<()> {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&tmp_path, path)?;
+        sync_dir(dir)
+    })();
+
+    if write_result.is_err() {
+        // Best-effort cleanup of the temp file on failure; ignore errors
+        // (e.g. already renamed or never created).
+        let _ = fs::remove_file(&tmp_path);
+    }
+
+    write_result
 }
 
 /// Fsyncs `dir` so a preceding `rename` inside it is durable. Propagates any
