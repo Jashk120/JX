@@ -12,9 +12,10 @@
 // Both file types are chained by a running hash (§5 of PHASE8_MIRROR_STREAMS.md)
 // and accompanied by an Ed25519 signature file (`.esf_sig` / `.rsf_sig`).
 //
-// This schema is vendored here for now; it migrates to a shared schema repo
-// owned together with the Go mirror, at which point `build.rs` switches to
-// include that repo instead of this file.
+// This schema lives at the monorepo root `proto/` so it can be shared
+// between `consensus-node` (Rust, `protocol/stream`) and future crates
+// (e.g. mirror node, SDKs). `consensus-node/protocol/stream/build.rs`
+// compiles it from `../../../proto`.
 //
 // A message in this file is the on-disk content of exactly one stream file:
 // the `.esf` bytes are a serialized `EventStreamFile`, the `.rsf` bytes are a

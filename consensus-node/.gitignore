@@ -1,10 +1,9 @@
 # ==========================================
-# Root monorepo — global ignores
+# Rust
 # ==========================================
 
-# Rust build outputs (each project has its own target/)
-**/target/
-consensus-node/target/
+# Cargo build output
+target/
 
 # ==========================================
 # Editors
@@ -12,6 +11,8 @@ consensus-node/target/
 
 .vscode/
 .idea/
+
+# Vim
 *.swp
 *.swo
 
@@ -43,13 +44,9 @@ Thumbs.db
 *~
 
 # ==========================================
-# Node daemon (consensus-node)
+# Node daemon
 # ==========================================
 
-# Per-node secrets and runtime data directories (may appear inside consensus-node/)
+# Per-node secrets and runtime data directories
 secret-*.bin
-**/secret-*.bin
 data/
-**/data/
-consensus-node/data/
-consensus-node/cluster-init/secret-*.bin

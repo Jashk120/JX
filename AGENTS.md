@@ -34,10 +34,11 @@ This document defines the development rules for contributors and AI coding agent
 
 # Formatting
 
-Always format Rust code using the nightly formatter.
+Always format Rust code using the nightly formatter (run inside the relevant project dir).
 
 ```bash
-cargo +nightly fmt --all
+cd consensus-node && cargo +nightly fmt --all
+# or: cargo +nightly fmt --manifest-path consensus-node/Cargo.toml --all
 ```
 
 Never use stable `cargo fmt` unless explicitly instructed.
@@ -49,7 +50,7 @@ Never use stable `cargo fmt` unless explicitly instructed.
 Run Clippy before considering work complete.
 
 ```bash
-cargo clippy --workspace --all-targets --locked -- -D warnings
+cd consensus-node && cargo clippy --workspace --all-targets --locked -- -D warnings
 ```
 
 Fix warnings whenever practical.
@@ -63,13 +64,13 @@ Run the smallest relevant test first.
 Examples:
 
 ```bash
-cargo test <test_name>
+cd consensus-node && cargo test <test_name>
 ```
 
 Before finishing larger changes:
 
 ```bash
-cargo test --workspace
+cd consensus-node && cargo test --workspace
 ```
 
 Do not claim code works unless the relevant tests have passed.
@@ -130,13 +131,13 @@ When changing public APIs:
 - Keep comments synchronized with implementation.
 
 Every crate and every umbrella directory (a directory containing crates or
-subdirectories, e.g. `protocol/`, `executor/`) must contain a `README.md`
+subdirectories, e.g. `consensus-node/protocol/`, `consensus-node/executor/`) must contain a `README.md`
 describing its role in the workspace:
 
 - Crate `README.md` files live at the crate root (e.g.
-  `protocol/gossip/README.md`).
+  `consensus-node/protocol/gossip/README.md`).
 - Umbrella `README.md` files live at the directory root (e.g.
-  `protocol/README.md`) and summarize the crates beneath them.
+  `consensus-node/protocol/README.md`) and summarize the crates beneath them.
 - `tests/` and other internal-only directories do not need a `README.md`.
 
 Keep these READMEs synchronized with the code they describe; update them
@@ -204,12 +205,12 @@ in library code unless failure is truly impossible or explicitly justified.
 
 # Before Finishing
 
-Always run:
+Always run (inside the relevant project dir):
 
 ```bash
-cargo +nightly fmt --all
-cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo test --workspace
+cd consensus-node && cargo +nightly fmt --all
+cd consensus-node && cargo clippy --workspace --all-targets --locked -- -D warnings
+cd consensus-node && cargo test --workspace
 ```
 
 If one of these cannot be run, explicitly state why.
