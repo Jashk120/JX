@@ -185,9 +185,13 @@
 > also verifies finalized order follows consensus order and that malformed
 > payloads fail identically on every instance. Membership is now dynamic:
 > add-member transactions (`MembershipOp::Add`) order through consensus and
-> activate through the roster history (Phase 8), with the executor applying
-> KV ops only. Verified with `cargo fmt`,
-> `cargo clippy`, and `cargo test --workspace`.
+> activate through the roster history (Phase 8). DID is implemented on top
+> of the same executor (`executor/state/src/did.rs:DidOp` `0x03`,
+> `executor/state/src/executor.rs:apply_did_op`, `docs/DID_method.md`) —
+> create/update/rotate/deactivate with signature checks against the prior
+> document's verification methods (1..=5 keys) and tombstone deactivation;
+> KV ops + DID ops share the `State::Put` path with Merkle-committed proofs.
+> Verified with `cargo fmt`, `cargo clippy`, and `cargo test --workspace`.
 
 ---
 
@@ -283,12 +287,79 @@ separate Go project) is downstream of this phase.
 
 ---
 
-## Phase 9 — Executor
+## Phase 9 — Scaling (Locked)
+
+> Design locked in `docs/OPTIMIZATION.md` (2026-08-20). Two tracks converge
+> at the finalized-event boundary and do not block each other. Services
+> (HCS/HTS/DID) below are deferred until the scaling tracks prove
+> deterministic equivalence at 100 nodes.
+
+### Gossip track — 1,000-node gossip
+
+Target: 100 nodes first, interfaces sized for 1,000.
+
+```
+G0  Instrument current gossip (success rate, RTT, delta size, spread, lag)
+G1  QUIC transport (SyncTransport impl, TcpTransport stays as fallback)
+G2  Concurrent bounded fanout (k_min..k_max, JoinSet, per-peer Mutex)
+G3  Dynamic peer scoring (frontier usefulness, success EWMA, latency,
+    freshness, diversity, recent-selection penalty, failure/backoff)
+G4  Adaptive fanout/interval (frontier gap, propagation lag, congestion,
+    hard bounds — no gossip storm)
+G5  Compression + batching (zstd on SyncResponse, chunked streams;
+    IBLT/bloom summary only if O(N) >20% at target N)
+G6  100 / 500 / 1,000-node benchmarks (localhost + VPS mesh)
+```
+
+- [ ] G0 — gossip instrumentation
+- [ ] G1 — `QuicTransport: SyncTransport` (`protocol/gossip/src/transport.rs`, `quinn` + SPKI pin)
+- [ ] G2 — bounded concurrent fanout (`protocol/gossip/src/node.rs` driver)
+- [ ] G3 — scored peer selection (`protocol/gossip/src/peer_manager.rs` + `peer/scoring.rs`)
+- [ ] G4 — adaptive fanout/interval controller
+- [ ] G5 — compression + chunked SyncResponse
+- [ ] G6 — 100/500/1,000-node bench harness
+
+Design choices locked: QUIC is transport only (not peer selection), bounded
+active QUIC pool 10–30 (tunable, not protocol constant), persistent QUIC for
+hot peers / resumption for cold, topology-aware diversity, gossip scheduling
+detached from consensus.
+
+### Execution track — deterministic parallel execution
+
+Migration: optional `access_list` + serial fallback (not mandatory).
+Maturity: `100% serial → 80/20 → 95%+ parallel / <5% genuinely serial`.
+`Unknown` is measured, not a permanent escape hatch.
+
+```
+E0  Benchmark + serial oracle/invariants (State::to_bytes equality)
+E1  Access-list wire format + typed domains (proto AccessKey enum)
+E2  Deterministic dependency scheduler (Levels, Kahn, deterministic tie-break)
+E3  Scheduler correctness / property / fuzz (State A == State B)
+E4  Parallel execution over versioned snapshot (overlay, spawn_blocking)
+E5  Deterministic commit + batched Merkle/Fjall
+E6  State partitioning / MVCC optimization
+E7  Consensus/execution pipeline decoupling (bounded mpsc)
+E8  Crypto/serialization optimization (batch verify, zero-copy)
+```
+
+- [ ] E0 — bench harness + serial oracle
+- [ ] E1 — `Transaction.access_list` (protobuf `AccessList` / `AccessKey`), typed domains `Account / HtsToken / HcsTopic / ContractStorage / StateKey / Unknown`
+- [ ] E2 — `executor/scheduler` (Levels, conflict `writes ∩ (reads ∪ writes)`)
+- [ ] E3 — property/fuzz: flatten(Levels) == consensus_order, parallel == serial
+- [ ] E4 — versioned snapshot + parallel workers
+- [ ] E5 — deterministic commit in consensus_order + batched Merkle/Fjall
+- [ ] E6 — per-domain shards / MVCC / hot-set write-behind
+- [ ] E7 — `GossipNode` channel-owned executor, not `Mutex<Executor>`
+- [ ] E8 — batch Ed25519, zero-copy decode, arena per batch
+
+Convergence: both tracks meet at `state::finalized_events(&hg)` →
+`GossipNode::process_finalized_rounds` boundary; build and bench independently.
+
+### Services (HCS/HTS deferred until G6/E3 equivalence proven; DID — implemented)
+
 - [ ] HCS
 - [ ] HTS
-- [ ] DID
-
-### Services
+- [x] DID — `did:jkain` (`executor/state/src/did.rs:DidId`/`DidDocument`/`DidOp`, `executor/state/src/op.rs:0x03`, `executor/state/src/executor.rs:apply_did_op`, spec `docs/DID_method.md`)
 
 **Account / Crypto Service**
 - [ ] Accounts
@@ -321,12 +392,12 @@ separate Go project) is downstream of this phase.
 - [ ] Data availability primitives
 
 **Identity Service**
-- [ ] DID creation
-- [ ] DID Documents
-- [ ] Verification methods
-- [ ] Authentication relationships
-- [ ] Key rotation
-- [ ] DID lifecycle
+- [x] DID creation — `DidOp::is_creation` + `Executor::apply_did_op` creation path (`executor/state/src/executor.rs:162`), self-signed check against `document.verification_methods[signed_by]`
+- [x] DID Documents — `DidDocument` 1..=5 `VerifyingKey`s + `deactivated` tombstone (`executor/state/src/did.rs:124`), binary `encode`/`decode` with deterministic rejects
+- [x] Verification methods — capped 5, enforced at `DidDocument::new` and `DidDocument::decode` (`executor/state/src/did.rs:134`, `executor/state/src/did.rs:161`), `UnknownSigner`/`InvalidSignature` errors (`executor/state/src/executor.rs:169`)
+- [x] Authentication relationships — `signed_by: u8` index into prior/current document's `verification_methods` (`executor/state/src/did.rs:185`, `executor/state/src/executor.rs:164`)
+- [x] Key rotation — update `DidDocument` via `Put` authorized by prior doc's key (`executor/state/src/executor.rs:174`, tests `did_update_succeeds_with_current_verification_method`)
+- [x] DID lifecycle — create → update/rotate → deactivation tombstone (not `Delete`, keeps Merkle proof — `docs/DID_method.md:102`, `executor/state/src/executor.rs:195`), `AlreadyDeactivated`/`IdentifierAlreadyExists`/`UnknownIdentifier` guards
 
 **Credential Service**
 - [ ] Verifiable Credential issuance
@@ -358,12 +429,6 @@ separate Go project) is downstream of this phase.
 - [ ] Expiration
 - [ ] Revocation
 
-### Parallel execution
-
-- [ ] Batch transaction execution across finalized rounds
-- [ ] Deterministic parallelism: result independent of thread scheduling
-- [ ] Parallel signature verification
-
 ---
 
 ## Phase 10 — Future
@@ -371,7 +436,4 @@ separate Go project) is downstream of this phase.
 - [ ] Privacy
 - [ ] Compute layer
 
-Parallel state database / lock-free scheduler
-Aggressive gossip optimization (QUIC, batching, compression)
-Sliding-window DAG in RAM with snapshots
-Efficient LSM + Merkle state storage
+Sliding-window DAG in RAM with snapshots (remaining after G-track lands)

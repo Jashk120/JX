@@ -152,16 +152,32 @@ async fn truncated_checkpoint_surfaced_as_error() {
     let data1 = tmp.path().join("node1");
 
     // Truncate the checkpoint file to simulate a write interrupted after the
-    // rename but before the data was fully flushed.
+    // rename but before the data was fully flushed.  We must corrupt the
+    // checkpoint that `Storage::latest()` will actually read (the highest
+    // round), not an arbitrary file by size.  Sorting by size and picking the
+    // smallest can corrupt an irrelevant round when more than one checkpoint
+    // accumulated before node1 stopped, leaving `latest()` to return the
+    // untouched newest file and making the test flake.
     let cp_dir = data1.join("checkpoints");
-    let mut cp_entries: Vec<_> = std::fs::read_dir(&cp_dir)
+    let cp_entries: Vec<_> = std::fs::read_dir(&cp_dir)
         .expect("checkpoint dir exists")
         .filter_map(|e| e.ok())
         .filter(|e| e.path().extension().is_some_and(|ext| ext == "cp"))
         .collect();
     assert!(!cp_entries.is_empty(), "at least one checkpoint file must exist");
-    cp_entries.sort_by_key(|e| e.metadata().map(|m| m.len()).unwrap_or(0));
-    let cp_file = cp_entries.first().expect("checkpoint file").path();
+    // Select by round number, matching `Storage::latest()` / `Storage::rounds()`
+    // semantics (`checkpoint-<round>.cp`).
+    let cp_file = cp_entries
+        .iter()
+        .filter_map(|e| {
+            let file_name = e.file_name();
+            let name = file_name.to_str()?.strip_prefix("checkpoint-")?.strip_suffix(".cp")?;
+            let round: u64 = name.parse().ok()?;
+            Some((round, e.path()))
+        })
+        .max_by_key(|(round, _)| *round)
+        .expect("at least one numbered checkpoint file")
+        .1;
     std::fs::write(&cp_file, b"truncated").expect("truncate checkpoint");
     assert!(
         std::fs::metadata(&cp_file).expect("stat").len() < 100,

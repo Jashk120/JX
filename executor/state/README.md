@@ -31,19 +31,26 @@ for the state's LSM backing.
   on the affected path, so per-round checkpoint roots are cheap. `MerkleProof`
   is a per-key inclusion proof (`verify`, `encode`/`decode`) that a mirror can
   check without shipping the whole state.
-- `Op` — the pure-KV transaction payload: one opcode byte plus
-  length-prefixed fields. `0x00` `Put { key, value }`, `0x01`
-  `Delete { key }`. `DecodedOp` is the top-level decode result: KV ops go to
-  `State`, while `0x02` `MembershipOp` bodies are decoded by
-  `crypto::MembershipOp` and returned as a side channel. Any other opcode, a
+- `Op` — the transaction payload: one opcode byte plus length-prefixed
+  fields. `0x00` `Put { key, value }`, `0x01` `Delete { key }`, `0x03`
+  `DidOp { id, document, signature, signed_by }` (`executor/state/src/did.rs`).
+  `DecodedOp` is the top-level decode result: `Put`/`Delete` go to `State`,
+  `DidOp` goes through `Executor::apply_did_op` (creation self-signed against
+  the new document's own verification method, updates authorized by the prior
+  document's indexed key, deactivation as a tombstone `Put` not `Delete`), while
+  `0x02` `MembershipOp` bodies are decoded by `crypto::MembershipOp` and
+  returned as a side channel. `DidDocument` holds 1..=5 `VerifyingKey`s plus a
+  `deactivated` flag with binary `encode`/`decode`. Any other opcode, a
   truncated payload, or trailing bytes decodes to a deterministic
   `ExecutorError`.
 - `Executor` — applies transactions to a `State` in the order presented.
-  `execute_event` applies every valid KV transaction and returns
-  `(Vec<ExecutorError>, Vec<MembershipOp>)`; membership ops never touch
-  `State`. `bucket_finalized` feeds a finalized `(event, roundReceived)`
-  batch through the executor once, bucketing membership ops by roundReceived
-  behind a processed-round watermark.
+  `execute_event` applies every valid transaction and returns
+  `(Vec<ExecutorError>, Vec<MembershipOp>)`; DID ops route through
+  `apply_did_op` and ultimately write via the same `State::Put` path (with
+  Merkle rehash) so proofs cover DID keys, membership ops never touch `State`.
+  `bucket_finalized` feeds a finalized `(event, roundReceived)` batch through
+  the executor once, bucketing membership ops by roundReceived behind a
+  processed-round watermark.
 - `finalized_events` — bridges to the consensus layer: walks a `Hashgraph`'s
   rounds in increasing order and returns each round's events in the exact
   order `Hashgraph::consensus_order` produces, so the executor never invents
