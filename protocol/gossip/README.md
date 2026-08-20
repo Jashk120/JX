@@ -31,8 +31,12 @@ implemented.
   `TcpTransport` over `tokio` + rustls. One persistent connection per peer,
   reused across sync rounds.
 - `proto` — the wire types: `SyncRequest` (a per-creator known summary),
-  `SyncResponse` (a topologically-ordered event delta), and the
-  length-prefixed, tag-delimited frame format.
+  `SyncResponse` (a topologically-ordered event delta), `ReconnectRequest` /
+  `ReconnectResponse` (Phase 4 checkpoint bootstrap), `Behind` (pruned-history
+  signal), and the length-prefixed, tag-delimited frame format (`[tag: u8][len:
+  u32 BE][payload]`). `ReconnectResponse` carries the signed checkpoint, state
+  bytes, roster history, decided round, retained graph, and `last_timestamp`
+  watermark with capacity guards on every counted field.
 - `frontier` — the sync summary and delta computation: `known_summary`
   builds the per-creator frontier from `Hashgraph::latest_event_by`, and
   `delta_events` walks each creator's self-parent chain above the frontier,
@@ -40,15 +44,22 @@ implemented.
   edges) so a receiver can insert every event parents-first.
 - `sync` — `run_sync`: send the request, verify + insert the response
   events (skipping ones already present), create the initiator's own event
-  (`self_parent` own last, `other_parent` the peer's last), insert it, and
-  push it back on the same stream.
+  (`self_parent` own last, `other_parent` the peer's last, monotonic
+  `next_timestamp` clamped against `last_timestamp`), insert it, and push it
+  back on the same stream. `next_timestamp` lives in `sync` so both the
+  driver and tests share the same clock-clamp logic.
 - `node` — `GossipNode`: owns a `Hashgraph`, the TLS identity, the peer
-  table, and the async machinery (inbound accept loop + a sync driver on a
-  fixed interval). A per-round timeout bounds how long a silent peer can
-  stall the driver; a `stop` flag lets the driver drain in-flight syncs and
-  exit cleanly. Finalized events carrying a `MembershipOp::Add` payload are
-  decoded and activated (hashgraph growth, roster schedule, peer pin) once
-  the round after their `roundReceived` is fully decided.
+  table, the Fjall `StateDb` (live state + per-round snapshots + watermark),
+  and the async machinery (inbound accept loop + a sync driver on a fixed
+  interval + dedicated reconnect port). A per-round timeout bounds how long a
+  silent peer can stall the driver; a `stop` flag lets the driver drain
+  in-flight syncs and exit cleanly. Three durable sinks are pluggable:
+  `CheckpointSink`, `EventSink` (event log), `EventStreamSink` + `RecordSink`
+  (mirror streams). Finalized events carrying a `MembershipOp::Add` payload
+  are decoded and activated (hashgraph growth, roster schedule, peer pin) once
+  the round after their `roundReceived` is fully decided; checkpoints are
+  produced per decided round from the deterministic per-round Merkle root and
+  gossiped as `Frame::CheckpointSig` on every successful sync until quorum.
 
 ## Design
 
@@ -57,16 +68,29 @@ implemented.
   events, preserving exponential gossip spread.
 - Already-present events are benign no-ops during insertion, so concurrent
   or redundant syncs never fail.
-- Sync interval is the one explicit tuning knob the spec leaves open;
-  weighting peer selection is deliberately deferred to Phase 6.
+- Sync interval + timeout (`SyncTiming`) are the explicit tuning knobs the
+  spec leaves open; weighting peer selection is deferred to Phase 9 (G-track).
+- Timestamps are monotonic per creator: `next_timestamp` clamps `SystemTime`
+  against the last emitted value, persisted per checkpoint, so clock
+  regression cannot produce equal/decreasing timestamps.
+- Checkpoint signatures are gossiped on the same stream as events
+  (`Frame::CheckpointSig`), re-sent until quorum (`valid * 3 > total * 2`).
+  A node that has not yet produced its own payload buffers inbound sigs.
+- Recovery is log-first: the durable `EventLog` is the primary restart path;
+  `Frame::Behind` / `MissingParent` triggers a `fetch_checkpoint` reconnect
+  only as fallback. The reconnect port is separate from the gossip port.
 
 ## Tests
 
-- Unit: frame encode/decode roundtrips, frontier delta correctness
+- Unit: frame encode/decode roundtrips (including capacity-guard rejections
+  for oversized counts and invalid tags), frontier delta correctness
   (including cross-creator `other_parent` topo-sorting), peer selection,
-  and TLS identity stability.
+  TLS identity stability, and `ReconnectResponse` round-trips.
 - Integration (`tests/`): real 2- and 4-node clusters on localhost exchange
   gossip and converge — every node ends holding events from every creator,
   with only a bounded in-flight window separating them. A partition/rejoin
   test seeds divergent histories and verifies reconciliation, including
-  that each node's isolated events reach the other.
+  that each node's isolated events reach the other. `tests/streams.rs`
+  verifies the live mirror-stream wiring; `tests/activation.rs` covers
+  dynamic membership via `MembershipOp::Add`; `tests/checkpoint.rs` covers
+  quorum and retrieval.

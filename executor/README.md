@@ -1,8 +1,9 @@
 # executor
 
 The deterministic execution layer of JKain (Phase 8 of `ROADMAP.md`, extended
-with `did:jkain` in `docs/DID_method.md`): turning the total order produced by
-consensus into an application state.
+with `did:jkain` in `docs/DID_method.md` and hardened with monotonic
+timestamps and durable watermark persistence): turning the total order
+produced by consensus into an application state.
 
 This umbrella directory holds one crate:
 

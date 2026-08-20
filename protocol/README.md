@@ -3,8 +3,9 @@
 The consensus-critical network layer of JKain: value types, cryptography,
 the virtual-voting hashgraph, and the gossip network that spreads it.
 
-This umbrella directory holds five crates with a strict dependency chain —
-nothing depends on a crate above it:
+This umbrella directory holds six crates with a strict dependency chain —
+nothing depends on a crate above it (except `test-support`, which is
+test-only and depends on nothing production):
 
 ```text
 primitives   zero-dependency value types (events, hashes, transactions)
@@ -18,6 +19,8 @@ storage      Fjall-backed durable event log + roster history (Phase 8)
 stream       mirror stream files: `.esf` events + `.rsf` records (Phase 8)
     ↑
 gossip       pinned-TLS gossip network + GossipNode runtime
+    ─────────────────────────────────────────────────────────────────
+test-support shared test timing constants (SYNC_INTERVAL, DEADLINE, …)
 ```
 
 ## Crates
@@ -42,6 +45,8 @@ gossip       pinned-TLS gossip network + GossipNode runtime
 - `gossip/` — the gossip-about-gossip network: TLS identities, sync
   transport, delta exchange, the reconnect protocol, and the long-running
   `GossipNode`.
+- `test-support/` — shared test helpers: sync timing constants and
+  `now_millis`, so `gossip` and `node` integration tests stay in sync.
 
 ## How it fits
 

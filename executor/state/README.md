@@ -19,10 +19,12 @@ for the state's LSM backing.
   keys is maintained incrementally in memory; its root is `State::root()`,
   the commitment a checkpoint signs as its `state_hash`.
 - `StateDb` (in `state_db.rs`) — the on-disk state database under
-  `<data>/statedb/`: the live `state` partition plus a `snap` keyspace
-  holding the exact state bytes of every accepted checkpoint round. The
-  `snap` entries replace the old per-round `.snap` files: restart recovery
-  restores and verifies the checkpoint-round state from here.
+  `<data>/statedb/`: the live `state` partition, a `snap` keyspace holding
+  the exact state bytes of every accepted checkpoint round, and a
+  monotonic `watermark` key (the last emitted timestamp). The `snap` entries
+  replace the old per-round `.snap` files: restart recovery restores and
+  verifies the checkpoint-round state from here, and the watermark restores
+  `GossipNode::last_timestamp` so clock regression cannot rewind timestamps.
 - `SparseMerkleTree` / `MerkleProof` (in `merkle.rs`) — the Merkle tree over
   the KV state. Node hashing is Hiero-style domain-separated SHA-256:
   `empty = SHA256(0x00)`, `leaf = SHA256(0x00 || len(key) || key || len(value)
@@ -45,12 +47,14 @@ for the state's LSM backing.
   `ExecutorError`.
 - `Executor` — applies transactions to a `State` in the order presented.
   `execute_event` applies every valid transaction and returns
-  `(Vec<ExecutorError>, Vec<MembershipOp>)`; DID ops route through
-  `apply_did_op` and ultimately write via the same `State::Put` path (with
-  Merkle rehash) so proofs cover DID keys, membership ops never touch `State`.
-  `bucket_finalized` feeds a finalized `(event, roundReceived)` batch through
-  the executor once, bucketing membership ops by roundReceived behind a
-  processed-round watermark.
+  `(Vec<ExecutorError>, Vec<MembershipOp>, Vec<DidError>)`; DID ops route
+  through `apply_did_op` (with `is_creation` flag for duplicate/unknown-id
+  checks, 1..=5 key limit, `AlreadyDeactivated` guard, and `UnknownSigner` /
+  `InvalidSignature` checks) and ultimately write via the same `State::Put`
+  path (with Merkle rehash) so proofs cover DID keys. Membership ops never
+  touch `State`. `bucket_finalized` feeds a finalized `(event,
+  roundReceived)` batch through the executor once, bucketing membership ops
+  by roundReceived behind a processed-round watermark (idempotent).
 - `finalized_events` — bridges to the consensus layer: walks a `Hashgraph`'s
   rounds in increasing order and returns each round's events in the exact
   order `Hashgraph::consensus_order` produces, so the executor never invents

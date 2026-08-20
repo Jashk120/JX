@@ -27,9 +27,13 @@ order finalization. Depends on `primitives` for the value types and
 - `reconnect` — wire codecs for `SignedCheckpoint`, `RosterHistory`, and the
   `RetainedEvent` record (event + record metadata) shared by the reconnect
   protocol and the Phase 8 durable event log.
-- `latest_event_by` / `all_event_hashes` — per-creator frontier accessors
-  (maintained incrementally by `insert`) that the gossip layer uses to
-  build sync summaries and enumerate stored events.
+- `checkpoint` — `SignedCheckpoint` / `CheckpointPayload` / `CheckpointSig` /
+  `CheckpointAccumulator` and `RETENTION_ROUNDS` (prune floor). Payload
+  signing bytes are domain-separated; quorum is `valid * 3 > total * 2`.
+- `latest_event_by` / `all_event_hashes` / `retained_events` /
+  `prune_before_round` / `from_checkpoint` — per-creator frontier accessors
+  and lifecycle helpers that the gossip layer and event log use to build sync
+  summaries, serve reconnect, and mirror pruning.
 
 ## Design
 

@@ -30,6 +30,9 @@ set since the prune floor.
 - `EventSink` — the lossy sink interface the gossip layer and daemon drive
   (errors are logged and dropped, so the consensus-hot path never fails on
   storage hiccups). `EventLog` implements it.
+- `atomic` — shared atomic-write helper (`temp + sync_all + rename + dir
+  fsync`) used by both `storage` checkpoint files and `stream` signature
+  files so the crash-durability dance cannot drift.
 
 ## Design
 

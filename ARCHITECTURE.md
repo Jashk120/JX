@@ -12,30 +12,43 @@ every step.
 │  gossip  (protocol/gossip)         NETWORK LAYER                 │
 │  GossipNode · PeerInfo · PeerManager · TlsIdentity ·            │
 │  TcpTransport · Frame · SyncRequest/SyncResponse ·              │
-│  ReconnectRequest/Response                                       │
+│  ReconnectRequest/Response · SyncTiming                          │
 └──────────────────────────┬──────────────────────────────────────┘
-                           │ depends on
+                            │ depends on
 ┌──────────────────────────▼──────────────────────────────────────┐
 │  consensus (protocol/consensus)   CONSENSUS / ORDERING          │
 │  Hashgraph · EventRecord · SignedCheckpoint · CheckpointPayload │
 │  CheckpointSig · CheckpointAccumulator · RetainedEvent          │
+│  RosterHistory · Ancestry (see/stronglySee)                     │
 └──────────────────────────┬──────────────────────────────────────┘
-                           │ depends on
+                            │ depends on
+┌──────────────────────────▼──────────────────────────────────────┐
+│  storage (protocol/storage)       DURABLE EVENT LOG             │
+│  EventLog · EventSink · atomic::atomic_write                    │
+│  stream  (protocol/stream)        MIRROR STREAM FILES           │
+│  EventStreamWriter · RecordStreamWriter · running_hash          │
+│  state   (executor/state)        DETERMINISTIC EXECUTOR        │
+│  State · StateDb · SparseMerkleTree · Executor · DidOp          │
+└──────────────────────────┬──────────────────────────────────────┘
+                            │ depends on
 ┌──────────────────────────▼──────────────────────────────────────┐
 │  crypto (protocol/crypto)          SIGNING / MEMBERSHIP         │
 │  MembershipRegistry · RosterHistory · MembershipOp · Signable  │
 │  Verifiable · Hashable · CanonicalEncode                        │
 └──────────────────────────┬──────────────────────────────────────┘
-                           │ depends on
+                            │ depends on
 ┌──────────────────────────▼──────────────────────────────────────┐
 │  primitives (protocol/primitives)    CORE VALUE TYPES           │
 │  Event · UnsignedEvent · EventHash · NodeId · Timestamp ·       │
 │  Signature · Transaction                                         │
 └─────────────────────────────────────────────────────────────────┘
+  test-support (protocol/test-support) — shared test timing, no prod deps
 ```
 
 Rule of thumb: `primitives` is the vocabulary, `crypto` signs and verifies
-it, `consensus` stores and orders it, `gossip` moves it across the network.
+it, `consensus` stores and orders it, `storage`/`stream`/`state` persist it,
+`gossip` moves it across the network. `node` (the `jkaind` daemon) wires
+all of the above to the filesystem and process lifecycle.
 
 ## 2. The core data structures
 
@@ -251,13 +264,31 @@ for the post-scaling target.
 
 ## 6. Recovery paths
 
-- **`Frame::Behind` or `MissingParent`** → the node is behind its peers'
-  pruned history; `needs_reconnect` is set, and next interval it calls
+- **Durable event log (primary, Phase 8)** — every verified event is
+  appended to `<data>/eventlog/` (Fjall, `protocol/storage`) on insertion and
+  `roundReceived` is recorded as ordering completes. A restarting node replays
+  the log via `node::restart::latest_for_restart_with_log`, verifying each
+  event against the roster active at its birth round (from the persisted
+  `RosterHistory`), and restores the timestamp watermark as
+  `max(persisted watermark, newest retained own-event)`. No peer required;
+  `request_reconnect()` is only the fallback when the log is empty
+  (pre-Phase-8 data dir).
+- **`Frame::Behind` or `MissingParent` (fallback)** → the node is behind its
+  peers' pruned history; `needs_reconnect` is set, and next interval it calls
   `fetch_checkpoint` against a peer's dedicated reconnect port
   (`protocol/gossip/src/reconnect.rs`). The teacher serves the highest
-  accepted `SignedCheckpoint` plus the raw state bytes, roster history, and
-  retained graph; `verify_signed_checkpoint` enforces the `>2/3` quorum proof
-  (`valid * 3 > total * 2`) before anything is applied.
+  accepted `SignedCheckpoint` plus the raw state bytes, roster history,
+  retained graph, and `last_timestamp` watermark; `verify_signed_checkpoint`
+  enforces the `>2/3` quorum proof (`valid * 3 > total * 2`) before anything
+  is applied.
 - **`GossipNode::from_checkpoint`** bootstraps a node directly from a served
   checkpoint instead of replaying history from genesis; `apply_checkpoint`
-  validates the state hash, roster, and this node's own key before loading.
+  validates the state hash (Merkle root via `State::root()`), roster, and
+  this node's own key before loading. The state snapshot lives in the
+  `StateDb` `snap` keyspace, verified non-destructively over a temp DB.
+- **Monotonic timestamps** — `GossipNode::next_timestamp` clamps
+  `SystemTime` against the per-node `last_timestamp` (AtomicU64) so wall-clock
+  regression or coarse resolution (Windows 15.6 ms) cannot emit equal or
+  decreasing timestamps. The watermark is persisted per checkpoint and
+  fsync'd via `atomic::atomic_write` (temp + `sync_all` + rename + dir
+  fsync).
