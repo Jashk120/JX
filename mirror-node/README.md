@@ -5,15 +5,16 @@ Go mirror node for JKaIN. It tails the consensus node's **mirror stream files**
 read-only HTTP API over the verified history.
 
 Protobuf schema: [`../proto/jkain_stream.proto`](../proto/jkain_stream.proto)
-shared with `consensus-node/protocol/stream` (Rust). The Go code is generated
-into `internal/stream/pb` via `make proto`.
+— the single shared schema, compiled directly from the repo root (no vendored
+copy). The Go code is generated into `internal/stream/pb` via `make proto`
+(the `go_package` is supplied with a protoc `M` flag, keeping the root schema
+language-neutral).
 
 ## Layout
 
 ```
 mirror-node/
   go.mod
-  proto/jkain_stream.proto   copy of ../proto (with go_package)
   internal/
     config/     env + flags → Config
     stream/     running hash, file naming, readers, verifier, pb/

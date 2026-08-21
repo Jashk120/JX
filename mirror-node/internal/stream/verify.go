@@ -4,225 +4,283 @@ import (
 	"bytes"
 	"crypto/ed25519"
 	"crypto/sha256"
+	"encoding/binary"
 	"fmt"
+	"sort"
 
 	"google.golang.org/protobuf/proto"
 
 	"github.com/JKaIN/mirror-node/internal/stream/pb"
 )
 
+// Field constants shared with consensus-node/protocol/stream/src/signature.rs.
+const (
+	hashAlgorithmSHA256 = 0 // HashObject.algorithm
+	hashLengthSHA256    = 32
+	sigTypeEd25519      = 0 // SignatureObject.type
+	sigLengthEd25519    = 64
+)
+
 // VerifyEventFile checks a single .esf's integrity:
 //   - start/end running hashes chain correctly over the contained events,
 //   - file signature and metadata signature (if a sig is provided) verify.
+//
+// Signature verification runs only when both sig and pubKey are non-nil;
+// structural and chain checks always run.
 func VerifyEventFile(fileBytes []byte, sig *pb.SignatureFile, pubKey ed25519.PublicKey) error {
 	var esf pb.EventStreamFile
-	if err := proto.Unmarshal(fileBytes, &esf); err != nil {
+	if err := unmarshalStrict(fileBytes, &esf); err != nil {
 		return fmt.Errorf("unmarshal EventStreamFile: %w", err)
 	}
 	if esf.Version != Version {
 		return fmt.Errorf("unsupported version %d", esf.Version)
 	}
-	if esf.StartRunningHash == nil || esf.EndRunningHash == nil {
-		return fmt.Errorf("missing running hash")
-	}
-	if err := verifyRunningHashEvent(&esf); err != nil {
+	start, err := runningHashOrErr(esf.StartRunningHash)
+	if err != nil {
 		return err
 	}
-	if sig != nil {
-		if err := verifySignatureFile(fileBytes, &esf, sig, pubKey); err != nil {
-			return err
-		}
+	end, err := runningHashOrErr(esf.EndRunningHash)
+	if err != nil {
+		return err
+	}
+	if err := verifyRunningHashEvent(start, end, esf.Events); err != nil {
+		return err
+	}
+	if sig != nil && pubKey != nil {
+		metadata := metadataBytes(esf.Version, start, end, 0, false)
+		return verifySignatureObjects(sig, fileBytes, metadata, pubKey)
 	}
 	return nil
 }
 
-// VerifyRecordFile checks a single .rsf: running hash + optional sig + quorum.
+// VerifyRecordFile checks a single .rsf: running hash + the embedded
+// checkpoint anchor (round consistency + quorum) + optional sig. Mirrors
+// consensus-node/protocol/stream/src/verify.rs — every record file must carry
+// its threshold-signed checkpoint.
 func VerifyRecordFile(fileBytes []byte, sig *pb.SignatureFile, pubKey ed25519.PublicKey) error {
 	var rsf pb.RecordStreamFile
-	if err := proto.Unmarshal(fileBytes, &rsf); err != nil {
+	if err := unmarshalStrict(fileBytes, &rsf); err != nil {
 		return fmt.Errorf("unmarshal RecordStreamFile: %w", err)
 	}
 	if rsf.Version != Version {
 		return fmt.Errorf("unsupported version %d", rsf.Version)
 	}
-	if rsf.StartRunningHash == nil || rsf.EndRunningHash == nil {
-		return fmt.Errorf("missing running hash")
-	}
-	if err := verifyRunningHashRecord(&rsf); err != nil {
+	start, err := runningHashOrErr(rsf.StartRunningHash)
+	if err != nil {
 		return err
 	}
-	if sig != nil {
-		if err := verifySignatureFileRecord(fileBytes, &rsf, sig, pubKey); err != nil {
-			return err
-		}
+	end, err := runningHashOrErr(rsf.EndRunningHash)
+	if err != nil {
+		return err
 	}
-	if rsf.Checkpoint != nil {
-		if err := verifyCheckpointQuorum(rsf.Checkpoint); err != nil {
-			return err
-		}
+	if err := verifyRunningHashRecord(start, end, rsf.Items); err != nil {
+		return err
+	}
+	if rsf.Checkpoint == nil {
+		return fmt.Errorf("record stream file has no checkpoint anchor")
+	}
+	if rsf.Checkpoint.Round != rsf.Round {
+		return fmt.Errorf("record stream file round %d disagrees with its checkpoint round %d",
+			rsf.Round, rsf.Checkpoint.Round)
+	}
+	if err := verifyCheckpointQuorum(rsf.Checkpoint); err != nil {
+		return err
+	}
+	if sig != nil && pubKey != nil {
+		metadata := metadataBytes(rsf.Version, start, end, rsf.Round, true)
+		return verifySignatureObjects(sig, fileBytes, metadata, pubKey)
 	}
 	return nil
 }
 
-func verifyRunningHashEvent(esf *pb.EventStreamFile) error {
-	var cur [32]byte
-	copy(cur[:], esf.StartRunningHash.Hash)
-	for _, ev := range esf.Events {
-		b, err := proto.Marshal(ev)
+// runningHashOrErr validates a HashObject commitment as a SHA-256 digest,
+// mirroring convert.rs:hash_object_digest (algorithm, length, byte count).
+func runningHashOrErr(h *pb.HashObject) ([32]byte, error) {
+	var out [32]byte
+	if h == nil {
+		return out, fmt.Errorf("missing running hash")
+	}
+	if h.Algorithm != hashAlgorithmSHA256 || h.Length != hashLengthSHA256 || len(h.Hash) != hashLengthSHA256 {
+		return out, fmt.Errorf("invalid running hash object: algorithm=%d length=%d hashLen=%d",
+			h.Algorithm, h.Length, len(h.Hash))
+	}
+	copy(out[:], h.Hash)
+	return out, nil
+}
+
+// metadataBytes builds the bytes the metadata_signature commits to:
+// [version u32 BE] || start (32) || end (32) plus round (u64 BE) for record
+// files — signature.rs:metadata_bytes.
+func metadataBytes(version uint32, start, end [32]byte, round uint64, hasRound bool) []byte {
+	size := 4 + len(start) + len(end)
+	if hasRound {
+		size += 8
+	}
+	out := make([]byte, 0, size)
+	var ver [4]byte
+	binary.BigEndian.PutUint32(ver[:], version)
+	out = append(out, ver[:]...)
+	out = append(out, start[:]...)
+	out = append(out, end[:]...)
+	if hasRound {
+		var r [8]byte
+		binary.BigEndian.PutUint64(r[:], round)
+		out = append(out, r[:]...)
+	}
+	return out
+}
+
+// verifySignatureObjects verifies both SignatureObjects of a signature file:
+// the file signature over SHA-256(fileBytes) and the metadata signature over
+// SHA-256(metadata), both under pubKey.
+func verifySignatureObjects(sig *pb.SignatureFile, fileBytes, metadata []byte, pubKey ed25519.PublicKey) error {
+	fileDigest := sha256.Sum256(fileBytes)
+	if err := verifySignatureObject(sig.FileSignature, fileDigest, pubKey); err != nil {
+		return fmt.Errorf("file signature invalid: %w", err)
+	}
+	metadataDigest := sha256.Sum256(metadata)
+	if err := verifySignatureObject(sig.MetadataSignature, metadataDigest, pubKey); err != nil {
+		return fmt.Errorf("metadata signature invalid: %w", err)
+	}
+	return nil
+}
+
+// verifySignatureObject checks one SignatureObject against the expected
+// digest: field validation (signature.rs:verify_signature_object), the
+// committed digest, and the Ed25519 signature over it.
+func verifySignatureObject(so *pb.SignatureObject, expected [32]byte, pubKey ed25519.PublicKey) error {
+	if so == nil {
+		return fmt.Errorf("missing signature object")
+	}
+	if so.Type != sigTypeEd25519 || so.Length != sigLengthEd25519 {
+		return fmt.Errorf("unsupported signature type %d or length %d", so.Type, so.Length)
+	}
+	if so.HashObject == nil {
+		return fmt.Errorf("missing hash object")
+	}
+	if so.HashObject.Algorithm != hashAlgorithmSHA256 || so.HashObject.Length != hashLengthSHA256 {
+		return fmt.Errorf("unsupported hash algorithm %d or length %d",
+			so.HashObject.Algorithm, so.HashObject.Length)
+	}
+	if !bytes.Equal(so.HashObject.Hash, expected[:]) {
+		return fmt.Errorf("committed digest mismatch")
+	}
+	if len(so.Signature) != ed25519.SignatureSize {
+		return fmt.Errorf("signature is %d bytes, want %d", len(so.Signature), ed25519.SignatureSize)
+	}
+	if !ed25519.Verify(pubKey, expected[:], so.Signature) {
+		return fmt.Errorf("ed25519 verification failed")
+	}
+	return nil
+}
+
+// deterministicMarshal serializes an item exactly the way the Rust writer did
+// when it computed the item hash: canonical protobuf bytes.
+func deterministicMarshal(m proto.Message) ([]byte, error) {
+	return proto.MarshalOptions{Deterministic: true}.Marshal(m)
+}
+
+func verifyRunningHashEvent(start, end [32]byte, events []*pb.Event) error {
+	cur := start
+	for _, ev := range events {
+		b, err := deterministicMarshal(ev)
 		if err != nil {
 			return fmt.Errorf("marshal event for hash: %w", err)
 		}
-		ih := ItemHash(b)
-		cur = ChainHash(cur, ih)
+		cur = ChainHash(cur, ItemHash(b))
 	}
-	if !bytes.Equal(cur[:], esf.EndRunningHash.Hash) {
-		return fmt.Errorf("running hash mismatch: got %x want %x", cur, esf.EndRunningHash.Hash)
+	if cur != end {
+		return fmt.Errorf("running hash mismatch: got %x want %x", cur, end[:])
 	}
 	return nil
 }
 
-func verifyRunningHashRecord(rsf *pb.RecordStreamFile) error {
-	var cur [32]byte
-	copy(cur[:], rsf.StartRunningHash.Hash)
-	for _, it := range rsf.Items {
-		b, err := proto.Marshal(it)
+func verifyRunningHashRecord(start, end [32]byte, items []*pb.RecordItem) error {
+	cur := start
+	for _, it := range items {
+		b, err := deterministicMarshal(it)
 		if err != nil {
 			return fmt.Errorf("marshal record item for hash: %w", err)
 		}
-		ih := ItemHash(b)
-		cur = ChainHash(cur, ih)
+		cur = ChainHash(cur, ItemHash(b))
 	}
-	if !bytes.Equal(cur[:], rsf.EndRunningHash.Hash) {
-		return fmt.Errorf("running hash mismatch: got %x want %x", cur, rsf.EndRunningHash.Hash)
-	}
-	return nil
-}
-
-func verifySignatureFile(fileBytes []byte, esf *pb.EventStreamFile, sig *pb.SignatureFile, pubKey ed25519.PublicKey) error {
-	// File signature: Ed25519 over SHA-256 of whole file bytes.
-	h := sha256.Sum256(fileBytes)
-	if sig.FileSignature == nil || sig.FileSignature.HashObject == nil {
-		return fmt.Errorf("missing file signature")
-	}
-	if !bytes.Equal(h[:], sig.FileSignature.HashObject.Hash) {
-		return fmt.Errorf("file hash mismatch in signature file")
-	}
-	if !ed25519.Verify(pubKey, h[:], sig.FileSignature.Signature) {
-		return fmt.Errorf("file signature invalid")
-	}
-	// Metadata signature: hash of (version || start || end) – mirror the Rust verifier's
-	// metadata commitment shape. We hash the concatenation of the three hashes.
-	metaH := metadataHashEvent(esf)
-	if sig.MetadataSignature == nil || sig.MetadataSignature.HashObject == nil {
-		return fmt.Errorf("missing metadata signature")
-	}
-	if !bytes.Equal(metaH[:], sig.MetadataSignature.HashObject.Hash) {
-		return fmt.Errorf("metadata hash mismatch")
-	}
-	if !ed25519.Verify(pubKey, metaH[:], sig.MetadataSignature.Signature) {
-		return fmt.Errorf("metadata signature invalid")
+	if cur != end {
+		return fmt.Errorf("running hash mismatch: got %x want %x", cur, end[:])
 	}
 	return nil
 }
 
-func verifySignatureFileRecord(fileBytes []byte, rsf *pb.RecordStreamFile, sig *pb.SignatureFile, pubKey ed25519.PublicKey) error {
-	h := sha256.Sum256(fileBytes)
-	if sig.FileSignature == nil || sig.FileSignature.HashObject == nil {
-		return fmt.Errorf("missing file signature")
+// rosterCanonicalBytes serializes the checkpoint's roster snapshot the way
+// crypto/src/membership.rs:to_bytes does: unique members (last registration
+// wins), sorted by node id, each as node_id (8 BE) || key (32).
+func rosterCanonicalBytes(members []*pb.CheckpointRosterMember) ([]byte, error) {
+	keyByID := make(map[uint64][]byte, len(members))
+	for _, m := range members {
+		if len(m.Key) != hashLengthSHA256 {
+			return nil, fmt.Errorf("roster member %d has a %d-byte key, want %d",
+				m.NodeId, len(m.Key), hashLengthSHA256)
+		}
+		keyByID[m.NodeId] = m.Key
 	}
-	if !bytes.Equal(h[:], sig.FileSignature.HashObject.Hash) {
-		return fmt.Errorf("file hash mismatch in signature file")
+	ids := make([]uint64, 0, len(keyByID))
+	for id := range keyByID {
+		ids = append(ids, id)
 	}
-	if !ed25519.Verify(pubKey, h[:], sig.FileSignature.Signature) {
-		return fmt.Errorf("file signature invalid")
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	buf := make([]byte, 0, len(ids)*40)
+	for _, id := range ids {
+		var be [8]byte
+		binary.BigEndian.PutUint64(be[:], id)
+		buf = append(buf, be[:]...)
+		buf = append(buf, keyByID[id]...)
 	}
-	metaH := metadataHashRecord(rsf)
-	if sig.MetadataSignature == nil || sig.MetadataSignature.HashObject == nil {
-		return fmt.Errorf("missing metadata signature")
-	}
-	if !bytes.Equal(metaH[:], sig.MetadataSignature.HashObject.Hash) {
-		return fmt.Errorf("metadata hash mismatch")
-	}
-	if !ed25519.Verify(pubKey, metaH[:], sig.MetadataSignature.Signature) {
-		return fmt.Errorf("metadata signature invalid")
-	}
-	return nil
+	return buf, nil
 }
 
-func metadataHashEvent(esf *pb.EventStreamFile) [32]byte {
-	h := sha256.New()
-	// Simple deterministic commitment: version BE + start_hash + end_hash.
-	var ver [4]byte
-	ver[0] = byte(esf.Version >> 24)
-	ver[1] = byte(esf.Version >> 16)
-	ver[2] = byte(esf.Version >> 8)
-	ver[3] = byte(esf.Version)
-	h.Write(ver[:])
-	if esf.StartRunningHash != nil {
-		h.Write(esf.StartRunningHash.Hash)
-	}
-	if esf.EndRunningHash != nil {
-		h.Write(esf.EndRunningHash.Hash)
-	}
-	var out [32]byte
-	copy(out[:], h.Sum(nil))
-	return out
-}
-
-func metadataHashRecord(rsf *pb.RecordStreamFile) [32]byte {
-	h := sha256.New()
-	var ver [4]byte
-	ver[0] = byte(rsf.Version >> 24)
-	ver[1] = byte(rsf.Version >> 16)
-	ver[2] = byte(rsf.Version >> 8)
-	ver[3] = byte(rsf.Version)
-	h.Write(ver[:])
-	if rsf.StartRunningHash != nil {
-		h.Write(rsf.StartRunningHash.Hash)
-	}
-	if rsf.EndRunningHash != nil {
-		h.Write(rsf.EndRunningHash.Hash)
-	}
-	var round [8]byte
-	round[0] = byte(rsf.Round >> 56)
-	round[1] = byte(rsf.Round >> 48)
-	round[2] = byte(rsf.Round >> 40)
-	round[3] = byte(rsf.Round >> 32)
-	round[4] = byte(rsf.Round >> 24)
-	round[5] = byte(rsf.Round >> 16)
-	round[6] = byte(rsf.Round >> 8)
-	round[7] = byte(rsf.Round)
-	h.Write(round[:])
-	var out [32]byte
-	copy(out[:], h.Sum(nil))
-	return out
-}
-
-// verifyCheckpointQuorum enforces valid*3 > total*2 over the embedded roster.
+// verifyCheckpointQuorum enforces the full mirror-side quorum proof:
+//   - state_hash and roster_hash are 32 bytes,
+//   - the embedded roster snapshot hashes (canonical form) to roster_hash,
+//   - every distinct, round-matching Ed25519 signature verifies over
+//     round (8 BE) || state_hash || roster_hash — checkpoint.rs:signing_bytes,
+//   - valid*3 > total*2 decides.
 func verifyCheckpointQuorum(cp *pb.SignedCheckpoint) error {
+	if len(cp.StateHash) != hashLengthSHA256 {
+		return fmt.Errorf("checkpoint state hash is %d bytes, want %d", len(cp.StateHash), hashLengthSHA256)
+	}
+	if len(cp.RosterHash) != hashLengthSHA256 {
+		return fmt.Errorf("checkpoint roster hash is %d bytes, want %d", len(cp.RosterHash), hashLengthSHA256)
+	}
+	rosterBytes, err := rosterCanonicalBytes(cp.RosterSnapshot)
+	if err != nil {
+		return err
+	}
+	rosterDigest := sha256.Sum256(rosterBytes)
+	if !bytes.Equal(rosterDigest[:], cp.RosterHash) {
+		return fmt.Errorf("embedded roster snapshot does not hash to roster_hash")
+	}
 	total := len(cp.RosterSnapshot)
 	if total == 0 {
 		return fmt.Errorf("empty roster snapshot")
 	}
-	// Count valid Ed25519 signatures over (round || state_hash) – simplified check:
-	// each sig must be 64 bytes and verify against the roster entry's key.
-	valid := 0
 	keyByID := make(map[uint64]ed25519.PublicKey, total)
 	for _, m := range cp.RosterSnapshot {
 		keyByID[m.NodeId] = ed25519.PublicKey(m.Key)
 	}
-	// Message signed is round (8BE) || state_hash.
-	msg := make([]byte, 8+len(cp.StateHash))
-	msg[0] = byte(cp.Round >> 56)
-	msg[1] = byte(cp.Round >> 48)
-	msg[2] = byte(cp.Round >> 40)
-	msg[3] = byte(cp.Round >> 32)
-	msg[4] = byte(cp.Round >> 24)
-	msg[5] = byte(cp.Round >> 16)
-	msg[6] = byte(cp.Round >> 8)
-	msg[7] = byte(cp.Round)
-	copy(msg[8:], cp.StateHash)
+	signingBytes := make([]byte, 0, 72)
+	var roundBE [8]byte
+	binary.BigEndian.PutUint64(roundBE[:], cp.Round)
+	signingBytes = append(signingBytes, roundBE[:]...)
+	signingBytes = append(signingBytes, cp.StateHash...)
+	signingBytes = append(signingBytes, cp.RosterHash...)
+	valid := 0
+	seen := make(map[uint64]bool, total)
 	for _, s := range cp.Sigs {
+		if s.Round != cp.Round {
+			continue
+		}
+		if seen[s.Signer] {
+			continue
+		}
 		pk, ok := keyByID[s.Signer]
 		if !ok {
 			continue
@@ -230,8 +288,9 @@ func verifyCheckpointQuorum(cp *pb.SignedCheckpoint) error {
 		if len(s.Sig) != ed25519.SignatureSize {
 			continue
 		}
-		if ed25519.Verify(pk, msg, s.Sig) {
+		if ed25519.Verify(pk, signingBytes, s.Sig) {
 			valid++
+			seen[s.Signer] = true
 		}
 	}
 	if valid*3 <= total*2 {

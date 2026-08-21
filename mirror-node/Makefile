@@ -10,7 +10,11 @@ test:
 	go test ./...
 
 proto:
-	protoc --proto_path=proto --go_out=internal/stream/pb --go_opt=paths=source_relative proto/jkain_stream.proto
+	protoc --proto_path=../proto \
+		--go_out=internal/stream/pb \
+		--go_opt=Mjkain_stream.proto=github.com/JKaIN/mirror-node/internal/stream/pb \
+		--go_opt=paths=source_relative \
+		../proto/jkain_stream.proto
 
 fmt:
 	go fmt ./...

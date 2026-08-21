@@ -5,7 +5,9 @@ package ingest
 import (
 	"context"
 	"crypto/ed25519"
+	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -13,6 +15,7 @@ import (
 
 	"github.com/JKaIN/mirror-node/internal/store"
 	"github.com/JKaIN/mirror-node/internal/stream"
+	"github.com/JKaIN/mirror-node/internal/stream/pb"
 )
 
 // Config controls the ingester.
@@ -105,26 +108,34 @@ func (ing *Ingester) Run(ctx context.Context) error {
 	}
 }
 
+// loadSig reads the companion signature file, returning nil when it does not
+// exist yet (the Rust writer emits the sig before the stream file, so a
+// missing sig for an existing file is a transient state at worst).
+func (ing *Ingester) loadSig(path string) (*pb.SignatureFile, error) {
+	sigPath := filepath.Join(filepath.Dir(path), stream.SignatureFileName(filepath.Base(path)))
+	sig, err := stream.ReadSignatureFile(sigPath)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read sig %s: %w", sigPath, err)
+	}
+	return sig, nil
+}
+
 func (ing *Ingester) ingestRecord(path string) error {
 	f, raw, err := stream.ReadRecordFile(path)
 	if err != nil {
 		return err
 	}
-	// Try to load companion sig.
-	sigPath := filepath.Join(filepath.Dir(path), stream.SignatureFileName(filepath.Base(path)))
-	sig, err := stream.ReadSignatureFile(sigPath)
-	if err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("read sig %s: %w", sigPath, err)
+	sig, err := ing.loadSig(path)
+	if err != nil {
+		return err
 	}
-	if sig != nil && ing.cfg.PubKey != nil {
-		if err := stream.VerifyRecordFile(raw, sig, ing.cfg.PubKey); err != nil {
-			return fmt.Errorf("verify record %s: %w", path, err)
-		}
-	} else if ing.cfg.PubKey != nil {
-		// Still verify running hash + quorum without sig.
-		if err := stream.VerifyRecordFile(raw, nil, nil); err != nil {
-			return err
-		}
+	// Chain + checkpoint quorum always verify; signatures verify when both
+	// the companion sig and the node key are available.
+	if err := stream.VerifyRecordFile(raw, sig, ing.cfg.PubKey); err != nil {
+		return fmt.Errorf("verify record %s: %w", path, err)
 	}
 	if err := ing.store.PutRecord(f); err != nil {
 		return err
@@ -138,19 +149,12 @@ func (ing *Ingester) ingestEvent(path string) error {
 	if err != nil {
 		return err
 	}
-	sigPath := filepath.Join(filepath.Dir(path), stream.SignatureFileName(filepath.Base(path)))
-	sig, err := stream.ReadSignatureFile(sigPath)
-	if err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("read sig %s: %w", sigPath, err)
+	sig, err := ing.loadSig(path)
+	if err != nil {
+		return err
 	}
-	if sig != nil && ing.cfg.PubKey != nil {
-		if err := stream.VerifyEventFile(raw, sig, ing.cfg.PubKey); err != nil {
-			return fmt.Errorf("verify event %s: %w", path, err)
-		}
-	} else if ing.cfg.PubKey != nil {
-		if err := stream.VerifyEventFile(raw, nil, nil); err != nil {
-			return err
-		}
+	if err := stream.VerifyEventFile(raw, sig, ing.cfg.PubKey); err != nil {
+		return fmt.Errorf("verify event %s: %w", path, err)
 	}
 	if err := ing.store.PutEvents(f); err != nil {
 		return err

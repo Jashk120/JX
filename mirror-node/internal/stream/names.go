@@ -29,6 +29,8 @@ func RecordFileName(round uint64) string {
 }
 
 // SignatureFileName returns the companion .sig name for a stream file.
+// Mirrors consensus-node/protocol/stream/src/lib.rs:signature_file_name —
+// unknown names fall back to the record signature suffix.
 func SignatureFileName(streamFileName string) string {
 	switch {
 	case len(streamFileName) > len(EventFileSuffix) && streamFileName[len(streamFileName)-len(EventFileSuffix):] == EventFileSuffix:
@@ -36,6 +38,6 @@ func SignatureFileName(streamFileName string) string {
 	case len(streamFileName) > len(RecordFileSuffix) && streamFileName[len(streamFileName)-len(RecordFileSuffix):] == RecordFileSuffix:
 		return streamFileName[:len(streamFileName)-len(RecordFileSuffix)] + RecordSigSuffix
 	default:
-		return streamFileName + ".sig"
+		return streamFileName + RecordSigSuffix
 	}
 }
