@@ -1,0 +1,4 @@
+/mirrord
+/data/
+*.db
+*.log
