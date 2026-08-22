@@ -51,3 +51,22 @@ func TestFileNaming(t *testing.T) {
 		t.Fatalf("got %q", got)
 	}
 }
+
+func TestFileNameParsing(t *testing.T) {
+	if idx, ok := EventFileIndex("events-00000042.esf"); !ok || idx != 42 {
+		t.Fatalf("got %d,%v", idx, ok)
+	}
+	if round, ok := RecordFileRound("round-7.rsf"); !ok || round != 7 {
+		t.Fatalf("got %d,%v", round, ok)
+	}
+	for _, name := range []string{"round-7.rsf", "events-x.esf", "events-.esf"} {
+		if _, ok := EventFileIndex(name); ok {
+			t.Fatalf("%q must not parse as an event index", name)
+		}
+	}
+	for _, name := range []string{"events-00000009.esf", "round-9", "round-nine.rsf"} {
+		if _, ok := RecordFileRound(name); ok {
+			t.Fatalf("%q must not parse as a record round", name)
+		}
+	}
+}

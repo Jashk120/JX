@@ -116,6 +116,8 @@ async fn main() -> Result<()> {
         "tx" => tx_cmd(&args[1..]).await,
         "add-member" => add_member(&args[1..]).await,
         "member" => member_cmd(&args[1..]),
+        "deploy" => node::deploy::deploy_cmd(&args[1..]),
+        "keygen" => node::deploy::keygen(&args[1..]),
         other => bail!("unknown subcommand '{other}'"),
     }
 }
@@ -1195,11 +1197,21 @@ fn print_usage() {
          \x20 jkaind member init --node-id <id> --gossip <ip:port> --reconnect <ip:port> \\\n\
          \x20                    --cluster <genesis cluster.toml> --out <dir>\n\
          \n\
+         Deploy a genesis cluster over SSH (secrets are generated on each node and\n\
+         never leave it; only public keys travel):\n\
+         \x20 jkaind deploy genesis --member <id>=<[user@]host>[=<advertise-ip>] \\\n\
+         \x20                      [--member ...] [--binary <path>] [--gossip-port <p>] \\\n\
+         \x20                      [--reconnect-port <p>] [--config-dir </etc/jkaind>] \\\n\
+         \x20                      [--data-dir </var/lib/jkaind>] [--out <dir>] [--ufw] [--force]\n\
+         \x20 jkaind keygen --node-id <id> [--out </etc/jkaind>] [--force]\n\
+         \n\
          Examples:\n\
          \x20 jkaind init --member 1:203.0.113.5:7000:203.0.113.5:7001 \\\n\
          \x20             --member 2:203.0.113.6:7000:203.0.113.6:7001 --out ./cluster\n\
          \x20 jkaind run --cluster ./cluster/cluster.toml --node-id 1 \\\n\
          \x20            --secret ./cluster/secret-1.bin --data ./data\n\
+         \x20 jkaind deploy genesis --member 1=root@203.0.113.5 --member 2=root@203.0.113.6 \\\n\
+         \x20                      --binary ./target/release/jkaind --ufw\n\
          \x20 jkaind status\n\
          \x20 jkaind tx put --key balance --value 100\n\
          \x20 jkaind add-member --node-id 3 --gossip 203.0.113.7:7000 \\\n\

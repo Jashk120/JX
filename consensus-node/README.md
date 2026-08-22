@@ -48,6 +48,17 @@ cargo test --workspace
 
 Two-node deployment needs one binary per VPS and one shared `cluster.toml` plus one `secret-<id>.bin` per node. How you get the binary there is up to you — the docs show the simplest path, but building directly on each VPS works too.
 
+**Fast path — `jkaind deploy genesis` (recommended):** one command from your admin machine provisions the whole genesis cluster over SSH: installs the binary, creates the `jkaind` service user and directories, generates every secret **on its own node** (only public keys travel back), assembles and pushes `cluster.toml`, writes the systemd unit, optionally opens `ufw` mesh rules, starts every node, and waits until all control sockets answer:
+
+```bash
+cargo build --release --bin jkaind
+cargo run --bin jkaind -- deploy genesis \
+  --member 1=root@203.0.113.5 --member 2=root@203.0.113.6 \
+  --binary ./target/release/jkaind --ufw
+```
+
+The public `cluster.toml` copy lands in `./jkaind-deploy/` (safe to keep; no secrets are ever stored locally). Nodes must be reachable with key-based SSH (`~/.ssh/config` aliases work); privileged steps use non-interactive `sudo`. See `node/RUNBOOK.md §0` for details.
+
 **Option A — build once, copy (recommended for identical binaries):**
 
 ```bash

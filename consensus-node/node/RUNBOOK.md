@@ -24,6 +24,80 @@ through its Unix control socket.
   `<data>/jkaind.sock`, mode `0600`) for terminal-driven inspection and
   transaction submission.
 
+## 0. One-command deployment
+
+`jkaind deploy genesis` automates §1–5 below from a single admin machine. It
+installs the binary, creates the `jkaind` service user plus `/etc/jkaind` and
+`/var/lib/jkaind`, generates each member's secret **on its own node** (the
+`jkaind keygen` helper prints only the public verifying key and TLS SPKI
+fingerprint; a secret never exists outside the machine it belongs to),
+assembles and distributes `cluster.toml` from those public keys, writes the
+§4 unit file verbatim, optionally applies the §5 `ufw` rules (`--ufw`),
+starts every node, and waits until each control socket answers:
+
+```bash
+cargo build --release --bin jkaind
+jkaind deploy genesis \
+  --member 1=root@203.0.113.5 \
+  --member 2=root@203.0.113.6 \
+  --binary ./target/release/jkaind --ufw
+```
+
+- Targets are `[user@]host[:ssh-port]`; the host doubles as the gossip address,
+  so it must be an IP literal unless an explicit advertise address is appended
+  (`=<advertise-ip>`). SSH aliases and custom users/ports resolve through your
+  `~/.ssh/config`.
+- Privileged remote steps run under non-interactive `sudo -n`; key-based auth
+  is required.
+- The only local artifact is a public `cluster.toml` copy under `--out`
+  (default `./jkaind-deploy/`) — keep it: `member init` consumes it later.
+- Re-running against existing nodes refuses to overwrite secrets or persist
+  over live checkpoints unless `--force` is passed (same hazard as
+  `init --force`: wipe data dirs first).
+- After genesis, growth stays manual-by-design: `member init` + `add-member`
+  flow through consensus (§8+), never through this tool.
+
+### 0a. Deploying to ARM64 nodes from an x86_64 admin machine
+
+One binary, two builds: an x86_64 copy stays on the admin machine purely to
+*run* `deploy genesis`; the copy pushed to the nodes via `--binary` must be
+aarch64. The orchestrator never executes the payload locally, so any file
+path works.
+
+**Route A — build on one VPS (no cross toolchain):** even when the VPSes
+cannot reach each other, the admin machine relays:
+
+```bash
+ssh root@vps-a 'apt install -y cargo && cd JKaIN/consensus-node \
+  && cargo build --release --bin jkaind'
+scp root@vps-a:JKaIN/consensus-node/target/release/jkaind ./jkaind-arm64
+jkaind deploy genesis --member 1=root@vps-a-ip --member 2=root@vps-b-ip \
+                      --binary ./jkaind-arm64 --ufw
+```
+
+(Prefer the distro `rustup` over `apt cargo` where available; the apt package
+is often stale.)
+
+**Route B — cross-compile on the x86_64 machine:**
+
+```bash
+rustup target add aarch64-unknown-linux-gnu
+sudo apt install gcc-aarch64-linux-gnu      # cross linker, needed by `ring`
+cat >> .cargo/config.toml <<'EOF'
+[target.aarch64-unknown-linux-gnu]
+linker = "aarch64-linux-gnu-gcc"
+EOF
+cargo build --release --target aarch64-unknown-linux-gnu --bin jkaind
+
+jkaind deploy genesis --member 1=root@vps-a-ip --member 2=root@vps-b-ip \
+  --binary target/aarch64-unknown-linux-gnu/release/jkaind --ufw
+```
+
+For fully static binaries immune to glibc version differences between nodes,
+use the `aarch64-unknown-linux-musl` target with a musl cross toolchain or
+[`cross`](https://github.com/cross-rs/cross). Whichever route you take, both
+nodes must receive the *same* binary.
+
 ## 1. Build
 
 On the build machine:

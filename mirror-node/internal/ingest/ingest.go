@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/JKaIN/mirror-node/internal/store"
@@ -27,11 +28,18 @@ type Config struct {
 	PubKey ed25519.PublicKey
 }
 
-// Ingester polls the streams directory and ingests new files.
+// Ingester polls the streams directory and ingests new files. It tracks the
+// stream files it has already stored and skips them on later polls, so each
+// file is read and verified once regardless of how many ticks it remains in
+// the directory.
 type Ingester struct {
 	cfg   Config
 	store store.Store
 	log   *slog.Logger
+
+	mu          sync.Mutex
+	seenRecords map[uint64]struct{} // ingested .rsf rounds
+	seenEvents  map[uint64]struct{} // ingested .esf indexes
 }
 
 func New(cfg Config, st store.Store, log *slog.Logger) *Ingester {
@@ -41,13 +49,19 @@ func New(cfg Config, st store.Store, log *slog.Logger) *Ingester {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Ingester{cfg: cfg, store: st, log: log}
+	return &Ingester{
+		cfg:         cfg,
+		store:       st,
+		log:         log,
+		seenRecords: make(map[uint64]struct{}),
+		seenEvents:  make(map[uint64]struct{}),
+	}
 }
 
-// RunOnce scans the streams directory and ingests any new files.
-// It is idempotent; already-seen rounds/files are skipped by the store layer
-// (or by tracking highest seen index – here we simply attempt to ingest and
-// let failures be logged).
+// RunOnce scans the streams directory and ingests any new files. Already
+// ingested files are skipped; a file is only marked ingested after it was
+// verified and stored, so files that failed are retried on the next poll.
+// Store-level deduplication guards against double ingestion anyway.
 func (ing *Ingester) RunOnce(ctx context.Context) error {
 	dir := ing.cfg.StreamsDir
 
@@ -123,7 +137,30 @@ func (ing *Ingester) loadSig(path string) (*pb.SignatureFile, error) {
 	return sig, nil
 }
 
+// markSeen records an ingested stream file by its numeric index. Callers
+// must only call it after the file was stored successfully.
+func (ing *Ingester) markSeen(seen map[uint64]struct{}, index uint64) {
+	ing.mu.Lock()
+	defer ing.mu.Unlock()
+	seen[index] = struct{}{}
+}
+
+// hasSeen reports whether a stream file index was already ingested.
+func (ing *Ingester) hasSeen(seen map[uint64]struct{}, index uint64) bool {
+	ing.mu.Lock()
+	defer ing.mu.Unlock()
+	_, ok := seen[index]
+	return ok
+}
+
 func (ing *Ingester) ingestRecord(path string) error {
+	// ListRecordFiles only returns names that parse; if one ever fails to,
+	// fall through with ok=false so the file is still ingested (store-level
+	// dedup keeps it a no-op) rather than wrongly sharing index 0.
+	index, ok := stream.RecordFileRound(filepath.Base(path))
+	if ok && ing.hasSeen(ing.seenRecords, index) {
+		return nil
+	}
 	f, raw, err := stream.ReadRecordFile(path)
 	if err != nil {
 		return err
@@ -140,11 +177,19 @@ func (ing *Ingester) ingestRecord(path string) error {
 	if err := ing.store.PutRecord(f); err != nil {
 		return err
 	}
+	if ok {
+		ing.markSeen(ing.seenRecords, index)
+	}
 	ing.log.Info("ingested record file", "path", path, "round", f.Round, "items", len(f.Items))
 	return nil
 }
 
 func (ing *Ingester) ingestEvent(path string) error {
+	// See ingestRecord for the ok=false fallback rationale.
+	index, ok := stream.EventFileIndex(filepath.Base(path))
+	if ok && ing.hasSeen(ing.seenEvents, index) {
+		return nil
+	}
 	f, raw, err := stream.ReadEventFile(path)
 	if err != nil {
 		return err
@@ -158,6 +203,9 @@ func (ing *Ingester) ingestEvent(path string) error {
 	}
 	if err := ing.store.PutEvents(f); err != nil {
 		return err
+	}
+	if ok {
+		ing.markSeen(ing.seenEvents, index)
 	}
 	ing.log.Info("ingested event file", "path", path, "events", len(f.Events))
 	return nil
