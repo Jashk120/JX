@@ -68,3 +68,9 @@ Matches `consensus-node/protocol/stream/src/verify.rs`.
 
 Implement `store.Store` (see `internal/store/store.go:Store`) with your DB and
 inject it in `cmd/mirrord/main.go:NewMemStore` call site.
+
+`Store` implementations must be idempotent: `PutRecord` keys on record round,
+`PutEvents` on each event's `(creator, seq)`; re-ingesting stored data must be
+a no-op. The ingester additionally skips files it has already verified and
+stored, so a backend only ever sees each stream file once per process
+lifetime.

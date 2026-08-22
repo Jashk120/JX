@@ -6,7 +6,6 @@ mod common;
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 use common::*;
 use crypto::{
@@ -171,12 +170,12 @@ async fn event_stream_records_live_events() {
 
     // Let the cluster gossip a while; every freshly inserted verified event is
     // appended to the event stream in topological order.
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(DEADLINE, async {
         loop {
             if !event_files_in(streams_dir.path()).expect("files").is_empty() {
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(25)).await;
+            tokio::time::sleep(test_support::POLL_INTERVAL).await;
         }
     })
     .await

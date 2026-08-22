@@ -19,25 +19,57 @@ type Store interface {
 	LatestRound() uint64
 }
 
-// MemStore is an in-memory Store.
+// MemStore is an in-memory Store. Put* methods are idempotent: records are
+// deduplicated by round and events by (creator, seq), so re-ingesting a file
+// already stored is a no-op.
 type MemStore struct {
-	mu      sync.RWMutex
-	events  []*pb.Event
-	records []*pb.RecordStreamFile
+	mu         sync.RWMutex
+	events     []*pb.Event
+	records    []*pb.RecordStreamFile
+	seenRounds map[uint64]struct{}
+	seenEvents map[eventKey]struct{}
+}
+
+// eventKey identifies an event by its creator and per-creator sequence
+// number — the same identity the API exposes.
+type eventKey struct {
+	creator uint64
+	seq     uint64
 }
 
 func NewMemStore() *MemStore { return &MemStore{} }
 
+// PutEvents appends the events not yet stored; events already present
+// (including duplicates within f) are skipped.
 func (m *MemStore) PutEvents(f *pb.EventStreamFile) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.events = append(m.events, f.Events...)
+	if m.seenEvents == nil {
+		m.seenEvents = make(map[eventKey]struct{})
+	}
+	for _, ev := range f.Events {
+		key := eventKey{creator: ev.Creator, seq: ev.Seq}
+		if _, dup := m.seenEvents[key]; dup {
+			continue
+		}
+		m.seenEvents[key] = struct{}{}
+		m.events = append(m.events, ev)
+	}
 	return nil
 }
 
+// PutRecord appends the record file unless a file for the same round was
+// already stored, in which case it is a no-op.
 func (m *MemStore) PutRecord(f *pb.RecordStreamFile) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.seenRounds == nil {
+		m.seenRounds = make(map[uint64]struct{})
+	}
+	if _, dup := m.seenRounds[f.Round]; dup {
+		return nil
+	}
+	m.seenRounds[f.Round] = struct{}{}
 	m.records = append(m.records, f)
 	return nil
 }

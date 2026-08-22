@@ -195,10 +195,28 @@ async fn transaction_events_propagate_with_payloads() {
     let refs: Vec<&TestNode> = nodes.iter().collect();
     let registry = registry_for_ids(&[1, 2]);
 
-    // Let the cluster establish a self-parent chain, then insert the payload
-    // events as the latest event of each creator so they are recent (and
-    // hence retained) when we verify them.
-    sleep(Duration::from_millis(300)).await;
+    // Wait until both creators hold an event of their own, then insert the
+    // payload events as the latest event of each creator so they are recent
+    // (and hence retained) when we verify them. A fixed warmup silently
+    // degrades into genesis inserts on a slow node, so poll for the chain.
+    timeout(DEADLINE, async {
+        loop {
+            let a_established = {
+                let hashgraph = nodes[0].node.hashgraph.lock().await;
+                hashgraph.latest_event_by(&NodeId::new(1)).is_some()
+            };
+            let b_established = {
+                let hashgraph = nodes[1].node.hashgraph.lock().await;
+                hashgraph.latest_event_by(&NodeId::new(2)).is_some()
+            };
+            if a_established && b_established {
+                break;
+            }
+            sleep(POLL_INTERVAL).await;
+        }
+    })
+    .await
+    .expect("both nodes create their first own event");
     let payload = b"hello ledger".to_vec();
     let a1_latest = {
         let hashgraph = nodes[0].node.hashgraph.lock().await;
@@ -228,7 +246,7 @@ async fn transaction_events_propagate_with_payloads() {
     // Verify the payloads as soon as they propagate to every node — pruning
     // only reaches these events once checkpoints are several rounds past
     // them, so the poll below always reads them before that happens.
-    timeout(Duration::from_secs(10), async {
+    timeout(DEADLINE, async {
         loop {
             let mut all_present = true;
             for node in &refs {
@@ -488,7 +506,7 @@ async fn malformed_frame_over_wire_does_not_crash_node() {
         .latest_event_by(&NodeId::new(1))
         .copied()
         .expect("client created an event");
-    wait_for_event(&node, client_latest, Duration::from_secs(5)).await;
+    wait_for_event(&node, client_latest, DEADLINE).await;
 
     stop.store(true, Ordering::Release);
     let _ = handle.await;
@@ -564,7 +582,7 @@ async fn tampered_signature_event_rejected_over_wire() {
         .latest_event_by(&NodeId::new(1))
         .copied()
         .expect("client created an event");
-    wait_for_event(&node, client_latest, Duration::from_secs(5)).await;
+    wait_for_event(&node, client_latest, DEADLINE).await;
 
     stop.store(true, Ordering::Release);
     let _ = handle.await;
@@ -874,12 +892,12 @@ async fn membership_added_node_joins_live_cluster() {
     // Every teacher verifies and inserts node 4's events.
     let first_hash = first.hash();
     for node in &refs {
-        wait_for_event(&node.node, first_hash, Duration::from_secs(10)).await;
+        wait_for_event(&node.node, first_hash, DEADLINE).await;
     }
 
     // Node 4 has caught up on the shared history from every pre-existing
     // creator, so it participates on equal footing.
-    timeout(Duration::from_secs(10), async {
+    timeout(DEADLINE, async {
         loop {
             let hashgraph = node4.hashgraph.lock().await;
             let caught_up = (1..=3).all(|id| hashgraph.latest_event_by(&NodeId::new(id)).is_some());
@@ -893,13 +911,13 @@ async fn membership_added_node_joins_live_cluster() {
     .await
     .expect("node 4 catches up on the shared history");
 
-    // The 4-member cluster continues to converge after node 4 joins.
+    // The 4-member cluster continues to converge after node 4 joins. Await
+    // node 4's actual shutdown rather than assuming a fixed wind-down window,
+    // then settle on the teachers.
     stop4.store(true, Ordering::Release);
-    sleep(Duration::from_millis(100)).await;
+    let _ = handle4.await;
     let (counts, lates) = stop_and_settle(&refs, Duration::from_secs(1)).await;
     assert_converged(&counts, &lates, "membership-added node");
-
-    let _ = handle4.await;
     drop_nodes(nodes);
 }
 
@@ -1039,7 +1057,7 @@ async fn reconnect_existing_node_catches_up() {
             spawn4b.run_until_stopped_with_reconnect(listener4b, reconnect4b, stop_handle4b).await;
     });
 
-    wait_for_new_own_event(&node4, node4_id, &frozen_own, Duration::from_secs(25)).await;
+    wait_for_new_own_event(&node4, node4_id, &frozen_own, DEADLINE).await;
 
     // The reconnect's apply_checkpoint restored node 4 from a served
     // checkpoint at or beyond the teachers' accepted floor. Node 4 had wiped

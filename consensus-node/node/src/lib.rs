@@ -8,6 +8,7 @@
 
 pub mod config;
 pub mod control;
+pub mod deploy;
 pub mod format;
 pub mod restart;
 pub mod storage;
