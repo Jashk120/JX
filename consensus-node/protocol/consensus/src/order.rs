@@ -76,9 +76,7 @@ use crate::hashgraph::{
 /// entire point of this phase.
 fn signature_tie_break(signature: &Signature) -> u64 {
     let bytes = signature.as_bytes();
-    bytes.chunks_exact(8).fold(0u64, |acc, chunk| {
-        acc ^ u64::from_le_bytes(chunk.try_into().expect("chunks_exact yields 8 bytes"))
-    })
+    bytes.as_chunks::<8>().0.iter().fold(0u64, |acc, chunk| acc ^ u64::from_le_bytes(*chunk))
 }
 
 impl Hashgraph {
