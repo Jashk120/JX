@@ -118,5 +118,7 @@ mod tests {
         // dir, so we accept either outcome — the important property is no
         // panic and dir-fsync was attempted for the normal case above.
         let _ = result;
+        // On success the rename leaves `no-parent` in the crate root under `cargo test`; remove it.
+        let _ = fs::remove_file(path);
     }
 }

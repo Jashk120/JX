@@ -143,7 +143,7 @@ pub fn decode_hex_bytes(input: &str) -> Option<Vec<u8>> {
         return None;
     }
     let mut out = Vec::with_capacity(input.len() / 2);
-    for pair in input.as_bytes().chunks_exact(2) {
+    for pair in input.as_bytes().as_chunks::<2>().0 {
         let hi = nibble(pair[0])?;
         let lo = nibble(pair[1])?;
         out.push((hi << 4) | lo);

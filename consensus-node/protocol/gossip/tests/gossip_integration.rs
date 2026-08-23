@@ -129,7 +129,7 @@ async fn diverged_node_rejoins_and_reconciles() {
     // Reconcile: poll until both divergent events are present on BOTH nodes.
     // Checkpoints (Phase 3) eventually prune these old-round events, so the
     // reconciliation is verified while they are still retained.
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    tokio::time::timeout(DEADLINE, async {
         loop {
             let mut reconciled = true;
             for node in [&a, &b] {

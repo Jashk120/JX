@@ -116,6 +116,8 @@ async fn main() -> Result<()> {
         "tx" => tx_cmd(&args[1..]).await,
         "add-member" => add_member(&args[1..]).await,
         "member" => member_cmd(&args[1..]),
+        "deploy" => node::deploy::deploy_cmd(&args[1..]),
+        "keygen" => node::deploy::keygen(&args[1..]),
         other => bail!("unknown subcommand '{other}'"),
     }
 }
@@ -201,18 +203,8 @@ fn init(args: &[String]) -> Result<()> {
         }
         let mut secret = [0u8; SECRET_LEN];
         OsRng.fill_bytes(&mut secret);
-        std::fs::write(&secret_path, secret)
+        write_secret_bytes(&secret_path, &secret)
             .with_context(|| format!("writing {}", secret_path.display()))?;
-        let mut secret_perms = std::fs::metadata(&secret_path)
-            .with_context(|| format!("stat {}", secret_path.display()))?
-            .permissions();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            secret_perms.set_mode(0o600);
-            std::fs::set_permissions(&secret_path, secret_perms)
-                .with_context(|| format!("chmod {}", secret_path.display()))?;
-        }
         let signing_key =
             SigningKey::from_bytes(&secret[..32].try_into().expect("32-byte consensus seed"));
         let identity =
@@ -996,18 +988,8 @@ fn member_init(args: &[String]) -> Result<()> {
         .with_context(|| format!("building TLS identity for node {node_id}"))?;
 
     let secret_path = out_dir.join(format!("secret-{node_id}.bin"));
-    std::fs::write(&secret_path, seed)
+    write_secret_bytes(&secret_path, &seed)
         .with_context(|| format!("writing {}", secret_path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&secret_path)
-            .with_context(|| format!("stat {}", secret_path.display()))?
-            .permissions();
-        perms.set_mode(0o600);
-        std::fs::set_permissions(&secret_path, perms)
-            .with_context(|| format!("chmod {}", secret_path.display()))?;
-    }
 
     // The new member's LOCAL cluster.toml = genesis members + itself, written
     // under a node-specific filename so it can never clobber the shared
@@ -1165,6 +1147,37 @@ fn parse_ms(value: &str, flag: &str) -> Result<u64> {
     value.parse().with_context(|| format!("{flag} must be milliseconds, got '{value}'"))
 }
 
+fn write_secret_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::fs::OpenOptions;
+        use std::io::Write;
+        use std::os::unix::fs::{
+            OpenOptionsExt,
+            PermissionsExt,
+        };
+        let tmp_path = PathBuf::from(format!("{}.tmp", path.display()));
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp_path)
+            .with_context(|| format!("creating {}", tmp_path.display()))?;
+        file.write_all(bytes).with_context(|| format!("writing {}", tmp_path.display()))?;
+        file.sync_all().with_context(|| format!("sync {}", tmp_path.display()))?;
+        std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("chmod {}", tmp_path.display()))?;
+        std::fs::rename(&tmp_path, path)
+            .with_context(|| format!("rename {} -> {}", tmp_path.display(), path.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, bytes).with_context(|| format!("writing {}", path.display()))?;
+    }
+    Ok(())
+}
+
 fn print_usage() {
     println!(
         "jkaind {} ({}) — JKain node daemon\n\
@@ -1195,11 +1208,21 @@ fn print_usage() {
          \x20 jkaind member init --node-id <id> --gossip <ip:port> --reconnect <ip:port> \\\n\
          \x20                    --cluster <genesis cluster.toml> --out <dir>\n\
          \n\
+         Deploy a genesis cluster over SSH (secrets are generated on each node and\n\
+         never leave it; only public keys travel):\n\
+         \x20 jkaind deploy genesis --member <id>=<[user@]host>[=<advertise-ip>] \\\n\
+         \x20                      [--member ...] [--binary <path>] [--gossip-port <p>] \\\n\
+         \x20                      [--reconnect-port <p>] [--config-dir </etc/jkaind>] \\\n\
+         \x20                      [--data-dir </var/lib/jkaind>] [--out <dir>] [--ufw] [--force]\n\
+         \x20 jkaind keygen --node-id <id> [--out </etc/jkaind>] [--force]\n\
+         \n\
          Examples:\n\
          \x20 jkaind init --member 1:203.0.113.5:7000:203.0.113.5:7001 \\\n\
          \x20             --member 2:203.0.113.6:7000:203.0.113.6:7001 --out ./cluster\n\
          \x20 jkaind run --cluster ./cluster/cluster.toml --node-id 1 \\\n\
          \x20            --secret ./cluster/secret-1.bin --data ./data\n\
+         \x20 jkaind deploy genesis --member 1=root@203.0.113.5 --member 2=root@203.0.113.6 \\\n\
+         \x20                      --binary ./target/release/jkaind --ufw\n\
          \x20 jkaind status\n\
          \x20 jkaind tx put --key balance --value 100\n\
          \x20 jkaind add-member --node-id 3 --gossip 203.0.113.7:7000 \\\n\
