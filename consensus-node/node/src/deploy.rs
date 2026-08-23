@@ -510,12 +510,19 @@ fn await_cluster_healthy(plan: &GenesisPlan) -> Result<()> {
     let mut pending: Vec<&MemberTarget> = plan.members.iter().collect();
     while !pending.is_empty() {
         pending.retain(|member| {
-            ssh_capture(
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return true;
+            };
+            if remaining.is_zero() {
+                return true;
+            }
+            ssh_capture_with_timeout(
                 &member.ssh_target,
                 &[REMOTE_BINARY, "status", "--socket", &format!("{}/jkaind.sock", plan.data_dir)],
                 None,
+                Some(remaining),
             )
-            .is_ok()
+            .is_err()
         });
         if pending.is_empty() {
             break;
@@ -568,14 +575,33 @@ fn generate_member_material(node_id: u64) -> Result<([u8; GENESIS_SEED_LEN], [u8
 }
 
 fn write_secret_file(path: &Path, seed: &[u8]) -> Result<()> {
-    fs::write(path, seed).with_context(|| format!("writing {}", path.display()))?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms =
-            fs::metadata(path).with_context(|| format!("stat {}", path.display()))?.permissions();
-        perms.set_mode(0o600);
-        fs::set_permissions(path, perms).with_context(|| format!("chmod {}", path.display()))?;
+        use std::fs::OpenOptions;
+        use std::io::Write;
+        use std::os::unix::fs::{
+            OpenOptionsExt,
+            PermissionsExt,
+        };
+        let tmp_path = PathBuf::from(format!("{}.tmp", path.display()));
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp_path)
+            .with_context(|| format!("creating {}", tmp_path.display()))?;
+        file.write_all(seed).with_context(|| format!("writing {}", tmp_path.display()))?;
+        file.sync_all().with_context(|| format!("sync {}", tmp_path.display()))?;
+        // Ensure 0600 regardless of umask.
+        fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("chmod {}", tmp_path.display()))?;
+        fs::rename(&tmp_path, path)
+            .with_context(|| format!("rename {} -> {}", tmp_path.display(), path.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        fs::write(path, seed).with_context(|| format!("writing {}", path.display()))?;
     }
     Ok(())
 }
@@ -625,6 +651,15 @@ fn shell_quote(value: &str) -> String {
 // --- process helpers ---------------------------------------------------------
 
 fn ssh_capture(target: &str, remote_args: &[&str], stdin: Option<&[u8]>) -> Result<String> {
+    ssh_capture_with_timeout(target, remote_args, stdin, None)
+}
+
+fn ssh_capture_with_timeout(
+    target: &str,
+    remote_args: &[&str],
+    stdin: Option<&[u8]>,
+    timeout: Option<Duration>,
+) -> Result<String> {
     let mut command = Command::new("ssh");
     command.args(SSH_OPTS).arg(target).args(remote_args);
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -636,15 +671,53 @@ fn ssh_capture(target: &str, remote_args: &[&str], stdin: Option<&[u8]>) -> Resu
         let mut handle = child.stdin.take().context("ssh stdin unavailable")?;
         handle.write_all(bytes).with_context(|| format!("writing stdin to ssh {target}"))?;
     }
-    let output = child.wait_with_output().context("waiting for ssh")?;
-    if !output.status.success() {
-        bail!(
-            "ssh {target} failed ({}): {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
+    drop(child.stdin.take());
+
+    let Some(timeout) = timeout else {
+        let output = child.wait_with_output().context("waiting for ssh")?;
+        if !output.status.success() {
+            bail!(
+                "ssh {target} failed ({}): {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
+    };
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait().context("waiting for ssh")? {
+            Some(status) => {
+                let mut stdout = Vec::new();
+                let mut stderr = Vec::new();
+                if let Some(mut out) = child.stdout.take() {
+                    std::io::Read::read_to_end(&mut out, &mut stdout)
+                        .context("reading ssh stdout")?;
+                }
+                if let Some(mut err) = child.stderr.take() {
+                    std::io::Read::read_to_end(&mut err, &mut stderr)
+                        .context("reading ssh stderr")?;
+                }
+                if !status.success() {
+                    bail!(
+                        "ssh {target} failed ({}): {}",
+                        status,
+                        String::from_utf8_lossy(&stderr).trim()
+                    );
+                }
+                return Ok(String::from_utf8_lossy(&stdout).into_owned());
+            }
+            None => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    bail!("ssh {target} timed out after {}s", timeout.as_secs());
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
     }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 fn scp_to(target: &str, source: &Path, remote_dest: &str) -> Result<()> {

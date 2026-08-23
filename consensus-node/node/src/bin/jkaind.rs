@@ -203,18 +203,8 @@ fn init(args: &[String]) -> Result<()> {
         }
         let mut secret = [0u8; SECRET_LEN];
         OsRng.fill_bytes(&mut secret);
-        std::fs::write(&secret_path, secret)
+        write_secret_bytes(&secret_path, &secret)
             .with_context(|| format!("writing {}", secret_path.display()))?;
-        let mut secret_perms = std::fs::metadata(&secret_path)
-            .with_context(|| format!("stat {}", secret_path.display()))?
-            .permissions();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            secret_perms.set_mode(0o600);
-            std::fs::set_permissions(&secret_path, secret_perms)
-                .with_context(|| format!("chmod {}", secret_path.display()))?;
-        }
         let signing_key =
             SigningKey::from_bytes(&secret[..32].try_into().expect("32-byte consensus seed"));
         let identity =
@@ -998,18 +988,8 @@ fn member_init(args: &[String]) -> Result<()> {
         .with_context(|| format!("building TLS identity for node {node_id}"))?;
 
     let secret_path = out_dir.join(format!("secret-{node_id}.bin"));
-    std::fs::write(&secret_path, seed)
+    write_secret_bytes(&secret_path, &seed)
         .with_context(|| format!("writing {}", secret_path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&secret_path)
-            .with_context(|| format!("stat {}", secret_path.display()))?
-            .permissions();
-        perms.set_mode(0o600);
-        std::fs::set_permissions(&secret_path, perms)
-            .with_context(|| format!("chmod {}", secret_path.display()))?;
-    }
 
     // The new member's LOCAL cluster.toml = genesis members + itself, written
     // under a node-specific filename so it can never clobber the shared
@@ -1165,6 +1145,37 @@ fn parse_port(value: &str, flag: &str) -> Result<u16> {
 
 fn parse_ms(value: &str, flag: &str) -> Result<u64> {
     value.parse().with_context(|| format!("{flag} must be milliseconds, got '{value}'"))
+}
+
+fn write_secret_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::fs::OpenOptions;
+        use std::io::Write;
+        use std::os::unix::fs::{
+            OpenOptionsExt,
+            PermissionsExt,
+        };
+        let tmp_path = PathBuf::from(format!("{}.tmp", path.display()));
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp_path)
+            .with_context(|| format!("creating {}", tmp_path.display()))?;
+        file.write_all(bytes).with_context(|| format!("writing {}", tmp_path.display()))?;
+        file.sync_all().with_context(|| format!("sync {}", tmp_path.display()))?;
+        std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("chmod {}", tmp_path.display()))?;
+        std::fs::rename(&tmp_path, path)
+            .with_context(|| format!("rename {} -> {}", tmp_path.display(), path.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, bytes).with_context(|| format!("writing {}", path.display()))?;
+    }
+    Ok(())
 }
 
 fn print_usage() {
