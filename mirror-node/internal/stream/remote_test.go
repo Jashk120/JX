@@ -1,6 +1,7 @@
 package stream
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"net/http"
@@ -9,6 +10,39 @@ import (
 	"testing"
 	"time"
 )
+
+type errReader struct{}
+
+func (errReader) Read([]byte) (int, error) { return 0, errors.New("read failed") }
+
+func TestReadCapped(t *testing.T) {
+	body, err := readCapped(strings.NewReader("ok"), 8)
+	if err != nil || string(body) != "ok" {
+		t.Fatalf("expected full small body, got %q, %v", body, err)
+	}
+	body, err = readCapped(strings.NewReader("exact-max"), 9)
+	if err != nil || string(body) != "exact-max" {
+		t.Fatalf("expected body exactly at the cap to be accepted, got %q, %v", body, err)
+	}
+	if _, err = readCapped(strings.NewReader("over-the-cap"), 9); err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("expected cap exceeded error, got %v", err)
+	}
+	if _, err = readCapped(errReader{}, 8); err == nil || !strings.Contains(err.Error(), "read failed") {
+		t.Fatalf("expected ordinary read error unchanged, got %v", err)
+	}
+}
+
+func TestRemoteSourceRejectsOversizedListing(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		line := []byte("round-0.rsf\n")
+		_, _ = w.Write(bytes.Repeat(line, maxListResponseBytes/len(line)+2))
+	}))
+	defer srv.Close()
+	rs := &RemoteSource{BaseURL: srv.URL}
+	if _, err := rs.List(context.Background()); err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("expected oversized listing error, got %v", err)
+	}
+}
 
 func TestRemoteSourceListTrimsAndDropsEmpties(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
