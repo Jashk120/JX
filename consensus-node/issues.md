@@ -31,7 +31,7 @@ failed; `gofmt`/`go vet`/`go build`/`go test` clean in `mirror-node`.
 | MH-3 | FIXED | `flush_streams(5s)` barrier awaited at shutdown; event-stream sink flushed alongside the event-log sink in `accept_checkpoint`; writer drains its buffer when the channel closes. |
 | MH-4 | FIXED | Buffer retained and hash/state not advanced on `.esf` write failure; retried on next flush, mirroring `record.rs` (+ chain-continuity test). |
 | M-1 | FIXED | `outbound_checkpoint_sigs` drained to rounds > accepted inside `accept_checkpoint`. |
-| M-2 | PARTIAL | Watermark drop at ingest, `(round, signer)` dedup, 64-per-round cap, purge on acceptance, and membership pre-check implemented; full signing-bytes verification at ingest deferred (accumulator/signing bytes do not exist pre-production) — flagged in code. |
+| M-2 | PARTIAL | Watermark drop at ingest, `(round, signer)` dedup, 64-per-round cap, purge on acceptance, and membership pre-check implemented; full signing-bytes verification at ingest verified impossible pre-production (see M-2 body) — correctly deferred. |
 | M-3 | FIXED | Secrets created via `OpenOptions::mode(0o600)` + `create_new` before bytes hit disk. |
 | M-4 | FIXED | KV write failures propagate fatally through `State::apply` / `execute_event` / `bucket_finalized`; round aborts before signing/persisting. |
 | M-5 | FIXED | Per-stream last-end hash tracked across polls; first file anchored to `CHAIN_SEED`; splice/reorder rejected. |
@@ -47,7 +47,7 @@ failed; `gofmt`/`go vet`/`go build`/`go test` clean in `mirror-node`.
 | L-8 | FIXED | Startup recovers resume state from the highest-index file's tail only; malformed candidates fall back to lower indices or seed. |
 | L-9 | NO CHANGE | Verified already mitigated in tree: control socket caps connections (16) and request size (1 MiB); stream sinks use bounded `mpsc::channel(64)`; `pending_transactions` capped at insert time. |
 | L-10 | FIXED | Port/sync-interval `0` rejected at CLI parse; wrong-width watermark surfaces corruption instead of `0`; `:` rejected in DID network/alias; non-UTF8 decode maps to a clear invalid-DID error. |
-| L-11 | OPEN | HTTP API still serves JSON; protobuf conversion requires the schema/scope decision AGENTS.md reserves for the project owner. |
+| L-11 | DEFERRED | No external mirror-API consumers exist yet; current milestone ends at consensus→mirror ingestion+storage. Owner decision 2026-08-24: serve JSON until consumer requirements define the exposure contract; revisit when SDK/API work starts (see L-11 body). |
 
 ---
 
@@ -228,6 +228,19 @@ preserved (flushed sigs are verified before counting); this is resource exhausti
 **Fix:** verify at ingest against `registry_at_round(sig.round)` + signing-bytes
 commitment, cap per-round queues, drop rounds ≤ watermark, dedup by signer.
 
+**Status (2026-08-24, re-verified):** KEEP DEFERRED — the deferred check is
+structurally impossible at ingest. `signing_bytes = round || state_hash ||
+roster_hash` (`checkpoint.rs:56`), and `state_hash` exists only after the
+round's events finalize and execute (`process_finalized_rounds` Phase B,
+`node.rs:642-692`; `checkpoint_payload` returns `None` until
+`is_round_decided`, `hashgraph.rs:790`). The roster half *is* checked at
+ingest (`registry_at_round`, `node.rs:1065`). Every buffered sig is
+re-verified via `verify_strict` against the accumulator's signing bytes
+before counting, at the `produce_checkpoint` drain (`node.rs:878`) and in
+`feed_checkpoint_sig` (`node.rs:920`) — so a faulty member's garbage sig can
+only waste its own bounded slot (dedup + 64/round cap); no quorum stall, no
+unbounded growth. No non-vacuous stronger ingest check exists.
+
 ### M-3. Secret files created world-readable before chmod
 - **File:** `node/src/bin/jkaind.rs:204-215, 998-1010`
 - **Confidence:** certain
@@ -396,6 +409,14 @@ Mitigated by the local-socket trust model for control; flagged for completeness.
 AGENTS.md requires protobuf for everything speaking to external consumers (a mirror
 node is named explicitly). The stream files comply; the HTTP surface hand-rolls JSON
 and no confirmed scope decision covers the exemption.
+
+**Status (2026-08-24, owner decision): DEFERRED, exemption documented.** No external
+consumer of the mirror API exists yet — the current milestone is consensus→mirror
+ingestion and storage only. The store already retains the decoded protobuf objects
+(`[]*pb.RecordStreamFile` / `[]*pb.Event`), so adding a protobuf encoding over the API
+later is a small additive change; nothing is lost by waiting until actual consumer
+requirements define what to expose and how. When SDK/API work starts, confirm the
+protobuf schema and scope per AGENTS.md before implementing.
 
 ---
 
