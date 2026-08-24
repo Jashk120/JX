@@ -73,6 +73,12 @@ pub trait AsyncReadWrite: AsyncRead + AsyncWrite {}
 
 impl<T: AsyncRead + AsyncWrite> AsyncReadWrite for T {}
 
+/// Maximum allowed frame payload size (64 MiB). Covers sync deltas and
+/// reconnect retained graphs with generous headroom while preventing a
+/// single unauthenticated peer from OOM-ing the process via a bogus u32
+/// length prefix.
+const MAX_FRAME_SIZE: usize = 64 * 1024 * 1024;
+
 impl SyncTransport for TcpTransport {
     async fn connect(&mut self, peer: &PeerInfo) -> Result<()> {
         if self.is_connected() {
@@ -103,6 +109,11 @@ impl SyncTransport for TcpTransport {
         let mut header = [0u8; 5];
         read_exact(stream, &mut header).await?;
         let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
+        if len > MAX_FRAME_SIZE {
+            return Err(GossipError::framing(format!(
+                "frame too large: {len} bytes exceeds MAX_FRAME_SIZE {MAX_FRAME_SIZE}"
+            )));
+        }
         let mut payload = vec![0u8; len];
         read_exact(stream, &mut payload).await?;
 
@@ -122,5 +133,49 @@ async fn read_exact(stream: &mut (impl AsyncRead + Unpin), buf: &mut [u8]) -> Re
         Ok(_) => Ok(()),
         Err(e) if e.kind() == ErrorKind::UnexpectedEof => Err(GossipError::Closed),
         Err(e) => Err(e.into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::io::AsyncWriteExt;
+
+    use super::*;
+    use crate::tls::TlsIdentity;
+
+    fn test_identity() -> TlsIdentity {
+        TlsIdentity::from_seed([7u8; 32], 1).expect("identity")
+    }
+
+    #[tokio::test]
+    async fn recv_frame_rejects_oversized_length_prefix() {
+        let (mut client, server) = tokio::io::duplex(1024);
+        let mut transport =
+            TcpTransport { tls_identity: test_identity(), stream: Some(Box::new(server)) };
+        let oversized = (MAX_FRAME_SIZE + 1) as u32;
+        let mut header = Vec::new();
+        header.push(0x00);
+        header.extend_from_slice(&oversized.to_be_bytes());
+        client.write_all(&header).await.expect("write header");
+        client.flush().await.expect("flush");
+        let err = transport.recv_frame().await.expect_err("must reject oversized frame");
+        match err {
+            GossipError::Framing(msg) => assert!(msg.contains("too large"), "msg: {msg}"),
+            other => panic!("expected Framing, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn recv_frame_accepts_max_frame_size_boundary() {
+        let (mut client, server) = tokio::io::duplex(4096);
+        let mut transport =
+            TcpTransport { tls_identity: test_identity(), stream: Some(Box::new(server)) };
+        let frame_bytes = Frame::Behind.to_bytes();
+        let len = frame_bytes.len() - 5;
+        assert!(len <= MAX_FRAME_SIZE);
+        client.write_all(&frame_bytes).await.expect("write");
+        client.flush().await.expect("flush");
+        let frame = transport.recv_frame().await.expect("should decode Behind frame");
+        assert_eq!(frame, Frame::Behind);
     }
 }

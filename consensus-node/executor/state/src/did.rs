@@ -59,8 +59,15 @@ pub struct DidId {
 }
 
 impl DidId {
-    pub fn new(network: String, alias: String, uuid: [u8; UUID_LEN]) -> Self {
-        Self { network, alias, uuid }
+    pub fn new(
+        network: String,
+        alias: String,
+        uuid: [u8; UUID_LEN],
+    ) -> std::result::Result<Self, DidParseError> {
+        if network.contains(':') || alias.contains(':') {
+            return Err(DidParseError::InvalidDid);
+        }
+        Ok(Self { network, alias, uuid })
     }
 
     pub fn network(&self) -> &str {
@@ -80,6 +87,9 @@ impl DidId {
         let rest = s.strip_prefix("did:jkain:").ok_or(DidParseError::MissingPrefix)?;
         let (network, rest) = rest.split_once(':').ok_or(DidParseError::MissingSeparator)?;
         let (alias, uuid_hex) = rest.split_once(':').ok_or(DidParseError::MissingSeparator)?;
+        if network.contains(':') || alias.contains(':') || uuid_hex.contains(':') {
+            return Err(DidParseError::InvalidDid);
+        }
         if uuid_hex.len() != UUID_LEN * 2 {
             return Err(DidParseError::InvalidUuid);
         }
@@ -102,8 +112,11 @@ impl DidId {
         let network_bytes = take_bytes(cursor)?;
         let alias_bytes = take_bytes(cursor)?;
         let uuid_bytes = take_exact(cursor, UUID_LEN)?;
-        let network = String::from_utf8(network_bytes).map_err(|_| ExecutorError::Truncated)?;
-        let alias = String::from_utf8(alias_bytes).map_err(|_| ExecutorError::Truncated)?;
+        let network = String::from_utf8(network_bytes).map_err(|_| ExecutorError::InvalidDid)?;
+        let alias = String::from_utf8(alias_bytes).map_err(|_| ExecutorError::InvalidDid)?;
+        if network.contains(':') || alias.contains(':') {
+            return Err(ExecutorError::InvalidDid);
+        }
         let uuid: [u8; UUID_LEN] = uuid_bytes.try_into().map_err(|_| ExecutorError::Truncated)?;
         Ok(Self { network, alias, uuid })
     }
@@ -258,6 +271,7 @@ pub enum DidParseError {
     MissingPrefix,
     MissingSeparator,
     InvalidUuid,
+    InvalidDid,
 }
 
 // --- Private helpers ---
@@ -333,7 +347,10 @@ mod tests {
     }
 
     fn sample_id() -> DidId {
-        DidId::new("main".into(), "alice".into(), [1u8; 16])
+        match DidId::new("main".into(), "alice".into(), [1u8; 16]) {
+            Ok(id) => id,
+            Err(e) => panic!("sample_id: {e:?}"),
+        }
     }
 
     fn sample_document() -> DidDocument {
@@ -372,7 +389,10 @@ mod tests {
 
     #[test]
     fn did_id_parse_and_display_round_trip() {
-        let id = DidId::new("testnet".into(), "bob".into(), [0xab; 16]);
+        let id = match DidId::new("testnet".into(), "bob".into(), [0xab; 16]) {
+            Ok(id) => id,
+            Err(e) => panic!("did_id: {e:?}"),
+        };
         let s = id.to_string();
         assert_eq!(s, "did:jkain:testnet:bob:abababababababababababababababab");
         let parsed = DidId::parse(&s).expect("parses");
@@ -400,6 +420,64 @@ mod tests {
             DidId::parse("did:jkain:main:alice:zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"),
             Err(DidParseError::InvalidUuid)
         );
+    }
+
+    #[test]
+    fn did_id_new_rejects_colon_in_network() {
+        assert_eq!(
+            DidId::new("main:net".into(), "alice".into(), [1u8; 16]),
+            Err(DidParseError::InvalidDid)
+        );
+    }
+
+    #[test]
+    fn did_id_new_rejects_colon_in_alias() {
+        assert_eq!(
+            DidId::new("main".into(), "al:ice".into(), [1u8; 16]),
+            Err(DidParseError::InvalidDid)
+        );
+    }
+
+    #[test]
+    fn did_id_parse_rejects_colon_in_alias() {
+        let uuid_hex = "abababababababababababababababab";
+        assert_eq!(
+            DidId::parse(&format!("did:jkain:main:al:ice:{uuid_hex}")),
+            Err(DidParseError::InvalidDid)
+        );
+    }
+
+    #[test]
+    fn did_id_parse_rejects_colon_in_network() {
+        let uuid_hex = "abababababababababababababababab";
+        assert_eq!(
+            DidId::parse(&format!("did:jkain:main:net:alice:{uuid_hex}")),
+            Err(DidParseError::InvalidDid)
+        );
+    }
+
+    #[test]
+    fn did_id_decode_rejects_colon_in_alias() {
+        let mut corrupted = Vec::new();
+        corrupted.extend_from_slice(&(4u32.to_be_bytes()));
+        corrupted.extend_from_slice(b"main");
+        corrupted.extend_from_slice(&(5u32.to_be_bytes()));
+        corrupted.extend_from_slice(b"al:ce");
+        corrupted.extend_from_slice(&[1u8; 16]);
+        let mut cursor = &corrupted[..];
+        assert_eq!(DidId::decode(&mut cursor), Err(ExecutorError::InvalidDid));
+    }
+
+    #[test]
+    fn did_id_decode_rejects_non_utf8() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&(2u32.to_be_bytes()));
+        buf.extend_from_slice(&[0xff, 0xff]);
+        buf.extend_from_slice(&(5u32.to_be_bytes()));
+        buf.extend_from_slice(b"alice");
+        buf.extend_from_slice(&[1u8; 16]);
+        let mut cursor = &buf[..];
+        assert_eq!(DidId::decode(&mut cursor), Err(ExecutorError::InvalidDid));
     }
 
     // --- DidDocument round-trip ---

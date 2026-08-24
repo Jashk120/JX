@@ -153,26 +153,34 @@ pub fn proto_to_signed_checkpoint(checkpoint: &pb::SignedCheckpoint) -> Option<S
 }
 
 /// Rebuilds a `MembershipRegistry` from the mirror's sorted member list.
+/// `None` on a wrong-width or invalid key, or on a duplicate `node_id` — a
+/// repeated id would let a forged first entry shadow the honest key in
+/// [`checkpoint_member_key`]'s lookup.
 fn roster_from_members(members: &[pb::CheckpointRosterMember]) -> Option<MembershipRegistry> {
     let mut registry = MembershipRegistry::new();
     for member in members {
+        let node = primitives::NodeId::new(member.node_id);
+        if registry.contains(&node) {
+            return None;
+        }
         let key_bytes: [u8; 32] = member.key.clone().try_into().ok()?;
         let key = VerifyingKey::from_bytes(&key_bytes).ok()?;
-        registry.register(primitives::NodeId::new(member.node_id), key);
+        registry.register(node, key);
     }
     Some(registry)
 }
 
 /// The key `node_id`'s roster entry in a checkpoint mirror, if any. A mirror
 /// verifies a node's `.rsf_sig` against the emitting node's key, which it
-/// reads from the file's own embedded roster.
+/// reads from the file's own embedded roster. Resolves through the same
+/// validated registry as [`roster_from_members`], so a duplicate `node_id`
+/// anywhere in the roster rejects the lookup instead of picking a key.
 pub fn checkpoint_member_key(
     checkpoint: &pb::SignedCheckpoint,
     node_id: u64,
 ) -> Option<VerifyingKey> {
-    let member = checkpoint.roster_snapshot.iter().find(|member| member.node_id == node_id)?;
-    let key_bytes: [u8; 32] = member.key.clone().try_into().ok()?;
-    VerifyingKey::from_bytes(&key_bytes).ok()
+    let registry = roster_from_members(&checkpoint.roster_snapshot)?;
+    registry.key_for(&primitives::NodeId::new(node_id)).ok().copied()
 }
 
 /// The record items of a decided round: every transaction of every event in
@@ -277,7 +285,14 @@ mod tests {
             vec![Transaction::from_bytes(vec![seq as u8])],
         )
         .finalize(Signature::new([seq as u8; 64]));
-        RetainedEvent { event, seq, round, ancestor_seqs: vec![seq], round_received: None }
+        RetainedEvent {
+            event,
+            seq,
+            round,
+            ancestor_seqs: vec![seq],
+            round_received: None,
+            consensus_timestamp: None,
+        }
     }
 
     #[test]
@@ -312,5 +327,23 @@ mod tests {
         let mut proto = signed_checkpoint_to_proto(&checkpoint);
         proto.roster_hash[0] ^= 0xff;
         assert!(proto_to_signed_checkpoint(&proto).is_none());
+    }
+
+    #[test]
+    fn proto_checkpoint_rejects_duplicate_roster_node_ids() {
+        let roster = registry_of(&[1, 2]);
+        let payload = CheckpointPayload::new(1, [0u8; 32], roster);
+        let checkpoint = SignedCheckpoint { payload, sigs: Vec::new() };
+        let mut proto = signed_checkpoint_to_proto(&checkpoint);
+        // Prepend a forged entry for node 1 with a different key: the honest
+        // roster hash still matches (last-wins registry), but the duplicate
+        // must be rejected rather than resolved first-match.
+        let forged = crate::pb::CheckpointRosterMember {
+            node_id: 1,
+            key: SigningKey::generate(&mut OsRng).verifying_key().to_bytes().to_vec(),
+        };
+        proto.roster_snapshot.insert(0, forged);
+        assert!(proto_to_signed_checkpoint(&proto).is_none());
+        assert!(checkpoint_member_key(&proto, 1).is_none());
     }
 }

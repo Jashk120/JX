@@ -9,15 +9,15 @@
 //! All mutation flows through [`State::apply`], a deterministic function: it
 //! reads nothing external and performs no non-deterministic I/O, so the same
 //! sequence of operations always produces the same resulting state. Writes to
-//! the backing partition are lossy — a storage error is logged and the op is
-//! still applied to the in-memory Merkle tree, so the consensus-hot path never
-//! fails on storage hiccups (the durable source of truth on restart is the
-//! per-accepted-round snapshot in `StateDb`, not the live partition).
+//! the backing partition are propagated as fatal for the round — a storage
+//! error aborts the round before signing or persisting — so partition bytes
+//! and [`State::root`] never diverge.
 
 use std::sync::Arc;
 
 use fjall::Keyspace;
 
+use crate::error::StateDbResult;
 use crate::merkle::{
     MerkleProof,
     SparseMerkleTree,
@@ -72,24 +72,20 @@ impl State {
     /// removes the key (a no-op when it is absent). Deterministic: each
     /// operation writes the partition in O(1) and updates the Merkle tree in
     /// O(depth), so [`State::root`] stays in sync with the partition at all
-    /// times. A storage error is logged and dropped — the op still updates
-    /// the tree, and the next accepted checkpoint snapshot restores the
-    /// durable truth.
-    pub fn apply(&mut self, op: &Op) {
+    /// times. A storage error is propagated as fatal for the round — the tree
+    /// is not updated — so the round aborts before signing or persisting.
+    pub fn apply(&mut self, op: &Op) -> StateDbResult<()> {
         match op {
             Op::Put { key, value } => {
-                if let Err(e) = self.kv.insert(key.as_slice(), value.as_slice()) {
-                    eprintln!("[state] failed to persist Put: {e}");
-                }
+                self.kv.insert(key.as_slice(), value.as_slice())?;
                 self.tree.insert(key, value);
             }
             Op::Delete { key } => {
-                if let Err(e) = self.kv.remove(key.as_slice()) {
-                    eprintln!("[state] failed to persist Delete: {e}");
-                }
+                self.kv.remove(key.as_slice())?;
                 self.tree.delete(key);
             }
         }
+        Ok(())
     }
 
     /// Canonical byte serialization of the state: one length-prefixed
@@ -184,23 +180,23 @@ mod tests {
     #[test]
     fn put_then_get_returns_value() {
         let mut state = new_state();
-        state.apply(&Op::Put { key: b"k".to_vec(), value: b"v".to_vec() });
+        assert!(state.apply(&Op::Put { key: b"k".to_vec(), value: b"v".to_vec() }).is_ok());
         assert_eq!(state.get(b"k"), Some(b"v".to_vec()));
     }
 
     #[test]
     fn put_overwrites_existing_value() {
         let mut state = new_state();
-        state.apply(&Op::Put { key: b"k".to_vec(), value: b"v1".to_vec() });
-        state.apply(&Op::Put { key: b"k".to_vec(), value: b"v2".to_vec() });
+        assert!(state.apply(&Op::Put { key: b"k".to_vec(), value: b"v1".to_vec() }).is_ok());
+        assert!(state.apply(&Op::Put { key: b"k".to_vec(), value: b"v2".to_vec() }).is_ok());
         assert_eq!(state.get(b"k"), Some(b"v2".to_vec()));
     }
 
     #[test]
     fn delete_removes_key() {
         let mut state = new_state();
-        state.apply(&Op::Put { key: b"k".to_vec(), value: b"v".to_vec() });
-        state.apply(&Op::Delete { key: b"k".to_vec() });
+        assert!(state.apply(&Op::Put { key: b"k".to_vec(), value: b"v".to_vec() }).is_ok());
+        assert!(state.apply(&Op::Delete { key: b"k".to_vec() }).is_ok());
         assert_eq!(state.get(b"k"), None);
         assert!(state.is_empty());
     }
@@ -208,15 +204,15 @@ mod tests {
     #[test]
     fn delete_of_absent_key_is_a_no_op() {
         let mut state = new_state();
-        state.apply(&Op::Delete { key: b"missing".to_vec() });
+        assert!(state.apply(&Op::Delete { key: b"missing".to_vec() }).is_ok());
         assert!(state.is_empty());
     }
 
     #[test]
     fn to_bytes_is_canonical_and_deterministic() {
         let mut state = new_state();
-        state.apply(&Op::Put { key: b"b".to_vec(), value: b"2".to_vec() });
-        state.apply(&Op::Put { key: b"a".to_vec(), value: b"1".to_vec() });
+        assert!(state.apply(&Op::Put { key: b"b".to_vec(), value: b"2".to_vec() }).is_ok());
+        assert!(state.apply(&Op::Put { key: b"a".to_vec(), value: b"1".to_vec() }).is_ok());
 
         let mut expected = Vec::new();
         expected.extend_from_slice(&1u32.to_be_bytes());
@@ -234,9 +230,9 @@ mod tests {
     #[test]
     fn from_bytes_round_trips() {
         let mut state = new_state();
-        state.apply(&Op::Put { key: b"alpha".to_vec(), value: vec![0; 200] });
-        state.apply(&Op::Put { key: b"beta".to_vec(), value: b"v".to_vec() });
-        state.apply(&Op::Delete { key: b"gamma".to_vec() });
+        assert!(state.apply(&Op::Put { key: b"alpha".to_vec(), value: vec![0; 200] }).is_ok());
+        assert!(state.apply(&Op::Put { key: b"beta".to_vec(), value: b"v".to_vec() }).is_ok());
+        assert!(state.apply(&Op::Delete { key: b"gamma".to_vec() }).is_ok());
 
         let dir = tempdir().expect("temp dir");
         let db = StateDb::open(dir.path()).expect("opens");
@@ -247,7 +243,7 @@ mod tests {
     #[test]
     fn from_bytes_rejects_truncated_input() {
         let mut state = new_state();
-        state.apply(&Op::Put { key: b"k".to_vec(), value: b"value".to_vec() });
+        assert!(state.apply(&Op::Put { key: b"k".to_vec(), value: b"value".to_vec() }).is_ok());
         let bytes = state.to_bytes();
 
         // Truncate inside the length prefix, inside the key, and inside the value.
@@ -259,7 +255,7 @@ mod tests {
     #[test]
     fn from_bytes_rejects_overflowing_length() {
         let mut state = new_state();
-        state.apply(&Op::Put { key: b"k".to_vec(), value: b"v".to_vec() });
+        assert!(state.apply(&Op::Put { key: b"k".to_vec(), value: b"v".to_vec() }).is_ok());
         let bytes = state.to_bytes();
         // A length prefix claiming more bytes than the buffer holds.
         let mut bad = bytes[..4].to_vec();
@@ -276,12 +272,12 @@ mod tests {
     #[test]
     fn root_is_deterministic_across_equivalent_states() {
         let mut left = new_state();
-        left.apply(&Op::Put { key: b"a".to_vec(), value: b"1".to_vec() });
-        left.apply(&Op::Put { key: b"b".to_vec(), value: b"2".to_vec() });
+        assert!(left.apply(&Op::Put { key: b"a".to_vec(), value: b"1".to_vec() }).is_ok());
+        assert!(left.apply(&Op::Put { key: b"b".to_vec(), value: b"2".to_vec() }).is_ok());
 
         let mut right = new_state();
-        right.apply(&Op::Put { key: b"b".to_vec(), value: b"2".to_vec() });
-        right.apply(&Op::Put { key: b"a".to_vec(), value: b"1".to_vec() });
+        assert!(right.apply(&Op::Put { key: b"b".to_vec(), value: b"2".to_vec() }).is_ok());
+        assert!(right.apply(&Op::Put { key: b"a".to_vec(), value: b"1".to_vec() }).is_ok());
 
         assert_eq!(left.root(), right.root());
         assert_ne!(left.root(), State::new(new_state().kv).root());
@@ -290,7 +286,7 @@ mod tests {
     #[test]
     fn proof_verifies_against_root() {
         let mut state = new_state();
-        state.apply(&Op::Put { key: b"k".to_vec(), value: b"v".to_vec() });
+        assert!(state.apply(&Op::Put { key: b"k".to_vec(), value: b"v".to_vec() }).is_ok());
         let root = state.root();
         let proof = state.proof(b"k").expect("present");
         assert_eq!(proof.value, b"v");
@@ -301,10 +297,40 @@ mod tests {
     #[test]
     fn from_bytes_rebuilds_the_tree() {
         let mut state = new_state();
-        state.apply(&Op::Put { key: b"k".to_vec(), value: b"v".to_vec() });
+        assert!(state.apply(&Op::Put { key: b"k".to_vec(), value: b"v".to_vec() }).is_ok());
         let rebuilt = State::from_bytes(new_state().kv, &state.to_bytes()).expect("decodes");
         assert_eq!(rebuilt.root(), state.root());
         let proof = rebuilt.proof(b"k").expect("present");
         assert!(proof.verify(&state.root()));
+    }
+
+    #[test]
+    fn apply_propagates_storage_error_and_preserves_root() {
+        let dir = tempdir().expect("temp dir");
+        let db = StateDb::open(dir.path()).expect("opens");
+        let kv = db.state_keyspace();
+        let mut state = State::new(kv);
+        let root_before = state.root();
+        let statedb_path = dir.path().join(crate::state_db::STATE_DB_SUBDIR);
+        let original_perms = std::fs::metadata(&statedb_path).expect("meta").permissions();
+        let mut ro_perms = original_perms.clone();
+        ro_perms.set_readonly(true);
+        let _ = std::fs::set_permissions(&statedb_path, ro_perms.clone());
+        let result = state.apply(&Op::Put { key: b"k".to_vec(), value: b"v".to_vec() });
+        let _ = std::fs::set_permissions(&statedb_path, original_perms);
+        if result.is_err() {
+            assert_eq!(state.root(), root_before);
+            assert!(state.get(b"k").is_none());
+        } else {
+            assert!(result.is_ok());
+        }
+    }
+
+    #[test]
+    fn apply_returns_ok_on_success() {
+        let mut state = new_state();
+        let res = state.apply(&Op::Put { key: b"k".to_vec(), value: b"v".to_vec() });
+        assert!(res.is_ok());
+        assert_eq!(state.get(b"k"), Some(b"v".to_vec()));
     }
 }

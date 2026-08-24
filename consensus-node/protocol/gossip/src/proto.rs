@@ -3,6 +3,7 @@ use primitives::{
     Event,
     EventHash,
     NodeId,
+    Timestamp,
 };
 
 use crate::error::{
@@ -164,6 +165,13 @@ impl Frame {
                     let event_bytes = retained.event.canonical_bytes();
                     payload.extend_from_slice(&(event_bytes.len() as u32).to_be_bytes());
                     payload.extend_from_slice(&event_bytes);
+                    match retained.consensus_timestamp {
+                        Some(ts) => {
+                            payload.push(0x01);
+                            payload.extend_from_slice(&ts.get().to_be_bytes());
+                        }
+                        None => payload.push(0x00),
+                    }
                 }
             }
             Self::Behind => {}
@@ -230,43 +238,186 @@ impl Frame {
                 if retained_count > cursor.remaining() / MIN_RETAINED {
                     return Err(GossipError::framing("declared count exceeds remaining buffer"));
                 }
-                let mut retained = Vec::with_capacity(retained_count);
-                for _ in 0..retained_count {
-                    let seq = cursor.read_u64()?;
-                    let round = cursor.read_u64()?;
-                    let round_received = match cursor.read(1)?[0] {
-                        0x00 => None,
-                        0x01 => Some(cursor.read_u64()?),
-                        other => {
-                            return Err(GossipError::framing(format!(
-                                "invalid round-received tag {other:#04x}"
-                            )));
+                // Try to parse retained entries with trailing consensus_timestamp
+                // (new format). If that fails, fall back to legacy without it.
+                let saved_pos = cursor.pos;
+                let mut retained: Option<Vec<consensus::RetainedEvent>> = None;
+                // Attempt with timestamp
+                {
+                    let mut try_cursor = Cursor { bytes: cursor.bytes, pos: saved_pos };
+                    let mut tmp = Vec::with_capacity(retained_count);
+                    let mut ok = true;
+                    for _ in 0..retained_count {
+                        let seq = match try_cursor.read_u64() {
+                            Ok(v) => v,
+                            Err(_) => {
+                                ok = false;
+                                break;
+                            }
+                        };
+                        let round = match try_cursor.read_u64() {
+                            Ok(v) => v,
+                            Err(_) => {
+                                ok = false;
+                                break;
+                            }
+                        };
+                        let round_received = match try_cursor.read(1) {
+                            Ok(b) => match b[0] {
+                                0x00 => None,
+                                0x01 => match try_cursor.read_u64() {
+                                    Ok(v) => Some(v),
+                                    Err(_) => {
+                                        ok = false;
+                                        break;
+                                    }
+                                },
+                                _ => {
+                                    ok = false;
+                                    break;
+                                }
+                            },
+                            Err(_) => {
+                                ok = false;
+                                break;
+                            }
+                        };
+                        if !ok {
+                            break;
                         }
-                    };
-                    let ancestor_count = cursor.read_u32()? as usize;
-                    const MIN_ANCESTOR_SEQ: usize = 8; // u64
-                    if ancestor_count > cursor.remaining() / MIN_ANCESTOR_SEQ {
-                        return Err(GossipError::framing(
-                            "declared count exceeds remaining buffer",
-                        ));
+                        let ancestor_count = match try_cursor.read_u32() {
+                            Ok(v) => v as usize,
+                            Err(_) => {
+                                ok = false;
+                                break;
+                            }
+                        };
+                        const MIN_ANCESTOR_SEQ: usize = 8;
+                        if ancestor_count > try_cursor.remaining() / MIN_ANCESTOR_SEQ {
+                            ok = false;
+                            break;
+                        }
+                        let mut ancestor_seqs = Vec::with_capacity(ancestor_count);
+                        for _ in 0..ancestor_count {
+                            match try_cursor.read_u64() {
+                                Ok(v) => ancestor_seqs.push(v),
+                                Err(_) => {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if !ok {
+                            break;
+                        }
+                        let event_len = match try_cursor.read_u32() {
+                            Ok(v) => v as usize,
+                            Err(_) => {
+                                ok = false;
+                                break;
+                            }
+                        };
+                        let event_bytes = match try_cursor.read(event_len) {
+                            Ok(b) => b,
+                            Err(_) => {
+                                ok = false;
+                                break;
+                            }
+                        };
+                        let mut event_cursor = Cursor::new(event_bytes);
+                        let event = match decode_event(&mut event_cursor) {
+                            Ok(e) => e,
+                            Err(_) => {
+                                ok = false;
+                                break;
+                            }
+                        };
+                        if event_cursor.finish().is_err() {
+                            ok = false;
+                            break;
+                        }
+                        let consensus_timestamp = match try_cursor.read(1) {
+                            Ok(b) => match b[0] {
+                                0x00 => None,
+                                0x01 => match try_cursor.read_u64() {
+                                    Ok(v) => Some(Timestamp::new(v)),
+                                    Err(_) => {
+                                        ok = false;
+                                        break;
+                                    }
+                                },
+                                _ => {
+                                    ok = false;
+                                    break;
+                                }
+                            },
+                            Err(_) => {
+                                ok = false;
+                                break;
+                            }
+                        };
+                        if !ok {
+                            break;
+                        }
+                        tmp.push(consensus::RetainedEvent {
+                            event,
+                            seq,
+                            round,
+                            ancestor_seqs,
+                            round_received,
+                            consensus_timestamp,
+                        });
                     }
-                    let mut ancestor_seqs = Vec::with_capacity(ancestor_count);
-                    for _ in 0..ancestor_count {
-                        ancestor_seqs.push(cursor.read_u64()?);
+                    if ok && try_cursor.pos == cursor.bytes.len() {
+                        retained = Some(tmp);
+                        cursor.pos = try_cursor.pos;
                     }
-                    let event_len = cursor.read_u32()? as usize;
-                    let event_bytes = cursor.read(event_len)?;
-                    let mut event_cursor = Cursor::new(event_bytes);
-                    let event = decode_event(&mut event_cursor)?;
-                    event_cursor.finish()?;
-                    retained.push(consensus::RetainedEvent {
-                        event,
-                        seq,
-                        round,
-                        ancestor_seqs,
-                        round_received,
-                    });
                 }
+                let retained = if let Some(v) = retained {
+                    v
+                } else {
+                    // Legacy fallback: no trailing consensus_timestamp
+                    cursor.pos = saved_pos;
+                    let mut legacy = Vec::with_capacity(retained_count);
+                    for _ in 0..retained_count {
+                        let seq = cursor.read_u64()?;
+                        let round = cursor.read_u64()?;
+                        let round_received = match cursor.read(1)?[0] {
+                            0x00 => None,
+                            0x01 => Some(cursor.read_u64()?),
+                            other => {
+                                return Err(GossipError::framing(format!(
+                                    "invalid round-received tag {other:#04x}"
+                                )));
+                            }
+                        };
+                        let ancestor_count = cursor.read_u32()? as usize;
+                        const MIN_ANCESTOR_SEQ: usize = 8;
+                        if ancestor_count > cursor.remaining() / MIN_ANCESTOR_SEQ {
+                            return Err(GossipError::framing(
+                                "declared count exceeds remaining buffer",
+                            ));
+                        }
+                        let mut ancestor_seqs = Vec::with_capacity(ancestor_count);
+                        for _ in 0..ancestor_count {
+                            ancestor_seqs.push(cursor.read_u64()?);
+                        }
+                        let event_len = cursor.read_u32()? as usize;
+                        let event_bytes = cursor.read(event_len)?;
+                        let mut event_cursor = Cursor::new(event_bytes);
+                        let event = decode_event(&mut event_cursor)?;
+                        event_cursor.finish()?;
+                        legacy.push(consensus::RetainedEvent {
+                            event,
+                            seq,
+                            round,
+                            ancestor_seqs,
+                            round_received,
+                            consensus_timestamp: None,
+                        });
+                    }
+                    legacy
+                };
                 cursor.finish()?;
                 Ok(Self::ReconnectResponse(ReconnectResponse {
                     signed_checkpoint,
@@ -604,6 +755,7 @@ mod tests {
                 round: 1,
                 ancestor_seqs: vec![2, 0, 0],
                 round_received: Some(1),
+                consensus_timestamp: Some(Timestamp::new(999)),
             }],
             last_timestamp: 12345,
         }

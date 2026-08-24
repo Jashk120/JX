@@ -96,9 +96,7 @@ fn run_rejects_non_numeric_sync_timeout() {
 }
 
 #[test]
-fn run_accepts_zero_sync_interval() {
-    // Zero is a valid u64; Duration::from_millis(0) is permitted.
-    // The binary fails later (missing secret), not at parse time.
+fn run_rejects_zero_sync_interval() {
     let output = Command::new(binary())
         .args([
             "run",
@@ -113,15 +111,16 @@ fn run_accepts_zero_sync_interval() {
         ])
         .output()
         .expect("binary runs");
+    assert!(!output.status.success(), "zero --sync-interval must be rejected");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        !stderr.contains("must be milliseconds"),
-        "zero --sync-interval must not be rejected at parse time: {stderr}"
+        stderr.contains("must be milliseconds"),
+        "zero --sync-interval must be rejected with 'must be milliseconds': {stderr}"
     );
 }
 
 #[test]
-fn run_accepts_zero_sync_timeout() {
+fn run_rejects_zero_sync_timeout() {
     let output = Command::new(binary())
         .args([
             "run",
@@ -136,10 +135,59 @@ fn run_accepts_zero_sync_timeout() {
         ])
         .output()
         .expect("binary runs");
+    assert!(!output.status.success(), "zero --sync-timeout must be rejected");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        !stderr.contains("must be milliseconds"),
-        "zero --sync-timeout must not be rejected at parse time: {stderr}"
+        stderr.contains("must be milliseconds"),
+        "zero --sync-timeout must be rejected with 'must be milliseconds': {stderr}"
+    );
+}
+
+#[test]
+fn run_rejects_zero_gossip_port() {
+    let output = Command::new(binary())
+        .args([
+            "run",
+            "--cluster",
+            "/dev/null",
+            "--node-id",
+            "1",
+            "--secret",
+            "/dev/null",
+            "--gossip-port",
+            "0",
+        ])
+        .output()
+        .expect("binary runs");
+    assert!(!output.status.success(), "zero --gossip-port must be rejected");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("must be a port 1-65535"),
+        "zero --gossip-port must be rejected with 'must be a port 1-65535': {stderr}"
+    );
+}
+
+#[test]
+fn run_rejects_zero_reconnect_port() {
+    let output = Command::new(binary())
+        .args([
+            "run",
+            "--cluster",
+            "/dev/null",
+            "--node-id",
+            "1",
+            "--secret",
+            "/dev/null",
+            "--reconnect-port",
+            "0",
+        ])
+        .output()
+        .expect("binary runs");
+    assert!(!output.status.success(), "zero --reconnect-port must be rejected");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("must be a port 1-65535"),
+        "zero --reconnect-port must be rejected with 'must be a port 1-65535': {stderr}"
     );
 }
 

@@ -23,6 +23,9 @@ pub enum ExecutorError {
     MalformedMembershipOp,
     /// The `0x03` DID-op body did not decode cleanly.
     MalformedDidOp,
+    /// DID identifier or document contains invalid bytes (e.g. non-UTF8
+    /// network/alias or ':' in segment).
+    InvalidDid,
 }
 
 pub type Result<T> = std::result::Result<T, ExecutorError>;
@@ -36,6 +39,7 @@ impl fmt::Display for ExecutorError {
             Self::TrailingBytes => write!(f, "transaction payload has trailing bytes"),
             Self::MalformedMembershipOp => write!(f, "malformed membership-op payload"),
             Self::MalformedDidOp => write!(f, "malformed DID-op payload"),
+            Self::InvalidDid => write!(f, "DID identifier contains invalid bytes"),
         }
     }
 }
@@ -48,6 +52,9 @@ pub enum StateDbError {
     /// A Fjall storage error (I/O, corrupt journal, etc.).
     #[error("state database I/O error: {0}")]
     Io(#[from] fjall::Error),
+    /// Stored watermark has wrong width (corruption).
+    #[error("corrupt watermark: expected 8 bytes, got {len} bytes")]
+    CorruptWatermark { len: usize },
 }
 
 /// Result alias for [`StateDbError`].

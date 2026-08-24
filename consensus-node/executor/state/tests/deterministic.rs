@@ -159,8 +159,16 @@ fn same_transaction_order_yields_bit_identical_state() {
     let mut right = new_executor();
     for tx in &order {
         let event = event_with(vec![tx.clone()]);
-        assert!(left.execute_event(&event).errors.is_empty());
-        assert!(right.execute_event(&event).errors.is_empty());
+        let left_res = match left.execute_event(&event) {
+            Ok(r) => r,
+            Err(e) => panic!("storage: {e}"),
+        };
+        let right_res = match right.execute_event(&event) {
+            Ok(r) => r,
+            Err(e) => panic!("storage: {e}"),
+        };
+        assert!(left_res.errors.is_empty());
+        assert!(right_res.errors.is_empty());
     }
 
     assert_eq!(left.state(), right.state());
@@ -184,8 +192,14 @@ fn same_finalized_order_yields_bit_identical_state() {
     let mut left = new_executor();
     let mut right = new_executor();
     for event in &events {
-        left.execute_event(event);
-        right.execute_event(event);
+        match left.execute_event(event) {
+            Ok(_) => {}
+            Err(e) => panic!("storage: {e}"),
+        }
+        match right.execute_event(event) {
+            Ok(_) => {}
+            Err(e) => panic!("storage: {e}"),
+        }
     }
 
     assert_eq!(left.state(), right.state());
@@ -228,12 +242,18 @@ fn malformed_payloads_fail_deterministically() {
     let left_errors: Vec<ExecutorError> = order
         .iter()
         .map(|tx| event_with(vec![tx.clone()]))
-        .flat_map(|event| left.execute_event(&event).errors)
+        .flat_map(|event| match left.execute_event(&event) {
+            Ok(r) => r.errors,
+            Err(e) => panic!("storage: {e}"),
+        })
         .collect();
     let right_errors: Vec<ExecutorError> = order
         .iter()
         .map(|tx| event_with(vec![tx.clone()]))
-        .flat_map(|event| right.execute_event(&event).errors)
+        .flat_map(|event| match right.execute_event(&event) {
+            Ok(r) => r.errors,
+            Err(e) => panic!("storage: {e}"),
+        })
         .collect();
 
     assert_eq!(left_errors, right_errors);

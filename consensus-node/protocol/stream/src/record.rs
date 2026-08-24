@@ -85,7 +85,7 @@ enum RecordStreamMsg {
 /// `set_record_sink`.
 pub struct RecordStreamWriter {
     hashgraph: Arc<Mutex<Hashgraph>>,
-    sender: mpsc::UnboundedSender<RecordStreamMsg>,
+    sender: mpsc::Sender<RecordStreamMsg>,
     _task: tokio::task::JoinHandle<()>,
 }
 
@@ -100,7 +100,7 @@ impl RecordStreamWriter {
     ) -> Result<Self> {
         fs::create_dir_all(dir)?;
         let (next_round, running_hash) = resume_state(dir)?;
-        let (sender, receiver) = mpsc::unbounded_channel();
+        let (sender, receiver) = mpsc::channel(64);
         let writer_dir = dir.to_path_buf();
         let task =
             tokio::spawn(run_writer(writer_dir, signing_key, receiver, (next_round, running_hash)));
@@ -125,15 +125,15 @@ impl RecordStreamWriter {
     pub fn submit_items(&self, checkpoint: SignedCheckpoint, items: Vec<pb::RecordItem>) {
         let round = checkpoint.payload.round;
         let msg = RecordStreamMsg::Write { checkpoint, items };
-        if self.sender.send(msg).is_err() {
-            eprintln!("[stream] record writer task is gone; dropping round {round}");
+        if self.sender.try_send(msg).is_err() {
+            eprintln!("[stream] record writer task is gone or full; dropping round {round}");
         }
     }
 
     /// Awaits until every previously queued file has been written to disk.
     pub async fn barrier(&self) {
         let (ack, receiver) = oneshot::channel();
-        if self.sender.send(RecordStreamMsg::Barrier { ack }).is_err() {
+        if self.sender.send(RecordStreamMsg::Barrier { ack }).await.is_err() {
             return;
         }
         let _ = receiver.await;
@@ -154,7 +154,7 @@ impl RecordSink for RecordStreamWriter {
 async fn run_writer(
     dir: PathBuf,
     signing_key: SigningKey,
-    mut receiver: mpsc::UnboundedReceiver<RecordStreamMsg>,
+    mut receiver: mpsc::Receiver<RecordStreamMsg>,
     mut state: (u64, [u8; 32]),
 ) {
     while let Some(message) = receiver.recv().await {
@@ -227,34 +227,46 @@ fn chain_items(start: [u8; 32], items: &[pb::RecordItem]) -> [u8; 32] {
 /// running_hash)` for the writer to resume from: the round after the highest
 /// written one, chained from that file's `end_running_hash` (or the seed for
 /// an empty directory).
+///
+/// Only the highest-index candidate's tail is inspected; a malformed or
+/// truncated highest file falls back to the next lower index (or the seed),
+/// so one legacy corruption never blocks startup and the scan is
+/// O(num_files + tail) rather than O(total_stream_size).
 fn resume_state(dir: &Path) -> Result<(u64, [u8; 32])> {
-    let mut highest: Option<(u64, [u8; 32])> = None;
+    let mut rounds = Vec::new();
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        let Some(round) = name
+        let Some(round_str) = name
             .strip_prefix(RECORD_FILE_PREFIX)
             .and_then(|rest| rest.strip_suffix(RECORD_FILE_SUFFIX))
         else {
             continue;
         };
-        let Ok(round) = round.parse::<u64>() else { continue };
-        let bytes = fs::read(entry.path())?;
-        let file = read_record_stream_file(&bytes)?;
-        let Some(end_hash) = file.end_running_hash.as_ref().and_then(hash_object_digest) else {
-            return Err(StreamError::Malformed(format!(
-                "record file {name} has an invalid end_running_hash"
-            )));
+        let Ok(round) = round_str.parse::<u64>() else { continue };
+        rounds.push(round);
+    }
+    if rounds.is_empty() {
+        return Ok((1, running_hash::CHAIN_SEED));
+    }
+    rounds.sort_unstable();
+    for &round in rounds.iter().rev() {
+        let path = dir.join(record_file_name(round));
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(_) => continue,
         };
-        if highest.as_ref().is_none_or(|(best, _)| round > *best) {
-            highest = Some((round, end_hash));
-        }
+        let file = match read_record_stream_file(&bytes) {
+            Ok(file) => file,
+            Err(_) => continue,
+        };
+        let Some(end_hash) = file.end_running_hash.as_ref().and_then(hash_object_digest) else {
+            continue;
+        };
+        return Ok((round + 1, end_hash));
     }
-    match highest {
-        Some((round, end_hash)) => Ok((round + 1, end_hash)),
-        None => Ok((1, running_hash::CHAIN_SEED)),
-    }
+    Ok((1, running_hash::CHAIN_SEED))
 }
 
 /// Decodes and structurally validates a record stream file: the version, the
@@ -399,5 +411,51 @@ mod tests {
             start_three, end_two,
             "the resumed writer chains from the highest existing file"
         );
+    }
+
+    #[tokio::test]
+    async fn resume_ignores_malformed_highest_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let hashgraph = empty_hashgraph();
+        let writer = RecordStreamWriter::open(
+            dir.path(),
+            SigningKey::from_bytes(&[1; 32]),
+            hashgraph.clone(),
+        )
+        .expect("opens");
+        writer.submit_items(checkpoint_for(1, &[1, 2, 3]), Vec::new());
+        writer.barrier().await;
+        writer.submit_items(checkpoint_for(2, &[1, 2, 3]), Vec::new());
+        writer.barrier().await;
+        drop(writer);
+        let files = record_files_in(dir.path()).expect("files");
+        assert_eq!(files.len(), 2);
+        let highest_path = files[1].1.clone();
+        fs::write(&highest_path, b"truncated garbage").expect("corrupt highest");
+        let resumed =
+            RecordStreamWriter::open(dir.path(), SigningKey::from_bytes(&[1; 32]), hashgraph)
+                .expect("reopens despite malformed highest");
+        resumed.submit_items(checkpoint_for(2, &[1, 2, 3]), Vec::new());
+        resumed.barrier().await;
+        let first_bytes = fs::read(&files[0].1).expect("first valid");
+        let first = read_record_stream_file(&first_bytes).expect("first decodes");
+        let second_bytes = fs::read(&highest_path).expect("overwritten");
+        let second = read_record_stream_file(&second_bytes).expect("second now valid");
+        assert_eq!(second.round, 2);
+        let end_first =
+            hash_object_digest(first.end_running_hash.as_ref().expect("end")).expect("hash");
+        let start_second =
+            hash_object_digest(second.start_running_hash.as_ref().expect("start")).expect("hash");
+        assert_eq!(start_second, end_first, "fallback chains from last valid file");
+    }
+
+    #[test]
+    fn resume_state_falls_back_when_all_files_malformed() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        fs::write(dir.path().join(record_file_name(1)), b"bad").expect("write");
+        fs::write(dir.path().join(record_file_name(9)), b"also bad").expect("write");
+        let (next_round, hash) = resume_state(dir.path()).expect("resume");
+        assert_eq!(next_round, 1);
+        assert_eq!(hash, running_hash::CHAIN_SEED);
     }
 }

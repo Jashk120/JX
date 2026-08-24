@@ -1,7 +1,6 @@
 use ed25519_dalek::{
     Signature as DalekSignature,
     Signer,
-    Verifier,
 };
 use primitives::{
     Event,
@@ -39,7 +38,7 @@ impl Verifiable for Event {
         let bytes = self.unsigned().canonical_bytes();
 
         verifying_key
-            .verify(&bytes, &signature)
+            .verify_strict(&bytes, &signature)
             .map_err(|_| CryptoError::SignatureVerificationFailed)?;
 
         Ok(VerifiedEvent::new(self))
