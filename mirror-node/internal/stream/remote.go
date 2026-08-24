@@ -12,6 +12,15 @@ import (
 
 var ErrNotFound = errors.New("not found")
 
+const (
+	// maxListResponseBytes bounds a /v1/blocks listing body so a hostile
+	// block node cannot exhaust memory through List.
+	maxListResponseBytes = 1 << 20 // 1 MiB
+	// maxBlockBytes bounds a single fetched block/stream file body so a
+	// hostile block node cannot exhaust memory through Fetch.
+	maxBlockBytes = 256 << 20 // 256 MiB
+)
+
 type RemoteSource struct {
 	BaseURL    string
 	HTTPClient *http.Client
@@ -59,7 +68,7 @@ func (r *RemoteSource) List(ctx context.Context) ([]string, error) {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
 		return nil, fmt.Errorf("GET %s returned %d: %s", url, resp.StatusCode, strings.TrimSpace(string(body)))
 	}
-	body, err := io.ReadAll(resp.Body)
+	body, err := readCapped(resp.Body, maxListResponseBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -96,9 +105,23 @@ func (r *RemoteSource) Fetch(ctx context.Context, name string) ([]byte, error) {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
 		return nil, fmt.Errorf("GET %s returned %d: %s", url, resp.StatusCode, strings.TrimSpace(string(body)))
 	}
-	b, err := io.ReadAll(resp.Body)
+	b, err := readCapped(resp.Body, maxBlockBytes)
 	if err != nil {
 		return nil, err
 	}
 	return b, nil
+}
+
+// readCapped reads r in full, capping it at max bytes: it copies at most
+// max+1 bytes so a body longer than max is detected and rejected instead of
+// being buffered. Ordinary read errors are returned unchanged.
+func readCapped(r io.Reader, max int64) ([]byte, error) {
+	body, err := io.ReadAll(io.LimitReader(r, max+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(body)) > max {
+		return nil, fmt.Errorf("response exceeds maximum size of %d bytes", max)
+	}
+	return body, nil
 }
