@@ -460,23 +460,32 @@ impl GossipNode {
                         registry.hash()
                     };
                     tracing::info!(peer = ?peer.node_id, "reconnect attempt starting");
-                    match fetch_checkpoint(
-                        &self.identity,
-                        &peer,
-                        reconnect_addr,
-                        self.node_id,
-                        trusted_roster_hash,
+                    // Bounded: `fetch_checkpoint`'s connect/recv awaits have
+                    // no internal timeouts, so an unresponsive teacher must
+                    // not wedge the driver past the stop check.
+                    let attempt = tokio::time::timeout(
+                        self.sync_timing.sync_timeout * 2,
+                        fetch_checkpoint(
+                            &self.identity,
+                            &peer,
+                            reconnect_addr,
+                            self.node_id,
+                            trusted_roster_hash,
+                        ),
                     )
-                    .await
-                    {
-                        Ok(response) => {
+                    .await;
+                    match attempt {
+                        Ok(Ok(response)) => {
                             if self.apply_checkpoint(response).await {
                                 self.needs_reconnect.store(false, Ordering::Release);
                                 tracing::info!(peer = ?peer.node_id, "reconnect succeeded");
                             }
                         }
-                        Err(e) => {
+                        Ok(Err(e)) => {
                             tracing::warn!(error = %e, "reconnect attempt failed");
+                        }
+                        Err(_) => {
+                            tracing::warn!(peer = ?peer.node_id, "reconnect attempt timed out");
                         }
                     }
                 }
