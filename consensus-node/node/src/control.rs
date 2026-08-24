@@ -120,14 +120,20 @@ pub async fn bind(path: &Path) -> Result<UnixListener> {
     Ok(listener)
 }
 
+const MAX_CONCURRENT_CONNECTIONS: usize = 16;
+const MAX_REQUEST_BYTES: usize = 1024 * 1024;
+const MAX_PAYLOAD_BYTES: usize = 1024 * 1024;
+
 /// Runs the control server until `stop` is set. Each accepted connection is
 /// handled on its own task; a malformed request gets an error response rather
-/// than closing the connection.
+/// than closing the connection, while an oversized request gets an error
+/// response and the connection is then closed.
 pub async fn serve(
     listener: UnixListener,
     node: Arc<GossipNode>,
     stop: Arc<std::sync::atomic::AtomicBool>,
 ) {
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
     loop {
         if stop.load(std::sync::atomic::Ordering::Acquire) {
             break;
@@ -139,8 +145,16 @@ pub async fn serve(
                 continue;
             }
         };
+        let permit = match semaphore.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                eprintln!("control: too many concurrent connections; rejecting");
+                continue;
+            }
+        };
         let node = node.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             if let Err(e) = handle_connection(stream, node).await {
                 eprintln!("control connection error: {e}");
             }
@@ -168,8 +182,25 @@ pub async fn request(socket_path: &Path, request: &ControlRequest) -> Result<Con
 
 async fn handle_connection(stream: UnixStream, node: Arc<GossipNode>) -> Result<()> {
     let (read_half, mut write_half) = stream.into_split();
-    let mut lines = BufReader::new(read_half).lines();
-    while let Some(line) = lines.next_line().await? {
+    let mut reader = BufReader::new(read_half);
+    loop {
+        let mut line_bytes = Vec::new();
+        let terminated = read_limited_line(&mut reader, &mut line_bytes).await?;
+        if !terminated && line_bytes.is_empty() {
+            break;
+        }
+        if !terminated && line_bytes.len() > MAX_REQUEST_BYTES {
+            // The peer streamed more than MAX_REQUEST_BYTES without a newline;
+            // answer once and drop the connection instead of draining the rest.
+            let response = error_response(format!(
+                "request too large: at least {} bytes exceeds {MAX_REQUEST_BYTES}",
+                line_bytes.len()
+            ));
+            write_response(&mut write_half, &response).await?;
+            break;
+        }
+        let line =
+            std::str::from_utf8(&line_bytes).context("control request is not valid UTF-8")?;
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -186,6 +217,35 @@ async fn handle_connection(stream: UnixStream, node: Arc<GossipNode>) -> Result<
         write_response(&mut write_half, &response).await?;
     }
     Ok(())
+}
+
+/// Reads one `\n`-terminated request line into `buf`, copying at most
+/// `MAX_REQUEST_BYTES + 1` bytes so a peer cannot make the daemon buffer an
+/// arbitrarily long line. Returns whether the copied bytes end with `\n`;
+/// `false` means EOF came first or the newline lies beyond that byte budget
+/// (the caller tells these apart via `buf.len()`).
+async fn read_limited_line(
+    reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
+    buf: &mut Vec<u8>,
+) -> Result<bool> {
+    let budget = MAX_REQUEST_BYTES + 1;
+    loop {
+        let available = match reader.fill_buf().await {
+            Ok(available) => available,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e.into()),
+        };
+        if available.is_empty() {
+            return Ok(false);
+        }
+        let newline_end = available.iter().position(|&byte| byte == b'\n').map(|pos| pos + 1);
+        let take = newline_end.unwrap_or(available.len()).min(budget - buf.len());
+        buf.extend_from_slice(&available[..take]);
+        reader.consume(take);
+        if buf.len() == budget || newline_end.is_some() {
+            return Ok(buf.ends_with(b"\n"));
+        }
+    }
 }
 
 async fn write_response(
@@ -278,12 +338,25 @@ async fn peers_response(node: &GossipNode) -> ControlResponse {
 }
 
 async fn submit_tx(node: &GossipNode, payload_hex: &str) -> ControlResponse {
+    if payload_hex.len() > MAX_PAYLOAD_BYTES * 2 {
+        return error_response(format!(
+            "payload_hex too large: {} hex chars exceeds {}",
+            payload_hex.len(),
+            MAX_PAYLOAD_BYTES * 2
+        ));
+    }
     let payload = match decode_hex_bytes(payload_hex) {
         Some(payload) => payload,
         None => {
             return error_response("payload_hex is not valid hex".to_string());
         }
     };
+    if payload.len() > MAX_PAYLOAD_BYTES {
+        return error_response(format!(
+            "payload too large: {} bytes exceeds {MAX_PAYLOAD_BYTES}",
+            payload.len()
+        ));
+    }
     node.submit_transaction(payload).await;
     ok_response(json!({ "queued": true }))
 }
@@ -431,6 +504,32 @@ mod tests {
         let response: ControlResponse = serde_json::from_str(&line).expect("response parses");
         assert!(!response.ok);
         assert!(response.error.expect("error").contains("malformed request"));
+
+        stop.store(true, Ordering::Release);
+    }
+
+    #[tokio::test]
+    async fn oversized_request_gets_an_error_response_and_connection_closed() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("ctl.sock");
+        let stop = serve_on(&path, test_node()).await;
+
+        let mut stream = UnixStream::connect(&path).await.expect("connect");
+        stream
+            .write_all(&vec![b'a'; MAX_REQUEST_BYTES + 1])
+            .await
+            .expect("write oversized line without newline");
+        stream.flush().await.expect("flush");
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.expect("read error response");
+        let response: ControlResponse = serde_json::from_str(&line).expect("response parses");
+        assert!(!response.ok);
+        assert!(response.error.expect("error").contains("too large"));
+
+        let mut after = String::new();
+        let read = reader.read_line(&mut after).await.expect("read after close");
+        assert_eq!(read, 0, "connection should be closed after an oversized request");
 
         stop.store(true, Ordering::Release);
     }

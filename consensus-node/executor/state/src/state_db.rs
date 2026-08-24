@@ -147,10 +147,17 @@ impl StateDb {
 
     /// The persisted `last_timestamp` watermark, if any.
     pub fn watermark(&self) -> StateDbResult<Option<u64>> {
-        Ok(self
-            .meta
-            .get(WATERMARK_KEY)?
-            .map(|v| u64::from_be_bytes(v.as_slice().try_into().unwrap_or([0u8; 8]))))
+        let Some(v) = self.meta.get(WATERMARK_KEY)? else {
+            return Ok(None);
+        };
+        let bytes = v.as_slice();
+        if bytes.is_empty() {
+            return Ok(Some(0));
+        }
+        if bytes.len() != 8 {
+            return Err(crate::error::StateDbError::CorruptWatermark { len: bytes.len() });
+        }
+        Ok(Some(u64::from_be_bytes(bytes.try_into().expect("len checked to 8"))))
     }
 }
 
@@ -227,5 +234,32 @@ mod tests {
         }
         let reopened = StateDb::open(dir.path()).expect("reopens");
         assert_eq!(reopened.snapshot_for(7).expect("present"), Some(b"bytes".to_vec()));
+    }
+
+    #[test]
+    fn watermark_empty_maps_to_zero() {
+        let dir = tempdir().expect("temp dir");
+        let db = StateDb::open(dir.path()).expect("opens");
+        db.meta.insert(WATERMARK_KEY, vec![]).expect("insert empty");
+        assert_eq!(db.watermark().expect("watermark"), Some(0));
+    }
+
+    #[test]
+    fn watermark_wrong_width_errors() {
+        let dir = tempdir().expect("temp dir");
+        let db = StateDb::open(dir.path()).expect("opens");
+        db.meta.insert(WATERMARK_KEY, vec![1, 2, 3]).expect("insert bad");
+        assert!(db.watermark().is_err());
+        db.meta.insert(WATERMARK_KEY, vec![0; 5]).expect("insert bad 5");
+        assert!(db.watermark().is_err());
+        db.meta.insert(WATERMARK_KEY, 42u64.to_be_bytes().to_vec()).expect("insert ok");
+        assert_eq!(db.watermark().expect("ok"), Some(42));
+    }
+
+    #[test]
+    fn watermark_absent_is_none() {
+        let dir = tempdir().expect("temp dir");
+        let db = StateDb::open(dir.path()).expect("opens");
+        assert_eq!(db.watermark().expect("none"), None);
     }
 }

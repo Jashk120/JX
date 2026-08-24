@@ -237,7 +237,7 @@ async fn from_checkpoint_rejects_roster_key_mismatched_to_the_learner() {
     let payload = CheckpointPayload::new(1, state_hash, roster.clone());
 
     // Both members sign: the 2-node roster's quorum is all of them.
-    let mut accumulator = CheckpointAccumulator::new(payload.clone());
+    let mut accumulator = CheckpointAccumulator::new(payload.clone(), Vec::new());
     accumulator.add_sig(checkpoint_sig_for(1, 1, &payload.signing_bytes()), &roster);
     let accepted = accumulator
         .add_sig(checkpoint_sig_for(4, 1, &payload.signing_bytes()), &roster)

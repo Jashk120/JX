@@ -6,9 +6,9 @@
 //! `protocol/gossip`; this crate only wires it to the filesystem and the
 //! process lifecycle.
 
+pub mod cli;
 pub mod config;
 pub mod control;
-pub mod deploy;
 pub mod format;
 pub mod restart;
 pub mod storage;

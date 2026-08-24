@@ -68,7 +68,14 @@ pub fn sample_record(creator: u64, seq: u64, round: u64) -> RetainedEvent {
         vec![Transaction::from_bytes(format!("payload-{seq}").into_bytes())],
     )
     .finalize(Signature::new([seq as u8; 64]));
-    RetainedEvent { event, seq, round, ancestor_seqs: vec![seq], round_received: None }
+    RetainedEvent {
+        event,
+        seq,
+        round,
+        ancestor_seqs: vec![seq],
+        round_received: None,
+        consensus_timestamp: None,
+    }
 }
 
 /// Reads `dir`'s stream files in order and returns their bytes for a

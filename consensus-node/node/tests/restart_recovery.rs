@@ -165,9 +165,15 @@ async fn setup_and_stop() -> (tempfile::TempDir, ClusterNet) {
         let fresh_db = StateDb::open(&data1).expect("reopen state db after stop");
         let storage = Storage::new(&data1).expect("storage reopens after stop");
         let persisted = storage.latest().expect("latest").expect("checkpoint after stop");
-        assert_eq!(
-            persisted.checkpoint.payload.round, persisted_round,
-            "latest round must still be the round validated before stop"
+        // Node1 keeps running until its stop flag is processed, so an
+        // eventless checkpoint can still be accepted and persisted during
+        // shutdown drain; history must merely not regress across the
+        // reopen. Durability is asserted on the specific round validated
+        // before the stop (finding 3.1).
+        assert!(
+            persisted.checkpoint.payload.round >= persisted_round,
+            "checkpoint history must not regress: latest {}, validated {persisted_round}",
+            persisted.checkpoint.payload.round
         );
         let bytes = fresh_db
             .snapshot_for(persisted_round)

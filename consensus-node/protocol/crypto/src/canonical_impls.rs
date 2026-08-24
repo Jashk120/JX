@@ -9,6 +9,7 @@ use primitives::{
 };
 
 use crate::canonical::CanonicalEncode;
+use crate::error::CryptoError;
 
 impl CanonicalEncode for NodeId {
     fn encode_canonical(&self, buf: &mut Vec<u8>) {
@@ -49,14 +50,34 @@ impl CanonicalEncode for Option<EventHash> {
 impl CanonicalEncode for Transaction {
     fn encode_canonical(&self, buf: &mut Vec<u8>) {
         let payload = self.payload();
-        buf.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        let len = match u32::try_from(payload.len()) {
+            Ok(v) => v,
+            Err(_) => panic!(
+                "{}",
+                CryptoError::Base(primitives::Error::OutOfRange {
+                    field: "Transaction payload length",
+                    got: payload.len().to_string()
+                })
+            ),
+        };
+        buf.extend_from_slice(&len.to_be_bytes());
         buf.extend_from_slice(payload);
     }
 }
 
 impl CanonicalEncode for Vec<Transaction> {
     fn encode_canonical(&self, buf: &mut Vec<u8>) {
-        buf.extend_from_slice(&(self.len() as u32).to_be_bytes());
+        let count = match u32::try_from(self.len()) {
+            Ok(v) => v,
+            Err(_) => panic!(
+                "{}",
+                CryptoError::Base(primitives::Error::OutOfRange {
+                    field: "Vec<Transaction> length",
+                    got: self.len().to_string()
+                })
+            ),
+        };
+        buf.extend_from_slice(&count.to_be_bytes());
         for tx in self {
             tx.encode_canonical(buf);
         }

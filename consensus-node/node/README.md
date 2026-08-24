@@ -9,12 +9,17 @@ a process lifecycle. It adds no consensus logic of its own.
 
 ## Layout
 
-- `src/bin/jkaind.rs` — the CLI: `jkaind init` generates per-node secrets and
-  the shared genesis `cluster.toml`; `jkaind run` loads the config, restores
-  from the last persisted checkpoint if one exists, and runs a
-  `gossip::GossipNode` on 0.0.0.0 until SIGINT/SIGTERM. Client subcommands
-  (`status`, `tx`, `add-member`, `member init`) drive a running node over its
-  Unix control socket and provision new members.
+- `src/cli/` — the terminal interface, one module per subcommand family:
+  `mod.rs` dispatches argv from the binary; `run.rs` is `jkaind run` — it
+  loads the config, restores from the last persisted checkpoint if one exists,
+  and runs a `gossip::GossipNode` on 0.0.0.0 until SIGINT/SIGTERM; `init.rs`
+  generates per-node secrets and the shared genesis `cluster.toml`;
+  `client.rs` drives a running node over its Unix control socket (`status`,
+  `tx`, `add-member`); `member.rs` provisions new members (`member init`);
+  `deploy.rs` deploys a genesis cluster over SSH (`deploy genesis`, `keygen`);
+  `args.rs`/`keys.rs` hold shared argument-parsing helpers and secret-file
+  handling.
+- `src/bin/jkaind.rs` — thin binary wrapper forwarding argv to `node::cli`.
 - `src/control.rs` — the Unix-socket control plane: line-delimited JSON
   requests (`status`, `peers`, `submit_tx`) served over a `0600` socket, plus
   the transaction payload encodings (`kv_op_payload`, `membership_op_payload`).

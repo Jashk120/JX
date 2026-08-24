@@ -35,6 +35,7 @@ use primitives::{
     NodeId,
     Transaction,
 };
+use storage::EventSink;
 use tokio::net::{
     TcpListener,
     TcpStream,
@@ -102,6 +103,10 @@ struct ActivationState {
 /// events; ordering across payloads is consensus's job, not the driver's.
 const TX_PER_SYNC: usize = 64;
 
+const MAX_PENDING_SIGS_PER_ROUND: usize = 64;
+
+const MAX_PENDING_TRANSACTIONS: usize = 1_024;
+
 /// A JKain node: owns a hashgraph, a TLS identity, the known-peer table,
 /// and the async machinery that runs gossip syncs on a fixed interval.
 pub struct GossipNode {
@@ -124,8 +129,10 @@ pub struct GossipNode {
     /// Accepted checkpoints, ascending by round.
     signed_checkpoints: Mutex<Vec<SignedCheckpoint>>,
     /// Per-round serialized state (`State::to_bytes()`), keyed by round,
-    /// captured when that round's checkpoint is produced. A reconnect learner
-    /// is served the snapshot for the checkpoint round — not the live state,
+    /// recorded when that round's checkpoint is accepted
+    /// (`accept_checkpoint`, from the accumulator-carried bytes) or restored
+    /// via reconnect apply, keyed by exact round. A reconnect learner is
+    /// served the snapshot for the checkpoint round — not the live state,
     /// which has advanced past it — so the served bytes rebuild to the
     /// committed `state_hash` and the learner's replay of the retained window
     /// is exactly-once. Evicted in `accept_checkpoint` alongside pruning,
@@ -168,11 +175,11 @@ pub struct GossipNode {
     /// Unlike the event log, ordering updates, roster-history changes, and
     /// prunes are deliberately not forwarded — event files are append-only
     /// and carry ordering only when the appended record already knows it.
-    event_stream_sink: Mutex<Option<Arc<dyn storage::EventSink + Send + Sync>>>,
+    event_stream_sink: Mutex<Option<Arc<stream::EventStreamWriter>>>,
     /// Sink for the record stream file writer (Phase 8, mirror streams):
     /// notified with every newly accepted checkpoint, so each decided round's
     /// record file is emitted. `None` means no record stream.
-    record_sink: Mutex<Option<Arc<dyn stream::RecordSink + Send + Sync>>>,
+    record_sink: Mutex<Option<Arc<stream::RecordStreamWriter>>>,
 }
 
 impl GossipNode {
@@ -270,7 +277,11 @@ impl GossipNode {
     /// If that sync round fails the drained payloads are dropped — ordering
     /// is consensus's job, so a dropped payload is simply not included.
     pub async fn submit_transaction(&self, payload: Vec<u8>) {
-        self.pending_transactions.lock().await.push_back(payload);
+        let mut pending = self.pending_transactions.lock().await;
+        if pending.len() >= MAX_PENDING_TRANSACTIONS {
+            return;
+        }
+        pending.push_back(payload);
     }
 
     /// Requests a reconnect from a live peer on the next sync interval, even
@@ -329,15 +340,43 @@ impl GossipNode {
     /// topological order; ordering/roster-history changes and prunes are not
     /// forwarded (event files are append-only and mirror the append hook
     /// only). Replacing the sink at runtime is allowed but unusual.
-    pub async fn set_event_stream_sink(&self, sink: Arc<dyn storage::EventSink + Send + Sync>) {
+    pub async fn set_event_stream_sink(&self, sink: Arc<stream::EventStreamWriter>) {
         *self.event_stream_sink.lock().await = Some(sink);
     }
 
     /// Registers `sink` as the record stream file writer (Phase 8, mirror
     /// streams). It is invoked with every newly accepted checkpoint, so each
     /// decided round's `.rsf` is emitted from the threshold-signed anchor.
-    pub async fn set_record_sink(&self, sink: Arc<dyn stream::RecordSink + Send + Sync>) {
+    pub async fn set_record_sink(&self, sink: Arc<stream::RecordStreamWriter>) {
         *self.record_sink.lock().await = Some(sink);
+    }
+
+    /// Flushes the event stream's buffered window to disk alongside the
+    /// event-log flush, so a checkpoint and its events are durably co-located.
+    async fn flush_event_stream_sink(&self) {
+        if let Some(sink) = self.event_stream_sink.lock().await.clone() {
+            storage::EventSink::flush(&*sink);
+        }
+    }
+
+    /// Flushes the event and record streams and awaits their writer barriers
+    /// with a bounded timeout. Returns `true` if both barriers were observed
+    /// within `timeout`, `false` on timeout or if no writers are configured.
+    pub async fn flush_streams(&self, timeout: Duration) -> bool {
+        if let Some(sink) = self.event_stream_sink.lock().await.clone() {
+            sink.flush();
+        }
+        let event_writer = self.event_stream_sink.lock().await.clone();
+        let record_writer = self.record_sink.lock().await.clone();
+        let flush_fut = async move {
+            if let Some(writer) = event_writer {
+                writer.barrier().await;
+            }
+            if let Some(writer) = record_writer {
+                writer.barrier().await;
+            }
+        };
+        tokio::time::timeout(timeout, flush_fut).await.is_ok()
     }
 
     /// Appends every freshly inserted event in `fresh` to the durable event
@@ -358,12 +397,13 @@ impl GossipNode {
                     round: record.round(),
                     ancestor_seqs: record.ancestor_seqs().to_vec(),
                     round_received: None,
+                    consensus_timestamp: None,
                 };
                 if let Some(sink) = &sink {
                     sink.append(&retained);
                 }
                 if let Some(stream_sink) = &stream_sink {
-                    stream_sink.append(&retained);
+                    storage::EventSink::append(&**stream_sink, &retained);
                 }
             }
         }
@@ -420,23 +460,32 @@ impl GossipNode {
                         registry.hash()
                     };
                     tracing::info!(peer = ?peer.node_id, "reconnect attempt starting");
-                    match fetch_checkpoint(
-                        &self.identity,
-                        &peer,
-                        reconnect_addr,
-                        self.node_id,
-                        trusted_roster_hash,
+                    // Bounded: `fetch_checkpoint`'s connect/recv awaits have
+                    // no internal timeouts, so an unresponsive teacher must
+                    // not wedge the driver past the stop check.
+                    let attempt = tokio::time::timeout(
+                        self.sync_timing.sync_timeout * 2,
+                        fetch_checkpoint(
+                            &self.identity,
+                            &peer,
+                            reconnect_addr,
+                            self.node_id,
+                            trusted_roster_hash,
+                        ),
                     )
-                    .await
-                    {
-                        Ok(response) => {
+                    .await;
+                    match attempt {
+                        Ok(Ok(response)) => {
                             if self.apply_checkpoint(response).await {
                                 self.needs_reconnect.store(false, Ordering::Release);
                                 tracing::info!(peer = ?peer.node_id, "reconnect succeeded");
                             }
                         }
-                        Err(e) => {
+                        Ok(Err(e)) => {
                             tracing::warn!(error = %e, "reconnect attempt failed");
+                        }
+                        Err(_) => {
+                            tracing::warn!(peer = ?peer.node_id, "reconnect attempt timed out");
                         }
                     }
                 }
@@ -554,6 +603,7 @@ impl GossipNode {
                 tracing::info!(decided_round = decided, "round decided");
             }
         }
+        let _ = self.flush_streams(Duration::from_secs(5)).await;
         Ok(())
     }
 
@@ -588,15 +638,13 @@ impl GossipNode {
 
         // Phase A.5: record each newly finalized event's ordering in the
         // durable log (Phase 8) so a later replay reproduces `roundReceived`
-        // exactly instead of re-deriving it. Filtered by the same watermark
-        // `bucket_finalized` uses, so each event's ordering is written once.
+        // exactly instead of re-deriving it. Called for every finalized event;
+        // `EventLog::set_round_received` is idempotent, so late events with
+        // `rr <= watermark` (H-2) still get persisted for crash recovery.
         let sink = self.event_sink.lock().await.clone();
         if let Some(sink) = &sink {
-            let processed = self.activation.lock().await.processed_through_round;
             for (event, rr) in &finalized {
-                if *rr > processed {
-                    sink.set_round_received(&event.hash(), *rr);
-                }
+                sink.set_round_received(&event.hash(), *rr);
             }
         }
 
@@ -632,19 +680,26 @@ impl GossipNode {
                 hashes.insert(0, pre_batch_hash);
                 snapshots.insert(0, pre_batch_bytes);
                 let ActivationState { pending, processed_through_round, .. } = &mut *activation;
+                let original_watermark = *processed_through_round;
                 for (round, events) in by_round {
-                    if round <= *processed_through_round {
+                    let before_root = executor.state().root();
+                    if let Err(e) =
+                        executor.bucket_finalized(pending, processed_through_round, &events)
+                    {
+                        tracing::error!(round, error = %e, "bucket_finalized failed");
                         continue;
                     }
-                    executor.bucket_finalized(pending, processed_through_round, &events);
-                    hashes.insert(round, executor.state().root());
-                    snapshots.insert(round, executor.state().to_bytes());
+                    let after_root = executor.state().root();
+                    if round > original_watermark {
+                        hashes.insert(round, after_root);
+                        snapshots.insert(round, executor.state().to_bytes());
+                    } else if after_root != before_root {
+                        hashes.insert(*processed_through_round, after_root);
+                        snapshots.insert(*processed_through_round, executor.state().to_bytes());
+                    }
                 }
                 (hashes, snapshots)
             };
-            // Retain the snapshots for reconnect serving (evicted alongside
-            // pruning in `accept_checkpoint`).
-            self.state_snapshots.lock().await.extend(snapshots);
 
             // Phase C: activate ops whose activation round is now fully decided.
             let candidate_rrs: Vec<u64> = {
@@ -725,18 +780,18 @@ impl GossipNode {
 
             // Phase D: produce checkpoints for every round decided since the
             // last pass, using the per-round state hashes captured above.
-            self.produce_pending_checkpoints(&state_hashes).await;
+            self.produce_pending_checkpoints(&state_hashes, &snapshots).await;
         } else {
             // No newly finalized events: no rounds were newly ordered, but a
-            // round may still have just been decided. The empty hash map's
+            // round may still have just been decided. The per-pass maps'
             // round-0 sentinel falls back to the current (unchanged) state.
             let (bytes, root) = {
                 let executor = self.executor.lock().await;
                 (executor.state().to_bytes(), executor.state().root())
             };
             let state_hashes = BTreeMap::from([(0, root)]);
-            self.state_snapshots.lock().await.insert(0, bytes);
-            self.produce_pending_checkpoints(&state_hashes).await;
+            let snapshots = BTreeMap::from([(0, bytes)]);
+            self.produce_pending_checkpoints(&state_hashes, &snapshots).await;
         }
         self.checkpoint_notify.notify_waiters();
     }
@@ -746,7 +801,11 @@ impl GossipNode {
     /// final fame decision *and* this node's view of the round is complete
     /// (`is_round_decided`), which is exactly the point at which its ordering
     /// can no longer change.
-    async fn produce_pending_checkpoints(&self, state_hashes: &BTreeMap<u64, [u8; 32]>) {
+    async fn produce_pending_checkpoints(
+        &self,
+        state_hashes: &BTreeMap<u64, [u8; 32]>,
+        snapshots: &BTreeMap<u64, Vec<u8>>,
+    ) {
         loop {
             let round = self.activation.lock().await.checkpoint_watermark + 1;
             let decided = {
@@ -760,7 +819,7 @@ impl GossipNode {
                 let mut activation = self.activation.lock().await;
                 activation.checkpoint_watermark = round;
             }
-            self.produce_checkpoint(round, state_hashes).await;
+            self.produce_checkpoint(round, state_hashes, snapshots).await;
         }
     }
 
@@ -772,11 +831,24 @@ impl GossipNode {
     /// processing the latest finalized round at or before `round` — i.e. the
     /// deterministic state exactly at this checkpoint, identical on every
     /// node, so signatures produced here verify against any peer.
-    async fn produce_checkpoint(&self, round: u64, state_hashes: &BTreeMap<u64, [u8; 32]>) {
+    async fn produce_checkpoint(
+        &self,
+        round: u64,
+        state_hashes: &BTreeMap<u64, [u8; 32]>,
+        snapshots: &BTreeMap<u64, Vec<u8>>,
+    ) {
         let state_hash = *state_hashes
             .range(..=round)
             .next_back()
             .map(|(_, hash)| hash)
+            .expect("the round-0 sentinel always present");
+        // The exact serialized state whose root is `state_hash`, captured in
+        // the same producing pass. Carried through the accumulator so
+        // acceptance persists exactly the committed bytes — no second lookup.
+        let snapshot_bytes = snapshots
+            .range(..=round)
+            .next_back()
+            .map(|(_, bytes)| bytes.clone())
             .expect("the round-0 sentinel always present");
         let payload = {
             let hg = self.hashgraph.lock().await;
@@ -802,10 +874,11 @@ impl GossipNode {
             pending.remove(&round).unwrap_or_default()
         };
 
-        let accepted = {
+        let (accepted, snapshot) = {
             let mut accumulators = self.checkpoint_accumulators.lock().await;
-            let accumulator =
-                accumulators.entry(round).or_insert_with(|| CheckpointAccumulator::new(payload));
+            let accumulator = accumulators
+                .entry(round)
+                .or_insert_with(|| CheckpointAccumulator::new(payload, snapshot_bytes));
             let mut accepted = accumulator.add_sig(own_sig, &roster);
             for sig in pending {
                 if accepted.is_some() {
@@ -815,13 +888,15 @@ impl GossipNode {
                     accepted = accumulator.add_sig(sig, &roster);
                 }
             }
+            let snapshot =
+                if accepted.is_some() { Some(accumulator.snapshot().to_vec()) } else { None };
             if accepted.is_some() {
                 accumulators.remove(&round);
             }
-            accepted
+            (accepted, snapshot)
         };
-        if let Some(accepted) = accepted {
-            self.accept_checkpoint(accepted).await;
+        if let (Some(accepted), Some(snapshot)) = (accepted, snapshot) {
+            self.accept_checkpoint(accepted, snapshot).await;
         }
     }
 
@@ -831,12 +906,20 @@ impl GossipNode {
     /// checkpoint for the round (so it has no payload to verify against),
     /// the signature is buffered and flushed when `produce_checkpoint` runs.
     async fn feed_checkpoint_sig(&self, sig: CheckpointSig) {
+        let watermark =
+            self.signed_checkpoints.lock().await.last().map(|c| c.payload.round).unwrap_or(0);
+        if sig.round <= watermark {
+            return;
+        }
+        if !self.is_pending_sig_admissible(&sig).await {
+            return;
+        }
         let signing_bytes = {
             let accumulators = self.checkpoint_accumulators.lock().await;
             accumulators.get(&sig.round).map(CheckpointAccumulator::signing_bytes)
         };
         let Some(signing_bytes) = signing_bytes else {
-            self.pending_checkpoint_sigs.lock().await.entry(sig.round).or_default().push(sig);
+            self.buffer_pending_sig(sig).await;
             return;
         };
         let roster = {
@@ -849,14 +932,17 @@ impl GossipNode {
         let accepted = {
             let mut accumulators = self.checkpoint_accumulators.lock().await;
             let round = sig.round;
-            let accepted = accumulators.get_mut(&round).and_then(|acc| acc.add_sig(sig, &roster));
+            let accepted = accumulators.get_mut(&round).and_then(|acc| {
+                let accepted = acc.add_sig(sig, &roster)?;
+                Some((accepted, acc.snapshot().to_vec()))
+            });
             if accepted.is_some() {
                 accumulators.remove(&round);
             }
             accepted
         };
-        if let Some(accepted) = accepted {
-            self.accept_checkpoint(accepted).await;
+        if let Some((accepted, snapshot)) = accepted {
+            self.accept_checkpoint(accepted, snapshot).await;
         }
     }
 
@@ -868,20 +954,20 @@ impl GossipNode {
     /// is always served the highest accepted checkpoint (round ≥ `round -
     /// RETENTION_ROUNDS`), so anything below the floor can never be served
     /// again and keeping it would only grow memory.
-    async fn accept_checkpoint(&self, accepted: SignedCheckpoint) {
+    async fn accept_checkpoint(&self, accepted: SignedCheckpoint, snapshot: Vec<u8>) {
         let round = accepted.payload.round;
-        // Persist before pruning: the state snapshot for the accepted round
-        // must still be present. The same predecessor lookup
-        // (`range(..=round).next_back()`) that selected the state hash in
-        // `produce_checkpoint` selects the bytes that hash to it.
-        let snapshot = {
-            let snapshots = self.state_snapshots.lock().await;
-            snapshots.range(..=round).next_back().map(|(_, bytes)| bytes.clone())
-        };
-        let Some(snapshot) = snapshot else {
-            tracing::warn!(round, "refusing to accept checkpoint: no state snapshot available");
+        // Defensive: refuse to persist a snapshot that does not rebuild to the
+        // committed root. The accumulator carries the bytes captured in the same
+        // producing pass as the payload, so this holds by construction — but a
+        // divergence here would brick restart recovery (`verify_persisted`),
+        // mirroring the rejection applied on the reconnect path.
+        if state::State::root_of_bytes(&snapshot) != Some(accepted.payload.state_hash) {
+            tracing::error!(
+                round,
+                "refusing to accept checkpoint: snapshot does not rebuild to the committed state_hash"
+            );
             return;
-        };
+        }
         // Durable copy: the `.snap` file is gone; a restart restores the
         // exact checkpoint-round state from this `snap` keyspace entry.
         // Flush *before* the checkpoint is recorded as accepted so a crash
@@ -909,12 +995,23 @@ impl GossipNode {
         // is race-free even when it runs concurrently.
         let record_sink = self.record_sink.lock().await.clone();
         if let Some(record_sink) = record_sink {
-            record_sink.persist(&accepted).await;
+            stream::RecordSink::persist(&*record_sink, &accepted).await;
         }
         {
             let mut signed = self.signed_checkpoints.lock().await;
             signed.push(accepted);
             signed.sort_by_key(|c| c.payload.round);
+        }
+        // Record the accepted snapshot under its exact round so a reconnect
+        // learner is served the state exactly as it stood at this checkpoint.
+        self.state_snapshots.lock().await.insert(round, snapshot);
+        {
+            let mut outbound = self.outbound_checkpoint_sigs.lock().await;
+            outbound.retain(|sig| sig.round > round);
+        }
+        {
+            let mut pending = self.pending_checkpoint_sigs.lock().await;
+            pending.retain(|r, _| *r > round);
         }
         let prune_before_round = round.saturating_sub(RETENTION_ROUNDS);
         {
@@ -935,6 +1032,7 @@ impl GossipNode {
             sink.prune(&pruned);
             sink.flush();
         }
+        self.flush_event_stream_sink().await;
         if let Err(e) = self.state_db.flush() {
             tracing::error!(error = %e, "failed to flush the state database");
         }
@@ -954,6 +1052,14 @@ impl GossipNode {
     /// `Frame::CheckpointSig` handling in `handle_inbound` so tests can
     /// exercise the same path without a live connection.
     pub async fn submit_checkpoint_sig(&self, sig: CheckpointSig) {
+        let watermark =
+            self.signed_checkpoints.lock().await.last().map(|c| c.payload.round).unwrap_or(0);
+        if sig.round <= watermark {
+            return;
+        }
+        if !self.is_pending_sig_admissible(&sig).await {
+            return;
+        }
         let decided = {
             let hg = self.hashgraph.lock().await;
             hg.is_round_decided(sig.round)
@@ -961,8 +1067,28 @@ impl GossipNode {
         if decided {
             self.feed_checkpoint_sig(sig).await;
         } else {
-            self.pending_checkpoint_sigs.lock().await.entry(sig.round).or_default().push(sig);
+            self.buffer_pending_sig(sig).await;
         }
+    }
+
+    async fn is_pending_sig_admissible(&self, sig: &CheckpointSig) -> bool {
+        let roster = {
+            let hg = self.hashgraph.lock().await;
+            hg.registry_at_round(sig.round)
+        };
+        roster.contains(&sig.signer)
+    }
+
+    async fn buffer_pending_sig(&self, sig: CheckpointSig) {
+        let mut pending = self.pending_checkpoint_sigs.lock().await;
+        let entry = pending.entry(sig.round).or_default();
+        if entry.iter().any(|existing| existing.signer == sig.signer) {
+            return;
+        }
+        if entry.len() >= MAX_PENDING_SIGS_PER_ROUND {
+            return;
+        }
+        entry.push(sig);
     }
 
     /// The signing bytes the node's checkpoint for `round` is over, if one
@@ -1239,6 +1365,7 @@ impl GossipNode {
                     retained.round,
                     retained.ancestor_seqs.clone(),
                     retained.round_received,
+                    retained.consensus_timestamp,
                 ) {
                     tracing::error!(error = %e, "reconnect: retained event rejected");
                     return false;
@@ -1455,4 +1582,125 @@ pub trait CheckpointSink {
     /// Called synchronously on the node's async task; implementations must
     /// not block for long.
     fn persist(&self, checkpoint: &SignedCheckpoint);
+}
+
+#[cfg(test)]
+mod pending_sig_tests {
+    use std::sync::Arc;
+
+    use consensus::CheckpointSig;
+    use crypto::MembershipRegistry;
+    use ed25519_dalek::SigningKey;
+    use primitives::{
+        NodeId,
+        Signature,
+    };
+    use tempfile::tempdir;
+
+    use super::*;
+
+    fn registry_with(nodes: &[u64]) -> (MembershipRegistry, Vec<SigningKey>) {
+        let mut registry = MembershipRegistry::new();
+        let mut keys = Vec::new();
+        for &id in nodes {
+            let k = SigningKey::from_bytes(&[id as u8; 32]);
+            registry.register(NodeId::new(id), k.verifying_key());
+            keys.push(k);
+        }
+        (registry, keys)
+    }
+
+    async fn make_node(registry: MembershipRegistry) -> Arc<GossipNode> {
+        let dir = tempdir().expect("tempdir");
+        let db = Arc::new(state::StateDb::open(dir.path()).expect("StateDb"));
+        let identity = TlsIdentity::from_seed([9u8; 32], 1).expect("tls");
+        let signing_key = SigningKey::from_bytes(&[1u8; 32]);
+        let node = GossipNode::new(
+            NodeId::new(1),
+            signing_key,
+            registry,
+            identity,
+            Vec::new(),
+            SyncTiming::new(
+                std::time::Duration::from_millis(50),
+                std::time::Duration::from_secs(1),
+            ),
+            db,
+        );
+        Arc::new(node)
+    }
+
+    fn sig(round: u64, signer: u64) -> CheckpointSig {
+        CheckpointSig { round, signer: NodeId::new(signer), sig: Signature::new([1u8; 64]) }
+    }
+
+    #[tokio::test]
+    async fn pending_dedups_per_round_signer() {
+        let (registry, _) = registry_with(&[1, 2, 3]);
+        let node = make_node(registry).await;
+        node.submit_checkpoint_sig(sig(5, 2)).await;
+        node.submit_checkpoint_sig(sig(5, 2)).await;
+        let pending = node.pending_checkpoint_sigs.lock().await;
+        assert_eq!(pending.get(&5).map(|v| v.len()), Some(1));
+    }
+
+    #[tokio::test]
+    async fn pending_caps_per_round_queue() {
+        let (registry2, _) = registry_with(&(1..80).collect::<Vec<_>>());
+        let node2 = make_node(registry2).await;
+        for i in 1..=(MAX_PENDING_SIGS_PER_ROUND as u64) {
+            node2.submit_checkpoint_sig(sig(9, i)).await;
+        }
+        let before =
+            node2.pending_checkpoint_sigs.lock().await.get(&9).map(|v| v.len()).unwrap_or(0);
+        assert_eq!(before, MAX_PENDING_SIGS_PER_ROUND);
+        node2.submit_checkpoint_sig(sig(9, 70)).await;
+        let after =
+            node2.pending_checkpoint_sigs.lock().await.get(&9).map(|v| v.len()).unwrap_or(0);
+        assert_eq!(after, MAX_PENDING_SIGS_PER_ROUND, "cap must hold");
+    }
+
+    #[tokio::test]
+    async fn pending_drops_round_at_or_below_watermark() {
+        let (registry, _) = registry_with(&[1, 2, 3]);
+        let node = make_node(registry.clone()).await;
+        let payload = consensus::CheckpointPayload::new(10, [0u8; 32], registry);
+        node.signed_checkpoints
+            .lock()
+            .await
+            .push(consensus::SignedCheckpoint { payload, sigs: vec![sig(10, 1)] });
+        node.submit_checkpoint_sig(sig(10, 2)).await;
+        node.submit_checkpoint_sig(sig(9, 2)).await;
+        node.submit_checkpoint_sig(sig(11, 2)).await;
+        let pending = node.pending_checkpoint_sigs.lock().await;
+        assert!(!pending.contains_key(&10), "round == watermark dropped");
+        assert!(!pending.contains_key(&9), "round < watermark dropped");
+        assert_eq!(pending.get(&11).map(|v| v.len()), Some(1));
+    }
+
+    #[tokio::test]
+    async fn outbound_and_pending_purged_on_accept() {
+        let (registry, _) = registry_with(&[1, 2, 3, 4]);
+        let node = make_node(registry).await;
+        node.outbound_checkpoint_sigs.lock().await.push(sig(3, 1));
+        node.outbound_checkpoint_sigs.lock().await.push(sig(5, 1));
+        node.pending_checkpoint_sigs.lock().await.insert(3, vec![sig(3, 2)]);
+        node.pending_checkpoint_sigs.lock().await.insert(5, vec![sig(5, 2)]);
+        node.hashgraph.lock().await.mark_decided_through(5);
+        let snapshot = node.executor.lock().await.state().to_bytes();
+        let state_hash = state::State::root_of_bytes(&snapshot).expect("empty state hashes");
+        let payload =
+            consensus::CheckpointPayload::new(5, state_hash, node.registry.lock().await.clone());
+        let accepted = consensus::SignedCheckpoint { payload, sigs: vec![sig(5, 1)] };
+        node.accept_checkpoint(accepted, snapshot).await;
+        assert!(
+            node.state_snapshots.lock().await.contains_key(&5),
+            "accepted round must be recorded for reconnect serving"
+        );
+        let outbound = node.outbound_checkpoint_sigs.lock().await;
+        assert!(outbound.iter().all(|s| s.round > 5), "outbound retained only > accepted round");
+        let pending = node.pending_checkpoint_sigs.lock().await;
+        assert!(!pending.contains_key(&3));
+        assert!(!pending.contains_key(&5));
+    }
 }

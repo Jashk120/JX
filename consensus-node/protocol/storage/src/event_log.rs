@@ -134,7 +134,7 @@ impl EventLog {
         };
         let (log_seq, mut stored) = decode_value(&existing)
             .ok_or_else(|| EventLogError::Corrupt("stored record undecodable".into()))?;
-        if stored.round_received == Some(round_received) {
+        if stored.round_received.is_some() {
             return Ok(());
         }
         stored.round_received = Some(round_received);
@@ -309,7 +309,14 @@ mod tests {
         let event =
             UnsignedEvent::new(NodeId::new(creator), None, None, Timestamp::new(seq), Vec::new())
                 .finalize(Signature::new([seq as u8; 64]));
-        RetainedEvent { event, seq, round, ancestor_seqs: vec![seq], round_received: None }
+        RetainedEvent {
+            event,
+            seq,
+            round,
+            ancestor_seqs: vec![seq],
+            round_received: None,
+            consensus_timestamp: None,
+        }
     }
 
     fn record_hash(record: &RetainedEvent) -> EventHash {
@@ -348,6 +355,24 @@ mod tests {
         let hash = record_hash(&record);
         log.append(&record).expect("append");
         log.set_round_received(&hash, 5).expect("set order");
+
+        let replayed = log.replay().expect("replays");
+        assert_eq!(replayed.len(), 1);
+        assert_eq!(replayed[0].round_received, Some(5));
+    }
+
+    #[test]
+    fn set_round_received_never_overwrites_recorded_ordering() {
+        let dir = tempdir().expect("temp dir");
+        let log = EventLog::open(dir.path()).expect("opens");
+        let record = sample_record(1, 1, 1);
+        let hash = record_hash(&record);
+        log.append(&record).expect("append");
+        log.set_round_received(&hash, 5).expect("set order");
+        // `round_received` is consensus-final: a second call must be a no-op
+        // regardless of the value passed.
+        log.set_round_received(&hash, 5).expect("equal value is a no-op");
+        log.set_round_received(&hash, 9).expect("different value is a no-op");
 
         let replayed = log.replay().expect("replays");
         assert_eq!(replayed.len(), 1);
@@ -443,7 +468,13 @@ mod tests {
 
     #[test]
     fn decode_value_rejects_truncated_record() {
-        let record = sample_record(1, 1, 1);
+        // Use a record with a consensus timestamp so the trailing field is
+        // 9 bytes (0x01 + u64); truncating even the last byte must still be
+        // rejected, while truncating a None record's single trailing 0x00
+        // would otherwise look like a valid legacy encoding.
+        let mut record = sample_record(1, 1, 1);
+        record.round_received = Some(1);
+        record.consensus_timestamp = Some(primitives::Timestamp::new(42));
         let encoded = encode_value(42, &record);
         for cut in [9, 17, encoded.len() / 2, encoded.len() - 1] {
             assert!(decode_value(&encoded[..cut]).is_none(), "cut at {cut}");

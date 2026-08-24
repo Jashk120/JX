@@ -293,7 +293,7 @@ mod tests {
     fn quorum_checkpoint(round: u64, state_hash: [u8; 32], ids: &[u64]) -> SignedCheckpoint {
         let (registry, keys) = cluster_of(ids);
         let payload = CheckpointPayload::new(round, state_hash, registry);
-        let mut accumulator = CheckpointAccumulator::new(payload.clone());
+        let mut accumulator = CheckpointAccumulator::new(payload.clone(), Vec::new());
         let mut accepted = None;
         for (id, key) in keys {
             let sig = key.sign(&payload.signing_bytes());
@@ -332,7 +332,9 @@ mod tests {
         // A non-empty state whose root cannot equal the empty-state root.
         let db = TestDb::new();
         let mut other = state::State::new(db.db.state_keyspace());
-        other.apply(&state::Op::Put { key: b"k".to_vec(), value: b"v".to_vec() });
+        other
+            .apply(&state::Op::Put { key: b"k".to_vec(), value: b"v".to_vec() })
+            .expect("apply to fresh state succeeds");
         db.db.snapshot(3, &other.to_bytes()).expect("snapshot");
         let state = PersistedCheckpoint { checkpoint };
         assert!(!verify_persisted(&state, &db.db), "mismatched state bytes must fail");
@@ -425,6 +427,7 @@ mod tests {
                 round: 1,
                 ancestor_seqs: vec![1],
                 round_received: None,
+                consensus_timestamp: None,
             })
             .expect("append");
 
@@ -463,6 +466,7 @@ mod tests {
                 round: 1,
                 ancestor_seqs: vec![1],
                 round_received: Some(1),
+                consensus_timestamp: Some(primitives::Timestamp::new(1)),
             })
             .expect("append");
 

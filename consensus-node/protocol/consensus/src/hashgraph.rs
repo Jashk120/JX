@@ -385,13 +385,14 @@ impl Hashgraph {
     /// the caller has accepted all history up to the checkpoint — so no
     /// parent validation is performed and no new elections are started.
     ///
-    /// The record is marked ordered at `round_received` when that is `Some`
-    /// (the teacher already ordered it; copying the assignment is safe
-    /// because both nodes hold the identical event set and ordering is
-    /// deterministic), and `Some` records are never re-ordered by a later
-    /// `assign_order`. Events transferred before their fame resolved keep
-    /// `round_received: None` and are ordered by this node's own machinery
-    /// once their rounds are decided.
+    /// When `round_received` is `Some`, the teacher's `consensus_timestamp`
+    /// is restored verbatim so within-round ordering (which sorts by
+    /// timestamp) is identical on learner and teacher. Legacy records that
+    /// lack a timestamp (decoded as `None`) fall back to `Timestamp(0)` to
+    /// preserve backward compatibility with persisted event logs. `Some`
+    /// records are never re-ordered by a later `assign_order`. Events
+    /// transferred before their fame resolved keep `round_received: None` and
+    /// are ordered by this node's own machinery once their rounds are decided.
     ///
     /// `ancestor_seqs` is the teacher's stored row for the event — the
     /// elementwise-max ancestry summary — without which this node's future
@@ -404,6 +405,7 @@ impl Hashgraph {
         round: u64,
         mut ancestor_seqs: Vec<u64>,
         round_received: Option<u64>,
+        consensus_timestamp: Option<Timestamp>,
     ) -> Result<EventHash> {
         let hash = event.hash();
         if self.events.contains_key(&hash) {
@@ -438,6 +440,11 @@ impl Hashgraph {
             }
         }
 
+        let consensus_timestamp = match (round_received, consensus_timestamp) {
+            (Some(_), Some(ts)) => Some(ts),
+            (Some(_), None) => Some(Timestamp::new(0)),
+            (None, _) => None,
+        };
         self.events.insert(
             hash,
             EventRecord {
@@ -449,7 +456,7 @@ impl Hashgraph {
                 votes: HashMap::new(),
                 fame_status: FameStatus::Undecided,
                 round_received,
-                consensus_timestamp: round_received.map(|_| Timestamp::new(0)),
+                consensus_timestamp,
             },
         );
         Ok(hash)
@@ -470,6 +477,7 @@ impl Hashgraph {
                 round: record.round(),
                 ancestor_seqs: record.ancestor_seqs().to_vec(),
                 round_received: record.round_received(),
+                consensus_timestamp: record.consensus_timestamp(),
             })
             .collect()
     }
@@ -850,6 +858,17 @@ impl Hashgraph {
             }
         }
 
+        // Collect creators whose tip is being pruned so we can repoint the
+        // frontier to the highest surviving ancestor instead of removing it
+        // (L-1: pruning the tip otherwise erases the frontier and causes a
+        // resumed creator to mint a fresh genesis event whose seq collides).
+        let mut pruned_tips: Vec<NodeId> = Vec::new();
+        for (creator, tip) in &self.latest_by_creator {
+            if pruned.contains(tip) {
+                pruned_tips.push(*creator);
+            }
+        }
+
         for hash in &pruned {
             let Some(record) = self.events.remove(hash) else { continue };
             let creator = *record.event().creator();
@@ -872,6 +891,25 @@ impl Hashgraph {
             }
             if self.latest_by_creator.get(&creator) == Some(hash) {
                 self.latest_by_creator.remove(&creator);
+            }
+        }
+
+        for creator in pruned_tips {
+            if self.latest_by_creator.contains_key(&creator) {
+                continue;
+            }
+            let mut best: Option<(u64, EventHash)> = None;
+            for ((c, seq), hash) in &self.by_creator_seq {
+                if *c != creator {
+                    continue;
+                }
+                match best {
+                    Some((best_seq, _)) if *seq <= best_seq => {}
+                    _ => best = Some((*seq, *hash)),
+                }
+            }
+            if let Some((_, hash)) = best {
+                self.latest_by_creator.insert(creator, hash);
             }
         }
 
@@ -953,6 +991,7 @@ mod tests {
     use primitives::{
         NodeId,
         Timestamp,
+        Transaction,
         UnsignedEvent,
     };
     use rand::rngs::OsRng;
@@ -1459,6 +1498,67 @@ mod tests {
     }
 
     #[test]
+    fn prune_repoints_tip_to_highest_surviving_ancestor() {
+        let keys: Vec<SigningKey> = (0..3).map(|_| SigningKey::generate(&mut OsRng)).collect();
+        let nodes = [NodeId::new(1), NodeId::new(2), NodeId::new(3)];
+        let registry = registry_of(&nodes.iter().copied().zip(&keys).collect::<Vec<_>>());
+        let mut hg = Hashgraph::new(&registry);
+        let mut events = std::collections::HashMap::new();
+        let mut ts = 100u64;
+        let mut step = |label: &'static str,
+                        author: usize,
+                        self_parent: Option<&'static str>,
+                        other_parent: Option<&'static str>| {
+            let self_parent = self_parent.map(|label| events[label]);
+            let other_parent = other_parent.map(|label| events[label]);
+            let ve = verified_event(&keys[author], nodes[author], self_parent, other_parent, ts);
+            ts += 1;
+            let hash = hg.insert(ve).expect("insert should succeed");
+            events.insert(label, hash);
+        };
+        step("c1", 2, None, None);
+        step("c2", 2, Some("c1"), None);
+        step("c3", 2, Some("c2"), None);
+        step("a1", 0, None, None);
+        step("a2", 0, Some("a1"), None);
+        step("a3", 0, Some("a2"), Some("c2"));
+
+        hg.set_event_order(&events["c1"], 1, Timestamp::new(100));
+        hg.set_event_order(&events["c2"], 1, Timestamp::new(101));
+        hg.set_event_order(&events["c3"], 1, Timestamp::new(102));
+        hg.set_event_order(&events["a1"], 1, Timestamp::new(103));
+        hg.set_event_order(&events["a2"], 1, Timestamp::new(104));
+        hg.set_event_order(&events["a3"], 3, Timestamp::new(300));
+        hg.next_round_to_order = 4;
+
+        let c3 = events["c3"];
+        let c2 = events["c2"];
+        assert_eq!(hg.latest_event_by(&nodes[2]), Some(&c3));
+        assert_eq!(hg.get(&c3).unwrap().seq(), 3);
+
+        hg.prune_before_round(2);
+
+        assert!(hg.get(&events["c1"]).is_none());
+        assert!(hg.get(&c2).is_some(), "c2 survives as border anchor");
+        assert!(hg.get(&c3).is_none(), "tip c3 is pruned");
+        assert!(hg.get(&events["a2"]).is_some());
+        assert!(hg.get(&events["a3"]).is_some());
+
+        let tip = hg.latest_event_by(&nodes[2]).expect("stalled creator stays anchored");
+        assert_eq!(*tip, c2);
+        assert_eq!(hg.get(tip).unwrap().seq(), 2);
+
+        let new_hash = hg
+            .insert(verified_event(&keys[2], nodes[2], Some(c2), Some(events["a3"]), 500))
+            .expect("resume insert should succeed");
+        let new_record = hg.get(&new_hash).unwrap();
+        assert_eq!(new_record.seq(), 3, "seq continues from repointed tip, not genesis");
+        assert_eq!(hg.latest_event_by(&nodes[2]), Some(&new_hash));
+        let idx = hg.member_index_of(&nodes[2]).unwrap();
+        assert!(!hg.creator_has_known_fork(idx), "innocent creator not flagged as forker");
+    }
+
+    #[test]
     fn from_checkpoint_builds_empty_but_sized_structure() {
         let registry = registry_of(&[
             (NodeId::new(1), &SigningKey::generate(&mut OsRng)),
@@ -1502,13 +1602,21 @@ mod tests {
             UnsignedEvent::new(node, None, None, Timestamp::new(100), Vec::new()).sign(&key);
         let ancestor_seqs = vec![7u64];
         let hash = hg
-            .insert_accepted(event.clone(), 7, 3, ancestor_seqs.clone(), Some(3))
+            .insert_accepted(
+                event.clone(),
+                7,
+                3,
+                ancestor_seqs.clone(),
+                Some(3),
+                Some(Timestamp::new(555)),
+            )
             .expect("accepted event inserts");
 
         let record = hg.get(&hash).expect("record present");
         assert_eq!(record.seq(), 7);
         assert_eq!(record.round(), 3);
         assert_eq!(record.round_received(), Some(3));
+        assert_eq!(record.consensus_timestamp(), Some(Timestamp::new(555)));
         assert_eq!(record.ancestor_seqs(), ancestor_seqs.as_slice());
         assert!(!record.is_witness(), "accepted events are never witnesses");
         assert_eq!(hg.latest_event_by(&node), Some(&hash), "frontier drives known-summary");
@@ -1517,7 +1625,7 @@ mod tests {
 
         // A duplicate accepted insert is rejected.
         assert_eq!(
-            hg.insert_accepted(event, 7, 3, ancestor_seqs, Some(3)),
+            hg.insert_accepted(event, 7, 3, ancestor_seqs, Some(3), Some(Timestamp::new(555))),
             Err(InsertError::AlreadyPresent(hash))
         );
     }
@@ -1534,7 +1642,8 @@ mod tests {
             UnsignedEvent::new(node, None, None, Timestamp::new(100), Vec::new()).sign(&key);
         // round_received None: the teacher had not ordered this event yet, so
         // the learner leaves it pending for its own ordering machinery.
-        let hash = hg.insert_accepted(event, 7, 3, vec![7], None).expect("accepted event inserts");
+        let hash =
+            hg.insert_accepted(event, 7, 3, vec![7], None, None).expect("accepted event inserts");
         assert_eq!(hg.get(&hash).expect("present").round_received(), None);
         assert_eq!(hg.pending_order_events(), vec![hash]);
     }
@@ -1549,7 +1658,7 @@ mod tests {
         let event = UnsignedEvent::new(rogue, None, None, Timestamp::new(100), Vec::new())
             .sign(&SigningKey::generate(&mut OsRng));
         assert_eq!(
-            hg.insert_accepted(event, 1, 1, vec![1], Some(1)),
+            hg.insert_accepted(event, 1, 1, vec![1], Some(1), Some(Timestamp::new(0))),
             Err(InsertError::UnknownCreator)
         );
     }
@@ -1566,7 +1675,7 @@ mod tests {
             UnsignedEvent::new(node, None, None, Timestamp::new(100), Vec::new()).sign(&key);
         // ancestor_seqs has 2 entries but the hashgraph only has 1 member.
         assert_eq!(
-            hg.insert_accepted(event, 1, 1, vec![1, 0], Some(1)),
+            hg.insert_accepted(event, 1, 1, vec![1, 0], Some(1), Some(Timestamp::new(0))),
             Err(InsertError::AncestorSeqsMismatch { expected: 1, got: 2 })
         );
     }
@@ -1596,18 +1705,21 @@ mod tests {
         let re_a1 = &by_seq[&(node_a, 1)];
         assert_eq!(re_a1.round, 1);
         assert_eq!(re_a1.round_received, Some(1));
+        assert_eq!(re_a1.consensus_timestamp, Some(Timestamp::new(100)));
         assert_eq!(re_a1.ancestor_seqs.len(), 2, "ancestor_seqs covers both members");
         assert_eq!(re_a1.event.hash(), a1);
 
         let re_a2 = &by_seq[&(node_a, 2)];
         assert_eq!(re_a2.round, 1, "birth round tracks the parents, not the ordering");
         assert_eq!(re_a2.round_received, Some(2), "round_received is the ordering round");
+        assert_eq!(re_a2.consensus_timestamp, Some(Timestamp::new(101)));
         // a2's row must reflect its own seq and a1's contribution.
         assert_eq!(re_a2.ancestor_seqs[0], 2);
 
         let re_b1 = &by_seq[&(node_b, 1)];
         assert_eq!(re_b1.round, 1);
         assert_eq!(re_b1.round_received, None, "unordered tip events keep round_received None");
+        assert_eq!(re_b1.consensus_timestamp, None);
     }
 
     #[test]
@@ -1639,5 +1751,132 @@ mod tests {
         assert_eq!(hg.max_ordered_round(), 0, "unordered events do not count");
         hg.set_event_order(&e1, 2, Timestamp::new(100));
         assert_eq!(hg.max_ordered_round(), 2);
+    }
+
+    #[test]
+    fn reconnect_preserves_within_round_order_for_same_key_with_different_timestamps() {
+        // Two events in the same round with the same payload key but different
+        // consensus timestamps must order by timestamp after a reconnect transfer,
+        // not by signature fold (the bug: fabricated zero timestamp).
+        let key_a = SigningKey::generate(&mut OsRng);
+        let key_b = SigningKey::generate(&mut OsRng);
+        let node_a = NodeId::new(1);
+        let node_b = NodeId::new(2);
+        let registry = registry_of(&[(node_a, &key_a), (node_b, &key_b)]);
+        let mut teacher = Hashgraph::new(&registry);
+
+        // Same-key payload: both events write the same key so execution order
+        // matters (distinct keys would hide the divergence).
+        let payload = vec![Transaction::from_bytes(b"same-key".to_vec())];
+        let event_a = UnsignedEvent::new(node_a, None, None, Timestamp::new(10), payload.clone())
+            .sign(&key_a);
+        let event_b = UnsignedEvent::new(node_b, None, None, Timestamp::new(20), payload.clone())
+            .sign(&key_b);
+        let verified_a = event_a.verify(&registry).expect("verify a");
+        let verified_b = event_b.verify(&registry).expect("verify b");
+        let hash_a = teacher.insert(verified_a).expect("insert a");
+        let hash_b = teacher.insert(verified_b).expect("insert b");
+
+        // Force both into the same round with distinct consensus timestamps.
+        // Timestamp 100 vs 200 in same round 5.
+        let ts_early = Timestamp::new(100);
+        let ts_late = Timestamp::new(200);
+        teacher.set_event_order(&hash_a, 5, ts_late);
+        teacher.set_event_order(&hash_b, 5, ts_early);
+        // Teacher orders by timestamp: b (early) before a (late)
+        let teacher_order = teacher.consensus_order(5);
+        assert_eq!(teacher_order, vec![hash_b, hash_a], "teacher sorts by timestamp");
+
+        // Transfer via retained events (teacher -> learner)
+        let retained = teacher.retained_events();
+        // Verify retained carries the timestamps
+        for re in &retained {
+            if re.event.hash() == hash_a {
+                assert_eq!(re.consensus_timestamp, Some(ts_late));
+                assert_eq!(re.round_received, Some(5));
+            }
+            if re.event.hash() == hash_b {
+                assert_eq!(re.consensus_timestamp, Some(ts_early));
+            }
+        }
+        // Encode/decode round-trip via storage wire format (backward compat)
+        for re in &retained {
+            let bytes = crate::reconnect::encode_retained_event(re);
+            let decoded = crate::reconnect::decode_retained_event(&bytes).expect("decode");
+            assert_eq!(&decoded, re, "storage wire round-trip preserves timestamp");
+        }
+        // Legacy old record without timestamp must decode as None (compat)
+        {
+            // Simulate old encoding by truncating the last byte (timestamp tag)
+            let re = retained.iter().find(|r| r.round_received.is_some()).unwrap();
+            let mut old_bytes = crate::reconnect::encode_retained_event(re);
+            // Old format had no trailing timestamp field: remove it
+            old_bytes.pop();
+            if re.consensus_timestamp.is_some() {
+                old_bytes.truncate(old_bytes.len() - 8);
+            }
+            let decoded = crate::reconnect::decode_retained_event(&old_bytes).expect("old decodes");
+            assert_eq!(decoded.consensus_timestamp, None, "legacy record maps to None");
+        }
+
+        // Learner reconstructs from checkpoint + retained
+        let checkpoint = crate::checkpoint::CheckpointPayload::new(1, [0u8; 32], registry.clone());
+        let history = crypto::RosterHistory::new(registry.clone());
+        let mut learner = Hashgraph::from_checkpoint(&checkpoint, history);
+        for re in retained {
+            learner
+                .insert_accepted(
+                    re.event,
+                    re.seq,
+                    re.round,
+                    re.ancestor_seqs,
+                    re.round_received,
+                    re.consensus_timestamp,
+                )
+                .expect("learner insert");
+        }
+        let learner_order = learner.consensus_order(5);
+        assert_eq!(
+            learner_order, teacher_order,
+            "learner must replay same-round events in timestamp order, not signature order"
+        );
+
+        // Second learner from same transfer must be identical (determinism)
+        let mut learner2 =
+            Hashgraph::from_checkpoint(&checkpoint, crypto::RosterHistory::new(registry.clone()));
+        // Re-use retained from teacher (clone before move above) – rebuild teacher retained again
+        let retained2 = teacher.retained_events();
+        for re in retained2 {
+            learner2
+                .insert_accepted(
+                    re.event,
+                    re.seq,
+                    re.round,
+                    re.ancestor_seqs,
+                    re.round_received,
+                    re.consensus_timestamp,
+                )
+                .expect("learner2 insert");
+        }
+        assert_eq!(
+            learner2.consensus_order(5),
+            teacher_order,
+            "two learners from same teacher must be deterministic"
+        );
+
+        // Legacy fallback: insert_accepted with round_received Some but timestamp None
+        // must fabricate Timestamp(0) (backward compat for old persisted logs)
+        let mut hg_legacy =
+            Hashgraph::from_checkpoint(&checkpoint, crypto::RosterHistory::new(registry.clone()));
+        let event_legacy =
+            UnsignedEvent::new(node_a, None, None, Timestamp::new(999), Vec::new()).sign(&key_a);
+        let hash_legacy = hg_legacy
+            .insert_accepted(event_legacy, 10, 1, vec![10, 0], Some(2), None)
+            .expect("legacy insert");
+        assert_eq!(
+            hg_legacy.get(&hash_legacy).unwrap().consensus_timestamp(),
+            Some(Timestamp::new(0)),
+            "legacy record without timestamp falls back to zero"
+        );
     }
 }
