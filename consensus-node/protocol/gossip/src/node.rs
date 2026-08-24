@@ -129,8 +129,10 @@ pub struct GossipNode {
     /// Accepted checkpoints, ascending by round.
     signed_checkpoints: Mutex<Vec<SignedCheckpoint>>,
     /// Per-round serialized state (`State::to_bytes()`), keyed by round,
-    /// captured when that round's checkpoint is produced. A reconnect learner
-    /// is served the snapshot for the checkpoint round — not the live state,
+    /// recorded when that round's checkpoint is accepted
+    /// (`accept_checkpoint`, from the accumulator-carried bytes) or restored
+    /// via reconnect apply, keyed by exact round. A reconnect learner is
+    /// served the snapshot for the checkpoint round — not the live state,
     /// which has advanced past it — so the served bytes rebuild to the
     /// committed `state_hash` and the learner's replay of the retained window
     /// is exactly-once. Evicted in `accept_checkpoint` alongside pruning,
@@ -689,9 +691,6 @@ impl GossipNode {
                 }
                 (hashes, snapshots)
             };
-            // Retain the snapshots for reconnect serving (evicted alongside
-            // pruning in `accept_checkpoint`).
-            self.state_snapshots.lock().await.extend(snapshots);
 
             // Phase C: activate ops whose activation round is now fully decided.
             let candidate_rrs: Vec<u64> = {
@@ -772,18 +771,18 @@ impl GossipNode {
 
             // Phase D: produce checkpoints for every round decided since the
             // last pass, using the per-round state hashes captured above.
-            self.produce_pending_checkpoints(&state_hashes).await;
+            self.produce_pending_checkpoints(&state_hashes, &snapshots).await;
         } else {
             // No newly finalized events: no rounds were newly ordered, but a
-            // round may still have just been decided. The empty hash map's
+            // round may still have just been decided. The per-pass maps'
             // round-0 sentinel falls back to the current (unchanged) state.
             let (bytes, root) = {
                 let executor = self.executor.lock().await;
                 (executor.state().to_bytes(), executor.state().root())
             };
             let state_hashes = BTreeMap::from([(0, root)]);
-            self.state_snapshots.lock().await.insert(0, bytes);
-            self.produce_pending_checkpoints(&state_hashes).await;
+            let snapshots = BTreeMap::from([(0, bytes)]);
+            self.produce_pending_checkpoints(&state_hashes, &snapshots).await;
         }
         self.checkpoint_notify.notify_waiters();
     }
@@ -793,7 +792,11 @@ impl GossipNode {
     /// final fame decision *and* this node's view of the round is complete
     /// (`is_round_decided`), which is exactly the point at which its ordering
     /// can no longer change.
-    async fn produce_pending_checkpoints(&self, state_hashes: &BTreeMap<u64, [u8; 32]>) {
+    async fn produce_pending_checkpoints(
+        &self,
+        state_hashes: &BTreeMap<u64, [u8; 32]>,
+        snapshots: &BTreeMap<u64, Vec<u8>>,
+    ) {
         loop {
             let round = self.activation.lock().await.checkpoint_watermark + 1;
             let decided = {
@@ -807,7 +810,7 @@ impl GossipNode {
                 let mut activation = self.activation.lock().await;
                 activation.checkpoint_watermark = round;
             }
-            self.produce_checkpoint(round, state_hashes).await;
+            self.produce_checkpoint(round, state_hashes, snapshots).await;
         }
     }
 
@@ -819,11 +822,24 @@ impl GossipNode {
     /// processing the latest finalized round at or before `round` — i.e. the
     /// deterministic state exactly at this checkpoint, identical on every
     /// node, so signatures produced here verify against any peer.
-    async fn produce_checkpoint(&self, round: u64, state_hashes: &BTreeMap<u64, [u8; 32]>) {
+    async fn produce_checkpoint(
+        &self,
+        round: u64,
+        state_hashes: &BTreeMap<u64, [u8; 32]>,
+        snapshots: &BTreeMap<u64, Vec<u8>>,
+    ) {
         let state_hash = *state_hashes
             .range(..=round)
             .next_back()
             .map(|(_, hash)| hash)
+            .expect("the round-0 sentinel always present");
+        // The exact serialized state whose root is `state_hash`, captured in
+        // the same producing pass. Carried through the accumulator so
+        // acceptance persists exactly the committed bytes — no second lookup.
+        let snapshot_bytes = snapshots
+            .range(..=round)
+            .next_back()
+            .map(|(_, bytes)| bytes.clone())
             .expect("the round-0 sentinel always present");
         let payload = {
             let hg = self.hashgraph.lock().await;
@@ -849,10 +865,11 @@ impl GossipNode {
             pending.remove(&round).unwrap_or_default()
         };
 
-        let accepted = {
+        let (accepted, snapshot) = {
             let mut accumulators = self.checkpoint_accumulators.lock().await;
-            let accumulator =
-                accumulators.entry(round).or_insert_with(|| CheckpointAccumulator::new(payload));
+            let accumulator = accumulators
+                .entry(round)
+                .or_insert_with(|| CheckpointAccumulator::new(payload, snapshot_bytes));
             let mut accepted = accumulator.add_sig(own_sig, &roster);
             for sig in pending {
                 if accepted.is_some() {
@@ -862,13 +879,15 @@ impl GossipNode {
                     accepted = accumulator.add_sig(sig, &roster);
                 }
             }
+            let snapshot =
+                if accepted.is_some() { Some(accumulator.snapshot().to_vec()) } else { None };
             if accepted.is_some() {
                 accumulators.remove(&round);
             }
-            accepted
+            (accepted, snapshot)
         };
-        if let Some(accepted) = accepted {
-            self.accept_checkpoint(accepted).await;
+        if let (Some(accepted), Some(snapshot)) = (accepted, snapshot) {
+            self.accept_checkpoint(accepted, snapshot).await;
         }
     }
 
@@ -904,14 +923,17 @@ impl GossipNode {
         let accepted = {
             let mut accumulators = self.checkpoint_accumulators.lock().await;
             let round = sig.round;
-            let accepted = accumulators.get_mut(&round).and_then(|acc| acc.add_sig(sig, &roster));
+            let accepted = accumulators.get_mut(&round).and_then(|acc| {
+                let accepted = acc.add_sig(sig, &roster)?;
+                Some((accepted, acc.snapshot().to_vec()))
+            });
             if accepted.is_some() {
                 accumulators.remove(&round);
             }
             accepted
         };
-        if let Some(accepted) = accepted {
-            self.accept_checkpoint(accepted).await;
+        if let Some((accepted, snapshot)) = accepted {
+            self.accept_checkpoint(accepted, snapshot).await;
         }
     }
 
@@ -923,20 +945,20 @@ impl GossipNode {
     /// is always served the highest accepted checkpoint (round ≥ `round -
     /// RETENTION_ROUNDS`), so anything below the floor can never be served
     /// again and keeping it would only grow memory.
-    async fn accept_checkpoint(&self, accepted: SignedCheckpoint) {
+    async fn accept_checkpoint(&self, accepted: SignedCheckpoint, snapshot: Vec<u8>) {
         let round = accepted.payload.round;
-        // Persist before pruning: the state snapshot for the accepted round
-        // must still be present. The same predecessor lookup
-        // (`range(..=round).next_back()`) that selected the state hash in
-        // `produce_checkpoint` selects the bytes that hash to it.
-        let snapshot = {
-            let snapshots = self.state_snapshots.lock().await;
-            snapshots.range(..=round).next_back().map(|(_, bytes)| bytes.clone())
-        };
-        let Some(snapshot) = snapshot else {
-            tracing::warn!(round, "refusing to accept checkpoint: no state snapshot available");
+        // Defensive: refuse to persist a snapshot that does not rebuild to the
+        // committed root. The accumulator carries the bytes captured in the same
+        // producing pass as the payload, so this holds by construction — but a
+        // divergence here would brick restart recovery (`verify_persisted`),
+        // mirroring the rejection applied on the reconnect path.
+        if state::State::root_of_bytes(&snapshot) != Some(accepted.payload.state_hash) {
+            tracing::error!(
+                round,
+                "refusing to accept checkpoint: snapshot does not rebuild to the committed state_hash"
+            );
             return;
-        };
+        }
         // Durable copy: the `.snap` file is gone; a restart restores the
         // exact checkpoint-round state from this `snap` keyspace entry.
         // Flush *before* the checkpoint is recorded as accepted so a crash
@@ -971,6 +993,9 @@ impl GossipNode {
             signed.push(accepted);
             signed.sort_by_key(|c| c.payload.round);
         }
+        // Record the accepted snapshot under its exact round so a reconnect
+        // learner is served the state exactly as it stood at this checkpoint.
+        self.state_snapshots.lock().await.insert(round, snapshot);
         {
             let mut outbound = self.outbound_checkpoint_sigs.lock().await;
             outbound.retain(|sig| sig.round > round);
@@ -1653,25 +1678,16 @@ mod pending_sig_tests {
         node.pending_checkpoint_sigs.lock().await.insert(3, vec![sig(3, 2)]);
         node.pending_checkpoint_sigs.lock().await.insert(5, vec![sig(5, 2)]);
         node.hashgraph.lock().await.mark_decided_through(5);
+        let snapshot = node.executor.lock().await.state().to_bytes();
+        let state_hash = state::State::root_of_bytes(&snapshot).expect("empty state hashes");
         let payload =
-            consensus::CheckpointPayload::new(5, [0u8; 32], node.registry.lock().await.clone());
-        let snapshot = {
-            let snaps = node.state_snapshots.lock().await;
-            if let Some(v) = snaps.get(&0).cloned() {
-                v
-            } else {
-                drop(snaps);
-                node.executor.lock().await.state().to_bytes()
-            }
-        };
-        {
-            let mut snaps = node.state_snapshots.lock().await;
-            snaps.insert(5, snapshot.clone());
-            snaps.insert(0, snapshot.clone());
-        }
+            consensus::CheckpointPayload::new(5, state_hash, node.registry.lock().await.clone());
         let accepted = consensus::SignedCheckpoint { payload, sigs: vec![sig(5, 1)] };
-        // Persist watermark/snapshot will succeed with temp db.
-        node.accept_checkpoint(accepted).await;
+        node.accept_checkpoint(accepted, snapshot).await;
+        assert!(
+            node.state_snapshots.lock().await.contains_key(&5),
+            "accepted round must be recorded for reconnect serving"
+        );
         let outbound = node.outbound_checkpoint_sigs.lock().await;
         assert!(outbound.iter().all(|s| s.round > 5), "outbound retained only > accepted round");
         let pending = node.pending_checkpoint_sigs.lock().await;
