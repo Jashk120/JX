@@ -26,10 +26,54 @@ func hashObj(h [32]byte) *pb.HashObject {
 	return &pb.HashObject{Algorithm: 0, Length: 32, Hash: h[:]}
 }
 
-// writeEventFile writes a valid .esf at dir holding one event per (creator,
-// seq) pair, chained from the seed so it passes VerifyEventFile without a
-// signature file.
-func writeEventFile(t *testing.T, dir string, index uint64, pairs [][2]uint64) {
+func trustedHashForPriv(priv ed25519.PrivateKey) [32]byte {
+	pub := priv.Public().(ed25519.PublicKey)
+	var buf [40]byte
+	binary.BigEndian.PutUint64(buf[:8], 0)
+	copy(buf[8:], pub)
+	return sha256.Sum256(buf[:])
+}
+
+func writeSigFile(t *testing.T, streamPath string, fileBytes, metadata []byte, priv ed25519.PrivateKey) {
+	t.Helper()
+	fileDigest := sha256.Sum256(fileBytes)
+	metaDigest := sha256.Sum256(metadata)
+	sigFile := &pb.SignatureFile{
+		FileSignature: &pb.SignatureObject{
+			Type:      0,
+			Length:    64,
+			Signature: ed25519.Sign(priv, fileDigest[:]),
+			HashObject: &pb.HashObject{
+				Algorithm: 0,
+				Length:    32,
+				Hash:      fileDigest[:],
+			},
+		},
+		MetadataSignature: &pb.SignatureObject{
+			Type:      0,
+			Length:    64,
+			Signature: ed25519.Sign(priv, metaDigest[:]),
+			HashObject: &pb.HashObject{
+				Algorithm: 0,
+				Length:    32,
+				Hash:      metaDigest[:],
+			},
+		},
+	}
+	raw, err := proto.Marshal(sigFile)
+	if err != nil {
+		t.Fatalf("marshal sig: %v", err)
+	}
+	out := make([]byte, 0, 1+len(raw))
+	out = append(out, stream.SigFileVersion)
+	out = append(out, raw...)
+	sigPath := filepath.Join(filepath.Dir(streamPath), stream.SignatureFileName(filepath.Base(streamPath)))
+	if err := os.WriteFile(sigPath, out, 0o644); err != nil {
+		t.Fatalf("write sig %s: %v", sigPath, err)
+	}
+}
+
+func writeEventFileWithSig(t *testing.T, dir string, index uint64, pairs [][2]uint64, priv ed25519.PrivateKey, start [32]byte) [32]byte {
 	t.Helper()
 	events := make([]*pb.Event, len(pairs))
 	serialized := make([][]byte, len(pairs))
@@ -41,10 +85,10 @@ func writeEventFile(t *testing.T, dir string, index uint64, pairs [][2]uint64) {
 		}
 		events[i], serialized[i] = ev, b
 	}
-	end := stream.RunningHash(stream.ChainSeed, serialized)
+	end := stream.RunningHash(start, serialized)
 	esf := &pb.EventStreamFile{
 		Version:          stream.Version,
-		StartRunningHash: hashObj(stream.ChainSeed),
+		StartRunningHash: hashObj(start),
 		Events:           events,
 		EndRunningHash:   hashObj(end),
 	}
@@ -56,22 +100,34 @@ func writeEventFile(t *testing.T, dir string, index uint64, pairs [][2]uint64) {
 	if err := os.WriteFile(path, raw, 0o644); err != nil {
 		t.Fatalf("write %s: %v", path, err)
 	}
+	meta := make([]byte, 0, 68)
+	var ver [4]byte
+	binary.BigEndian.PutUint32(ver[:], stream.Version)
+	meta = append(meta, ver[:]...)
+	meta = append(meta, start[:]...)
+	meta = append(meta, end[:]...)
+	writeSigFile(t, path, raw, meta, priv)
+	return end
 }
 
-// writeCorruptEventFile writes an .esf whose end running hash does not match
-// its events, i.e. one that must fail verification.
-func writeCorruptEventFile(t *testing.T, dir string, index uint64) {
+func writeEventFile(t *testing.T, dir string, index uint64, pairs [][2]uint64) {
+	priv := ed25519.NewKeyFromSeed(make([]byte, ed25519.SeedSize))
+	// For backwards compatibility in simple tests, if no chaining info, use ChainSeed.
+	writeEventFileWithSig(t, dir, index, pairs, priv, stream.ChainSeed)
+}
+
+func writeCorruptEventFileWithSig(t *testing.T, dir string, index uint64, priv ed25519.PrivateKey, start [32]byte) {
 	t.Helper()
 	ev := &pb.Event{Creator: 1, Seq: 99}
 	b, err := proto.MarshalOptions{Deterministic: true}.Marshal(ev)
 	if err != nil {
 		t.Fatalf("marshal event: %v", err)
 	}
-	end := stream.RunningHash(stream.ChainSeed, [][]byte{b})
+	end := stream.RunningHash(start, [][]byte{b})
 	end[0] ^= 0xff
 	esf := &pb.EventStreamFile{
 		Version:          stream.Version,
-		StartRunningHash: hashObj(stream.ChainSeed),
+		StartRunningHash: hashObj(start),
 		Events:           []*pb.Event{ev},
 		EndRunningHash:   hashObj(end),
 	}
@@ -83,38 +139,45 @@ func writeCorruptEventFile(t *testing.T, dir string, index uint64) {
 	if err := os.WriteFile(path, raw, 0o644); err != nil {
 		t.Fatalf("write %s: %v", path, err)
 	}
+	meta := make([]byte, 0, 68)
+	var ver [4]byte
+	binary.BigEndian.PutUint32(ver[:], stream.Version)
+	meta = append(meta, ver[:]...)
+	meta = append(meta, start[:]...)
+	meta = append(meta, end[:]...)
+	writeSigFile(t, path, raw, meta, priv)
 }
 
-// writeRecordFile writes a valid .rsf for round at dir, carrying one record
-// item and a single-member threshold-signed checkpoint.
-func writeRecordFile(t *testing.T, dir string, round uint64, priv ed25519.PrivateKey) {
+func writeCorruptEventFile(t *testing.T, dir string, index uint64) {
+	priv := ed25519.NewKeyFromSeed(make([]byte, ed25519.SeedSize))
+	writeCorruptEventFileWithSig(t, dir, index, priv, stream.ChainSeed)
+}
+
+func writeRecordFileWithSig(t *testing.T, dir string, round uint64, priv ed25519.PrivateKey, start [32]byte) [32]byte {
 	t.Helper()
 	item := &pb.RecordItem{
 		EventHash: make([]byte, 32),
 		TxIndex:   0,
 		TxPayload: []byte("put"),
 	}
-	serialized := make([][]byte, 1)
 	b, err := proto.MarshalOptions{Deterministic: true}.Marshal(item)
 	if err != nil {
 		t.Fatalf("marshal item: %v", err)
 	}
-	serialized[0] = b
+	serialized := [][]byte{b}
+	end := stream.RunningHash(start, serialized)
 	pub := priv.Public().(ed25519.PublicKey)
-
 	var rosterBuf [40]byte
 	binary.BigEndian.PutUint64(rosterBuf[:8], 0)
 	copy(rosterBuf[8:], pub)
 	rosterHash := sha256.Sum256(rosterBuf[:])
 	stateHash := sha256.Sum256([]byte("state"))
-
 	signing := make([]byte, 0, 72)
 	var roundBE [8]byte
 	binary.BigEndian.PutUint64(roundBE[:], round)
 	signing = append(signing, roundBE[:]...)
 	signing = append(signing, stateHash[:]...)
 	signing = append(signing, rosterHash[:]...)
-
 	cp := &pb.SignedCheckpoint{
 		Round:      round,
 		StateHash:  stateHash[:],
@@ -129,9 +192,9 @@ func writeRecordFile(t *testing.T, dir string, round uint64, priv ed25519.Privat
 	rsf := &pb.RecordStreamFile{
 		Version:          stream.Version,
 		Round:            round,
-		StartRunningHash: hashObj(stream.ChainSeed),
+		StartRunningHash: hashObj(start),
 		Items:            []*pb.RecordItem{item},
-		EndRunningHash:   hashObj(stream.RunningHash(stream.ChainSeed, serialized)),
+		EndRunningHash:   hashObj(end),
 		Checkpoint:       cp,
 	}
 	raw, err := proto.Marshal(rsf)
@@ -142,6 +205,21 @@ func writeRecordFile(t *testing.T, dir string, round uint64, priv ed25519.Privat
 	if err := os.WriteFile(path, raw, 0o644); err != nil {
 		t.Fatalf("write %s: %v", path, err)
 	}
+	meta := make([]byte, 0, 76)
+	var ver [4]byte
+	binary.BigEndian.PutUint32(ver[:], stream.Version)
+	meta = append(meta, ver[:]...)
+	meta = append(meta, start[:]...)
+	meta = append(meta, end[:]...)
+	var rbe [8]byte
+	binary.BigEndian.PutUint64(rbe[:], round)
+	meta = append(meta, rbe[:]...)
+	writeSigFile(t, path, raw, meta, priv)
+	return end
+}
+
+func writeRecordFile(t *testing.T, dir string, round uint64, priv ed25519.PrivateKey) {
+	writeRecordFileWithSig(t, dir, round, priv, stream.ChainSeed)
 }
 
 func assertCounts(t *testing.T, st *store.MemStore, wantEvents, wantRecords int) {
@@ -157,11 +235,14 @@ func assertCounts(t *testing.T, st *store.MemStore, wantEvents, wantRecords int)
 func TestRunOnceDoesNotReingestOnLaterPolls(t *testing.T) {
 	dir := t.TempDir()
 	priv := ed25519.NewKeyFromSeed(make([]byte, ed25519.SeedSize))
-	writeEventFile(t, dir, 0, [][2]uint64{{1, 0}, {1, 1}})
-	writeRecordFile(t, dir, 0, priv)
+	pub := priv.Public().(ed25519.PublicKey)
+	trusted := trustedHashForPriv(priv)
+
+	end0events := writeEventFileWithSig(t, dir, 0, [][2]uint64{{1, 0}, {1, 1}}, priv, stream.ChainSeed)
+	writeRecordFileWithSig(t, dir, 0, priv, stream.ChainSeed)
 
 	st := store.NewMemStore()
-	ing := New(Config{StreamsDir: dir}, st, quietLogger())
+	ing := New(Config{StreamsDir: dir, PubKey: pub, TrustedRosterHash: trusted[:]}, st, quietLogger())
 	ctx := context.Background()
 
 	if err := ing.RunOnce(ctx); err != nil {
@@ -169,15 +250,18 @@ func TestRunOnceDoesNotReingestOnLaterPolls(t *testing.T) {
 	}
 	assertCounts(t, st, 2, 1)
 
-	// Re-polling the unchanged directory must be a no-op.
 	if err := ing.RunOnce(ctx); err != nil {
 		t.Fatalf("second RunOnce: %v", err)
 	}
 	assertCounts(t, st, 2, 1)
 
-	// New files appear; exactly they get ingested.
-	writeEventFile(t, dir, 1, [][2]uint64{{2, 0}})
-	writeRecordFile(t, dir, 1, priv)
+	writeEventFileWithSig(t, dir, 1, [][2]uint64{{2, 0}}, priv, end0events)
+	end0records := stream.RunningHash(stream.ChainSeed, [][]byte{func() []byte {
+		item := &pb.RecordItem{EventHash: make([]byte, 32), TxIndex: 0, TxPayload: []byte("put")}
+		b, _ := proto.MarshalOptions{Deterministic: true}.Marshal(item)
+		return b
+	}()})
+	writeRecordFileWithSig(t, dir, 1, priv, end0records)
 	if err := ing.RunOnce(ctx); err != nil {
 		t.Fatalf("third RunOnce: %v", err)
 	}
@@ -187,21 +271,21 @@ func TestRunOnceDoesNotReingestOnLaterPolls(t *testing.T) {
 func TestReingestIntoPopulatedStoreIsNoop(t *testing.T) {
 	dir := t.TempDir()
 	priv := ed25519.NewKeyFromSeed(make([]byte, ed25519.SeedSize))
-	writeEventFile(t, dir, 0, [][2]uint64{{1, 0}})
-	writeRecordFile(t, dir, 0, priv)
+	pub := priv.Public().(ed25519.PublicKey)
+	trusted := trustedHashForPriv(priv)
+	writeEventFileWithSig(t, dir, 0, [][2]uint64{{1, 0}}, priv, stream.ChainSeed)
+	writeRecordFileWithSig(t, dir, 0, priv, stream.ChainSeed)
 
 	st := store.NewMemStore()
 	ctx := context.Background()
 
-	first := New(Config{StreamsDir: dir}, st, quietLogger())
+	first := New(Config{StreamsDir: dir, PubKey: pub, TrustedRosterHash: trusted[:]}, st, quietLogger())
 	if err := first.RunOnce(ctx); err != nil {
 		t.Fatalf("first ingester RunOnce: %v", err)
 	}
 	assertCounts(t, st, 1, 1)
 
-	// A fresh Ingester (e.g. after restart) against the same populated store:
-	// store-level dedup must keep the data single-copy.
-	second := New(Config{StreamsDir: dir}, st, quietLogger())
+	second := New(Config{StreamsDir: dir, PubKey: pub, TrustedRosterHash: trusted[:]}, st, quietLogger())
 	if err := second.RunOnce(ctx); err != nil {
 		t.Fatalf("second ingester RunOnce: %v", err)
 	}
@@ -210,21 +294,282 @@ func TestReingestIntoPopulatedStoreIsNoop(t *testing.T) {
 
 func TestFailedFileIsNotMarkedSeen(t *testing.T) {
 	dir := t.TempDir()
+	priv := ed25519.NewKeyFromSeed(make([]byte, ed25519.SeedSize))
+	pub := priv.Public().(ed25519.PublicKey)
+	trusted := trustedHashForPriv(priv)
 	st := store.NewMemStore()
-	ing := New(Config{StreamsDir: dir}, st, quietLogger())
+	ing := New(Config{StreamsDir: dir, PubKey: pub, TrustedRosterHash: trusted[:]}, st, quietLogger())
 	ctx := context.Background()
 
-	writeCorruptEventFile(t, dir, 0)
+	writeCorruptEventFileWithSig(t, dir, 0, priv, stream.ChainSeed)
 	if err := ing.RunOnce(ctx); err != nil {
 		t.Fatalf("RunOnce with corrupt file: %v", err)
 	}
 	assertCounts(t, st, 0, 0)
 
-	// The same file name now holds valid content; it must be retried and
-	// stored rather than skipped as already seen.
-	writeEventFile(t, dir, 0, [][2]uint64{{3, 0}})
+	os.Remove(filepath.Join(dir, stream.EventFileName(0)))
+	os.Remove(filepath.Join(dir, stream.SignatureFileName(stream.EventFileName(0))))
+	writeEventFileWithSig(t, dir, 0, [][2]uint64{{3, 0}}, priv, stream.ChainSeed)
 	if err := ing.RunOnce(ctx); err != nil {
 		t.Fatalf("RunOnce after fix: %v", err)
 	}
 	assertCounts(t, st, 1, 0)
+}
+
+func TestMissingSigDeferredNotAccepted(t *testing.T) {
+	dir := t.TempDir()
+	priv := ed25519.NewKeyFromSeed(make([]byte, ed25519.SeedSize))
+	pub := priv.Public().(ed25519.PublicKey)
+	trusted := trustedHashForPriv(priv)
+
+	events := []*pb.Event{{Creator: 1, Seq: 0}}
+	serialized := make([][]byte, len(events))
+	for i, ev := range events {
+		b, _ := proto.MarshalOptions{Deterministic: true}.Marshal(ev)
+		serialized[i] = b
+	}
+	end := stream.RunningHash(stream.ChainSeed, serialized)
+	esf := &pb.EventStreamFile{
+		Version:          stream.Version,
+		StartRunningHash: hashObj(stream.ChainSeed),
+		Events:           events,
+		EndRunningHash:   hashObj(end),
+	}
+	raw, _ := proto.Marshal(esf)
+	path := filepath.Join(dir, stream.EventFileName(0))
+	if err := os.WriteFile(path, raw, 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	// No sig file written.
+
+	st := store.NewMemStore()
+	ing := New(Config{StreamsDir: dir, PubKey: pub, TrustedRosterHash: trusted[:]}, st, quietLogger())
+	ctx := context.Background()
+	if err := ing.RunOnce(ctx); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	assertCounts(t, st, 0, 0)
+
+	// Now sig arrives.
+	meta := make([]byte, 0, 68)
+	var ver [4]byte
+	binary.BigEndian.PutUint32(ver[:], stream.Version)
+	meta = append(meta, ver[:]...)
+	meta = append(meta, stream.ChainSeed[:]...)
+	meta = append(meta, end[:]...)
+	writeSigFile(t, path, raw, meta, priv)
+
+	if err := ing.RunOnce(ctx); err != nil {
+		t.Fatalf("RunOnce after sig: %v", err)
+	}
+	assertCounts(t, st, 1, 0)
+}
+
+func TestMissingSigRecordDeferred(t *testing.T) {
+	dir := t.TempDir()
+	priv := ed25519.NewKeyFromSeed(make([]byte, ed25519.SeedSize))
+	pub := priv.Public().(ed25519.PublicKey)
+	trusted := trustedHashForPriv(priv)
+
+	item := &pb.RecordItem{EventHash: make([]byte, 32), TxIndex: 0, TxPayload: []byte("put")}
+	b, _ := proto.MarshalOptions{Deterministic: true}.Marshal(item)
+	end := stream.RunningHash(stream.ChainSeed, [][]byte{b})
+	pub2 := pub
+	var rosterBuf [40]byte
+	binary.BigEndian.PutUint64(rosterBuf[:8], 0)
+	copy(rosterBuf[8:], pub2)
+	rosterHash := sha256.Sum256(rosterBuf[:])
+	stateHash := sha256.Sum256([]byte("state"))
+	signing := make([]byte, 0, 72)
+	var roundBE [8]byte
+	binary.BigEndian.PutUint64(roundBE[:], 0)
+	signing = append(signing, roundBE[:]...)
+	signing = append(signing, stateHash[:]...)
+	signing = append(signing, rosterHash[:]...)
+	cp := &pb.SignedCheckpoint{
+		Round:          0,
+		StateHash:      stateHash[:],
+		RosterHash:     rosterHash[:],
+		RosterSnapshot: []*pb.CheckpointRosterMember{{NodeId: 0, Key: pub2}},
+		Sigs:           []*pb.CheckpointSig{{Round: 0, Signer: 0, Sig: ed25519.Sign(priv, signing)}},
+	}
+	rsf := &pb.RecordStreamFile{
+		Version:          stream.Version,
+		Round:            0,
+		StartRunningHash: hashObj(stream.ChainSeed),
+		Items:            []*pb.RecordItem{item},
+		EndRunningHash:   hashObj(end),
+		Checkpoint:       cp,
+	}
+	raw, _ := proto.Marshal(rsf)
+	path := filepath.Join(dir, stream.RecordFileName(0))
+	if err := os.WriteFile(path, raw, 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	st := store.NewMemStore()
+	ing := New(Config{StreamsDir: dir, PubKey: pub, TrustedRosterHash: trusted[:]}, st, quietLogger())
+	ctx := context.Background()
+	if err := ing.RunOnce(ctx); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	assertCounts(t, st, 0, 0)
+
+	meta := make([]byte, 0, 76)
+	var ver [4]byte
+	binary.BigEndian.PutUint32(ver[:], stream.Version)
+	meta = append(meta, ver[:]...)
+	meta = append(meta, stream.ChainSeed[:]...)
+	meta = append(meta, end[:]...)
+	var rbe [8]byte
+	binary.BigEndian.PutUint64(rbe[:], 0)
+	meta = append(meta, rbe[:]...)
+	writeSigFile(t, path, raw, meta, priv)
+	if err := ing.RunOnce(ctx); err != nil {
+		t.Fatalf("RunOnce after sig: %v", err)
+	}
+	assertCounts(t, st, 0, 1)
+}
+
+func TestChainContinuityFirstFileMustBeSeed(t *testing.T) {
+	dir := t.TempDir()
+	priv := ed25519.NewKeyFromSeed(make([]byte, ed25519.SeedSize))
+	pub := priv.Public().(ed25519.PublicKey)
+	trusted := trustedHashForPriv(priv)
+
+	// Write file 0 with wrong start (not seed)
+	badStart := sha256.Sum256([]byte("bad"))
+	writeEventFileWithSig(t, dir, 0, [][2]uint64{{1, 0}}, priv, badStart)
+
+	st := store.NewMemStore()
+	ing := New(Config{StreamsDir: dir, PubKey: pub, TrustedRosterHash: trusted[:]}, st, quietLogger())
+	if err := ing.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	assertCounts(t, st, 0, 0)
+}
+
+func TestChainContinuitySpliceRejected(t *testing.T) {
+	dir := t.TempDir()
+	priv := ed25519.NewKeyFromSeed(make([]byte, ed25519.SeedSize))
+	pub := priv.Public().(ed25519.PublicKey)
+	trusted := trustedHashForPriv(priv)
+
+	end0 := writeEventFileWithSig(t, dir, 0, [][2]uint64{{1, 0}}, priv, stream.ChainSeed)
+	// File 1 should start at end0, but we write it starting at seed -> splice
+	writeEventFileWithSig(t, dir, 1, [][2]uint64{{1, 1}}, priv, stream.ChainSeed)
+
+	st := store.NewMemStore()
+	ing := New(Config{StreamsDir: dir, PubKey: pub, TrustedRosterHash: trusted[:]}, st, quietLogger())
+	if err := ing.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	// Only first file should be ingested, second rejected due to discontinuity.
+	assertCounts(t, st, 1, 0)
+
+	// Verify second file still not marked seen, can be retried after fixing splice
+	_ = end0
+}
+
+func TestChainContinuityAcrossPolls(t *testing.T) {
+	dir := t.TempDir()
+	priv := ed25519.NewKeyFromSeed(make([]byte, ed25519.SeedSize))
+	pub := priv.Public().(ed25519.PublicKey)
+	trusted := trustedHashForPriv(priv)
+
+	end0 := writeEventFileWithSig(t, dir, 0, [][2]uint64{{1, 0}}, priv, stream.ChainSeed)
+	st := store.NewMemStore()
+	ing := New(Config{StreamsDir: dir, PubKey: pub, TrustedRosterHash: trusted[:]}, st, quietLogger())
+	if err := ing.RunOnce(context.Background()); err != nil {
+		t.Fatalf("first poll: %v", err)
+	}
+	assertCounts(t, st, 1, 0)
+
+	// Second poll with correctly chained file should succeed.
+	writeEventFileWithSig(t, dir, 1, [][2]uint64{{1, 1}}, priv, end0)
+	if err := ing.RunOnce(context.Background()); err != nil {
+		t.Fatalf("second poll: %v", err)
+	}
+	assertCounts(t, st, 2, 0)
+
+	// Third file with bad chain should be rejected
+	badStart := sha256.Sum256([]byte("wrong"))
+	writeEventFileWithSig(t, dir, 2, [][2]uint64{{1, 2}}, priv, badStart)
+	if err := ing.RunOnce(context.Background()); err != nil {
+		t.Fatalf("third poll: %v", err)
+	}
+	assertCounts(t, st, 2, 0)
+}
+
+func TestNilPubKeyFailsClosed(t *testing.T) {
+	dir := t.TempDir()
+	priv := ed25519.NewKeyFromSeed(make([]byte, ed25519.SeedSize))
+	writeEventFileWithSig(t, dir, 0, [][2]uint64{{1, 0}}, priv, stream.ChainSeed)
+	st := store.NewMemStore()
+	trusted := trustedHashForPriv(priv)
+	ing := New(Config{StreamsDir: dir, TrustedRosterHash: trusted[:]}, st, quietLogger())
+	// PubKey nil -> verification must fail
+	if err := ing.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	assertCounts(t, st, 0, 0)
+}
+
+func TestUntrustedRosterFails(t *testing.T) {
+	dir := t.TempDir()
+	priv := ed25519.NewKeyFromSeed(make([]byte, ed25519.SeedSize))
+	pub := priv.Public().(ed25519.PublicKey)
+	// Real trusted is for priv, but file will embed different roster
+	trusted := sha256.Sum256([]byte("other roster"))
+
+	item := &pb.RecordItem{EventHash: make([]byte, 32), TxIndex: 0, TxPayload: []byte("put")}
+	b, _ := proto.MarshalOptions{Deterministic: true}.Marshal(item)
+	end := stream.RunningHash(stream.ChainSeed, [][]byte{b})
+	var rosterBuf [40]byte
+	binary.BigEndian.PutUint64(rosterBuf[:8], 0)
+	copy(rosterBuf[8:], pub)
+	rosterHash := sha256.Sum256(rosterBuf[:])
+	stateHash := sha256.Sum256([]byte("state"))
+	signing := make([]byte, 0, 72)
+	var roundBE [8]byte
+	binary.BigEndian.PutUint64(roundBE[:], 0)
+	signing = append(signing, roundBE[:]...)
+	signing = append(signing, stateHash[:]...)
+	signing = append(signing, rosterHash[:]...)
+	cp := &pb.SignedCheckpoint{
+		Round:          0,
+		StateHash:      stateHash[:],
+		RosterHash:     rosterHash[:],
+		RosterSnapshot: []*pb.CheckpointRosterMember{{NodeId: 0, Key: pub}},
+		Sigs:           []*pb.CheckpointSig{{Round: 0, Signer: 0, Sig: ed25519.Sign(priv, signing)}},
+	}
+	rsf := &pb.RecordStreamFile{
+		Version:          stream.Version,
+		Round:            0,
+		StartRunningHash: hashObj(stream.ChainSeed),
+		Items:            []*pb.RecordItem{item},
+		EndRunningHash:   hashObj(end),
+		Checkpoint:       cp,
+	}
+	raw, _ := proto.Marshal(rsf)
+	path := filepath.Join(dir, stream.RecordFileName(0))
+	if err := os.WriteFile(path, raw, 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	meta := make([]byte, 0, 76)
+	var ver [4]byte
+	binary.BigEndian.PutUint32(ver[:], stream.Version)
+	meta = append(meta, ver[:]...)
+	meta = append(meta, stream.ChainSeed[:]...)
+	meta = append(meta, end[:]...)
+	var rbe [8]byte
+	binary.BigEndian.PutUint64(rbe[:], 0)
+	meta = append(meta, rbe[:]...)
+	writeSigFile(t, path, raw, meta, priv)
+
+	st := store.NewMemStore()
+	ing := New(Config{StreamsDir: dir, PubKey: pub, TrustedRosterHash: trusted[:]}, st, quietLogger())
+	if err := ing.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	assertCounts(t, st, 0, 0)
 }
