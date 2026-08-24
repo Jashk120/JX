@@ -32,6 +32,11 @@ type Config struct {
 	// that anchors checkpoint quorum verification. Required; fail-closed if
 	// absent. The embedded roster must hash to this value.
 	TrustedRosterHashHex string `env:"MIRRORD_TRUSTED_ROSTER_HASH"`
+
+	// BlockNodeURL is the remote block-node HTTP base URL (e.g.
+	// "http://block-node:8080"). When empty the mirror polls the local
+	// StreamsDir. When set the mirror polls the block node instead.
+	BlockNodeURL string `env:"MIRROR_BLOCK_NODE_URL"`
 }
 
 // Default returns a Config with sensible local-dev defaults.
@@ -70,6 +75,9 @@ func Load() (Config, error) {
 		cfg.TrustedRosterHashHex = strings.TrimSpace(v)
 	} else if v := os.Getenv("MIRROR_TRUSTED_ROSTER_HASH"); v != "" {
 		cfg.TrustedRosterHashHex = strings.TrimSpace(v)
+	}
+	if v := os.Getenv("MIRROR_BLOCK_NODE_URL"); v != "" {
+		cfg.BlockNodeURL = strings.TrimSpace(v)
 	}
 
 	// Allow CLI overrides via explicit env-like map passed through os.Args parsing

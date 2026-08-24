@@ -39,9 +39,41 @@ make proto
 go run ./cmd/mirrord --streams ../consensus-node/data/streams --addr :8080
 # or via env
 MIRROR_STREAMS_DIR=./data/streams MIRROR_API_ADDR=:8080 go run ./cmd/mirrord
+
+# .env file (hand-rolled dotenv, stdlib only): copy .env.example to .env
+cp .env.example .env
+# real environment overrides .env, which overrides defaults; missing .env is not an error
+go run ./cmd/mirrord
 ```
 
-Flags override env: `--streams`, `--db`, `--addr`, `--version`.
+Flags override env: `--streams`, `--db`, `--addr`, `--pubkey`, `--trusted-roster-hash`, `--block-node-url`, `--version`.
+
+## Configuration
+
+All settings come from `internal/config` with precedence: real environment > `.env` (loaded from `./.env` at startup) > built-in defaults. `.env` is parsed with stdlib only: blank and `#` lines skipped, split on first `=`, trim spaces, strip matching single/double quotes.
+
+| Env var | Flag | Description |
+|---|---|---|
+| `MIRROR_STREAMS_DIR` | `--streams` | Directory watched for `.esf`/`.rsf` files (local mode) |
+| `MIRROR_DB_PATH` | `--db` | Mirror local state path/DSN |
+| `MIRROR_API_ADDR` | `--addr` | HTTP API listen address |
+| `MIRROR_LOG_LEVEL` | — | `debug`, `info`, `warn`, `error` |
+| `MIRRORD_PUBKEY` / `MIRROR_PUBKEY` | `--pubkey` | Ed25519 verifying key, 64 hex chars (required) |
+| `MIRRORD_TRUSTED_ROSTER_HASH` / `MIRROR_TRUSTED_ROSTER_HASH` | `--trusted-roster-hash` | 32-byte roster hash anchor, 64 hex chars (required) |
+| `MIRROR_BLOCK_NODE_URL` | `--block-node-url` | Remote block-node base URL; when set the mirror polls the block node instead of the local directory |
+
+See `.env.example` for a templated file.
+
+## Remote block-node mode
+
+When `MIRROR_BLOCK_NODE_URL` is set (or `--block-node-url` is passed), the ingester polls the remote block-node HTTP service instead of scanning `MIRROR_STREAMS_DIR`.
+
+- `GET /v1/blocks` lists files (newline-separated names; whitespace trimmed, empties dropped).
+- `GET /v1/blocks/{name}` fetches a file; name validation rejects empty, `/`, or `..`; `404` maps to `ErrNotFound`.
+- Each poll filters to `{.esf,.rsf,.esf_sig,.rsf_sig}`, sorts by numeric index ascending, and applies the same skip/dedupe semantics as the local scan (per-round/per-index `seen` + `in-flight` guards, chain continuity, `VerifyRecordFile`/`VerifyEventFile`, `PutRecord`/`PutEvents`). Missing companion sig defers ingestion (transient); per-file verify/store errors are logged and skipped; listing failure returns an error like the local `ReadDir` path.
+- Default HTTP client timeout is 10s and context is honored.
+
+When `MIRROR_BLOCK_NODE_URL` is empty the legacy local-directory behavior is 100% unchanged.
 
 ## API
 
