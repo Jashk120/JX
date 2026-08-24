@@ -50,6 +50,7 @@ use gossip::TlsIdentity;
 use rand::RngCore;
 use rand::rngs::OsRng;
 
+use crate::cli::args::next_value;
 use crate::config::{
     ClusterConfigFile,
     MemberFile,
@@ -63,9 +64,6 @@ const GENESIS_SEED_LEN: usize = 32;
 
 /// Default gossip port for deployed members.
 pub const DEFAULT_GOSSIP_PORT: u16 = 7000;
-
-/// Default reconnect port for deployed members.
-pub const DEFAULT_RECONNECT_PORT: u16 = 7001;
 
 /// Remote directory holding `cluster.toml` and the per-node secret files.
 pub const DEFAULT_CONFIG_DIR: &str = "/etc/jkaind";
@@ -734,13 +732,6 @@ fn scp_to(target: &str, source: &Path, remote_dest: &str) -> Result<()> {
         );
     }
     Ok(())
-}
-
-fn next_value(args: &[String], i: &mut usize, flag: &str) -> Result<String> {
-    *i += 1;
-    let value = args.get(*i).with_context(|| format!("{flag} requires a value"))?;
-    *i += 1;
-    Ok(value.clone())
 }
 
 #[cfg(test)]
