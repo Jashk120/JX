@@ -105,17 +105,29 @@ pub struct SignedCheckpoint {
 /// Accumulates partial signatures for a single round until quorum is met.
 pub struct CheckpointAccumulator {
     payload: CheckpointPayload,
+    /// The canonical serialized state whose Merkle root equals
+    /// `payload.state_hash`, captured in the same producing pass as the
+    /// payload and carried through accumulation so acceptance persists
+    /// exactly the committed bytes instead of re-selecting them from a
+    /// mutable snapshot map.
+    snapshot: Vec<u8>,
     sigs: HashMap<NodeId, CheckpointSig>,
 }
 
 impl CheckpointAccumulator {
-    pub fn new(payload: CheckpointPayload) -> Self {
-        Self { payload, sigs: HashMap::new() }
+    pub fn new(payload: CheckpointPayload, snapshot: Vec<u8>) -> Self {
+        Self { payload, snapshot, sigs: HashMap::new() }
     }
 
     /// The payload this accumulator is collecting signatures for.
     pub fn payload(&self) -> &CheckpointPayload {
         &self.payload
+    }
+
+    /// The carried snapshot bytes — the state whose root is
+    /// `self.payload.state_hash`.
+    pub fn snapshot(&self) -> &[u8] {
+        &self.snapshot
     }
 
     /// The signing bytes every collected signature is over.
@@ -199,8 +211,10 @@ mod tests {
     #[test]
     fn accumulator_accepts_quorum_at_two_thirds_plus_one() {
         let registry = registry_of(&[1, 2, 3, 4]);
-        let mut accumulator =
-            CheckpointAccumulator::new(CheckpointPayload::new(1, [0u8; 32], registry.clone()));
+        let mut accumulator = CheckpointAccumulator::new(
+            CheckpointPayload::new(1, [0u8; 32], registry.clone()),
+            Vec::new(),
+        );
         assert!(accumulator.add_sig(sig(1, 1), &registry).is_none());
         assert!(accumulator.add_sig(sig(1, 2), &registry).is_none());
         let accepted = accumulator.add_sig(sig(1, 3), &registry);
@@ -213,8 +227,10 @@ mod tests {
     #[test]
     fn accumulator_rejects_below_quorum() {
         let registry = registry_of(&[1, 2, 3, 4]);
-        let mut accumulator =
-            CheckpointAccumulator::new(CheckpointPayload::new(1, [0u8; 32], registry.clone()));
+        let mut accumulator = CheckpointAccumulator::new(
+            CheckpointPayload::new(1, [0u8; 32], registry.clone()),
+            Vec::new(),
+        );
         assert!(accumulator.add_sig(sig(1, 1), &registry).is_none());
         assert!(accumulator.add_sig(sig(1, 2), &registry).is_none());
         // 2 of 4 is not a 2/3 supermajority.
@@ -224,8 +240,10 @@ mod tests {
     #[test]
     fn accumulator_uses_round_roster_not_stale_roster() {
         let round_roster = registry_of(&[1, 2, 3, 4]);
-        let mut accumulator =
-            CheckpointAccumulator::new(CheckpointPayload::new(1, [0u8; 32], round_roster.clone()));
+        let mut accumulator = CheckpointAccumulator::new(
+            CheckpointPayload::new(1, [0u8; 32], round_roster.clone()),
+            Vec::new(),
+        );
         // A 5th node joins after the checkpoint round: the live roster is
         // bigger, but quorum must use the 4-node roster active at round 1.
         let live_roster = {
@@ -241,8 +259,10 @@ mod tests {
 
         // The same three sigs against the stale 5-node live roster would not
         // reach quorum.
-        let mut stale =
-            CheckpointAccumulator::new(CheckpointPayload::new(1, [0u8; 32], live_roster.clone()));
+        let mut stale = CheckpointAccumulator::new(
+            CheckpointPayload::new(1, [0u8; 32], live_roster.clone()),
+            Vec::new(),
+        );
         stale.add_sig(sig(1, 1), &live_roster);
         stale.add_sig(sig(1, 2), &live_roster);
         assert!(stale.add_sig(sig(1, 3), &live_roster).is_none());
@@ -251,8 +271,10 @@ mod tests {
     #[test]
     fn duplicate_signer_does_not_double_count() {
         let registry = registry_of(&[1, 2, 3, 4]);
-        let mut accumulator =
-            CheckpointAccumulator::new(CheckpointPayload::new(1, [0u8; 32], registry.clone()));
+        let mut accumulator = CheckpointAccumulator::new(
+            CheckpointPayload::new(1, [0u8; 32], registry.clone()),
+            Vec::new(),
+        );
         accumulator.add_sig(sig(1, 1), &registry);
         // Same signer twice: still only one.
         assert!(accumulator.add_sig(sig(1, 1), &registry).is_none());
@@ -284,18 +306,32 @@ mod tests {
     #[test]
     fn wrong_round_sig_is_ignored() {
         let registry = registry_of(&[1, 2, 3, 4]);
-        let mut accumulator =
-            CheckpointAccumulator::new(CheckpointPayload::new(1, [0u8; 32], registry.clone()));
+        let mut accumulator = CheckpointAccumulator::new(
+            CheckpointPayload::new(1, [0u8; 32], registry.clone()),
+            Vec::new(),
+        );
         assert!(accumulator.add_sig(sig(2, 1), &registry).is_none());
     }
 
     #[test]
     fn non_member_sig_is_ignored() {
         let registry = registry_of(&[1, 2, 3, 4]);
-        let mut accumulator =
-            CheckpointAccumulator::new(CheckpointPayload::new(1, [0u8; 32], registry.clone()));
+        let mut accumulator = CheckpointAccumulator::new(
+            CheckpointPayload::new(1, [0u8; 32], registry.clone()),
+            Vec::new(),
+        );
         // Node 5 is not in the registry.
         assert!(accumulator.add_sig(sig(1, 5), &registry).is_none());
         assert!(accumulator.sigs.is_empty());
+    }
+
+    #[test]
+    fn accumulator_carries_snapshot_bytes() {
+        let registry = registry_of(&[1, 2, 3]);
+        let payload = CheckpointPayload::new(1, [0u8; 32], registry);
+        let snapshot = vec![7u8; 4];
+        let accumulator = CheckpointAccumulator::new(payload, snapshot.clone());
+        assert_eq!(accumulator.snapshot(), &[7u8; 4]);
+        assert_eq!(accumulator.snapshot(), snapshot.as_slice());
     }
 }

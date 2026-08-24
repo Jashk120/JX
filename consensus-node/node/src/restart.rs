@@ -293,7 +293,7 @@ mod tests {
     fn quorum_checkpoint(round: u64, state_hash: [u8; 32], ids: &[u64]) -> SignedCheckpoint {
         let (registry, keys) = cluster_of(ids);
         let payload = CheckpointPayload::new(round, state_hash, registry);
-        let mut accumulator = CheckpointAccumulator::new(payload.clone());
+        let mut accumulator = CheckpointAccumulator::new(payload.clone(), Vec::new());
         let mut accepted = None;
         for (id, key) in keys {
             let sig = key.sign(&payload.signing_bytes());
