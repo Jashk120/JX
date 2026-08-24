@@ -23,12 +23,13 @@ var (
 
 func main() {
 	var (
-		streamsDir      = flag.String("streams", "", "streams directory (overrides MIRROR_STREAMS_DIR)")
-		dbPath          = flag.String("db", "", "mirror db path (overrides MIRROR_DB_PATH)")
-		addr            = flag.String("addr", "", "API listen addr (overrides MIRROR_API_ADDR)")
-		pubkeyFlag      = flag.String("pubkey", "", "Ed25519 verifying key hex 64 chars (overrides MIRRORD_PUBKEY)")
-		trustedHashFlag = flag.String("trusted-roster-hash", "", "trusted roster hash hex 64 chars (overrides MIRRORD_TRUSTED_ROSTER_HASH)")
-		showVer         = flag.Bool("version", false, "print version and exit")
+		streamsDir       = flag.String("streams", "", "streams directory (overrides MIRROR_STREAMS_DIR)")
+		dbPath           = flag.String("db", "", "mirror db path (overrides MIRROR_DB_PATH)")
+		addr             = flag.String("addr", "", "API listen addr (overrides MIRROR_API_ADDR)")
+		pubkeyFlag       = flag.String("pubkey", "", "Ed25519 verifying key hex 64 chars (overrides MIRRORD_PUBKEY)")
+		trustedHashFlag  = flag.String("trusted-roster-hash", "", "trusted roster hash hex 64 chars (overrides MIRRORD_TRUSTED_ROSTER_HASH)")
+		blockNodeURLFlag = flag.String("block-node-url", "", "block node base URL (overrides MIRROR_BLOCK_NODE_URL)")
+		showVer          = flag.Bool("version", false, "print version and exit")
 	)
 	flag.Parse()
 
@@ -36,6 +37,8 @@ func main() {
 		fmt.Printf("mirrord %s\n", version)
 		os.Exit(0)
 	}
+
+	_ = config.LoadDotEnv("./.env")
 
 	cfg, err := config.Load()
 	if err != nil {
@@ -56,6 +59,9 @@ func main() {
 	}
 	if *trustedHashFlag != "" {
 		cfg.TrustedRosterHashHex = *trustedHashFlag
+	}
+	if *blockNodeURLFlag != "" {
+		cfg.BlockNodeURL = *blockNodeURLFlag
 	}
 	if err := cfg.Validate(); err != nil {
 		fmt.Fprintf(os.Stderr, "invalid config: %v\n", err)
@@ -87,6 +93,7 @@ func main() {
 		StreamsDir:        cfg.StreamsDir,
 		PubKey:            pubKey,
 		TrustedRosterHash: trustedBytes,
+		BlockNodeURL:      cfg.BlockNodeURL,
 	}, st, h)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
