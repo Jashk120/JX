@@ -562,7 +562,7 @@ Execution maturity: `100% serial → 80/20 (E2) → 95%+ parallel / <5% genuinel
 | Gossip transport | `protocol/gossip/src/transport.rs`, `.../transport/quic.rs` (new), `.../tls.rs` |
 | Peer selection | `protocol/gossip/src/peer_manager.rs`, `.../peer/scoring.rs` (new) |
 | Gossip driver | `protocol/gossip/src/node.rs` (`run_until_stopped`, `process_finalized_rounds`, `GossipController` split), `.../sync.rs`, `.../frontier.rs`, `.../proto.rs` |
-| Node daemon | `node/src/bin/jkaind.rs`, `node/src/config.rs`, `node/src/storage.rs` |
+| Node daemon | `node/src/cli/`, `node/src/config.rs`, `node/src/storage.rs` |
 | Tests/benches | `executor/state/tests/deterministic.rs`, `.../scheduler.rs` (new), `protocol/gossip/tests/*`, `benches/gossip.rs` + `benches/parallel.rs` (new) |
 | Docs | `docs/OPTIMIZATION.md` (this file), `ARCHITECTURE.md`, `ROADMAP.md`, `protocol/gossip/README.md`, `executor/state/README.md` |
 

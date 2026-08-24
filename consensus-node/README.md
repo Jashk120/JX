@@ -184,7 +184,7 @@ longer verify.
 
 ## Growing the cluster (dynamic membership)
 
-The genesis `cluster.toml` is never rewritten. Once a cluster is running, you **never** re-run `init` with more `--member`s to add a node — that would generate new mismatched keys and require wiping `data/` on every node (`node/src/bin/jkaind.rs:160`). Instead, new nodes join via consensus:
+The genesis `cluster.toml` is never rewritten. Once a cluster is running, you **never** re-run `init` with more `--member`s to add a node — that would generate new mismatched keys and require wiping `data/` on every node (see `node/src/cli/init.rs`). Instead, new nodes join via consensus:
 
 **If you started with 1 node and want to add a 2nd (same for 2 → 3, 3 → 4, etc.):**
 
