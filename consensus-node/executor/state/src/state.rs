@@ -121,6 +121,23 @@ impl State {
         }
         Some(state)
     }
+
+    /// Rebuilds the Merkle root of canonical state bytes ([`State::to_bytes`]
+    /// format) without touching a keyspace or database: parses the
+    /// length-prefixed pairs and folds them into a fresh
+    /// [`SparseMerkleTree`]. Returns `None` on any truncation or length
+    /// overflow. This is the cheap, side-effect-free check that a serialized
+    /// snapshot really hashes to a committed state root.
+    pub fn root_of_bytes(bytes: &[u8]) -> Option<[u8; 32]> {
+        let mut tree = SparseMerkleTree::new();
+        let mut cursor = bytes;
+        while !cursor.is_empty() {
+            let key = read_bytes(&mut cursor)?;
+            let value = read_bytes(&mut cursor)?;
+            tree.insert(&key, &value);
+        }
+        Some(tree.root())
+    }
 }
 
 impl Clone for State {
@@ -332,5 +349,37 @@ mod tests {
         let res = state.apply(&Op::Put { key: b"k".to_vec(), value: b"v".to_vec() });
         assert!(res.is_ok());
         assert_eq!(state.get(b"k"), Some(b"v".to_vec()));
+    }
+
+    #[test]
+    fn root_of_bytes_round_trips_with_state() {
+        let dir = tempdir().expect("temp dir");
+        let db = StateDb::open(dir.path()).expect("opens");
+        let mut state = State::new(db.state_keyspace());
+        assert!(state.apply(&Op::Put { key: b"a".to_vec(), value: b"1".to_vec() }).is_ok());
+        assert!(state.apply(&Op::Put { key: b"b".to_vec(), value: b"2".to_vec() }).is_ok());
+        assert!(state.apply(&Op::Put { key: b"c".to_vec(), value: b"3".to_vec() }).is_ok());
+        assert!(state.apply(&Op::Delete { key: b"b".to_vec() }).is_ok());
+        let bytes = state.to_bytes();
+        assert_eq!(State::root_of_bytes(&bytes), Some(state.root()));
+    }
+
+    #[test]
+    fn root_of_bytes_empty_is_empty_root() {
+        assert_eq!(State::root_of_bytes(b""), Some(SparseMerkleTree::new().root()));
+    }
+
+    #[test]
+    fn root_of_bytes_rejects_truncated_input() {
+        let dir = tempdir().expect("temp dir");
+        let db = StateDb::open(dir.path()).expect("opens");
+        let mut state = State::new(db.state_keyspace());
+        assert!(state.apply(&Op::Put { key: b"k".to_vec(), value: b"value".to_vec() }).is_ok());
+        assert!(state.apply(&Op::Put { key: b"a".to_vec(), value: b"1".to_vec() }).is_ok());
+        let bytes = state.to_bytes();
+        assert!(!bytes.is_empty());
+        let truncated = &bytes[..bytes.len() - 1];
+        assert_eq!(State::root_of_bytes(truncated), None);
+        assert_eq!(State::root_of_bytes(&[0u8, 0, 0, 9, b'a']), None);
     }
 }

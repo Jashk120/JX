@@ -18,6 +18,8 @@ for the state's LSM backing.
   matching `crypto`'s canonical encoding). A sparse Merkle tree over the same
   keys is maintained incrementally in memory; its root is `State::root()`,
   the commitment a checkpoint signs as its `state_hash`.
+  `State::root_of_bytes` recomputes a snapshot's root from `to_bytes` bytes
+  without a keyspace for verification.
 - `StateDb` (in `state_db.rs`) — the on-disk state database under
   `<data>/statedb/`: the live `state` partition, a `snap` keyspace holding
   the exact state bytes of every accepted checkpoint round, and a
