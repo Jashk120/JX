@@ -288,6 +288,98 @@ fn init_accepts_mixed_member_forms() {
     assert_eq!(config.member_for(2).expect("node 2").reconnect_addr, None);
 }
 
+#[test]
+fn member_init_refuses_to_overwrite_secrets_without_force() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let genesis_out = tmp.path().join("genesis");
+    assert!(init_args(&genesis_out, false).status().expect("genesis init").success());
+
+    let member_out = tmp.path().join("member3");
+    let args = |force: bool| {
+        let mut cmd = Command::new(binary());
+        cmd.arg("member")
+            .arg("init")
+            .arg("--node-id")
+            .arg("3")
+            .arg("--gossip")
+            .arg("203.0.113.7:7000")
+            .arg("--reconnect")
+            .arg("203.0.113.7:7001")
+            .arg("--cluster")
+            .arg(genesis_out.join("cluster.toml"))
+            .arg("--out")
+            .arg(&member_out);
+        if force {
+            cmd.arg("--force");
+        }
+        cmd
+    };
+    assert!(args(false).status().expect("first member init").success());
+    let secret_before = std::fs::read(member_out.join("secret-3.bin")).expect("secret 3");
+
+    let status = args(false).status().expect("second member init");
+    assert!(!status.success(), "member init refuses overwrite without --force");
+    let secret_after =
+        std::fs::read(member_out.join("secret-3.bin")).expect("secret 3 still there");
+    assert_eq!(secret_before, secret_after, "secret untouched without --force");
+
+    let status = args(true).status().expect("forced member init");
+    assert!(status.success(), "member init with --force succeeds");
+    let secret_forced =
+        std::fs::read(member_out.join("secret-3.bin")).expect("secret 3 after force");
+    assert_ne!(secret_before, secret_forced, "secret regenerated with --force");
+}
+
+#[test]
+fn member_init_overwrite_refusal_message_matches_init() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let genesis_out = tmp.path().join("genesis");
+    assert!(init_args(&genesis_out, false).status().expect("genesis init").success());
+
+    let member_out = tmp.path().join("member3");
+    assert!(
+        Command::new(binary())
+            .arg("member")
+            .arg("init")
+            .arg("--node-id")
+            .arg("3")
+            .arg("--gossip")
+            .arg("203.0.113.7:7000")
+            .arg("--reconnect")
+            .arg("203.0.113.7:7001")
+            .arg("--cluster")
+            .arg(genesis_out.join("cluster.toml"))
+            .arg("--out")
+            .arg(&member_out)
+            .status()
+            .expect("member init")
+            .success()
+    );
+
+    let output = Command::new(binary())
+        .arg("member")
+        .arg("init")
+        .arg("--node-id")
+        .arg("3")
+        .arg("--gossip")
+        .arg("203.0.113.7:7000")
+        .arg("--reconnect")
+        .arg("203.0.113.7:7001")
+        .arg("--cluster")
+        .arg(genesis_out.join("cluster.toml"))
+        .arg("--out")
+        .arg(&member_out)
+        .output()
+        .expect("member init second");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr
+            .contains("already exists; use --force to regenerate (refusing to overwrite secrets)"),
+        "member init refusal message must match init's: {stderr}"
+    );
+}
+
 /// Derivation from a fixed secret is deterministic: the same seed always
 /// yields the same key and fingerprint, and `MemberFile` hex round-trips them.
 #[test]

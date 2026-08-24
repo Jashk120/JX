@@ -689,10 +689,16 @@ async fn run_until_shutdown(
 
     let result = match reconnect_listener {
         Some(reconnect_listener) => {
-            node.run_until_stopped_with_reconnect(gossip_listener, reconnect_listener, stop).await
+            node.clone()
+                .run_until_stopped_with_reconnect(gossip_listener, reconnect_listener, stop.clone())
+                .await
         }
-        None => node.run_until_stopped(gossip_listener, stop).await,
+        None => node.clone().run_until_stopped(gossip_listener, stop.clone()).await,
     };
+    let flush_timeout = Duration::from_secs(5);
+    if !node.flush_streams(flush_timeout).await {
+        tracing::warn!("stream flush timed out after {:?}", flush_timeout);
+    }
     signal_task.abort();
     control_task.abort();
     let _ = std::fs::remove_file(&control_socket_path);
@@ -938,6 +944,7 @@ fn member_init(args: &[String]) -> Result<()> {
     let mut reconnect: Option<SocketAddr> = None;
     let mut cluster_path: Option<PathBuf> = None;
     let mut out_dir: Option<PathBuf> = None;
+    let mut force = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -961,6 +968,10 @@ fn member_init(args: &[String]) -> Result<()> {
                 cluster_path = Some(PathBuf::from(next_value(args, &mut i, "--cluster")?))
             }
             "--out" => out_dir = Some(PathBuf::from(next_value(args, &mut i, "--out")?)),
+            "--force" => {
+                force = true;
+                i += 1;
+            }
             other => bail!("member init: unknown argument '{other}'"),
         }
     }
@@ -988,6 +999,12 @@ fn member_init(args: &[String]) -> Result<()> {
         .with_context(|| format!("building TLS identity for node {node_id}"))?;
 
     let secret_path = out_dir.join(format!("secret-{node_id}.bin"));
+    if secret_path.exists() && !force {
+        bail!(
+            "{} already exists; use --force to regenerate (refusing to overwrite secrets)",
+            secret_path.display()
+        );
+    }
     write_secret_bytes(&secret_path, &seed)
         .with_context(|| format!("writing {}", secret_path.display()))?;
 
@@ -1140,11 +1157,21 @@ fn next_value(args: &[String], i: &mut usize, flag: &str) -> Result<String> {
 }
 
 fn parse_port(value: &str, flag: &str) -> Result<u16> {
-    value.parse().with_context(|| format!("{flag} must be a port 1-65535, got '{value}'"))
+    let port: u16 =
+        value.parse().with_context(|| format!("{flag} must be a port 1-65535, got '{value}'"))?;
+    if port == 0 {
+        bail!("{flag} must be a port 1-65535, got '{value}'");
+    }
+    Ok(port)
 }
 
 fn parse_ms(value: &str, flag: &str) -> Result<u64> {
-    value.parse().with_context(|| format!("{flag} must be milliseconds, got '{value}'"))
+    let ms: u64 =
+        value.parse().with_context(|| format!("{flag} must be milliseconds, got '{value}'"))?;
+    if ms == 0 {
+        bail!("{flag} must be milliseconds, got '{value}'");
+    }
+    Ok(ms)
 }
 
 fn write_secret_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -1156,20 +1183,30 @@ fn write_secret_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
             OpenOptionsExt,
             PermissionsExt,
         };
-        let tmp_path = PathBuf::from(format!("{}.tmp", path.display()));
+        if path.exists() {
+            std::fs::remove_file(path).with_context(|| format!("removing {}", path.display()))?;
+        }
         let mut file = OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .mode(0o600)
-            .open(&tmp_path)
-            .with_context(|| format!("creating {}", tmp_path.display()))?;
-        file.write_all(bytes).with_context(|| format!("writing {}", tmp_path.display()))?;
-        file.sync_all().with_context(|| format!("sync {}", tmp_path.display()))?;
-        std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("chmod {}", tmp_path.display()))?;
-        std::fs::rename(&tmp_path, path)
-            .with_context(|| format!("rename {} -> {}", tmp_path.display(), path.display()))?;
+            .open(path)
+            .with_context(|| format!("creating {}", path.display()))?;
+        let write_res: Result<()> = (|| {
+            file.write_all(bytes).with_context(|| format!("writing {}", path.display()))?;
+            file.sync_all().with_context(|| format!("sync {}", path.display()))?;
+            Ok(())
+        })();
+        if let Err(e) = write_res {
+            let _ = std::fs::remove_file(path);
+            return Err(e);
+        }
+        if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("chmod {}", path.display()))
+        {
+            let _ = std::fs::remove_file(path);
+            return Err(e);
+        }
     }
     #[cfg(not(unix))]
     {

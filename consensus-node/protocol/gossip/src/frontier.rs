@@ -49,9 +49,16 @@ pub fn delta_events(
     known: &[(NodeId, u64)],
 ) -> Result<Vec<Event>> {
     let known_seq: HashMap<NodeId, u64> = known.iter().copied().collect();
+    let mut creators: std::collections::HashSet<NodeId> = known_seq.keys().copied().collect();
+    for hash in hashgraph.all_event_hashes() {
+        if let Some(record) = hashgraph.get(&hash) {
+            creators.insert(*record.event().creator());
+        }
+    }
 
     let mut collected: HashMap<EventHash, Event> = HashMap::new();
-    for (&creator, &frontier) in &known_seq {
+    for creator in creators {
+        let frontier = known_seq.get(&creator).copied().unwrap_or(0);
         let mut cursor = hashgraph.latest_event_by(&creator).copied();
         while let Some(hash) = cursor {
             let record = hashgraph.get(&hash).ok_or_else(|| {
@@ -261,5 +268,32 @@ mod tests {
             .sign(&key);
         let expected_hash = event.hash();
         assert_eq!(event.verify(&h.registry).map(|v| v.event().hash()), Ok(expected_hash));
+    }
+
+    #[test]
+    fn delta_includes_unknown_creator_from_responder_union() {
+        let mut h = Harness::new(&[1, 2, 3]);
+        let a1 = h.make_event(1, None, None);
+        let b1 = h.make_event(2, None, Some(a1));
+        let c1 = h.make_event(3, None, Some(b1));
+        let c2 = h.make_event(3, Some(c1), Some(a1));
+        let known = vec![(NodeId::new(1), 1u64), (NodeId::new(2), 1u64)];
+        let delta = delta_events(&h.hashgraph, &known).expect("delta computes");
+        let hashes: Vec<_> = delta.iter().map(|e| e.hash()).collect();
+        assert!(hashes.contains(&c1), "union must include unknown creator 3 events");
+        assert!(
+            hashes.contains(&c2),
+            "union must include all events above frontier for unknown creator"
+        );
+    }
+
+    #[test]
+    fn delta_union_still_empty_when_all_known() {
+        let mut h = Harness::new(&[1, 2]);
+        let a1 = h.make_event(1, None, None);
+        h.make_event(2, None, Some(a1));
+        let summary = known_summary(&h.hashgraph, &h.registry);
+        let delta = delta_events(&h.hashgraph, &summary).expect("delta");
+        assert!(delta.is_empty(), "fully known should still be empty with union");
     }
 }

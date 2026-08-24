@@ -92,7 +92,7 @@ impl WriterState {
 /// [`EventStreamWriter::open`]; register it on a node via
 /// `set_event_stream_sink`.
 pub struct EventStreamWriter {
-    sender: mpsc::UnboundedSender<EventStreamMsg>,
+    sender: mpsc::Sender<EventStreamMsg>,
     _task: tokio::task::JoinHandle<()>,
 }
 
@@ -104,7 +104,7 @@ impl EventStreamWriter {
     pub fn open(dir: &Path, signing_key: SigningKey, events_per_file: usize) -> Result<Self> {
         fs::create_dir_all(dir)?;
         let (next_index, running_hash) = resume_state(dir)?;
-        let (sender, receiver) = mpsc::unbounded_channel();
+        let (sender, receiver) = mpsc::channel(64);
         let writer_dir = dir.to_path_buf();
         let task = tokio::spawn(run_writer(
             writer_dir,
@@ -119,7 +119,7 @@ impl EventStreamWriter {
     /// Awaits until every previously queued append has been written to disk.
     pub async fn barrier(&self) {
         let (ack, receiver) = oneshot::channel();
-        if self.sender.send(EventStreamMsg::Barrier { ack }).is_err() {
+        if self.sender.send(EventStreamMsg::Barrier { ack }).await.is_err() {
             return;
         }
         let _ = receiver.await;
@@ -130,8 +130,8 @@ impl storage::EventSink for EventStreamWriter {
     /// Queues a freshly inserted event for the writer task. Non-blocking, so
     /// the consensus hot path never waits on disk.
     fn append(&self, record: &RetainedEvent) {
-        if self.sender.send(EventStreamMsg::Append(Box::new(record.clone()))).is_err() {
-            eprintln!("[stream] event writer task is gone; dropping event append");
+        if self.sender.try_send(EventStreamMsg::Append(Box::new(record.clone()))).is_err() {
+            eprintln!("[stream] event writer task is gone or full; dropping event append");
         }
     }
 
@@ -149,8 +149,8 @@ impl storage::EventSink for EventStreamWriter {
     /// Closes the current file if it holds any events, so a flush leaves the
     /// stream durable up to the last appended event.
     fn flush(&self) {
-        if self.sender.send(EventStreamMsg::Flush).is_err() {
-            eprintln!("[stream] event writer task is gone; drop during flush");
+        if self.sender.try_send(EventStreamMsg::Flush).is_err() {
+            eprintln!("[stream] event writer task is gone or full; drop during flush");
         }
     }
 }
@@ -161,7 +161,7 @@ async fn run_writer(
     dir: PathBuf,
     signing_key: SigningKey,
     events_per_file: usize,
-    mut receiver: mpsc::UnboundedReceiver<EventStreamMsg>,
+    mut receiver: mpsc::Receiver<EventStreamMsg>,
     mut state: WriterState,
 ) {
     while let Some(message) = receiver.recv().await {
@@ -173,24 +173,34 @@ async fn run_writer(
                     running_hash::chain_hash(&state.running_hash, &running_hash::item_hash(&bytes));
                 state.buffer.push(event);
                 if state.buffer.len() >= events_per_file {
-                    if let Err(e) = write_event_file(&dir, &signing_key, &state) {
-                        eprintln!("[stream] failed to write event stream file: {e}");
+                    match write_event_file(&dir, &signing_key, &state) {
+                        Ok(()) => state.advance(),
+                        Err(e) => {
+                            eprintln!("[stream] failed to write event stream file: {e}");
+                        }
                     }
-                    state.advance();
                 }
             }
             EventStreamMsg::Flush => {
                 if state.buffer.is_empty() {
                     continue;
                 }
-                if let Err(e) = write_event_file(&dir, &signing_key, &state) {
-                    eprintln!("[stream] failed to flush event stream file: {e}");
+                match write_event_file(&dir, &signing_key, &state) {
+                    Ok(()) => state.advance(),
+                    Err(e) => {
+                        eprintln!("[stream] failed to flush event stream file: {e}");
+                    }
                 }
-                state.advance();
             }
             EventStreamMsg::Barrier { ack } => {
                 let _ = ack.send(());
             }
+        }
+    }
+    if !state.buffer.is_empty() {
+        match write_event_file(&dir, &signing_key, &state) {
+            Ok(()) => {}
+            Err(e) => eprintln!("[stream] failed to flush event stream file on shutdown: {e}"),
         }
     }
 }
@@ -224,34 +234,46 @@ fn write_event_file(dir: &Path, signing_key: &SigningKey, state: &WriterState) -
 /// running_hash)` for the writer to resume from: the index after the highest
 /// written one, chained from that file's `end_running_hash` (or the seed for
 /// an empty directory).
+///
+/// Only the highest-index candidate's tail is inspected; a malformed or
+/// truncated highest file falls back to the next lower index (or the seed),
+/// so one legacy corruption never blocks startup and the scan is
+/// O(num_files + tail) rather than O(total_stream_size).
 fn resume_state(dir: &Path) -> Result<(u64, [u8; 32])> {
-    let mut highest: Option<(u64, [u8; 32])> = None;
+    let mut indices = Vec::new();
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        let Some(index) = name
+        let Some(index_str) = name
             .strip_prefix(EVENT_FILE_PREFIX)
             .and_then(|rest| rest.strip_suffix(EVENT_FILE_SUFFIX))
         else {
             continue;
         };
-        let Ok(index) = index.parse::<u64>() else { continue };
-        let bytes = fs::read(entry.path())?;
-        let file = read_event_stream_file(&bytes)?;
-        let Some(end_hash) = file.end_running_hash.as_ref().and_then(hash_object_digest) else {
-            return Err(StreamError::Malformed(format!(
-                "event file {name} has an invalid end_running_hash"
-            )));
+        let Ok(index) = index_str.parse::<u64>() else { continue };
+        indices.push(index);
+    }
+    if indices.is_empty() {
+        return Ok((0, running_hash::CHAIN_SEED));
+    }
+    indices.sort_unstable();
+    for &index in indices.iter().rev() {
+        let path = dir.join(event_file_name(index));
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(_) => continue,
         };
-        if highest.as_ref().is_none_or(|(best, _)| index > *best) {
-            highest = Some((index, end_hash));
-        }
+        let file = match read_event_stream_file(&bytes) {
+            Ok(file) => file,
+            Err(_) => continue,
+        };
+        let Some(end_hash) = file.end_running_hash.as_ref().and_then(hash_object_digest) else {
+            continue;
+        };
+        return Ok((index + 1, end_hash));
     }
-    match highest {
-        Some((index, end_hash)) => Ok((index + 1, end_hash)),
-        None => Ok((0, running_hash::CHAIN_SEED)),
-    }
+    Ok((0, running_hash::CHAIN_SEED))
 }
 
 /// Decodes and structurally validates an event stream file: the version and
@@ -318,7 +340,14 @@ mod tests {
             vec![Transaction::from_bytes(vec![seq as u8])],
         )
         .finalize(Signature::new([seq as u8; 64]));
-        RetainedEvent { event, seq, round, ancestor_seqs: vec![seq], round_received: None }
+        RetainedEvent {
+            event,
+            seq,
+            round,
+            ancestor_seqs: vec![seq],
+            round_received: None,
+            consensus_timestamp: None,
+        }
     }
 
     #[tokio::test]
@@ -387,5 +416,128 @@ mod tests {
         let start_two =
             hash_object_digest(two.start_running_hash.as_ref().expect("start")).expect("hash");
         assert_eq!(start_two, end_one, "the resumed writer chains from the highest existing file");
+    }
+
+    #[tokio::test]
+    async fn failed_write_then_retry_keeps_chain_continuous() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let writer = EventStreamWriter::open(dir.path(), SigningKey::from_bytes(&[1; 32]), 2)
+            .expect("opens");
+        let blocking_path = dir.path().join(event_file_name(0));
+        fs::create_dir(&blocking_path).expect("blocking dir forces write failure");
+        writer.append(&sample_record(1, 1));
+        writer.append(&sample_record(2, 1));
+        writer.barrier().await;
+        assert!(
+            fs::read(&blocking_path).is_err(),
+            "first write should have failed (path is a dir)"
+        );
+        fs::remove_dir(&blocking_path).expect("remove blocking dir");
+        writer.flush();
+        writer.barrier().await;
+        let files = event_files_in(dir.path()).expect("files");
+        assert_eq!(files.len(), 1, "retry should have written the buffered events");
+        let file = read_event_stream_file(&fs::read(&files[0].1).expect("read")).expect("decodes");
+        assert_eq!(file.events.len(), 2, "failed events were retained and retried");
+        let start =
+            hash_object_digest(file.start_running_hash.as_ref().expect("start")).expect("hash");
+        assert_eq!(start, running_hash::CHAIN_SEED);
+        writer.append(&sample_record(3, 1));
+        writer.append(&sample_record(4, 1));
+        writer.barrier().await;
+        let files = event_files_in(dir.path()).expect("files");
+        assert_eq!(files.len(), 2);
+        let first = read_event_stream_file(&fs::read(&files[0].1).expect("read")).expect("first");
+        let second = read_event_stream_file(&fs::read(&files[1].1).expect("read")).expect("second");
+        let end_first =
+            hash_object_digest(first.end_running_hash.as_ref().expect("end")).expect("hash");
+        let start_second =
+            hash_object_digest(second.start_running_hash.as_ref().expect("start")).expect("hash");
+        assert_eq!(start_second, end_first, "chain remains continuous after retry");
+        let key = SigningKey::from_bytes(&[1; 32]).verifying_key();
+        crate::verify::verify_event_stream_dir(dir.path(), &key).expect("chain verifies");
+    }
+
+    #[tokio::test]
+    async fn resume_ignores_malformed_highest_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let writer = EventStreamWriter::open(dir.path(), SigningKey::from_bytes(&[1; 32]), 10)
+            .expect("opens");
+        writer.append(&sample_record(1, 1));
+        writer.flush();
+        writer.barrier().await;
+        writer.append(&sample_record(2, 1));
+        writer.flush();
+        writer.barrier().await;
+        drop(writer);
+        let files = event_files_in(dir.path()).expect("files");
+        assert_eq!(files.len(), 2);
+        let highest_path = files[1].1.clone();
+        fs::write(&highest_path, b"truncated garbage").expect("corrupt highest file");
+        let resumed = EventStreamWriter::open(dir.path(), SigningKey::from_bytes(&[1; 32]), 10)
+            .expect("reopens despite malformed highest");
+        resumed.append(&sample_record(3, 1));
+        resumed.flush();
+        resumed.barrier().await;
+        let first_bytes = fs::read(&files[0].1).expect("first still valid");
+        let first = read_event_stream_file(&first_bytes).expect("first decodes");
+        let second_bytes = fs::read(&highest_path).expect("overwritten");
+        let second = read_event_stream_file(&second_bytes).expect("second now valid");
+        let end_first =
+            hash_object_digest(first.end_running_hash.as_ref().expect("end")).expect("hash");
+        let start_second =
+            hash_object_digest(second.start_running_hash.as_ref().expect("start")).expect("hash");
+        assert_eq!(start_second, end_first, "fallback chains from last valid file");
+    }
+
+    #[test]
+    fn resume_state_falls_back_when_all_files_malformed() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        fs::write(dir.path().join(event_file_name(0)), b"bad").expect("write");
+        fs::write(dir.path().join(event_file_name(5)), b"also bad").expect("write");
+        let (next_index, hash) = resume_state(dir.path()).expect("resume");
+        assert_eq!(next_index, 0);
+        assert_eq!(hash, running_hash::CHAIN_SEED);
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_flush_survives_restart() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        {
+            let writer =
+                EventStreamWriter::open(dir.path(), SigningKey::from_bytes(&[1; 32]), 10_000)
+                    .expect("opens");
+            for seq in 1..=5 {
+                writer.append(&sample_record(seq, 1));
+            }
+            // Simulate graceful shutdown: flush the partial window and await
+            // the writer barrier so in-flight writes complete before exit.
+            writer.flush();
+            writer.barrier().await;
+        }
+        let files = event_files_in(dir.path()).expect("files");
+        assert_eq!(files.len(), 1, "flush on shutdown must have written the buffered window");
+        let file = read_event_stream_file(&fs::read(&files[0].1).expect("read")).expect("decodes");
+        assert_eq!(file.events.len(), 5);
+        let start =
+            hash_object_digest(file.start_running_hash.as_ref().expect("start")).expect("hash");
+        assert_eq!(start, running_hash::CHAIN_SEED);
+        let end = hash_object_digest(file.end_running_hash.as_ref().expect("end")).expect("hash");
+        let resumed = EventStreamWriter::open(dir.path(), SigningKey::from_bytes(&[1; 32]), 10_000)
+            .expect("reopens");
+        resumed.append(&sample_record(6, 1));
+        resumed.flush();
+        resumed.barrier().await;
+        let files = event_files_in(dir.path()).expect("files");
+        assert_eq!(files.len(), 2);
+        let second = read_event_stream_file(&fs::read(&files[1].1).expect("read")).expect("second");
+        let start_second =
+            hash_object_digest(second.start_running_hash.as_ref().expect("start")).expect("hash");
+        assert_eq!(start_second, end, "restart must chain from the flushed file");
+        crate::verify::verify_event_stream_dir(
+            dir.path(),
+            &SigningKey::from_bytes(&[1; 32]).verifying_key(),
+        )
+        .expect("chain verifies after graceful shutdown");
     }
 }

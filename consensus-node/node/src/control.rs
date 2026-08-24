@@ -120,6 +120,10 @@ pub async fn bind(path: &Path) -> Result<UnixListener> {
     Ok(listener)
 }
 
+const MAX_CONCURRENT_CONNECTIONS: usize = 16;
+const MAX_REQUEST_BYTES: usize = 1024 * 1024;
+const MAX_PAYLOAD_BYTES: usize = 1024 * 1024;
+
 /// Runs the control server until `stop` is set. Each accepted connection is
 /// handled on its own task; a malformed request gets an error response rather
 /// than closing the connection.
@@ -128,6 +132,7 @@ pub async fn serve(
     node: Arc<GossipNode>,
     stop: Arc<std::sync::atomic::AtomicBool>,
 ) {
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
     loop {
         if stop.load(std::sync::atomic::Ordering::Acquire) {
             break;
@@ -139,8 +144,16 @@ pub async fn serve(
                 continue;
             }
         };
+        let permit = match semaphore.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                eprintln!("control: too many concurrent connections; rejecting");
+                continue;
+            }
+        };
         let node = node.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             if let Err(e) = handle_connection(stream, node).await {
                 eprintln!("control connection error: {e}");
             }
@@ -170,6 +183,14 @@ async fn handle_connection(stream: UnixStream, node: Arc<GossipNode>) -> Result<
     let (read_half, mut write_half) = stream.into_split();
     let mut lines = BufReader::new(read_half).lines();
     while let Some(line) = lines.next_line().await? {
+        if line.len() > MAX_REQUEST_BYTES {
+            let response = error_response(format!(
+                "request too large: {} bytes exceeds {MAX_REQUEST_BYTES}",
+                line.len()
+            ));
+            write_response(&mut write_half, &response).await?;
+            continue;
+        }
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -278,12 +299,25 @@ async fn peers_response(node: &GossipNode) -> ControlResponse {
 }
 
 async fn submit_tx(node: &GossipNode, payload_hex: &str) -> ControlResponse {
+    if payload_hex.len() > MAX_PAYLOAD_BYTES * 2 {
+        return error_response(format!(
+            "payload_hex too large: {} hex chars exceeds {}",
+            payload_hex.len(),
+            MAX_PAYLOAD_BYTES * 2
+        ));
+    }
     let payload = match decode_hex_bytes(payload_hex) {
         Some(payload) => payload,
         None => {
             return error_response("payload_hex is not valid hex".to_string());
         }
     };
+    if payload.len() > MAX_PAYLOAD_BYTES {
+        return error_response(format!(
+            "payload too large: {} bytes exceeds {MAX_PAYLOAD_BYTES}",
+            payload.len()
+        ));
+    }
     node.submit_transaction(payload).await;
     ok_response(json!({ "queued": true }))
 }
