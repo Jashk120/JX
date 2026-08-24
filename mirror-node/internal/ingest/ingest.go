@@ -21,11 +21,10 @@ import (
 
 // Config controls the ingester.
 type Config struct {
-	StreamsDir   string
-	PollInterval time.Duration
-	// PubKey is the consensus node's Ed25519 verifying key used to check
-	// .sig files. If nil, signature verification is skipped (useful for tests).
-	PubKey ed25519.PublicKey
+	StreamsDir        string
+	PollInterval      time.Duration
+	PubKey            ed25519.PublicKey
+	TrustedRosterHash []byte
 }
 
 // Ingester polls the streams directory and ingests new files. It tracks the
@@ -42,6 +41,8 @@ type Ingester struct {
 	seenEvents      map[uint64]struct{} // ingested .esf indexes
 	inFlightRecords map[uint64]struct{} // reserved while a .rsf is being ingested
 	inFlightEvents  map[uint64]struct{} // reserved while an .esf is being ingested
+	lastRecordEnd   *[32]byte           // last accepted .rsf end hash (M-5)
+	lastEventEnd    *[32]byte           // last accepted .esf end hash (M-5)
 
 	runMu sync.Mutex // serializes concurrent RunOnce calls
 }
@@ -133,9 +134,6 @@ func (ing *Ingester) Run(ctx context.Context) error {
 	}
 }
 
-// loadSig reads the companion signature file, returning nil when it does not
-// exist yet (the Rust writer emits the sig before the stream file, so a
-// missing sig for an existing file is a transient state at worst).
 func (ing *Ingester) loadSig(path string) (*pb.SignatureFile, error) {
 	sigPath := filepath.Join(filepath.Dir(path), stream.SignatureFileName(filepath.Base(path)))
 	sig, err := stream.ReadSignatureFile(sigPath)
@@ -146,6 +144,18 @@ func (ing *Ingester) loadSig(path string) (*pb.SignatureFile, error) {
 		return nil, fmt.Errorf("read sig %s: %w", sigPath, err)
 	}
 	return sig, nil
+}
+
+func hashFromPB(h *pb.HashObject) ([32]byte, error) {
+	var out [32]byte
+	if h == nil {
+		return out, fmt.Errorf("missing running hash")
+	}
+	if h.Algorithm != 0 || h.Length != 32 || len(h.Hash) != 32 {
+		return out, fmt.Errorf("invalid running hash object: algorithm=%d length=%d hashLen=%d", h.Algorithm, h.Length, len(h.Hash))
+	}
+	copy(out[:], h.Hash)
+	return out, nil
 }
 
 // markSeen records an ingested stream file by its numeric index. Callers
@@ -198,9 +208,6 @@ func (ing *Ingester) releaseClaim(inFlight map[uint64]struct{}, index uint64) {
 }
 
 func (ing *Ingester) ingestRecord(path string) error {
-	// ListRecordFiles only returns names that parse; if one ever fails to,
-	// fall through with ok=false so the file is still ingested (store-level
-	// dedup keeps it a no-op) rather than wrongly sharing index 0.
 	index, ok := stream.RecordFileRound(filepath.Base(path))
 	if ok {
 		if !ing.tryClaim(ing.seenRecords, ing.inFlightRecords, index) {
@@ -221,14 +228,39 @@ func (ing *Ingester) ingestRecord(path string) error {
 		if err != nil {
 			return err
 		}
-		// Chain + checkpoint quorum always verify; signatures verify when both
-		// the companion sig and the node key are available.
-		if err := stream.VerifyRecordFile(raw, sig, ing.cfg.PubKey); err != nil {
+		if sig == nil {
+			ing.log.Warn("missing signature file, deferring record ingestion", "path", path)
+			return fmt.Errorf("missing signature file for %s: deferring until sig arrives", path)
+		}
+		start, err := hashFromPB(f.StartRunningHash)
+		if err != nil {
+			return fmt.Errorf("record %s start hash: %w", path, err)
+		}
+		end, err := hashFromPB(f.EndRunningHash)
+		if err != nil {
+			return fmt.Errorf("record %s end hash: %w", path, err)
+		}
+		ing.mu.Lock()
+		var expected [32]byte
+		if ing.lastRecordEnd == nil {
+			expected = stream.ChainSeed
+		} else {
+			expected = *ing.lastRecordEnd
+		}
+		ing.mu.Unlock()
+		if start != expected {
+			ing.log.Warn("record chain continuity violation", "path", path, "expected", fmt.Sprintf("%x", expected), "got", fmt.Sprintf("%x", start))
+			return fmt.Errorf("record chain continuity violation for %s: expected start %x got %x", path, expected, start)
+		}
+		if err := stream.VerifyRecordFile(raw, sig, ing.cfg.PubKey, ing.cfg.TrustedRosterHash); err != nil {
 			return fmt.Errorf("verify record %s: %w", path, err)
 		}
 		if err := ing.store.PutRecord(f); err != nil {
 			return err
 		}
+		ing.mu.Lock()
+		ing.lastRecordEnd = &end
+		ing.mu.Unlock()
 		ing.confirmClaim(ing.seenRecords, ing.inFlightRecords, index)
 		succeeded = true
 		ing.log.Info("ingested record file", "path", path, "round", f.Round, "items", len(f.Items))
@@ -242,18 +274,44 @@ func (ing *Ingester) ingestRecord(path string) error {
 	if err != nil {
 		return err
 	}
-	if err := stream.VerifyRecordFile(raw, sig, ing.cfg.PubKey); err != nil {
+	if sig == nil {
+		ing.log.Warn("missing signature file, deferring record ingestion", "path", path)
+		return fmt.Errorf("missing signature file for %s: deferring until sig arrives", path)
+	}
+	start, err := hashFromPB(f.StartRunningHash)
+	if err != nil {
+		return fmt.Errorf("record %s start hash: %w", path, err)
+	}
+	end, err := hashFromPB(f.EndRunningHash)
+	if err != nil {
+		return fmt.Errorf("record %s end hash: %w", path, err)
+	}
+	ing.mu.Lock()
+	var expected [32]byte
+	if ing.lastRecordEnd == nil {
+		expected = stream.ChainSeed
+	} else {
+		expected = *ing.lastRecordEnd
+	}
+	ing.mu.Unlock()
+	if start != expected {
+		ing.log.Warn("record chain continuity violation", "path", path, "expected", fmt.Sprintf("%x", expected), "got", fmt.Sprintf("%x", start))
+		return fmt.Errorf("record chain continuity violation for %s: expected start %x got %x", path, expected, start)
+	}
+	if err := stream.VerifyRecordFile(raw, sig, ing.cfg.PubKey, ing.cfg.TrustedRosterHash); err != nil {
 		return fmt.Errorf("verify record %s: %w", path, err)
 	}
 	if err := ing.store.PutRecord(f); err != nil {
 		return err
 	}
+	ing.mu.Lock()
+	ing.lastRecordEnd = &end
+	ing.mu.Unlock()
 	ing.log.Info("ingested record file", "path", path, "round", f.Round, "items", len(f.Items))
 	return nil
 }
 
 func (ing *Ingester) ingestEvent(path string) error {
-	// See ingestRecord for the ok=false fallback rationale.
 	index, ok := stream.EventFileIndex(filepath.Base(path))
 	if ok {
 		if !ing.tryClaim(ing.seenEvents, ing.inFlightEvents, index) {
@@ -274,12 +332,39 @@ func (ing *Ingester) ingestEvent(path string) error {
 		if err != nil {
 			return err
 		}
+		if sig == nil {
+			ing.log.Warn("missing signature file, deferring event ingestion", "path", path)
+			return fmt.Errorf("missing signature file for %s: deferring until sig arrives", path)
+		}
+		start, err := hashFromPB(f.StartRunningHash)
+		if err != nil {
+			return fmt.Errorf("event %s start hash: %w", path, err)
+		}
+		end, err := hashFromPB(f.EndRunningHash)
+		if err != nil {
+			return fmt.Errorf("event %s end hash: %w", path, err)
+		}
+		ing.mu.Lock()
+		var expected [32]byte
+		if ing.lastEventEnd == nil {
+			expected = stream.ChainSeed
+		} else {
+			expected = *ing.lastEventEnd
+		}
+		ing.mu.Unlock()
+		if start != expected {
+			ing.log.Warn("event chain continuity violation", "path", path, "expected", fmt.Sprintf("%x", expected), "got", fmt.Sprintf("%x", start))
+			return fmt.Errorf("event chain continuity violation for %s: expected start %x got %x", path, expected, start)
+		}
 		if err := stream.VerifyEventFile(raw, sig, ing.cfg.PubKey); err != nil {
 			return fmt.Errorf("verify event %s: %w", path, err)
 		}
 		if err := ing.store.PutEvents(f); err != nil {
 			return err
 		}
+		ing.mu.Lock()
+		ing.lastEventEnd = &end
+		ing.mu.Unlock()
 		ing.confirmClaim(ing.seenEvents, ing.inFlightEvents, index)
 		succeeded = true
 		ing.log.Info("ingested event file", "path", path, "events", len(f.Events))
@@ -293,12 +378,39 @@ func (ing *Ingester) ingestEvent(path string) error {
 	if err != nil {
 		return err
 	}
+	if sig == nil {
+		ing.log.Warn("missing signature file, deferring event ingestion", "path", path)
+		return fmt.Errorf("missing signature file for %s: deferring until sig arrives", path)
+	}
+	start, err := hashFromPB(f.StartRunningHash)
+	if err != nil {
+		return fmt.Errorf("event %s start hash: %w", path, err)
+	}
+	end, err := hashFromPB(f.EndRunningHash)
+	if err != nil {
+		return fmt.Errorf("event %s end hash: %w", path, err)
+	}
+	ing.mu.Lock()
+	var expected [32]byte
+	if ing.lastEventEnd == nil {
+		expected = stream.ChainSeed
+	} else {
+		expected = *ing.lastEventEnd
+	}
+	ing.mu.Unlock()
+	if start != expected {
+		ing.log.Warn("event chain continuity violation", "path", path, "expected", fmt.Sprintf("%x", expected), "got", fmt.Sprintf("%x", start))
+		return fmt.Errorf("event chain continuity violation for %s: expected start %x got %x", path, expected, start)
+	}
 	if err := stream.VerifyEventFile(raw, sig, ing.cfg.PubKey); err != nil {
 		return fmt.Errorf("verify event %s: %w", path, err)
 	}
 	if err := ing.store.PutEvents(f); err != nil {
 		return err
 	}
+	ing.mu.Lock()
+	ing.lastEventEnd = &end
+	ing.mu.Unlock()
 	ing.log.Info("ingested event file", "path", path, "events", len(f.Events))
 	return nil
 }

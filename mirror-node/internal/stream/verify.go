@@ -23,11 +23,14 @@ const (
 
 // VerifyEventFile checks a single .esf's integrity:
 //   - start/end running hashes chain correctly over the contained events,
-//   - file signature and metadata signature (if a sig is provided) verify.
-//
-// Signature verification runs only when both sig and pubKey are non-nil;
-// structural and chain checks always run.
+//   - file signature and metadata signature verify under pubKey (fail-closed).
 func VerifyEventFile(fileBytes []byte, sig *pb.SignatureFile, pubKey ed25519.PublicKey) error {
+	if len(pubKey) != ed25519.PublicKeySize {
+		return fmt.Errorf("missing verifying key: pubkey is required (H-4)")
+	}
+	if sig == nil {
+		return fmt.Errorf("missing signature file for event stream file")
+	}
 	var esf pb.EventStreamFile
 	if err := unmarshalStrict(fileBytes, &esf); err != nil {
 		return fmt.Errorf("unmarshal EventStreamFile: %w", err)
@@ -46,18 +49,25 @@ func VerifyEventFile(fileBytes []byte, sig *pb.SignatureFile, pubKey ed25519.Pub
 	if err := verifyRunningHashEvent(start, end, esf.Events); err != nil {
 		return err
 	}
-	if sig != nil && pubKey != nil {
-		metadata := metadataBytes(esf.Version, start, end, 0, false)
-		return verifySignatureObjects(sig, fileBytes, metadata, pubKey)
-	}
-	return nil
+	metadata := metadataBytes(esf.Version, start, end, 0, false)
+	return verifySignatureObjects(sig, fileBytes, metadata, pubKey)
 }
 
 // VerifyRecordFile checks a single .rsf: running hash + the embedded
-// checkpoint anchor (round consistency + quorum) + optional sig. Mirrors
+// checkpoint anchor (round consistency + quorum) + sig. Mirrors
 // consensus-node/protocol/stream/src/verify.rs — every record file must carry
-// its threshold-signed checkpoint.
-func VerifyRecordFile(fileBytes []byte, sig *pb.SignatureFile, pubKey ed25519.PublicKey) error {
+// its threshold-signed checkpoint. trustedRosterHash is required (fail-closed);
+// the embedded roster hash must equal it (H-5).
+func VerifyRecordFile(fileBytes []byte, sig *pb.SignatureFile, pubKey ed25519.PublicKey, trustedRosterHash []byte) error {
+	if len(pubKey) != ed25519.PublicKeySize {
+		return fmt.Errorf("missing verifying key: pubkey is required (H-4)")
+	}
+	if sig == nil {
+		return fmt.Errorf("missing signature file for record stream file")
+	}
+	if len(trustedRosterHash) != hashLengthSHA256 {
+		return fmt.Errorf("missing trusted roster hash: 32 bytes required (H-5)")
+	}
 	var rsf pb.RecordStreamFile
 	if err := unmarshalStrict(fileBytes, &rsf); err != nil {
 		return fmt.Errorf("unmarshal RecordStreamFile: %w", err)
@@ -83,14 +93,11 @@ func VerifyRecordFile(fileBytes []byte, sig *pb.SignatureFile, pubKey ed25519.Pu
 		return fmt.Errorf("record stream file round %d disagrees with its checkpoint round %d",
 			rsf.Round, rsf.Checkpoint.Round)
 	}
-	if err := verifyCheckpointQuorum(rsf.Checkpoint); err != nil {
+	if err := verifyCheckpointQuorum(rsf.Checkpoint, trustedRosterHash); err != nil {
 		return err
 	}
-	if sig != nil && pubKey != nil {
-		metadata := metadataBytes(rsf.Version, start, end, rsf.Round, true)
-		return verifySignatureObjects(sig, fileBytes, metadata, pubKey)
-	}
-	return nil
+	metadata := metadataBytes(rsf.Version, start, end, rsf.Round, true)
+	return verifySignatureObjects(sig, fileBytes, metadata, pubKey)
 }
 
 // runningHashOrErr validates a HashObject commitment as a SHA-256 digest,
@@ -168,6 +175,10 @@ func verifySignatureObject(so *pb.SignatureObject, expected [32]byte, pubKey ed2
 	if len(so.Signature) != ed25519.SignatureSize {
 		return fmt.Errorf("signature is %d bytes, want %d", len(so.Signature), ed25519.SignatureSize)
 	}
+	// Divergence from Rust verify_strict (L-5): Go stdlib ed25519.Verify is lenient
+	// (accepts malleable S encodings that dalek's verify_strict rejects). The Go
+	// mirror therefore accepts a strict superset of what Rust considers valid.
+	// This is documented, not hardened — do not hand-roll strict math here.
 	if !ed25519.Verify(pubKey, expected[:], so.Signature) {
 		return fmt.Errorf("ed25519 verification failed")
 	}
@@ -240,15 +251,19 @@ func rosterCanonicalBytes(members []*pb.CheckpointRosterMember) ([]byte, error) 
 // verifyCheckpointQuorum enforces the full mirror-side quorum proof:
 //   - state_hash and roster_hash are 32 bytes,
 //   - the embedded roster snapshot hashes (canonical form) to roster_hash,
+//   - roster_hash must equal the externally-supplied trustedRosterHash (H-5, fail-closed),
 //   - every distinct, round-matching Ed25519 signature verifies over
 //     round (8 BE) || state_hash || roster_hash — checkpoint.rs:signing_bytes,
-//   - valid*3 > total*2 decides.
-func verifyCheckpointQuorum(cp *pb.SignedCheckpoint) error {
+//   - valid*3 > total*2 decides, counting against the deduplicated canonical roster (L-6).
+func verifyCheckpointQuorum(cp *pb.SignedCheckpoint, trustedRosterHash []byte) error {
 	if len(cp.StateHash) != hashLengthSHA256 {
 		return fmt.Errorf("checkpoint state hash is %d bytes, want %d", len(cp.StateHash), hashLengthSHA256)
 	}
 	if len(cp.RosterHash) != hashLengthSHA256 {
 		return fmt.Errorf("checkpoint roster hash is %d bytes, want %d", len(cp.RosterHash), hashLengthSHA256)
+	}
+	if len(trustedRosterHash) != hashLengthSHA256 {
+		return fmt.Errorf("missing trusted roster hash: 32 bytes required (H-5)")
 	}
 	rosterBytes, err := rosterCanonicalBytes(cp.RosterSnapshot)
 	if err != nil {
@@ -258,13 +273,16 @@ func verifyCheckpointQuorum(cp *pb.SignedCheckpoint) error {
 	if !bytes.Equal(rosterDigest[:], cp.RosterHash) {
 		return fmt.Errorf("embedded roster snapshot does not hash to roster_hash")
 	}
-	total := len(cp.RosterSnapshot)
-	if total == 0 {
-		return fmt.Errorf("empty roster snapshot")
+	if !bytes.Equal(cp.RosterHash, trustedRosterHash) {
+		return fmt.Errorf("roster hash does not match trusted roster hash")
 	}
-	keyByID := make(map[uint64]ed25519.PublicKey, total)
+	keyByID := make(map[uint64]ed25519.PublicKey, len(cp.RosterSnapshot))
 	for _, m := range cp.RosterSnapshot {
 		keyByID[m.NodeId] = ed25519.PublicKey(m.Key)
+	}
+	total := len(keyByID)
+	if total == 0 {
+		return fmt.Errorf("empty roster snapshot")
 	}
 	signingBytes := make([]byte, 0, 72)
 	var roundBE [8]byte
