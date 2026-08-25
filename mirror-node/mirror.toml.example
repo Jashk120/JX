@@ -1,0 +1,26 @@
+# mirror-node configuration — copy to mirror.toml and edit
+# flags override values in this file; missing keys keep built-in defaults
+
+# Directory watched when block_node_url is empty
+streams_dir = "./data/streams"
+
+# Local state: any non-postgres:// value keeps the in-memory store.
+# A postgres:// DSN enables the PostgreSQL backend, e.g.
+# db_path = "postgres://mirror:mirror@localhost:5432/mirror?sslmode=disable"
+db_path = "./data/mirror.db"
+
+# HTTP API listen address
+api_addr = ":8080"
+
+# Log level: debug, info, warn, error
+log_level = "info"
+
+# Ed25519 verifying key (32 bytes, 64 hex chars) — required
+pubkey = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+
+# Trusted roster hash anchor (32 bytes, 64 hex chars) — required
+trusted_roster_hash = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+
+# Remote block-node base URL — when set, the mirror polls the block node
+# instead of scanning streams_dir. Example: "http://block-node:8080"
+block_node_url = ""

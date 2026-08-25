@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -23,12 +24,13 @@ var (
 
 func main() {
 	var (
-		streamsDir       = flag.String("streams", "", "streams directory (overrides MIRROR_STREAMS_DIR)")
-		dbPath           = flag.String("db", "", "mirror db path (overrides MIRROR_DB_PATH)")
-		addr             = flag.String("addr", "", "API listen addr (overrides MIRROR_API_ADDR)")
-		pubkeyFlag       = flag.String("pubkey", "", "Ed25519 verifying key hex 64 chars (overrides MIRRORD_PUBKEY)")
-		trustedHashFlag  = flag.String("trusted-roster-hash", "", "trusted roster hash hex 64 chars (overrides MIRRORD_TRUSTED_ROSTER_HASH)")
-		blockNodeURLFlag = flag.String("block-node-url", "", "block node base URL (overrides MIRROR_BLOCK_NODE_URL)")
+		configFlag       = flag.String("config", "", "TOML config file; defaults to ./mirror.toml when present")
+		streamsDir       = flag.String("streams", "", "streams directory (overrides mirror.toml)")
+		dbPath           = flag.String("db", "", "mirror db path or postgres:// DSN (overrides MIRROR_DB_PATH and mirror.toml)")
+		addr             = flag.String("addr", "", "API listen addr (overrides mirror.toml)")
+		pubkeyFlag       = flag.String("pubkey", "", "Ed25519 verifying key hex 64 chars (overrides mirror.toml)")
+		trustedHashFlag  = flag.String("trusted-roster-hash", "", "trusted roster hash hex 64 chars (overrides mirror.toml)")
+		blockNodeURLFlag = flag.String("block-node-url", "", "block node base URL (overrides mirror.toml)")
 		showVer          = flag.Bool("version", false, "print version and exit")
 	)
 	flag.Parse()
@@ -40,7 +42,15 @@ func main() {
 
 	_ = config.LoadDotEnv("./.env")
 
-	cfg, err := config.Load()
+	var (
+		cfg config.Config
+		err error
+	)
+	if *configFlag != "" {
+		cfg, err = config.Load(*configFlag)
+	} else {
+		cfg, err = config.LoadOptional(config.DefaultPath)
+	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "config: %v\n", err)
 		os.Exit(1)
@@ -86,8 +96,21 @@ func main() {
 	}
 	trustedBytes := trustedHash[:]
 
-	// Store: in-memory for now; swap for persistent backend when available.
-	st := store.NewMemStore()
+	// Store: in-memory by default. A --db / db_path value starting with
+	// postgres:// (or postgresql://) selects the persistent backend.
+	var st store.Store = store.NewMemStore()
+	if strings.HasPrefix(cfg.DBPath, "postgres://") || strings.HasPrefix(cfg.DBPath, "postgresql://") {
+		pgCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		pgst, err := store.NewPostgresStore(pgCtx, cfg.DBPath)
+		cancel()
+		if err != nil {
+			h.Error("postgres store init failed", "err", err)
+			os.Exit(1)
+		}
+		defer pgst.Close()
+		st = pgst
+		h.Info("using postgresql store")
+	}
 
 	ing := ingest.New(ingest.Config{
 		StreamsDir:        cfg.StreamsDir,
