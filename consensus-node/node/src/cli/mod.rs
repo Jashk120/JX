@@ -12,9 +12,9 @@
 //! jkaind tx put    --key <k> --value <v>  [--socket <path>]
 //! jkaind tx delete --key <k>              [--socket <path>]
 //! jkaind add-member --node-id <id> --gossip <ip:port> [--reconnect <ip:port>] \
-//!                   --key <hex> [--socket <path>]
+//!                   --key <hex> --bls-key <96 hex> (--bls-secret <path> | --pop <192 hex>) [--socket <path>]
 //! jkaind member init --node-id <id> --gossip <ip:port> --reconnect <ip:port> \
-//!                    --cluster <genesis cluster.toml> --out <dir>
+//!                    --cluster <genesis cluster.toml> --out <dir> [--socket <path>]
 //! ```
 //!
 //! `init` generates per-node secrets (64 bytes each: consensus signing seed ‖
@@ -63,7 +63,7 @@ pub async fn run(args: Vec<String>) -> Result<()> {
         "status" => client::status_cmd(&args[1..]).await,
         "tx" => client::tx_cmd(&args[1..]).await,
         "add-member" => client::add_member(&args[1..]).await,
-        "member" => member::member_cmd(&args[1..]),
+        "member" => member::member_cmd(&args[1..]).await,
         "deploy" => deploy::deploy_cmd(&args[1..]),
         "keygen" => deploy::keygen(&args[1..]),
         other => bail!("unknown subcommand '{other}'"),
@@ -94,11 +94,13 @@ fn print_usage() {
          \x20 jkaind tx put    --key <k> --value <v> [--socket <path>]\n\
          \x20 jkaind tx delete --key <k>             [--socket <path>]\n\
          \x20 jkaind add-member --node-id <id> --gossip <ip:port> \\\n\
-         \x20                  [--reconnect <ip:port>] --key <hex> [--socket <path>]\n\
+         \x20                  [--reconnect <ip:port>] --key <hex> \\\n\
+         \x20                  --bls-key <96 hex> (--bls-secret <path> | --pop <192 hex>) \\\n\
+         \x20                  [--socket <path>]\n\
          \n\
          Provision a new member (never touches the genesis cluster.toml):\n\
          \x20 jkaind member init --node-id <id> --gossip <ip:port> --reconnect <ip:port> \\\n\
-         \x20                    --cluster <genesis cluster.toml> --out <dir>\n\
+         \x20                    --cluster <genesis cluster.toml> --out <dir> [--socket <path>]\n\
          \n\
          Deploy a genesis cluster over SSH (secrets are generated on each node and\n\
          never leave it; only public keys travel):\n\
@@ -118,7 +120,8 @@ fn print_usage() {
          \x20 jkaind status\n\
          \x20 jkaind tx put --key balance --value 100\n\
          \x20 jkaind add-member --node-id 3 --gossip 203.0.113.7:7000 \\\n\
-         \x20                 --reconnect 203.0.113.7:7001 --key <hex-from-member-init>",
+         \x20                 --reconnect 203.0.113.7:7001 --key <hex-from-member-init> \\\n\
+         \x20                 --bls-key <bls-hex> --bls-secret ./cluster/secret-3.bls.bin",
         env!("CARGO_PKG_VERSION"),
         env!("JKAIN_GIT_HASH"),
     );

@@ -60,11 +60,12 @@ fn registry_for(ids: &[u64]) -> MembershipRegistry {
 }
 
 fn membership_add_tx(new_node: u64) -> Transaction {
+    let bls_id = crypto::BlsIdentity::from_ikm(&[new_node as u8; 32]).expect("bls");
     let op = MembershipOp::Add {
         node: NodeId::new(new_node),
         key: Box::new(key_for(new_node).verifying_key()),
-        bls_key: [0u8; 48],
-        pop: [0u8; 96],
+        bls_key: bls_id.public.to_bytes(),
+        pop: crypto::sign_pop(&bls_id).to_bytes(),
         addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7000),
         reconnect_addr: Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7001)),
     };

@@ -116,6 +116,10 @@ pub(crate) fn init(args: &[String]) -> Result<()> {
         OsRng.fill_bytes(&mut bls_ikm);
         let bls_identity = crypto::BlsIdentity::from_ikm(&bls_ikm)
             .with_context(|| format!("generating BLS identity for node {node_id}"))?;
+        let pop_self = crypto::sign_pop(&bls_identity);
+        if !crypto::verify_pop(&bls_identity.public, &pop_self) {
+            bail!("init: BLS PoP self-check failed for node {node_id}");
+        }
         write_secret_bytes(&bls_path, &bls_ikm)
             .with_context(|| format!("writing {}", bls_path.display()))?;
         let signing_key =

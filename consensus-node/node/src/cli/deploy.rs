@@ -613,6 +613,10 @@ fn generate_member_material(node_id: u64) -> Result<GeneratedKeys> {
     OsRng.fill_bytes(&mut bls_ikm);
     let bls_identity = crypto::BlsIdentity::from_ikm(&bls_ikm)
         .with_context(|| format!("node {node_id}: generating BLS identity"))?;
+    let pop_self = crypto::sign_pop(&bls_identity);
+    if !crypto::verify_pop(&bls_identity.public, &pop_self) {
+        bail!("node {node_id}: BLS PoP self-check failed");
+    }
     Ok(GeneratedKeys {
         seed,
         verifying_key: signing_key.verifying_key().to_bytes(),
