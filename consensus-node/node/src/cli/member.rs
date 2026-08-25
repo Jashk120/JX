@@ -100,15 +100,29 @@ fn member_init(args: &[String]) -> Result<()> {
     let identity = TlsIdentity::from_seed(seed, node_id)
         .with_context(|| format!("building TLS identity for node {node_id}"))?;
 
+    // BLS identity: separate 32-byte IKM, derives the BLS public key for checkpoints.
+    let mut bls_ikm = [0u8; 32];
+    OsRng.fill_bytes(&mut bls_ikm);
+    let bls_identity = crypto::BlsIdentity::from_ikm(&bls_ikm)
+        .with_context(|| format!("generating BLS identity for node {node_id}"))?;
+    let bls_pub = bls_identity.public.to_bytes();
+
     let secret_path = out_dir.join(format!("secret-{node_id}.bin"));
-    if secret_path.exists() && !force {
+    let bls_path = out_dir.join(format!("secret-{node_id}.bls.bin"));
+    if (secret_path.exists() || bls_path.exists()) && !force {
+        let existing = if secret_path.exists() {
+            secret_path.display().to_string()
+        } else {
+            bls_path.display().to_string()
+        };
         bail!(
-            "{} already exists; use --force to regenerate (refusing to overwrite secrets)",
-            secret_path.display()
+            "{existing} already exists; use --force to regenerate (refusing to overwrite secrets)"
         );
     }
     write_secret_bytes(&secret_path, &seed)
         .with_context(|| format!("writing {}", secret_path.display()))?;
+    write_secret_bytes(&bls_path, &bls_ikm)
+        .with_context(|| format!("writing {}", bls_path.display()))?;
 
     // The new member's LOCAL cluster.toml = genesis members + itself, written
     // under a node-specific filename so it can never clobber the shared
@@ -122,6 +136,7 @@ fn member_init(args: &[String]) -> Result<()> {
         Some(reconnect),
         &signing_key.verifying_key(),
         identity.spki_fingerprint(),
+        bls_pub,
     ));
     let config = ClusterConfigFile { members };
     let config_path = out_dir.join(format!("cluster-{node_id}.toml"));
@@ -139,9 +154,15 @@ fn member_init(args: &[String]) -> Result<()> {
     );
     tracing::info!(
         node_id,
+        secret = %bls_path.display(),
+        "BLS secret file written"
+    );
+    tracing::info!(
+        node_id,
         gossip = %gossip,
         reconnect = %reconnect,
         key = encode_hex(&signing_key.verifying_key().to_bytes()),
+        bls_key = encode_hex(&bls_pub),
         "add-member command"
     );
     tracing::info!(

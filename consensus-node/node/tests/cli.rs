@@ -50,7 +50,8 @@ fn init_writes_config_and_secrets_consistent_with_derivation() {
 
     // Each secret must be 64 bytes (consensus seed ‖ TLS seed) and derive the
     // exact verifying_key and SPKI fingerprint the config declares — the same
-    // cross-check `jkaind run` performs.
+    // cross-check `jkaind run` performs. Each BLS secret must be 32 bytes and
+    // derive the bls_verifying_key in cluster.toml.
     for member in &config.members {
         let secret = std::fs::read(out.join(format!("secret-{}.bin", member.node_id)))
             .expect("secret file exists");
@@ -71,6 +72,25 @@ fn init_writes_config_and_secrets_consistent_with_derivation() {
             "spki_fingerprint matches secret for node {}",
             member.node_id
         );
+        let bls_secret = std::fs::read(out.join(format!("secret-{}.bls.bin", member.node_id)))
+            .expect("BLS secret file exists");
+        assert_eq!(bls_secret.len(), 32, "BLS secret is 32 bytes");
+        let bls_ikm: [u8; 32] = bls_secret.try_into().expect("32 bytes");
+        let bls_id = crypto::BlsIdentity::from_ikm(&bls_ikm).expect("BLS identity");
+        assert_eq!(
+            node::config::decode_bls_hex(&member.bls_verifying_key).expect("bls hex"),
+            bls_id.public.to_bytes(),
+            "bls_verifying_key matches BLS secret for node {}",
+            member.node_id
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::metadata(out.join(format!("secret-{}.bls.bin", member.node_id)))
+                .expect("metadata")
+                .permissions();
+            assert_eq!(perms.mode() & 0o777, 0o600, "BLS secret file must be 0600");
+        }
     }
 
     // The config converts cleanly into the gossip-layer cluster config.
@@ -190,6 +210,12 @@ fn member_init_single_seed_secret_pins_match_and_leaves_genesis_untouched() {
     let signing_key = SigningKey::from_bytes(&seed);
     let identity = TlsIdentity::from_seed(seed, 3).expect("identity builds");
 
+    // BLS secret must be 32-byte IKM and derive the configured bls_verifying_key.
+    let bls_secret = std::fs::read(member_out.join("secret-3.bls.bin")).expect("BLS secret file");
+    assert_eq!(bls_secret.len(), 32, "BLS secret is 32 bytes");
+    let bls_ikm: [u8; 32] = bls_secret.try_into().expect("32 bytes");
+    let bls_id = crypto::BlsIdentity::from_ikm(&bls_ikm).expect("BLS identity");
+
     // The member's local cluster.toml (node-specific filename, so the shared
     // genesis cluster.toml can never be clobbered) lists genesis + itself, and
     // its own entry is self-consistent with the secret (so `run`'s sanity
@@ -206,6 +232,11 @@ fn member_init_single_seed_secret_pins_match_and_leaves_genesis_untouched() {
         decode_hex(&member3.spki_fingerprint).expect("fingerprint hex"),
         identity.spki_fingerprint(),
         "member 3's configured TLS pin matches its secret"
+    );
+    assert_eq!(
+        node::config::decode_bls_hex(&member3.bls_verifying_key).expect("bls hex"),
+        bls_id.public.to_bytes(),
+        "member 3's configured BLS key matches its secret"
     );
 
     // THE EXACT BUG: a peer that node 1 (or 2) pins via add_peer_from_key
@@ -388,6 +419,7 @@ fn derivation_from_fixed_secret_is_stable_and_round_trips() {
     let key = SigningKey::from_bytes(secret[..32].try_into().expect("seed"));
     let identity = TlsIdentity::from_seed(secret[32..].try_into().expect("tls seed"), 1)
         .expect("identity builds");
+    let bls = crypto::BlsIdentity::from_ikm(&[7u8; 32]).expect("bls").public.to_bytes();
 
     let again_key = SigningKey::from_bytes(secret[..32].try_into().expect("seed"));
     let again_identity = TlsIdentity::from_seed(secret[32..].try_into().expect("tls seed"), 1)
@@ -401,10 +433,198 @@ fn derivation_from_fixed_secret_is_stable_and_round_trips() {
         Some("127.0.0.1:7001".parse().expect("addr")),
         &key.verifying_key(),
         identity.spki_fingerprint(),
+        bls,
     );
     assert_eq!(decode_hex(&member.verifying_key).expect("key hex"), key.verifying_key().to_bytes());
     assert_eq!(
         decode_hex(&member.spki_fingerprint).expect("fingerprint hex"),
         identity.spki_fingerprint()
+    );
+    assert_eq!(node::config::decode_bls_hex(&member.bls_verifying_key).expect("bls hex"), bls);
+}
+
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("bind ephemeral")
+        .local_addr()
+        .expect("addr")
+        .port()
+}
+
+#[test]
+fn run_refuses_when_bls_file_missing() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let out = tmp.path().join("cluster");
+    assert!(init_args(&out, false).status().expect("init").success());
+    let config_path = out.join("cluster.toml");
+    let secret_path = out.join("secret-1.bin");
+    let bls_path = out.join("secret-1.bls.bin");
+    assert!(bls_path.exists());
+    std::fs::remove_file(&bls_path).expect("remove bls");
+
+    let data = tmp.path().join("data-missing");
+    let gossip_port = free_port();
+    let reconnect_port = free_port();
+    let output = Command::new(binary())
+        .args([
+            "run",
+            "--cluster",
+            config_path.to_str().unwrap(),
+            "--node-id",
+            "1",
+            "--secret",
+            secret_path.to_str().unwrap(),
+            "--data",
+            data.to_str().unwrap(),
+            "--gossip-port",
+            &gossip_port.to_string(),
+            "--reconnect-port",
+            &reconnect_port.to_string(),
+            "--control-socket",
+            tmp.path().join("sock-missing").to_str().unwrap(),
+            "--log-file",
+            "-",
+        ])
+        .output()
+        .expect("run");
+    assert!(!output.status.success(), "run must refuse when BLS file missing");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("missing BLS identity file at"),
+        "expected missing BLS error, got: {stderr}"
+    );
+}
+
+#[test]
+fn run_refuses_when_bls_file_corrupted() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let out = tmp.path().join("cluster");
+    assert!(init_args(&out, false).status().expect("init").success());
+    let config_path = out.join("cluster.toml");
+    let secret_path = out.join("secret-1.bin");
+    let bls_path = out.join("secret-1.bls.bin");
+    let mut bytes = std::fs::read(&bls_path).expect("read bls");
+    bytes[0] ^= 0xFF;
+    std::fs::write(&bls_path, &bytes).expect("write corrupted");
+
+    let data = tmp.path().join("data-corrupt");
+    let gossip_port = free_port();
+    let reconnect_port = free_port();
+    let output = Command::new(binary())
+        .args([
+            "run",
+            "--cluster",
+            config_path.to_str().unwrap(),
+            "--node-id",
+            "1",
+            "--secret",
+            secret_path.to_str().unwrap(),
+            "--data",
+            data.to_str().unwrap(),
+            "--gossip-port",
+            &gossip_port.to_string(),
+            "--reconnect-port",
+            &reconnect_port.to_string(),
+            "--control-socket",
+            tmp.path().join("sock-corrupt").to_str().unwrap(),
+            "--log-file",
+            "-",
+        ])
+        .output()
+        .expect("run");
+    assert!(!output.status.success(), "run must refuse when BLS file corrupted");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("BLS identity mismatch for member 1"),
+        "expected BLS mismatch, got: {stderr}"
+    );
+}
+
+#[test]
+fn run_refuses_when_bls_verifying_key_mismatch() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let out = tmp.path().join("cluster");
+    assert!(init_args(&out, false).status().expect("init").success());
+    let config_path = out.join("cluster.toml");
+    let secret_path = out.join("secret-1.bin");
+
+    let mut config = ClusterConfigFile::load(&config_path).expect("load");
+    let fake_bls = crypto::BlsIdentity::from_ikm(&[0xFFu8; 32]).expect("bls").public.to_bytes();
+    config.members[0].bls_verifying_key = node::config::encode_hex(&fake_bls);
+    config.save(&config_path).expect("save edited");
+
+    let data = tmp.path().join("data-mismatch");
+    let gossip_port = free_port();
+    let reconnect_port = free_port();
+    let output = Command::new(binary())
+        .args([
+            "run",
+            "--cluster",
+            config_path.to_str().unwrap(),
+            "--node-id",
+            "1",
+            "--secret",
+            secret_path.to_str().unwrap(),
+            "--data",
+            data.to_str().unwrap(),
+            "--gossip-port",
+            &gossip_port.to_string(),
+            "--reconnect-port",
+            &reconnect_port.to_string(),
+            "--control-socket",
+            tmp.path().join("sock-mismatch").to_str().unwrap(),
+            "--log-file",
+            "-",
+        ])
+        .output()
+        .expect("run");
+    assert!(!output.status.success(), "run must refuse when toml BLS key mismatched");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("BLS identity mismatch for member 1"),
+        "expected BLS mismatch, got: {stderr}"
+    );
+}
+
+#[test]
+fn run_refuses_when_bls_file_has_wrong_length() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let out = tmp.path().join("cluster");
+    assert!(init_args(&out, false).status().expect("init").success());
+    let config_path = out.join("cluster.toml");
+    let secret_path = out.join("secret-1.bin");
+    let bls_path = out.join("secret-1.bls.bin");
+    std::fs::write(&bls_path, b"short").expect("write short");
+
+    let data = tmp.path().join("data-short");
+    let gossip_port = free_port();
+    let reconnect_port = free_port();
+    let output = Command::new(binary())
+        .args([
+            "run",
+            "--cluster",
+            config_path.to_str().unwrap(),
+            "--node-id",
+            "1",
+            "--secret",
+            secret_path.to_str().unwrap(),
+            "--data",
+            data.to_str().unwrap(),
+            "--gossip-port",
+            &gossip_port.to_string(),
+            "--reconnect-port",
+            &reconnect_port.to_string(),
+            "--control-socket",
+            tmp.path().join("sock-short").to_str().unwrap(),
+            "--log-file",
+            "-",
+        ])
+        .output()
+        .expect("run");
+    assert!(!output.status.success(), "run must refuse when BLS file wrong length");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("has invalid length: expected 32"),
+        "expected invalid length error, got: {stderr}"
     );
 }
