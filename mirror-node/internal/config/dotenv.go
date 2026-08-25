@@ -6,6 +6,9 @@ import (
 	"strings"
 )
 
+// LoadDotEnv populates process env vars from a KEY=VALUE file, skipping
+// keys already present so the real environment wins. A missing file is not
+// an error; other read/scan errors are returned.
 func LoadDotEnv(path string) error {
 	f, err := os.Open(path)
 	if err != nil {
