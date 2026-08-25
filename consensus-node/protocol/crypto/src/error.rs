@@ -13,6 +13,8 @@ pub enum CryptoError {
     MalformedOp,
     /// The first payload byte is not a recognized membership opcode.
     UnknownMembershipOpcode(u8),
+    BlsKeyGenFailed,
+    BlsAggregateFailed,
 }
 
 pub type Result<T> = std::result::Result<T, CryptoError>;
@@ -33,6 +35,8 @@ impl fmt::Display for CryptoError {
             Self::UnknownMembershipOpcode(opcode) => {
                 write!(f, "unknown membership opcode {opcode:#04x}")
             }
+            Self::BlsKeyGenFailed => write!(f, "bls key generation failed"),
+            Self::BlsAggregateFailed => write!(f, "bls aggregate failed"),
         }
     }
 }
