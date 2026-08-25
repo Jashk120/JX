@@ -18,7 +18,9 @@ use anyhow::{
 /// The on-disk format version this binary writes. Bump on every breaking
 /// change (e.g. the checkpoint `state_hash` becoming a Merkle root, or the
 /// per-round `.snap` files being replaced by the Fjall state database).
-pub const CURRENT_FORMAT: u32 = 3;
+/// 4 = BLS aggregate checkpoints with `records_root` binding (hard genesis
+/// break; roster canonical bytes grew and the checkpoint codec changed).
+pub const CURRENT_FORMAT: u32 = 4;
 
 /// The filename of the version stamp inside the data directory.
 const FORMAT_VERSION_FILE: &str = "FORMAT_VERSION";
@@ -39,8 +41,9 @@ pub fn check_or_init_data_dir(data_dir: &Path) -> Result<()> {
         if version != CURRENT_FORMAT {
             bail!(
                 "data/ format version {version} is incompatible with this binary \
-                 (expects {CURRENT_FORMAT}).\n\
-                 Wipe data/ and re-genesis to continue."
+                 (expects {CURRENT_FORMAT}). This is a hard genesis break \
+                 (FORMAT_VERSION 3→4: BLS aggregate checkpoints); wipe data/ and \
+                 re-run `jkaind init` for a fresh genesis to continue."
             );
         }
     } else {
@@ -79,5 +82,20 @@ mod tests {
             .expect("overwrite");
         let err = check_or_init_data_dir(dir.path()).expect_err("mismatch fails");
         assert!(err.to_string().contains("incompatible"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn old_version_3_is_rejected_with_fresh_genesis_hint() {
+        let dir = tempdir().expect("temp dir");
+        fs::create_dir_all(dir.path()).expect("create dir");
+        fs::write(dir.path().join(FORMAT_VERSION_FILE), "3").expect("write 3");
+        let err = check_or_init_data_dir(dir.path()).expect_err("version 3 must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("incompatible"), "must mention incompatible: {msg}");
+        assert!(msg.contains("3") || msg.contains("4"), "must mention version numbers: {msg}");
+        assert!(
+            msg.contains("fresh genesis") || msg.contains("wipe data"),
+            "must point at fresh genesis: {msg}"
+        );
     }
 }
