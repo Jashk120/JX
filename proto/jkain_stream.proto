@@ -100,6 +100,8 @@ message CheckpointSig {
 message CheckpointRosterMember {
   uint64 node_id = 1;
   bytes  key     = 2; // 32-byte Ed25519 verifying key
+  bytes  bls_key = 3; // 48-byte BLS12-381 G1 public key
+  bytes  pop     = 4; // 96-byte BLS proof-of-possession
 }
 
 // A mirror of `consensus::SignedCheckpoint` — the threshold-signed state-root
@@ -109,7 +111,11 @@ message SignedCheckpoint {
   bytes       state_hash  = 2; // Merkle root, 32 bytes
   bytes       roster_hash = 3; // 32 bytes
   repeated CheckpointRosterMember roster_snapshot = 4;
-  repeated CheckpointSig sigs = 5;
+  reserved 5;
+  reserved "sigs";
+  bytes       records_root  = 6; // 32 bytes, content binding
+  bytes       aggregate_sig = 7; // 96-byte BLS12-381 aggregate signature
+  repeated uint64 signers   = 8;
 }
 
 message RecordStreamFile {

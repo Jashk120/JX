@@ -38,18 +38,40 @@ pub fn registry_of(members: &[u64]) -> MembershipRegistry {
 /// A checkpoint for `round` with real BLS signatures from `signers`.
 /// `members` is the roster active at the round; the returned checkpoint is
 /// quorum-valid whenever `signers` exceeds 2/3 of `members`.
+#[allow(dead_code)]
 pub fn signed_checkpoint(round: u64, members: &[u64], signers: &[u64]) -> SignedCheckpoint {
-    let payload = CheckpointPayload::new(
-        round,
-        consensus::compute_records_root(&[]),
-        [round as u8; 32],
-        registry_of(members),
-    );
+    signed_checkpoint_with_items(round, members, signers, &[])
+}
+
+/// A checkpoint for `round` with `records_root` derived from `items`.
+pub fn signed_checkpoint_with_items(
+    round: u64,
+    members: &[u64],
+    signers: &[u64],
+    items: &[stream::pb::RecordItem],
+) -> SignedCheckpoint {
+    let rr_items: Vec<consensus::RecordsRootItem> = items
+        .iter()
+        .map(|it| consensus::RecordsRootItem {
+            event_hash: it.event_hash.clone().try_into().expect("32-byte event_hash"),
+            tx_index: it.tx_index,
+            tx_payload: it.tx_payload.clone(),
+        })
+        .collect();
+    let records_root = consensus::compute_records_root(&rr_items);
+    let payload =
+        CheckpointPayload::new(round, records_root, [round as u8; 32], registry_of(members));
     let signing_bytes = payload.signing_bytes();
     let mut sigs = Vec::new();
     for &signer in signers {
         let bls = crypto::BlsIdentity::from_ikm(&[signer as u8; 32]).expect("bls");
         sigs.push(bls.sign(&signing_bytes));
+    }
+    // Handle empty signer set: still need an aggregate (use dummy zero key) for
+    // structural validity; it will not verify as quorum.
+    if sigs.is_empty() {
+        let dummy = crypto::BlsIdentity::from_ikm(&[0u8; 32]).expect("bls").sign(&signing_bytes);
+        return SignedCheckpoint { payload, aggregate_sig: dummy, signers: Vec::new() };
     }
     let mut pairs: Vec<(NodeId, blst::min_pk::Signature)> =
         signers.iter().zip(sigs).map(|(&id, s)| (NodeId::new(id), s)).collect();

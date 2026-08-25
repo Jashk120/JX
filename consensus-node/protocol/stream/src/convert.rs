@@ -92,8 +92,9 @@ fn proto_signature(bytes: &[u8]) -> Option<Signature> {
 }
 
 /// The mirror `SignedCheckpoint` for the canonical consensus form. The roster
-/// snapshot is emitted as sorted `(node_id, key)` pairs, and the BLS
-/// aggregate signature is carried via the first proto sig entry (96 bytes).
+/// snapshot is emitted as sorted `(node_id, key)` triples, and the BLS
+/// aggregate signature covers `payload.signing_bytes()` (round || records_root
+/// || state_hash || roster_hash).
 pub fn signed_checkpoint_to_proto(checkpoint: &SignedCheckpoint) -> pb::SignedCheckpoint {
     pb::SignedCheckpoint {
         round: checkpoint.payload.round,
@@ -110,49 +111,39 @@ pub fn signed_checkpoint_to_proto(checkpoint: &SignedCheckpoint) -> pb::SignedCh
                     .roster_snapshot
                     .key_for(&node)
                     .expect("member_ids yields registered members");
-                pb::CheckpointRosterMember { node_id: node.get(), key: key.to_bytes().to_vec() }
+                let bls_key = checkpoint
+                    .payload
+                    .roster_snapshot
+                    .bls_key_for(&node)
+                    .expect("member_ids yields registered members");
+                pb::CheckpointRosterMember {
+                    node_id: node.get(),
+                    key: key.to_bytes().to_vec(),
+                    bls_key: bls_key.to_vec(),
+                    pop: Vec::new(),
+                }
             })
             .collect(),
-        sigs: {
-            if checkpoint.signers.is_empty() {
-                Vec::new()
-            } else {
-                let agg_bytes = checkpoint.aggregate_sig.to_bytes().to_vec();
-                checkpoint
-                    .signers
-                    .iter()
-                    .enumerate()
-                    .map(|(idx, signer)| pb::CheckpointSig {
-                        round: checkpoint.payload.round,
-                        signer: signer.get(),
-                        sig: if idx == 0 { agg_bytes.clone() } else { vec![0u8; 64] },
-                    })
-                    .collect()
-            }
-        },
+        records_root: checkpoint.payload.records_root.to_vec(),
+        aggregate_sig: checkpoint.aggregate_sig.to_bytes().to_vec(),
+        signers: checkpoint.signers.iter().map(|n| n.get()).collect(),
     }
 }
 
 /// The inverse of [`signed_checkpoint_to_proto`]: rebuilds the canonical
 /// `SignedCheckpoint`, verifying that the embedded roster snapshot really
-/// hashes to the committed `roster_hash` (a mirror's own quorum verification
-/// then works against the payload alone). `None` on wrong-width fields or a
-/// roster hash mismatch.
-///
-/// NOTE: Minimal mechanical fix for todo 6 (BLS aggregate). The proto schema
-/// still lacks `records_root`/`aggregate_sig`/`signers` fields (todo 8 will
-/// add them). For now `records_root` is set to the empty root and the BLS
-/// aggregate is carried in the first sig entry (96 bytes) with remaining
-/// entries as dummy signers. This preserves roundtrip for tests that use
-/// zero BLS keys and is replaced in todo 8.
+/// hashes to the committed `roster_hash`. `None` on wrong-width fields,
+/// invalid BLS keys, or a roster hash mismatch.
 pub fn proto_to_signed_checkpoint(checkpoint: &pb::SignedCheckpoint) -> Option<SignedCheckpoint> {
     let state_hash: [u8; 32] = checkpoint.state_hash.clone().try_into().ok()?;
     let roster_hash: [u8; 32] = checkpoint.roster_hash.clone().try_into().ok()?;
+    let records_root: [u8; 32] = checkpoint.records_root.clone().try_into().ok()?;
+    let agg_bytes: [u8; 96] = checkpoint.aggregate_sig.clone().try_into().ok()?;
+    let aggregate_sig = blst::min_pk::Signature::from_bytes(&agg_bytes).ok()?;
     let roster_snapshot = roster_from_members(&checkpoint.roster_snapshot)?;
     if roster_snapshot.hash() != roster_hash {
         return None;
     }
-    let records_root = consensus::compute_records_root(&[]);
     let payload = CheckpointPayload {
         round: checkpoint.round,
         records_root,
@@ -160,26 +151,14 @@ pub fn proto_to_signed_checkpoint(checkpoint: &pb::SignedCheckpoint) -> Option<S
         roster_hash,
         roster_snapshot,
     };
-    if checkpoint.sigs.is_empty() {
-        let dummy_agg =
-            crypto::BlsIdentity::from_ikm(&[0u8; 32]).ok()?.sign(&payload.signing_bytes());
-        return Some(SignedCheckpoint { payload, aggregate_sig: dummy_agg, signers: Vec::new() });
-    }
-    let first = &checkpoint.sigs[0];
-    let aggregate_sig =
-        if let Ok(bytes) = first.sig.clone().try_into() as std::result::Result<[u8; 96], _> {
-            blst::min_pk::Signature::from_bytes(&bytes).ok()?
-        } else {
-            crypto::BlsIdentity::from_ikm(&[0u8; 32]).ok()?.sign(&payload.signing_bytes())
-        };
-    let signers = checkpoint.sigs.iter().map(|s| primitives::NodeId::new(s.signer)).collect();
+    let signers = checkpoint.signers.iter().map(|s| primitives::NodeId::new(*s)).collect();
     Some(SignedCheckpoint { payload, aggregate_sig, signers })
 }
 
 /// Rebuilds a `MembershipRegistry` from the mirror's sorted member list.
-/// `None` on a wrong-width or invalid key, or on a duplicate `node_id` — a
-/// repeated id would let a forged first entry shadow the honest key in
-/// [`checkpoint_member_key`]'s lookup.
+/// `None` on a wrong-width or invalid key, duplicate `node_id`, or invalid
+/// BLS key — a repeated id would let a forged first entry shadow the honest
+/// key in [`checkpoint_member_key`]'s lookup.
 fn roster_from_members(members: &[pb::CheckpointRosterMember]) -> Option<MembershipRegistry> {
     let mut registry = MembershipRegistry::new();
     for member in members {
@@ -189,8 +168,21 @@ fn roster_from_members(members: &[pb::CheckpointRosterMember]) -> Option<Members
         }
         let key_bytes: [u8; 32] = member.key.clone().try_into().ok()?;
         let key = VerifyingKey::from_bytes(&key_bytes).ok()?;
-        let bls = crypto::BlsIdentity::from_ikm(&[member.node_id as u8; 32]).expect("bls");
-        registry.register(node, key, bls.public.to_bytes());
+        let bls_key: [u8; 48] = if member.bls_key.is_empty() {
+            crypto::BlsIdentity::from_ikm(&[member.node_id as u8; 32]).ok()?.public.to_bytes()
+        } else {
+            member.bls_key.clone().try_into().ok()?
+        };
+        if !member.bls_key.is_empty() && member.bls_key.len() != 48 {
+            return None;
+        }
+        if !member.pop.is_empty() && member.pop.len() != 96 {
+            return None;
+        }
+        if blst::min_pk::PublicKey::from_bytes(&bls_key).is_err() {
+            return None;
+        }
+        registry.register(node, key, bls_key);
     }
     Some(registry)
 }
@@ -386,6 +378,8 @@ mod tests {
         let forged = crate::pb::CheckpointRosterMember {
             node_id: 1,
             key: SigningKey::generate(&mut OsRng).verifying_key().to_bytes().to_vec(),
+            bls_key: crypto::BlsIdentity::from_ikm(&[99u8; 32]).unwrap().public.to_bytes().to_vec(),
+            pop: Vec::new(),
         };
         proto.roster_snapshot.insert(0, forged);
         assert!(proto_to_signed_checkpoint(&proto).is_none());

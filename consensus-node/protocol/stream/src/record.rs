@@ -52,7 +52,6 @@ use crate::{
     record_file_name,
     running_hash,
     signature,
-    signature_file_name,
 };
 
 /// The sink a `GossipNode` notifies from `accept_checkpoint` whenever a round
@@ -80,9 +79,9 @@ enum RecordStreamMsg {
     },
 }
 
-/// Writes the per-round record stream: `<dir>/round-<r>.rsf` plus its
-/// `<dir>/round-<r>.rsf_sig` signature file. Construct with
-/// [`RecordStreamWriter::open`]; register it on a node via
+/// Writes the per-round record stream: `<dir>/round-<r>.rsf` (no
+/// `.rsf_sig` — content binding via `records_root` + BLS aggregate replaces it).
+/// Construct with [`RecordStreamWriter::open`]; register it on a node via
 /// `set_record_sink`.
 pub struct RecordStreamWriter {
     hashgraph: Arc<Mutex<Hashgraph>>,
@@ -181,13 +180,11 @@ async fn run_writer(
     }
 }
 
-/// Builds, signs, and atomically writes one record file, advancing
-/// `running_hash` past the round. The signature file is written first so a
-/// crash between the two writes can only leave an orphaned signature — never a
-/// stream file without its signature.
+/// Builds and atomically writes one record file, advancing `running_hash` past
+/// the round.
 fn write_record_file(
     dir: &Path,
-    signing_key: &SigningKey,
+    _signing_key: &SigningKey,
     checkpoint: &SignedCheckpoint,
     items: &[pb::RecordItem],
     running_hash: &mut [u8; 32],
@@ -204,10 +201,7 @@ fn write_record_file(
         checkpoint: Some(signed_checkpoint_to_proto(checkpoint)),
     };
     let file_bytes = file.encode_to_vec();
-    let metadata = signature::metadata_bytes(STREAM_VERSION, &start_hash, &end_hash, Some(round));
-    let signature_file = signature::build_signature_file(&file_bytes, &metadata, signing_key);
     let file_name = record_file_name(round);
-    signature::write_signature_file(&dir.join(signature_file_name(&file_name)), &signature_file)?;
     signature::write_atomic(&dir.join(file_name), &file_bytes)?;
     *running_hash = end_hash;
     Ok(())

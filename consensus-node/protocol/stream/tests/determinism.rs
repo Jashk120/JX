@@ -14,7 +14,6 @@ use common::{
     node_key,
     read_all_files,
     sample_record,
-    signed_checkpoint,
 };
 use consensus::Hashgraph;
 use storage::EventSink;
@@ -38,7 +37,6 @@ async fn record_streams_are_byte_identical_across_writers() {
         RecordStreamWriter::open(dir_b.path(), node_key(1), hashgraph).expect("writer b opens");
 
     for round in 1..=3 {
-        let checkpoint = signed_checkpoint(round, &[1, 2, 3, 4], &[1, 2, 3]);
         let items: Vec<RecordItem> = (0..round)
             .map(|i| RecordItem {
                 event_hash: vec![round as u8; 32],
@@ -46,6 +44,8 @@ async fn record_streams_are_byte_identical_across_writers() {
                 tx_payload: format!("tx-{round}-{i}").into_bytes(),
             })
             .collect();
+        let checkpoint =
+            common::signed_checkpoint_with_items(round, &[1, 2, 3, 4], &[1, 2, 3], &items);
         writer_a.submit_items(checkpoint.clone(), items.clone());
         writer_b.submit_items(checkpoint, items);
     }
@@ -54,7 +54,14 @@ async fn record_streams_are_byte_identical_across_writers() {
 
     let files_a = read_all_files(dir_a.path());
     let files_b = read_all_files(dir_b.path());
-    assert_eq!(files_a.len(), 6, "one `.rsf` + one `.rsf_sig` per round");
+    assert_eq!(files_a.len(), 3, "one `.rsf` per round");
+    // no `.rsf_sig` files should exist
+    let rsf_sig_count = std::fs::read_dir(dir_a.path())
+        .expect("read dir")
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".rsf_sig"))
+        .count();
+    assert_eq!(rsf_sig_count, 0, ".rsf_sig files must not be produced");
     assert_eq!(files_a, files_b, "two independent record writers must be byte-identical");
 }
 

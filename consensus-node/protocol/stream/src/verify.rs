@@ -19,7 +19,11 @@
 use std::fs;
 use std::path::Path;
 
-use consensus::SignedCheckpoint;
+use consensus::{
+    RecordsRootItem,
+    SignedCheckpoint,
+    compute_records_root,
+};
 use ed25519_dalek::VerifyingKey;
 use primitives::NodeId;
 use prost::Message;
@@ -75,17 +79,21 @@ pub fn verify_event_stream_dir(dir: &Path, node_key: &VerifyingKey) -> Result<()
 }
 
 /// Verifies a whole record-stream directory exactly as a mirror would: chain
-/// continuity + per-file signature files (against `node_id`'s key in each
-/// file's embedded roster) + the embedded checkpoint quorum.
+/// continuity + BLS aggregate verification (anchored against
+/// `trusted_roster_hash`) + content binding via `records_root`.
 ///
 /// `trusted_roster_hash` anchors each checkpoint's `roster_snapshot` against
 /// a roster the caller already trusts. A mismatch is rejected before
 /// signature verification — a fabricated roster could make the
 /// self-referential quorum trivially pass. There is no `None` path; callers
 /// must supply a trusted hash and fail-closed if none is available.
+///
+/// Content binding: `records_root` in the checkpoint must equal
+/// `compute_records_root` over the file's `RecordItem` triples. The
+/// `.rsf_sig` file is not consulted — it no longer exists.
 pub fn verify_record_stream_dir(
     dir: &Path,
-    node_id: NodeId,
+    _node_id: NodeId,
     trusted_roster_hash: [u8; 32],
 ) -> Result<()> {
     let files = record_files_in(dir)?;
@@ -105,17 +113,9 @@ pub fn verify_record_stream_dir(
                 "record file for round {round} has no checkpoint anchor"
             ))
         })?;
-        if !checkpoint_quorum(checkpoint, trusted_roster_hash) {
+        if !verify_checkpoint_binding(checkpoint, trusted_roster_hash, &file.items) {
             return Err(StreamError::BadQuorum);
         }
-        let node_key = crate::convert::checkpoint_member_key(checkpoint, node_id.get())
-            .ok_or_else(|| {
-                StreamError::Malformed(format!(
-                    "record file for round {round} embeds no key for node {}",
-                    node_id.get()
-                ))
-            })?;
-        verify_signature_file_for(&path, &bytes, &start, &end, Some(round), &node_key)?;
         previous_end = Some(end);
     }
     Ok(())
@@ -223,14 +223,9 @@ impl RunningHashCommitments for pb::RecordStreamFile {
     }
 }
 
-/// Verifies the ≥2/3 threshold-signed quorum of a checkpoint mirror: every
-/// distinct, round-matching, roster-valid Ed25519 signature counts, and
-/// `valid * 3 > total * 2` decides. A stale, forged, or duplicate signature
-/// is a no-op — never a rejection.
-///
-/// The checkpoint's `roster_hash` is compared against `expected_roster_hash`
-/// first. A mismatch means the file embeds a roster the caller does not
-/// recognise — the quorum proof is rejected without checking signatures.
+/// Verifies the ≥2/3 BLS-aggregate quorum of a checkpoint mirror, anchored
+/// against `expected_roster_hash`, and its `records_root` content binding.
+/// A stale, forged, or duplicate signer is rejected.
 pub fn checkpoint_quorum(
     checkpoint: &pb::SignedCheckpoint,
     expected_roster_hash: [u8; 32],
@@ -244,6 +239,38 @@ fn verify_checkpoint_quorum(checkpoint: &SignedCheckpoint, expected_roster_hash:
         return false;
     }
     checkpoint.verify()
+}
+
+fn verify_checkpoint_binding(
+    checkpoint_pb: &pb::SignedCheckpoint,
+    trusted_roster_hash: [u8; 32],
+    items: &[pb::RecordItem],
+) -> bool {
+    let Some(cp) = proto_to_signed_checkpoint(checkpoint_pb) else { return false };
+    if cp.payload.roster_hash != trusted_roster_hash {
+        return false;
+    }
+    if !cp.verify() {
+        return false;
+    }
+    let Some(computed) = records_root_from_items(items) else { return false };
+    if computed != cp.payload.records_root {
+        return false;
+    }
+    true
+}
+
+fn records_root_from_items(items: &[pb::RecordItem]) -> Option<[u8; 32]> {
+    let mut rr_items = Vec::with_capacity(items.len());
+    for item in items {
+        let hash: [u8; 32] = item.event_hash.clone().try_into().ok()?;
+        rr_items.push(RecordsRootItem {
+            event_hash: hash,
+            tx_index: item.tx_index,
+            tx_payload: item.tx_payload.clone(),
+        });
+    }
+    Some(compute_records_root(&rr_items))
 }
 
 #[cfg(test)]
