@@ -20,8 +20,13 @@ CREATE TABLE IF NOT EXISTS record_files (
     -- its repeated parts are the two child tables below.
     checkpoint_round   BIGINT,
     state_hash         BYTEA,
-    roster_hash        BYTEA
+    roster_hash        BYTEA,
+    records_root       BYTEA,
+    aggregate_sig      BYTEA
 );
+
+ALTER TABLE record_files ADD COLUMN IF NOT EXISTS records_root BYTEA;
+ALTER TABLE record_files ADD COLUMN IF NOT EXISTS aggregate_sig BYTEA CHECK (aggregate_sig IS NULL OR octet_length(aggregate_sig) = 96);
 
 -- repeated RecordItem items — order inside the file matters, hence item_index in the key
 CREATE TABLE IF NOT EXISTS record_items (
@@ -33,11 +38,11 @@ CREATE TABLE IF NOT EXISTS record_items (
     PRIMARY KEY (round, item_index)
 );
 
--- repeated CheckpointSig sigs — a signer signs once per round
+-- signers of the aggregate (one row per signer; the single aggregate_sig lives in record_files)
 CREATE TABLE IF NOT EXISTS checkpoint_sigs (
     round  BIGINT NOT NULL REFERENCES record_files(round),
     signer BIGINT NOT NULL,
-    sig    BYTEA  NOT NULL CHECK (octet_length(sig) = 64),
+    sig    BYTEA  NOT NULL DEFAULT '' CHECK (octet_length(sig) = 0 OR octet_length(sig) = 64 OR octet_length(sig) = 96),
     PRIMARY KEY (round, signer)
 );
 
@@ -47,8 +52,13 @@ CREATE TABLE IF NOT EXISTS checkpoint_roster (
     member_index INTEGER NOT NULL,
     node_id      BIGINT  NOT NULL,
     key          BYTEA   NOT NULL CHECK (octet_length(key) = 32),
+    bls_key      BYTEA   NOT NULL DEFAULT '' CHECK (bls_key = '' OR octet_length(bls_key) = 48),
+    pop          BYTEA   NOT NULL DEFAULT '' CHECK (pop = '' OR octet_length(pop) = 96),
     PRIMARY KEY (round, member_index)
 );
+
+ALTER TABLE checkpoint_roster ADD COLUMN IF NOT EXISTS bls_key BYTEA NOT NULL DEFAULT '' CHECK (bls_key = '' OR octet_length(bls_key) = 48);
+ALTER TABLE checkpoint_roster ADD COLUMN IF NOT EXISTS pop BYTEA NOT NULL DEFAULT '' CHECK (pop = '' OR octet_length(pop) = 96);
 
 -- ---------- event stream (.esf) ----------
 

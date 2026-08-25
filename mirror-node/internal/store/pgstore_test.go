@@ -42,9 +42,9 @@ func TestPGPutRecordDeduplicatesByRound(t *testing.T) {
 	st := newTestPGStore(t)
 	// Files reach the store only after ingest verification, so they always
 	// carry valid running-hash objects; tests construct them accordingly.
-	first := &pb.RecordStreamFile{Version: 1, Round: 7,
+	first := &pb.RecordStreamFile{Version: 2, Round: 7,
 		StartRunningHash: hashFor(0x70), EndRunningHash: hashFor(0x71)}
-	replay := &pb.RecordStreamFile{Version: 1, Round: 7,
+	replay := &pb.RecordStreamFile{Version: 2, Round: 7,
 		StartRunningHash: hashFor(0x70), EndRunningHash: hashFor(0x71)}
 
 	for _, f := range []*pb.RecordStreamFile{first, replay} {
@@ -113,7 +113,7 @@ func TestPGRoundTripFidelity(t *testing.T) {
 	st := newTestPGStore(t)
 
 	wantRecord := &pb.RecordStreamFile{
-		Version:          1,
+		Version:          2,
 		Round:            42,
 		StartRunningHash: hashFor(0xAA),
 		EndRunningHash:   hashFor(0xBB),
@@ -122,17 +122,16 @@ func TestPGRoundTripFidelity(t *testing.T) {
 			{EventHash: bytes.Repeat([]byte{0x02}, 32), TxIndex: 3, TxPayload: []byte{}},
 		},
 		Checkpoint: &pb.SignedCheckpoint{
-			Round:      42,
-			StateHash:  bytes.Repeat([]byte{0x03}, 32),
-			RosterHash: bytes.Repeat([]byte{0x04}, 32),
+			Round:       42,
+			StateHash:   bytes.Repeat([]byte{0x03}, 32),
+			RosterHash:  bytes.Repeat([]byte{0x04}, 32),
+			RecordsRoot: bytes.Repeat([]byte{0x09}, 32),
 			RosterSnapshot: []*pb.CheckpointRosterMember{
-				{NodeId: 1, Key: bytes.Repeat([]byte{0x05}, 32)},
-				{NodeId: 2, Key: bytes.Repeat([]byte{0x06}, 32)},
+				{NodeId: 1, Key: bytes.Repeat([]byte{0x05}, 32), BlsKey: bytes.Repeat([]byte{0x0a}, 48)},
+				{NodeId: 2, Key: bytes.Repeat([]byte{0x06}, 32), BlsKey: bytes.Repeat([]byte{0x0b}, 48)},
 			},
-			Sigs: []*pb.CheckpointSig{
-				{Round: 42, Signer: 1, Sig: bytes.Repeat([]byte{0x07}, 64)},
-				{Round: 42, Signer: 2, Sig: bytes.Repeat([]byte{0x08}, 64)},
-			},
+			AggregateSig: bytes.Repeat([]byte{0x07}, 96),
+			Signers:      []uint64{1, 2},
 		},
 	}
 	if err := st.PutRecord(wantRecord); err != nil {
