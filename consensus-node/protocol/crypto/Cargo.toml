@@ -9,6 +9,8 @@ primitives      =   {workspace = true}
 sha2            =   {workspace = true}
 ed25519-dalek   =   {workspace = true, features = ["rand_core"]}
 thiserror       =   {workspace = true}
+blst            =   {workspace = true}
+rand            =   {workspace = true}
 
 [dev-dependencies]
 rand            =   "0.8"
