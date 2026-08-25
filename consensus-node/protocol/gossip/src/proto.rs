@@ -235,7 +235,7 @@ impl Frame {
                 let decided_round = cursor.read_u64()?;
                 let last_timestamp = cursor.read_u64()?;
                 let retained_count = cursor.read_u32()? as usize;
-                const MIN_RETAINED: usize = 8 + 8 + 1 + 4 + 4 + 86; // seq + round + rr_tag + ancestor_count + event_len + event
+                const MIN_RETAINED: usize = 8 + 8 + 1 + 4 + 4 + 86 + 1; // seq + round + rr_tag + ancestor_count + event_len + event + ts_tag
                 if retained_count > cursor.remaining() / MIN_RETAINED {
                     return Err(GossipError::framing("declared count exceeds remaining buffer"));
                 }
