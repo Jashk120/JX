@@ -61,12 +61,13 @@ async fn add_member_via_control_socket_activates_and_pins_reconnect() {
     let key3 = SigningKey::from_bytes(&seed3).verifying_key();
     let gossip3: std::net::SocketAddr = "127.0.0.1:9000".parse().expect("addr");
     let reconnect3: std::net::SocketAddr = "127.0.0.1:9001".parse().expect("addr");
+    let bls_id3 = crypto::BlsIdentity::from_ikm(&seed3).expect("bls");
 
     let op = MembershipOp::Add {
         node: NodeId::new(3),
         key: Box::new(key3),
-        bls_key: [0u8; 48],
-        pop: [0u8; 96],
+        bls_key: bls_id3.public.to_bytes(),
+        pop: crypto::sign_pop(&bls_id3).to_bytes(),
         addr: gossip3,
         reconnect_addr: Some(reconnect3),
     };
@@ -93,6 +94,57 @@ async fn add_member_via_control_socket_activates_and_pins_reconnect() {
         identity3.spki_fingerprint(),
         "TLS pin matches the added member's certificate"
     );
+
+    stop1.store(true, std::sync::atomic::Ordering::Release);
+    drop_nodes(nodes);
+}
+
+#[tokio::test]
+async fn add_member_with_wrong_pop_is_not_activated() {
+    let (nodes, _net) = spawn_cluster(&[1, 2]).await;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let sock1 = dir.path().join("node1.sock");
+    let listener1 = UnixListener::bind(&sock1).expect("bind control socket");
+    let stop1 = Arc::new(AtomicBool::new(false));
+    let node1 = nodes[0].node.clone();
+    tokio::spawn(control::serve(listener1, node1.clone(), stop1.clone()));
+
+    let seed4 = [0x44u8; 32];
+    let key4 = SigningKey::from_bytes(&seed4).verifying_key();
+    let gossip4: std::net::SocketAddr = "127.0.0.1:9100".parse().expect("addr");
+    let bls_id4 = crypto::BlsIdentity::from_ikm(&seed4).expect("bls");
+    let bls_wrong = crypto::BlsIdentity::from_ikm(&[0x99u8; 32]).expect("bls");
+    let wrong_pop = crypto::sign_pop(&bls_wrong).to_bytes();
+
+    let op = MembershipOp::Add {
+        node: NodeId::new(4),
+        key: Box::new(key4),
+        bls_key: bls_id4.public.to_bytes(),
+        pop: wrong_pop,
+        addr: gossip4,
+        reconnect_addr: None,
+    };
+    let payload = control::membership_op_payload(&op);
+    let response =
+        control::request(&sock1, &ControlRequest::SubmitTx { payload_hex: encode_hex(&payload) })
+            .await
+            .expect("submit request");
+    assert!(response.ok, "submit accepted: {:?}", response.error);
+
+    let present = timeout(Duration::from_secs(4), async {
+        loop {
+            if nodes[0].node.is_consensus_member(NodeId::new(4)).await
+                || nodes[1].node.is_consensus_member(NodeId::new(4)).await
+            {
+                return true;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap_or(false);
+    assert!(!present, "member with wrong PoP must NOT be activated");
 
     stop1.store(true, std::sync::atomic::Ordering::Release);
     drop_nodes(nodes);

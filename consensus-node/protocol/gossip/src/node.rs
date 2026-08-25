@@ -751,14 +751,21 @@ impl GossipNode {
                 };
 
                 for op in ops {
-                    if let MembershipOp::Add { node, key, bls_key, pop: _, addr, reconnect_addr } =
-                        op
+                    if let MembershipOp::Add { node, key, bls_key, pop, addr, reconnect_addr } = op
                     {
                         let already_member = {
                             let hg = self.hashgraph.lock().await;
                             hg.is_member(&node)
                         };
                         if already_member {
+                            continue;
+                        }
+
+                        if !verify_pop_bytes(&bls_key, &pop) {
+                            tracing::warn!(
+                                node_id = node.get(),
+                                "invalid BLS PoP for add-member; skipping activation"
+                            );
                             continue;
                         }
 
@@ -1624,6 +1631,16 @@ impl GossipNode {
             tokio::spawn(self.clone().accept_reconnect_loop(reconnect_listener));
         self.run_until_stopped(gossip_listener, stop).await
     }
+}
+
+fn verify_pop_bytes(bls_key: &[u8; 48], pop: &[u8; 96]) -> bool {
+    let Ok(pk) = blst::min_pk::PublicKey::from_bytes(bls_key) else {
+        return false;
+    };
+    let Ok(sig) = blst::min_pk::Signature::from_bytes(pop) else {
+        return false;
+    };
+    crypto::bls::verify_pop(&pk, &sig)
 }
 
 /// Verifies `sig` over `signing_bytes` against the BLS key registered for
