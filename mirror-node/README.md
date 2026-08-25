@@ -18,7 +18,7 @@ mirror-node/
   internal/
     config/     env + flags → Config
     stream/     running hash, file naming, readers, verifier, pb/
-    store/      Store interface + MemStore (swap for SQLite/Postgres)
+    store/      Store interface + MemStore (in-memory) + PGStore (PostgreSQL)
     ingest/     polls streams dir, verifies, stores
     api/        HTTP handlers (/health, /api/v1/*)
   cmd/mirrord/  binary entrypoint
@@ -55,7 +55,7 @@ All settings come from `internal/config` with precedence: real environment > `.e
 | Env var | Flag | Description |
 |---|---|---|
 | `MIRROR_STREAMS_DIR` | `--streams` | Directory watched for `.esf`/`.rsf` files (local mode) |
-| `MIRROR_DB_PATH` | `--db` | Mirror local state path/DSN |
+| `MIRROR_DB_PATH` | `--db` | Mirror local state: any non-`postgres://` value keeps the in-memory store; a `postgres://…` DSN enables the PostgreSQL backend |
 | `MIRROR_API_ADDR` | `--addr` | HTTP API listen address |
 | `MIRROR_LOG_LEVEL` | — | `debug`, `info`, `warn`, `error` |
 | `MIRRORD_PUBKEY` / `MIRROR_PUBKEY` | `--pubkey` | Ed25519 verifying key, 64 hex chars (required) |
@@ -96,10 +96,39 @@ Each stream file is checked before ingestion:
 
 Matches `consensus-node/protocol/stream/src/verify.rs`.
 
-## Adding a persistent store
+## PostgreSQL persistence
 
-Implement `store.Store` (see `internal/store/store.go:Store`) with your DB and
-inject it in `cmd/mirrord/main.go:NewMemStore` call site.
+When `MIRROR_DB_PATH` / `--db` is a `postgres://` (or `postgresql://`) DSN,
+mirrord stores everything in PostgreSQL instead of memory:
+
+```bash
+MIRROR_DB_PATH="postgres://mirror:mirror@localhost:5432/mirror?sslmode=disable" \
+  go run ./cmd/mirrord --streams ../consensus-node/data/streams
+```
+
+- The schema (`internal/store/schema.sql`) is embedded in the binary and
+  applied idempotently on every startup — no migration tool needed.
+- Deduplication lives in the database: records are unique per `round`,
+  events per `(creator, seq)`; re-ingesting a file is a no-op, so restarts
+  replay safely.
+- Writes are transactional: a record file's items and checkpoint children
+  commit atomically with the file row.
+- Reads reconstruct full protobuf messages; `ListEvents` preserves arrival
+  order via `ingested_seq`.
+
+Store tests run against a real database only when `MIRROR_TEST_PG_DSN` is
+set, so plain `go test ./...` needs no database:
+
+```bash
+docker run --rm -d -p 5432:5432 -e POSTGRES_PASSWORD=dev postgres:16
+MIRROR_TEST_PG_DSN="postgres://postgres:dev@localhost:5432/postgres?sslmode=disable" \
+  go test ./internal/store/
+```
+
+## Adding another persistent store
+
+Implement `store.Store` (see `internal/store/store.go:Store`) and select it
+in `cmd/mirrord/main.go` at the backend-choice call site.
 
 `Store` implementations must be idempotent: `PutRecord` keys on record round,
 `PutEvents` on each event's `(creator, seq)`; re-ingesting stored data must be
