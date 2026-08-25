@@ -66,6 +66,7 @@ const RECONNECT_PRESENT: u8 = 0x01;
 /// (Phase 2); it deliberately lives apart from the registry itself, mirroring
 /// how the executor separates `Op` (wire format) from the mutable state.
 #[derive(Clone, Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum MembershipOp {
     /// Adds `node`, registering `key` as the Ed25519 key used to verify events
     /// it creates, together with the `SocketAddr` where it can be reached.
@@ -81,6 +82,8 @@ pub enum MembershipOp {
     Add {
         node: NodeId,
         key: Box<VerifyingKey>,
+        bls_key: [u8; 48],
+        pop: [u8; 96],
         addr: SocketAddr,
         reconnect_addr: Option<SocketAddr>,
     },
@@ -101,10 +104,19 @@ impl MembershipOp {
             MEMBERSHIP_ADD => {
                 let node = NodeId::new(take_u64(&mut cursor)?);
                 let key = take_key(&mut cursor)?;
+                let bls_key = take_bls_key(&mut cursor)?;
+                let pop = take_pop(&mut cursor)?;
                 let addr = take_addr(&mut cursor)?;
                 let reconnect_addr = take_optional_addr(&mut cursor)?;
                 reject_trailing(cursor)?;
-                Ok(MembershipOp::Add { node, key: Box::new(key), addr, reconnect_addr })
+                Ok(MembershipOp::Add {
+                    node,
+                    key: Box::new(key),
+                    bls_key,
+                    pop,
+                    addr,
+                    reconnect_addr,
+                })
             }
             MEMBERSHIP_REMOVE => {
                 let node = NodeId::new(take_u64(&mut cursor)?);
@@ -120,10 +132,12 @@ impl MembershipOp {
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = Vec::new();
         match self {
-            MembershipOp::Add { node, key, addr, reconnect_addr } => {
+            MembershipOp::Add { node, key, bls_key, pop, addr, reconnect_addr } => {
                 buf.push(MEMBERSHIP_ADD);
                 buf.extend_from_slice(&node.get().to_be_bytes());
                 buf.extend_from_slice(&key.to_bytes());
+                buf.extend_from_slice(bls_key);
+                buf.extend_from_slice(pop);
                 write_bytes(&mut buf, &encode_addr(addr));
                 match reconnect_addr {
                     Some(reconnect_addr) => {
@@ -161,16 +175,20 @@ impl PartialEq for MembershipOp {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (
-                MembershipOp::Add { node, key, addr, reconnect_addr },
+                MembershipOp::Add { node, key, bls_key, pop, addr, reconnect_addr },
                 MembershipOp::Add {
                     node: other_node,
                     key: other_key,
+                    bls_key: other_bls_key,
+                    pop: other_pop,
                     addr: other_addr,
                     reconnect_addr: other_reconnect_addr,
                 },
             ) => {
                 node == other_node
                     && key.to_bytes() == other_key.to_bytes()
+                    && bls_key == other_bls_key
+                    && pop == other_pop
                     && addr == other_addr
                     && reconnect_addr == other_reconnect_addr
             }
@@ -293,6 +311,18 @@ fn take_key(cursor: &mut &[u8]) -> Result<VerifyingKey> {
     VerifyingKey::from_bytes(&arr).map_err(|_| CryptoError::MalformedOp)
 }
 
+fn take_bls_key(cursor: &mut &[u8]) -> Result<[u8; 48]> {
+    let bytes = take_exact(cursor, 48)?;
+    let arr: [u8; 48] = bytes.try_into().map_err(|_| CryptoError::MalformedOp)?;
+    Ok(arr)
+}
+
+fn take_pop(cursor: &mut &[u8]) -> Result<[u8; 96]> {
+    let bytes = take_exact(cursor, 96)?;
+    let arr: [u8; 96] = bytes.try_into().map_err(|_| CryptoError::MalformedOp)?;
+    Ok(arr)
+}
+
 /// Reads one length-prefixed field from `cursor`, advancing it past the
 /// field. Returns `MalformedOp` if the declared length overruns the payload.
 fn take_bytes(cursor: &mut &[u8]) -> Result<Vec<u8>> {
@@ -366,6 +396,8 @@ mod tests {
         MembershipOp::Add {
             node: NodeId::new(1),
             key: Box::new(verifying_key),
+            bls_key: [0x11u8; 48],
+            pop: [0x22u8; 96],
             addr,
             reconnect_addr: None,
         }
@@ -377,6 +409,8 @@ mod tests {
         MembershipOp::Add {
             node: NodeId::new(1),
             key: Box::new(verifying_key),
+            bls_key: [0x33u8; 48],
+            pop: [0x44u8; 96],
             addr,
             reconnect_addr: Some(reconnect_addr),
         }
@@ -452,6 +486,8 @@ mod tests {
         payload.push(MEMBERSHIP_ADD);
         payload.extend_from_slice(&1u64.to_be_bytes());
         payload.extend_from_slice(&SigningKey::generate(&mut OsRng).verifying_key().to_bytes());
+        payload.extend_from_slice(&[0u8; 48]);
+        payload.extend_from_slice(&[0u8; 96]);
         // The addr length prefix declares an empty addr blob, so no tag follows.
         payload.extend_from_slice(&0u32.to_be_bytes());
         assert_eq!(MembershipOp::decode(&payload), Err(CryptoError::MalformedOp));
@@ -463,6 +499,8 @@ mod tests {
         payload.push(MEMBERSHIP_ADD);
         payload.extend_from_slice(&1u64.to_be_bytes());
         payload.extend_from_slice(&SigningKey::generate(&mut OsRng).verifying_key().to_bytes());
+        payload.extend_from_slice(&[0u8; 48]);
+        payload.extend_from_slice(&[0u8; 96]);
         // The addr blob declares 3 bytes; an IPv4 addr needs 7, IPv6 needs 19.
         payload.extend_from_slice(&3u32.to_be_bytes());
         payload.extend_from_slice(&[ADDR_IPV4, 0x01, 0x02]);
@@ -490,6 +528,8 @@ mod tests {
         payload.push(MEMBERSHIP_ADD);
         payload.extend_from_slice(&1u64.to_be_bytes());
         payload.extend_from_slice(&SigningKey::generate(&mut OsRng).verifying_key().to_bytes());
+        payload.extend_from_slice(&[0u8; 48]);
+        payload.extend_from_slice(&[0u8; 96]);
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 7000);
         write_bytes(&mut payload, &encode_addr(&addr));
         // A presence flag that is neither 0x00 nor 0x01 is malformed.
@@ -503,6 +543,8 @@ mod tests {
         payload.push(MEMBERSHIP_ADD);
         payload.extend_from_slice(&1u64.to_be_bytes());
         payload.extend_from_slice(&SigningKey::generate(&mut OsRng).verifying_key().to_bytes());
+        payload.extend_from_slice(&[0u8; 48]);
+        payload.extend_from_slice(&[0u8; 96]);
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 7000);
         write_bytes(&mut payload, &encode_addr(&addr));
         // Present flag but the reconnect addr blob is cut short.
@@ -522,6 +564,8 @@ mod tests {
             2u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
             0, 0, 0, 0,
         ]);
+        payload.extend_from_slice(&[0u8; 48]);
+        payload.extend_from_slice(&[0u8; 96]);
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 8080);
         write_bytes(&mut payload, &encode_addr(&addr));
         assert_eq!(MembershipOp::decode(&payload), Err(CryptoError::MalformedOp));
@@ -534,7 +578,7 @@ mod tests {
             let mut registry = MembershipRegistry::new();
             for id in members {
                 let key = SigningKey::generate(&mut OsRng).verifying_key();
-                registry.register(NodeId::new(*id), key);
+                registry.register(NodeId::new(*id), key, [0u8; 48]);
             }
             registry
         }
@@ -687,6 +731,8 @@ mod tests {
             let op = MembershipOp::Add {
                 node: NodeId::new(u64::MAX),
                 key: Box::new(verifying_key),
+                bls_key: [0x55u8; 48],
+                pop: [0x66u8; 96],
                 addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 1),
                 reconnect_addr: None,
             };
@@ -732,6 +778,8 @@ mod tests {
             payload.push(MEMBERSHIP_ADD);
             payload.extend_from_slice(&1u64.to_be_bytes());
             payload.extend_from_slice(&SigningKey::generate(&mut OsRng).verifying_key().to_bytes());
+            payload.extend_from_slice(&[0u8; 48]);
+            payload.extend_from_slice(&[0u8; 96]);
             payload.extend_from_slice(&0u32.to_be_bytes());
             payload.push(RECONNECT_ABSENT);
             assert_eq!(MembershipOp::decode(&payload), Err(CryptoError::MalformedOp));
@@ -743,6 +791,8 @@ mod tests {
             payload.push(MEMBERSHIP_ADD);
             payload.extend_from_slice(&1u64.to_be_bytes());
             payload.extend_from_slice(&SigningKey::generate(&mut OsRng).verifying_key().to_bytes());
+            payload.extend_from_slice(&[0u8; 48]);
+            payload.extend_from_slice(&[0u8; 96]);
             let bad_addr = vec![0xFF, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
             write_bytes(&mut payload, &bad_addr);
             payload.push(RECONNECT_ABSENT);
@@ -771,6 +821,8 @@ mod tests {
             let op = MembershipOp::Add {
                 node: NodeId::new(999),
                 key: Box::new(verifying_key),
+                bls_key: [0x77u8; 48],
+                pop: [0x88u8; 96],
                 addr: SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 443),
                 reconnect_addr: Some(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 444)),
             };
@@ -778,6 +830,98 @@ mod tests {
             let decoded1 = MembershipOp::decode(&encoded).expect("first decode");
             let decoded2 = MembershipOp::decode(&encoded).expect("second decode");
             assert_eq!(decoded1, decoded2);
+        }
+
+        #[test]
+        fn add_with_real_bls_key_and_pop_round_trips() {
+            let signing_key = SigningKey::generate(&mut OsRng);
+            let verifying_key = signing_key.verifying_key();
+            let bls_id = crate::bls::BlsIdentity::from_ikm(&[0x42u8; 32]).expect("bls");
+            let bls_key: [u8; 48] = bls_id.public.to_bytes();
+            let pop = crate::bls::sign_pop(&bls_id).to_bytes();
+            let op = MembershipOp::Add {
+                node: NodeId::new(10),
+                key: Box::new(verifying_key),
+                bls_key,
+                pop,
+                addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 7000),
+                reconnect_addr: None,
+            };
+            let encoded = op.encode();
+            let decoded = MembershipOp::decode(&encoded).expect("decode");
+            assert_eq!(decoded, op);
+            match decoded {
+                MembershipOp::Add { bls_key: got_bls, pop: got_pop, .. } => {
+                    assert_eq!(got_bls, bls_key);
+                    assert_eq!(got_pop, pop);
+                }
+                _ => panic!("expected Add"),
+            }
+        }
+
+        #[test]
+        fn truncated_bls_key_is_rejected() {
+            let mut payload = Vec::new();
+            payload.push(MEMBERSHIP_ADD);
+            payload.extend_from_slice(&1u64.to_be_bytes());
+            payload.extend_from_slice(&SigningKey::generate(&mut OsRng).verifying_key().to_bytes());
+            payload.extend_from_slice(&[0u8; 20]);
+            assert_eq!(MembershipOp::decode(&payload), Err(CryptoError::MalformedOp));
+        }
+
+        #[test]
+        fn truncated_pop_is_rejected() {
+            let mut payload = Vec::new();
+            payload.push(MEMBERSHIP_ADD);
+            payload.extend_from_slice(&1u64.to_be_bytes());
+            payload.extend_from_slice(&SigningKey::generate(&mut OsRng).verifying_key().to_bytes());
+            payload.extend_from_slice(&[0u8; 48]);
+            payload.extend_from_slice(&[0u8; 50]);
+            assert_eq!(MembershipOp::decode(&payload), Err(CryptoError::MalformedOp));
+        }
+
+        #[test]
+        fn old_add_layout_without_bls_pop_is_rejected() {
+            let signing_key = SigningKey::generate(&mut OsRng);
+            let verifying_key = signing_key.verifying_key();
+            let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 7000);
+            let mut old_payload = Vec::new();
+            old_payload.push(MEMBERSHIP_ADD);
+            old_payload.extend_from_slice(&1u64.to_be_bytes());
+            old_payload.extend_from_slice(&verifying_key.to_bytes());
+            write_bytes(&mut old_payload, &encode_addr(&addr));
+            old_payload.push(RECONNECT_ABSENT);
+            assert_eq!(
+                MembershipOp::decode(&old_payload),
+                Err(CryptoError::MalformedOp),
+                "old Add layout missing bls_key/pop must be rejected as MalformedOp"
+            );
+        }
+
+        #[test]
+        fn partial_eq_considers_bls_key_and_pop() {
+            let signing_key = SigningKey::generate(&mut OsRng);
+            let verifying_key = signing_key.verifying_key();
+            let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 7000);
+            let base = MembershipOp::Add {
+                node: NodeId::new(1),
+                key: Box::new(verifying_key),
+                bls_key: [0x11u8; 48],
+                pop: [0x22u8; 96],
+                addr,
+                reconnect_addr: None,
+            };
+            let mut different_bls = base.clone();
+            if let MembershipOp::Add { ref mut bls_key, .. } = different_bls {
+                bls_key[0] ^= 0xFF;
+            }
+            assert_ne!(base, different_bls, "bls_key difference must affect equality");
+
+            let mut different_pop = base.clone();
+            if let MembershipOp::Add { ref mut pop, .. } = different_pop {
+                pop[0] ^= 0xFF;
+            }
+            assert_ne!(base, different_pop, "pop difference must affect equality");
         }
     }
 }

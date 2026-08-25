@@ -830,6 +830,8 @@ async fn membership_added_node_joins_live_cluster() {
     let op = MembershipOp::Add {
         node: node4_id,
         key: Box::new(key4.verifying_key()),
+        bls_key: [0u8; 48],
+        pop: [0u8; 96],
         addr: addr4,
         reconnect_addr: None,
     };
@@ -947,6 +949,8 @@ async fn reconnect_existing_node_catches_up() {
     let op = MembershipOp::Add {
         node: node4_id,
         key: Box::new(key4.verifying_key()),
+        bls_key: [0u8; 48],
+        pop: [0u8; 96],
         addr: addr4,
         reconnect_addr: Some(reconnect4.local_addr().expect("local addr")),
     };

@@ -280,7 +280,7 @@ mod tests {
             .iter()
             .map(|&id| {
                 let key = SigningKey::from_bytes(&[id as u8; 32]);
-                registry.register(NodeId::new(id), key.verifying_key());
+                registry.register(NodeId::new(id), key.verifying_key(), [0u8; 48]);
                 (id, key)
             })
             .collect();

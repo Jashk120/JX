@@ -79,7 +79,7 @@ mod tests {
     fn registry_of(nodes: &[(NodeId, &SigningKey)]) -> MembershipRegistry {
         let mut registry = MembershipRegistry::new();
         for (id, key) in nodes {
-            registry.register(*id, key.verifying_key());
+            registry.register(*id, key.verifying_key(), [0u8; 48]);
         }
         registry
     }
@@ -121,7 +121,7 @@ mod tests {
             for (i, &name) in members.iter().enumerate() {
                 let key = SigningKey::generate(&mut OsRng);
                 let node = NodeId::new((i + 1) as u64);
-                registry.register(node, key.verifying_key());
+                registry.register(node, key.verifying_key(), [0u8; 48]);
                 nodes.insert(name, (node, key));
             }
             let hg = Hashgraph::new(&registry);

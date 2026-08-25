@@ -254,7 +254,7 @@ mod tests {
     fn registry_of(nodes: &[(NodeId, &SigningKey)]) -> MembershipRegistry {
         let mut registry = MembershipRegistry::new();
         for (id, key) in nodes {
-            registry.register(*id, key.verifying_key());
+            registry.register(*id, key.verifying_key(), [0u8; 48]);
         }
         registry
     }

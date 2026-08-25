@@ -65,6 +65,8 @@ async fn add_member_via_control_socket_activates_and_pins_reconnect() {
     let op = MembershipOp::Add {
         node: NodeId::new(3),
         key: Box::new(key3),
+        bls_key: [0u8; 48],
+        pop: [0u8; 96],
         addr: gossip3,
         reconnect_addr: Some(reconnect3),
     };

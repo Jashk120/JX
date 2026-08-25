@@ -46,8 +46,11 @@ use primitives::{
 fn registry_for_ids(ids: &[u64]) -> MembershipRegistry {
     let mut registry = MembershipRegistry::new();
     for &id in ids {
-        registry
-            .register(NodeId::new(id), SigningKey::from_bytes(&consensus_seed(id)).verifying_key());
+        registry.register(
+            NodeId::new(id),
+            SigningKey::from_bytes(&consensus_seed(id)).verifying_key(),
+            [0u8; 48],
+        );
     }
     registry
 }

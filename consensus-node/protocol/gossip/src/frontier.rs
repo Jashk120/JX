@@ -152,7 +152,7 @@ mod tests {
                 .iter()
                 .map(|&id| {
                     let key = SigningKey::generate(&mut OsRng);
-                    registry.register(NodeId::new(id), key.verifying_key());
+                    registry.register(NodeId::new(id), key.verifying_key(), [0u8; 48]);
                     (NodeId::new(id), key)
                 })
                 .collect();

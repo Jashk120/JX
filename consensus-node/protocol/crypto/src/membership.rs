@@ -14,7 +14,7 @@ use crate::error::{
 /// remains a plain index with no knowledge that keys exist at all.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MembershipRegistry {
-    keys: HashMap<NodeId, VerifyingKey>,
+    keys: HashMap<NodeId, (VerifyingKey, [u8; 48])>,
 }
 
 impl MembershipRegistry {
@@ -22,12 +22,16 @@ impl MembershipRegistry {
         Self { keys: HashMap::new() }
     }
 
-    pub fn register(&mut self, node: NodeId, key: VerifyingKey) {
-        self.keys.insert(node, key);
+    pub fn register(&mut self, node: NodeId, key: VerifyingKey, bls_key: [u8; 48]) {
+        self.keys.insert(node, (key, bls_key));
     }
 
     pub fn key_for(&self, node: &NodeId) -> Result<&VerifyingKey> {
-        self.keys.get(node).ok_or(CryptoError::UnknownSigner { node_id: *node })
+        self.keys.get(node).map(|(k, _)| k).ok_or(CryptoError::UnknownSigner { node_id: *node })
+    }
+
+    pub fn bls_key_for(&self, node: &NodeId) -> Option<&[u8; 48]> {
+        self.keys.get(node).map(|(_, b)| b)
     }
 
     pub fn contains(&self, node: &NodeId) -> bool {
@@ -53,33 +57,36 @@ impl MembershipRegistry {
     }
 
     /// Canonical byte serialization of the roster: the sorted `(NodeId,
-    /// VerifyingKey)` pairs in [`MembershipRegistry::member_ids`] order.
+    /// VerifyingKey, bls_key)` triples in [`MembershipRegistry::member_ids`] order.
     /// Deterministic on every node — the same roster always produces the
     /// same bytes — so a SHA-256 of this value anchors a checkpoint message
-    /// (Phase 3).
+    /// (Phase 3). Each member occupies 88 bytes: 8 (id) + 32 (ed25519) + 48 (bls).
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut members: Vec<(&NodeId, &VerifyingKey)> = self.keys.iter().collect();
+        let mut members: Vec<(&NodeId, &(VerifyingKey, [u8; 48]))> = self.keys.iter().collect();
         members.sort_by_key(|(id, _)| **id);
-        let mut buf = Vec::with_capacity(members.len() * 40);
-        for (id, key) in members {
+        let mut buf = Vec::with_capacity(members.len() * 88);
+        for (id, (key, bls_key)) in members {
             buf.extend_from_slice(&id.get().to_be_bytes());
             buf.extend_from_slice(&key.to_bytes());
+            buf.extend_from_slice(bls_key);
         }
         buf
     }
 
     /// The inverse of [`MembershipRegistry::to_bytes`]: parses the sorted
-    /// `(NodeId, VerifyingKey)` pairs. Returns `None` on truncation or an
-    /// invalid compressed Edwards point. Used by the reconnect codec to
-    /// rebuild the roster snapshot embedded in a signed checkpoint.
+    /// `(NodeId, VerifyingKey, bls_key)` triples. Returns `None` on truncation
+    /// or an invalid compressed Edwards point. Used by the reconnect codec to
+    /// rebuild the roster snapshot embedded in a signed checkpoint. The
+    /// proof-of-possession is NOT persisted — only the BLS public key is.
     pub fn from_bytes(mut bytes: &[u8]) -> Option<Self> {
         let mut registry = Self::new();
         while !bytes.is_empty() {
-            let head = bytes.get(..40)?;
+            let head = bytes.get(..88)?;
             let node = NodeId::new(u64::from_be_bytes(head[..8].try_into().ok()?));
             let key = VerifyingKey::from_bytes(head[8..40].try_into().ok()?).ok()?;
-            registry.register(node, key);
-            bytes = &bytes[40..];
+            let bls_key: [u8; 48] = head[40..88].try_into().ok()?;
+            registry.register(node, key, bls_key);
+            bytes = &bytes[88..];
         }
         Some(registry)
     }
@@ -91,6 +98,7 @@ mod tests {
     use rand::rngs::OsRng;
 
     use super::*;
+    use crate::hash::Hashable;
 
     #[test]
     fn registers_and_resolves_a_key() {
@@ -98,7 +106,7 @@ mod tests {
         let verifying_key = signing_key.verifying_key();
 
         let mut registry = MembershipRegistry::new();
-        registry.register(NodeId::new(1), verifying_key);
+        registry.register(NodeId::new(1), verifying_key, [0u8; 48]);
 
         assert_eq!(registry.key_for(&NodeId::new(1)), Ok(&verifying_key));
     }
@@ -118,7 +126,7 @@ mod tests {
         let verifying_key = signing_key.verifying_key();
 
         let mut registry = MembershipRegistry::new();
-        registry.register(NodeId::new(1), verifying_key);
+        registry.register(NodeId::new(1), verifying_key, [0u8; 48]);
 
         assert!(registry.contains(&NodeId::new(1)));
     }
@@ -133,12 +141,16 @@ mod tests {
     fn to_bytes_is_canonical_and_order_independent() {
         let mut registry = MembershipRegistry::new();
         for id in [3u64, 1, 2] {
-            registry.register(NodeId::new(id), SigningKey::generate(&mut OsRng).verifying_key());
+            registry.register(
+                NodeId::new(id),
+                SigningKey::generate(&mut OsRng).verifying_key(),
+                [0u8; 48],
+            );
         }
 
         let bytes = registry.to_bytes();
-        // 3 members, each serialized as 8-byte id + 32-byte key.
-        assert_eq!(bytes.len(), 3 * 40);
+        // 3 members, each serialized as 8-byte id + 32-byte key + 48-byte bls.
+        assert_eq!(bytes.len(), 3 * 88);
         // The first entry is the smallest NodeId (1), regardless of the
         // insertion order above.
         assert_eq!(u64::from_be_bytes(bytes[0..8].try_into().unwrap()), 1);
@@ -146,7 +158,11 @@ mod tests {
         // Identical rosters serialize identically.
         let mut clone = MembershipRegistry::new();
         for id in [1u64, 2, 3] {
-            clone.register(NodeId::new(id), registry.key_for(&NodeId::new(id)).unwrap().to_owned());
+            clone.register(
+                NodeId::new(id),
+                registry.key_for(&NodeId::new(id)).unwrap().to_owned(),
+                [0u8; 48],
+            );
         }
         assert_eq!(clone.to_bytes(), bytes);
     }
@@ -155,7 +171,11 @@ mod tests {
     fn from_bytes_round_trips() {
         let mut registry = MembershipRegistry::new();
         for id in [3u64, 1, 2] {
-            registry.register(NodeId::new(id), SigningKey::generate(&mut OsRng).verifying_key());
+            registry.register(
+                NodeId::new(id),
+                SigningKey::generate(&mut OsRng).verifying_key(),
+                [0u8; 48],
+            );
         }
         assert_eq!(MembershipRegistry::from_bytes(&registry.to_bytes()), Some(registry.clone()));
 
@@ -174,7 +194,11 @@ mod tests {
     #[test]
     fn from_bytes_rejects_truncation_and_invalid_keys() {
         let mut registry = MembershipRegistry::new();
-        registry.register(NodeId::new(1), SigningKey::generate(&mut OsRng).verifying_key());
+        registry.register(
+            NodeId::new(1),
+            SigningKey::generate(&mut OsRng).verifying_key(),
+            [0u8; 48],
+        );
         let bytes = registry.to_bytes();
 
         assert_eq!(MembershipRegistry::from_bytes(&bytes[..bytes.len() - 1]), None);
@@ -187,6 +211,7 @@ mod tests {
             2u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
             0, 0, 0, 0,
         ]);
+        bad.extend_from_slice(&[0u8; 48]);
         assert_eq!(MembershipRegistry::from_bytes(&bad), None);
     }
 
@@ -196,10 +221,10 @@ mod tests {
         let key2 = SigningKey::generate(&mut OsRng).verifying_key();
 
         let mut registry = MembershipRegistry::new();
-        registry.register(NodeId::new(1), key1);
+        registry.register(NodeId::new(1), key1, [0u8; 48]);
         assert_eq!(registry.key_for(&NodeId::new(1)), Ok(&key1));
 
-        registry.register(NodeId::new(1), key2);
+        registry.register(NodeId::new(1), key2, [0u8; 48]);
         assert_eq!(registry.key_for(&NodeId::new(1)), Ok(&key2));
         assert_eq!(registry.len(), 1, "duplicate register should not increase member count");
     }
@@ -208,7 +233,11 @@ mod tests {
     fn member_ids_returns_sorted_order() {
         let mut registry = MembershipRegistry::new();
         for id in [5, 1, 3, 2, 4] {
-            registry.register(NodeId::new(id), SigningKey::generate(&mut OsRng).verifying_key());
+            registry.register(
+                NodeId::new(id),
+                SigningKey::generate(&mut OsRng).verifying_key(),
+                [0u8; 48],
+            );
         }
         let ids = registry.member_ids();
         assert_eq!(
@@ -223,18 +252,26 @@ mod tests {
         assert!(registry.is_empty());
         assert_eq!(registry.len(), 0);
 
-        registry.register(NodeId::new(1), SigningKey::generate(&mut OsRng).verifying_key());
+        registry.register(
+            NodeId::new(1),
+            SigningKey::generate(&mut OsRng).verifying_key(),
+            [0u8; 48],
+        );
         assert!(!registry.is_empty());
         assert_eq!(registry.len(), 1);
 
-        registry.register(NodeId::new(2), SigningKey::generate(&mut OsRng).verifying_key());
+        registry.register(
+            NodeId::new(2),
+            SigningKey::generate(&mut OsRng).verifying_key(),
+            [0u8; 48],
+        );
         assert_eq!(registry.len(), 2);
     }
 
     #[test]
     fn from_bytes_rejects_non_aligned_input() {
-        // 41 bytes is not a multiple of 40 (the per-member record size).
-        let bytes = vec![0u8; 41];
+        // 89 bytes is not a multiple of 88 (the per-member record size).
+        let bytes = vec![0u8; 89];
         assert_eq!(MembershipRegistry::from_bytes(&bytes), None);
     }
 
@@ -247,8 +284,10 @@ mod tests {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&1u64.to_be_bytes());
         bytes.extend_from_slice(&key1.to_bytes());
+        bytes.extend_from_slice(&[0x11u8; 48]);
         bytes.extend_from_slice(&1u64.to_be_bytes());
         bytes.extend_from_slice(&key2.to_bytes());
+        bytes.extend_from_slice(&[0x22u8; 48]);
 
         let registry = MembershipRegistry::from_bytes(&bytes).expect("valid bytes");
         assert_eq!(registry.len(), 1, "duplicate NodeId should produce single member");
@@ -259,7 +298,7 @@ mod tests {
     fn lookup_after_clear_and_re_register() {
         let mut registry = MembershipRegistry::new();
         let key = SigningKey::generate(&mut OsRng).verifying_key();
-        registry.register(NodeId::new(1), key);
+        registry.register(NodeId::new(1), key, [0u8; 48]);
         assert!(registry.contains(&NodeId::new(1)));
 
         // Remove the entry and re-register with a new key.
@@ -267,7 +306,79 @@ mod tests {
         assert!(!registry.contains(&NodeId::new(1)));
 
         let new_key = SigningKey::generate(&mut OsRng).verifying_key();
-        registry.register(NodeId::new(1), new_key);
+        registry.register(NodeId::new(1), new_key, [0u8; 48]);
         assert_eq!(registry.key_for(&NodeId::new(1)), Ok(&new_key));
+    }
+
+    #[test]
+    fn registry_to_bytes_is_88_per_member_and_sorted() {
+        let mut registry = MembershipRegistry::new();
+        for id in [3u64, 1, 2] {
+            let key = SigningKey::generate(&mut OsRng).verifying_key();
+            let bls = [id as u8; 48];
+            registry.register(NodeId::new(id), key, bls);
+        }
+        let bytes = registry.to_bytes();
+        assert_eq!(bytes.len(), 3 * 88, "each member must be 88 bytes");
+        assert_eq!(u64::from_be_bytes(bytes[0..8].try_into().unwrap()), 1);
+        assert_eq!(u64::from_be_bytes(bytes[88..96].try_into().unwrap()), 2);
+        assert_eq!(u64::from_be_bytes(bytes[176..184].try_into().unwrap()), 3);
+        let rebuilt = MembershipRegistry::from_bytes(&bytes).expect("roundtrip");
+        assert_eq!(rebuilt, registry);
+        for id in [1u64, 2, 3] {
+            let expected = [id as u8; 48];
+            assert_eq!(rebuilt.bls_key_for(&NodeId::new(id)), Some(&expected));
+        }
+    }
+
+    #[test]
+    fn old_40_byte_layout_is_rejected() {
+        let key = SigningKey::generate(&mut OsRng).verifying_key();
+        let mut old_bytes = Vec::new();
+        old_bytes.extend_from_slice(&1u64.to_be_bytes());
+        old_bytes.extend_from_slice(&key.to_bytes());
+        assert_eq!(old_bytes.len(), 40, "old layout is 40 bytes per member");
+        assert_eq!(
+            MembershipRegistry::from_bytes(&old_bytes),
+            None,
+            "old 40-byte member layout must fail to parse as 88-byte triples"
+        );
+        let key2 = SigningKey::generate(&mut OsRng).verifying_key();
+        let mut old_two = Vec::new();
+        old_two.extend_from_slice(&1u64.to_be_bytes());
+        old_two.extend_from_slice(&key.to_bytes());
+        old_two.extend_from_slice(&2u64.to_be_bytes());
+        old_two.extend_from_slice(&key2.to_bytes());
+        assert_eq!(old_two.len(), 80);
+        assert_eq!(MembershipRegistry::from_bytes(&old_two), None);
+    }
+
+    #[test]
+    fn registry_partial_eq_covers_both_keys() {
+        let k1 = SigningKey::generate(&mut OsRng).verifying_key();
+        let k2 = k1;
+        let mut r1 = MembershipRegistry::new();
+        r1.register(NodeId::new(1), k1, [0xAAu8; 48]);
+        let mut r2 = MembershipRegistry::new();
+        r2.register(NodeId::new(1), k2, [0xBBu8; 48]);
+        assert_ne!(r1, r2, "different bls keys must make registries unequal");
+        assert_ne!(r1.to_bytes(), r2.to_bytes());
+        assert_ne!(r1.hash(), r2.hash());
+    }
+
+    #[test]
+    fn bls_key_for_returns_none_for_unknown() {
+        let registry = MembershipRegistry::new();
+        assert_eq!(registry.bls_key_for(&NodeId::new(99)), None);
+    }
+
+    #[test]
+    fn registry_hash_changes_with_bls_key() {
+        let key = SigningKey::generate(&mut OsRng).verifying_key();
+        let mut r1 = MembershipRegistry::new();
+        r1.register(NodeId::new(1), key, [0x11u8; 48]);
+        let mut r2 = MembershipRegistry::new();
+        r2.register(NodeId::new(1), key, [0x22u8; 48]);
+        assert_ne!(r1.hash(), r2.hash(), "bls difference must change roster hash");
     }
 }

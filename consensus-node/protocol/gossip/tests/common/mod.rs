@@ -67,7 +67,7 @@ pub async fn bind_ephemeral() -> TcpListener {
 pub fn registry_for(keys: &[(u64, SigningKey)]) -> MembershipRegistry {
     let mut registry = MembershipRegistry::new();
     for &(id, ref key) in keys {
-        registry.register(NodeId::new(id), key.verifying_key());
+        registry.register(NodeId::new(id), key.verifying_key(), [0u8; 48]);
     }
     registry
 }
@@ -81,7 +81,7 @@ pub fn registry_for_ids(ids: &[u64]) -> MembershipRegistry {
     let mut registry = MembershipRegistry::new();
     for &id in ids {
         let key = SigningKey::from_bytes(&consensus_seed(id));
-        registry.register(NodeId::new(id), key.verifying_key());
+        registry.register(NodeId::new(id), key.verifying_key(), [0u8; 48]);
     }
     registry
 }
