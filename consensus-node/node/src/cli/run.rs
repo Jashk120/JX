@@ -397,13 +397,7 @@ async fn run_node(opts: &RunOptions) -> Result<()> {
     };
     let node = Arc::new(node);
 
-    node.set_checkpoint_sink(Arc::new(storage)).await;
     node.set_event_sink(event_log.clone()).await;
-    // Mirror streams (Phase 8): open `<data>/streams/` and register both
-    // writers. The record writer needs the live hashgraph to assemble each
-    // round's finalized items; the event writer is a second event sink that
-    // records every inserted event in topological order. Both write on their
-    // own background tasks, so the consensus hot path never blocks on disk.
     let streams_dir = opts.data_dir.join(stream::STREAMS_SUBDIR);
     let event_stream = Arc::new(EventStreamWriter::open(
         &streams_dir,
@@ -417,6 +411,9 @@ async fn run_node(opts: &RunOptions) -> Result<()> {
     )?);
     node.set_event_stream_sink(event_stream).await;
     node.set_record_sink(record_stream).await;
+    let ckpt_sink = crate::storage::CkptSink::new(&streams_dir)?;
+    let composite = crate::storage::CompositeCheckpointSink::new(storage, ckpt_sink);
+    node.set_checkpoint_sink(Arc::new(composite)).await;
     // Keep the current roster history durable (Phase 8) so a future restart
     // can replay the log and verify each event against the roster active at
     // its birth round. Idempotent — membership changes overwrite it via the
