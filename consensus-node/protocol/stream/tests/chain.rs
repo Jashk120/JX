@@ -128,7 +128,13 @@ async fn record_verifier_rejects_tampering_and_reordering() {
     let writer =
         RecordStreamWriter::open(dir.path(), node_key(1), empty_hashgraph()).expect("opens");
     for round in 1..=3 {
-        writer.submit_items(signed_checkpoint(round, &[1, 2, 3, 4], &[1, 2, 3]), Vec::new());
+        let items = vec![stream::pb::RecordItem {
+            event_hash: vec![round as u8; 32],
+            tx_index: 0,
+            tx_payload: format!("r{round}").into_bytes(),
+        }];
+        let cp = common::signed_checkpoint_with_items(round, &[1, 2, 3, 4], &[1, 2, 3], &items);
+        writer.submit_items(cp, items);
     }
     writer.barrier().await;
     let trusted_hash = registry_of(&[1, 2, 3, 4]).hash();
@@ -163,7 +169,13 @@ async fn record_verifier_rejects_tampering_and_reordering() {
     let writer =
         RecordStreamWriter::open(dir.path(), node_key(1), empty_hashgraph()).expect("opens 2");
     for round in 1..=3 {
-        writer.submit_items(signed_checkpoint(round, &[1, 2, 3, 4], &[1, 2, 3]), Vec::new());
+        let items = vec![stream::pb::RecordItem {
+            event_hash: vec![round as u8; 32],
+            tx_index: 0,
+            tx_payload: format!("r{round}").into_bytes(),
+        }];
+        let cp = common::signed_checkpoint_with_items(round, &[1, 2, 3, 4], &[1, 2, 3], &items);
+        writer.submit_items(cp, items);
     }
     writer.barrier().await;
     let files = record_files_in(dir.path()).expect("files");

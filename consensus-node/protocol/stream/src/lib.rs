@@ -46,7 +46,7 @@ pub use record::{
 
 /// The version stamped inside every `EventStreamFile` / `RecordStreamFile`
 /// message.
-pub const STREAM_VERSION: u32 = 1;
+pub const STREAM_VERSION: u32 = 2;
 
 /// Subdirectory (under the data dir) holding the stream files.
 pub const STREAMS_SUBDIR: &str = "streams";
