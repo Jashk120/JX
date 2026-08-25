@@ -3,6 +3,7 @@ module github.com/JKaIN/mirror-node
 go 1.25.0
 
 require (
+	github.com/BurntSushi/toml v1.6.0
 	github.com/jackc/pgx/v5 v5.10.0
 	google.golang.org/protobuf v1.36.5
 )
