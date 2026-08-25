@@ -2,4 +2,4 @@
 /data/
 *.db
 *.log
-!.env.example
+/mirror.toml
