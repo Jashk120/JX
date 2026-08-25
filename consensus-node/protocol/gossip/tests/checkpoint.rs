@@ -25,10 +25,7 @@ use crypto::{
     Signable,
     Verifiable,
 };
-use ed25519_dalek::{
-    Signer,
-    SigningKey,
-};
+use ed25519_dalek::SigningKey;
 use gossip::{
     GossipNode,
     ReconnectResponse,
@@ -46,28 +43,25 @@ use primitives::{
 fn registry_for_ids(ids: &[u64]) -> MembershipRegistry {
     let mut registry = MembershipRegistry::new();
     for &id in ids {
+        let bls = crypto::BlsIdentity::from_ikm(&consensus_seed(id)).expect("bls");
         registry.register(
             NodeId::new(id),
             SigningKey::from_bytes(&consensus_seed(id)).verifying_key(),
-            [0u8; 48],
+            bls.public.to_bytes(),
         );
     }
     registry
 }
 
-/// Signs the node's checkpoint signing bytes for `round` with `signer`'s key.
+/// Signs the node's checkpoint signing bytes for `round` with `signer`'s BLS key.
 fn checkpoint_sig_for(
     signer: u64,
     round: u64,
-    signing_bytes: &[u8; 72],
+    signing_bytes: &[u8; 104],
 ) -> consensus::CheckpointSig {
-    let key = SigningKey::from_bytes(&consensus_seed(signer));
-    let signature = key.sign(signing_bytes);
-    consensus::CheckpointSig {
-        round,
-        signer: NodeId::new(signer),
-        sig: primitives::Signature::new(signature.to_bytes()),
-    }
+    let bls = crypto::BlsIdentity::from_ikm(&consensus_seed(signer)).expect("bls");
+    let sig = bls.sign(signing_bytes);
+    consensus::CheckpointSig { round, signer: NodeId::new(signer), sig }
 }
 
 /// The deterministic 4-member deep clique from `consensus`'s `order.rs`:
@@ -157,7 +151,8 @@ async fn checkpoint_accepted_requires_two_thirds_weight_at_that_round() {
     node.submit_checkpoint_sig(checkpoint_sig_for(3, 1, &signing_bytes)).await;
     let accepted = node.signed_checkpoint_for(1).await.expect("3 of 4 reaches quorum");
     assert_eq!(accepted.payload.round, 1);
-    assert_eq!(accepted.sigs.len(), 3);
+    assert_eq!(accepted.signers.len(), 3);
+    assert!(accepted.verify());
 }
 
 #[tokio::test]
@@ -237,7 +232,8 @@ async fn from_checkpoint_rejects_roster_key_mismatched_to_the_learner() {
     let state = state::State::new(temp_state_db().state_keyspace());
     let state_bytes = state.to_bytes();
     let state_hash = state.root();
-    let payload = CheckpointPayload::new(1, state_hash, roster.clone());
+    let payload =
+        CheckpointPayload::new(1, consensus::compute_records_root(&[]), state_hash, roster.clone());
 
     // Both members sign: the 2-node roster's quorum is all of them.
     let mut accumulator = CheckpointAccumulator::new(payload.clone(), Vec::new());

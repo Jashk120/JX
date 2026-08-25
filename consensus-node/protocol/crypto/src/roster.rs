@@ -578,7 +578,11 @@ mod tests {
             let mut registry = MembershipRegistry::new();
             for id in members {
                 let key = SigningKey::generate(&mut OsRng).verifying_key();
-                registry.register(NodeId::new(*id), key, [0u8; 48]);
+                registry.register(
+                    NodeId::new(*id),
+                    key,
+                    crate::BlsIdentity::from_ikm(&[*id as u8; 32]).expect("bls").public.to_bytes(),
+                );
             }
             registry
         }

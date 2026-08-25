@@ -288,7 +288,6 @@ async fn run_node(opts: &RunOptions) -> Result<()> {
             expected_bls_hex
         );
     }
-    let _ = &bls_identity;
 
     let gossip_port = opts.gossip_port.unwrap_or(member.gossip_addr.port());
     // A member may have no dedicated reconnect port (gossip-only). Such a node
@@ -366,9 +365,10 @@ async fn run_node(opts: &RunOptions) -> Result<()> {
                 retained_events = response.retained.len(),
                 "restoring from persisted checkpoint"
             );
-            let node = GossipNode::from_checkpoint(
+            let node = GossipNode::from_checkpoint_with_bls(
                 NodeId::new(opts.node_id),
                 signing_key,
+                bls_identity,
                 identity,
                 peers,
                 SyncTiming::new(opts.sync_interval, opts.sync_timeout),
@@ -383,9 +383,10 @@ async fn run_node(opts: &RunOptions) -> Result<()> {
         }
         None => {
             tracing::info!("fresh start (no persisted checkpoint)");
-            GossipNode::new(
+            GossipNode::new_with_bls(
                 NodeId::new(opts.node_id),
                 signing_key,
+                bls_identity,
                 registry,
                 identity,
                 peers,

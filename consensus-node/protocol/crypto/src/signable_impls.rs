@@ -58,7 +58,11 @@ mod tests {
 
     fn registry_with(node: NodeId, key: &SigningKey) -> MembershipRegistry {
         let mut registry = MembershipRegistry::new();
-        registry.register(node, key.verifying_key(), [0u8; 48]);
+        registry.register(
+            node,
+            key.verifying_key(),
+            crate::BlsIdentity::from_ikm(&[0u8; 32]).expect("bls").public.to_bytes(),
+        );
         registry
     }
 

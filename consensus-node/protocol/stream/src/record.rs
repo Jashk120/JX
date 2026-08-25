@@ -67,6 +67,7 @@ pub trait RecordSink: Send + Sync {
 }
 
 /// One message on the record writer's ordered channel.
+#[allow(clippy::large_enum_variant)]
 enum RecordStreamMsg {
     Write {
         checkpoint: SignedCheckpoint,
@@ -323,10 +324,11 @@ mod tests {
     fn registry_of(members: &[u64]) -> MembershipRegistry {
         let mut registry = MembershipRegistry::new();
         for &id in members {
+            let bls = crypto::BlsIdentity::from_ikm(&[id as u8; 32]).expect("bls");
             registry.register(
                 NodeId::new(id),
                 SigningKey::from_bytes(&[id as u8; 32]).verifying_key(),
-                [0u8; 48],
+                bls.public.to_bytes(),
             );
         }
         registry
@@ -334,8 +336,15 @@ mod tests {
 
     fn checkpoint_for(round: u64, members: &[u64]) -> SignedCheckpoint {
         let roster = registry_of(members);
-        let payload = consensus::CheckpointPayload::new(round, [round as u8; 32], roster);
-        SignedCheckpoint { payload, sigs: Vec::new() }
+        let payload = consensus::CheckpointPayload::new(
+            round,
+            consensus::compute_records_root(&[]),
+            [round as u8; 32],
+            roster,
+        );
+        let agg =
+            crypto::BlsIdentity::from_ikm(&[0u8; 32]).expect("bls").sign(&payload.signing_bytes());
+        SignedCheckpoint { payload, aggregate_sig: agg, signers: Vec::new() }
     }
 
     fn empty_hashgraph() -> Arc<Mutex<Hashgraph>> {

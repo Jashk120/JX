@@ -16,16 +16,17 @@ use consensus::{
     CheckpointAccumulator,
     CheckpointSig,
     RETENTION_ROUNDS,
+    RecordsRootItem,
     SignedCheckpoint,
 };
 use crypto::{
+    BlsIdentity,
     Hashable,
     MembershipOp,
     MembershipRegistry,
     Verifiable,
 };
 use ed25519_dalek::{
-    Signer,
     SigningKey,
     VerifyingKey,
 };
@@ -113,6 +114,7 @@ pub struct GossipNode {
     pub node_id: NodeId,
     pub hashgraph: Arc<Mutex<consensus::Hashgraph>>,
     signing_key: SigningKey,
+    bls_identity: BlsIdentity,
     registry: Mutex<MembershipRegistry>,
     identity: TlsIdentity,
     peers: Mutex<PeerManager>,
@@ -199,6 +201,31 @@ impl GossipNode {
         sync_timing: SyncTiming,
         state_db: Arc<state::StateDb>,
     ) -> Self {
+        let bls_identity =
+            BlsIdentity::from_ikm(&signing_key.to_bytes()).expect("BLS identity from signing key");
+        Self::new_with_bls(
+            node_id,
+            signing_key,
+            bls_identity,
+            registry,
+            identity,
+            peers,
+            sync_timing,
+            state_db,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_bls(
+        node_id: NodeId,
+        signing_key: SigningKey,
+        bls_identity: BlsIdentity,
+        registry: MembershipRegistry,
+        identity: TlsIdentity,
+        peers: Vec<PeerInfo>,
+        sync_timing: SyncTiming,
+        state_db: Arc<state::StateDb>,
+    ) -> Self {
         let peers: Vec<PeerInfo> =
             peers.into_iter().filter(|peer| peer.node_id != node_id).collect();
         let hashgraph = consensus::Hashgraph::new(&registry);
@@ -206,6 +233,7 @@ impl GossipNode {
             node_id,
             hashgraph: Arc::new(Mutex::new(hashgraph)),
             signing_key,
+            bls_identity,
             registry: Mutex::new(registry),
             identity,
             peers: Mutex::new(PeerManager::new(peers)),
@@ -854,17 +882,29 @@ impl GossipNode {
             .expect("the round-0 sentinel always present");
         let payload = {
             let hg = self.hashgraph.lock().await;
-            hg.checkpoint_payload(round, state_hash)
+            // Determinism: records_root is over consensus-order items for the
+            // round (final/deterministic once the round is decided).
+            let order = hg.consensus_order(round);
+            let mut items = Vec::with_capacity(order.len());
+            for hash in &order {
+                if let Some(record) = hg.get(hash) {
+                    for (idx, tx) in record.event().payload().iter().enumerate() {
+                        items.push(RecordsRootItem {
+                            event_hash: *hash.as_bytes(),
+                            tx_index: idx as u32,
+                            tx_payload: tx.payload().to_vec(),
+                        });
+                    }
+                }
+            }
+            let records_root = consensus::compute_records_root(&items);
+            hg.checkpoint_payload(round, records_root, state_hash)
         };
         let Some(payload) = payload else { return };
 
-        let signature = self.signing_key.sign(&payload.signing_bytes());
-        let own_sig = CheckpointSig {
-            round,
-            signer: self.node_id,
-            sig: primitives::Signature::new(signature.to_bytes()),
-        };
-        self.outbound_checkpoint_sigs.lock().await.push(own_sig.clone());
+        let sig = self.bls_identity.sign(&payload.signing_bytes());
+        let own_sig = CheckpointSig { round, signer: self.node_id, sig };
+        self.outbound_checkpoint_sigs.lock().await.push(own_sig);
 
         let roster = {
             let hg = self.hashgraph.lock().await;
@@ -1095,7 +1135,7 @@ impl GossipNode {
 
     /// The signing bytes the node's checkpoint for `round` is over, if one
     /// has been produced. Tests use this to craft valid signatures.
-    pub async fn checkpoint_signing_bytes(&self, round: u64) -> Option<[u8; 72]> {
+    pub async fn checkpoint_signing_bytes(&self, round: u64) -> Option<[u8; 104]> {
         self.checkpoint_accumulators
             .lock()
             .await
@@ -1227,9 +1267,36 @@ impl GossipNode {
         response: ReconnectResponse,
         state_db: Arc<state::StateDb>,
     ) -> Result<Self> {
-        let shell = Self::new(
+        let bls_identity =
+            BlsIdentity::from_ikm(&signing_key.to_bytes()).expect("BLS identity from signing key");
+        Self::from_checkpoint_with_bls(
             node_id,
             signing_key,
+            bls_identity,
+            identity,
+            peers,
+            sync_timing,
+            response,
+            state_db,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn from_checkpoint_with_bls(
+        node_id: NodeId,
+        signing_key: SigningKey,
+        bls_identity: BlsIdentity,
+        identity: TlsIdentity,
+        peers: Vec<PeerInfo>,
+        sync_timing: SyncTiming,
+        response: ReconnectResponse,
+        state_db: Arc<state::StateDb>,
+    ) -> Result<Self> {
+        let shell = Self::new_with_bls(
+            node_id,
+            signing_key,
+            bls_identity,
             MembershipRegistry::new(),
             identity,
             peers,
@@ -1559,20 +1626,22 @@ impl GossipNode {
     }
 }
 
-/// Verifies `sig` over `signing_bytes` against the key registered for
+/// Verifies `sig` over `signing_bytes` against the BLS key registered for
 /// `sig.signer` in the roster active at the signature's round. A signature
-/// from a member not in that roster (e.g. a node that joined later) is
-/// rejected.
+/// from a member not in that roster is rejected.
 fn verify_checkpoint_sig(
     sig: &CheckpointSig,
-    signing_bytes: &[u8; 72],
+    signing_bytes: &[u8; 104],
     roster: &MembershipRegistry,
 ) -> bool {
-    let Ok(key) = roster.key_for(&sig.signer) else {
+    let Some(bls_bytes) = roster.bls_key_for(&sig.signer) else {
         return false;
     };
-    let signature = ed25519_dalek::Signature::from_bytes(sig.sig.as_bytes());
-    key.verify_strict(signing_bytes, &signature).is_ok()
+    let Ok(pk) = blst::min_pk::PublicKey::from_bytes(bls_bytes) else {
+        return false;
+    };
+    sig.sig.verify(true, signing_bytes, crypto::bls::CHECKPOINT_DST, &[], &pk, true)
+        == blst::BLST_ERROR::BLST_SUCCESS
 }
 
 /// Persists an accepted [`SignedCheckpoint`]. Implemented by the embedding
@@ -1593,10 +1662,7 @@ mod pending_sig_tests {
     use consensus::CheckpointSig;
     use crypto::MembershipRegistry;
     use ed25519_dalek::SigningKey;
-    use primitives::{
-        NodeId,
-        Signature,
-    };
+    use primitives::NodeId;
     use tempfile::tempdir;
 
     use super::*;
@@ -1606,7 +1672,8 @@ mod pending_sig_tests {
         let mut keys = Vec::new();
         for &id in nodes {
             let k = SigningKey::from_bytes(&[id as u8; 32]);
-            registry.register(NodeId::new(id), k.verifying_key(), [0u8; 48]);
+            let bls = crypto::BlsIdentity::from_ikm(&[id as u8; 32]).expect("bls");
+            registry.register(NodeId::new(id), k.verifying_key(), bls.public.to_bytes());
             keys.push(k);
         }
         (registry, keys)
@@ -1633,7 +1700,10 @@ mod pending_sig_tests {
     }
 
     fn sig(round: u64, signer: u64) -> CheckpointSig {
-        CheckpointSig { round, signer: NodeId::new(signer), sig: Signature::new([1u8; 64]) }
+        let bls = crypto::BlsIdentity::from_ikm(&[signer as u8; 32]).expect("bls");
+        // Dummy payload for signing not validated in pending tests; sign a fixed message.
+        let dummy = [0u8; 104];
+        CheckpointSig { round, signer: NodeId::new(signer), sig: bls.sign(&dummy) }
     }
 
     #[tokio::test]
@@ -1666,11 +1736,16 @@ mod pending_sig_tests {
     async fn pending_drops_round_at_or_below_watermark() {
         let (registry, _) = registry_with(&[1, 2, 3]);
         let node = make_node(registry.clone()).await;
-        let payload = consensus::CheckpointPayload::new(10, [0u8; 32], registry);
-        node.signed_checkpoints
-            .lock()
-            .await
-            .push(consensus::SignedCheckpoint { payload, sigs: vec![sig(10, 1)] });
+        let payload = consensus::CheckpointPayload::new(10, [0u8; 32], [0u8; 32], registry);
+        let agg = {
+            let bls = crypto::BlsIdentity::from_ikm(&[1u8; 32]).expect("bls");
+            bls.sign(&payload.signing_bytes())
+        };
+        node.signed_checkpoints.lock().await.push(consensus::SignedCheckpoint {
+            payload,
+            aggregate_sig: agg,
+            signers: vec![NodeId::new(1)],
+        });
         node.submit_checkpoint_sig(sig(10, 2)).await;
         node.submit_checkpoint_sig(sig(9, 2)).await;
         node.submit_checkpoint_sig(sig(11, 2)).await;
@@ -1691,9 +1766,21 @@ mod pending_sig_tests {
         node.hashgraph.lock().await.mark_decided_through(5);
         let snapshot = node.executor.lock().await.state().to_bytes();
         let state_hash = state::State::root_of_bytes(&snapshot).expect("empty state hashes");
-        let payload =
-            consensus::CheckpointPayload::new(5, state_hash, node.registry.lock().await.clone());
-        let accepted = consensus::SignedCheckpoint { payload, sigs: vec![sig(5, 1)] };
+        let payload = consensus::CheckpointPayload::new(
+            5,
+            [0u8; 32],
+            state_hash,
+            node.registry.lock().await.clone(),
+        );
+        let agg = {
+            let bls = crypto::BlsIdentity::from_ikm(&[1u8; 32]).expect("bls");
+            bls.sign(&payload.signing_bytes())
+        };
+        let accepted = consensus::SignedCheckpoint {
+            payload,
+            aggregate_sig: agg,
+            signers: vec![NodeId::new(1)],
+        };
         node.accept_checkpoint(accepted, snapshot).await;
         assert!(
             node.state_snapshots.lock().await.contains_key(&5),

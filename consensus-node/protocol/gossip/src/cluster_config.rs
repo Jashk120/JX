@@ -47,7 +47,11 @@ impl ClusterConfig {
     pub fn registry(&self) -> MembershipRegistry {
         let mut registry = MembershipRegistry::new();
         for member in &self.members {
-            registry.register(member.node_id, member.verifying_key, [0u8; 48]);
+            registry.register(
+                member.node_id,
+                member.verifying_key,
+                crypto::BlsIdentity::from_ikm(&[0u8; 32]).expect("bls").public.to_bytes(),
+            );
         }
         registry
     }
@@ -98,7 +102,11 @@ mod tests {
 
         let mut manual = MembershipRegistry::new();
         for &(id, ref key) in &keys {
-            manual.register(NodeId::new(id), key.verifying_key(), [0u8; 48]);
+            manual.register(
+                NodeId::new(id),
+                key.verifying_key(),
+                crypto::BlsIdentity::from_ikm(&[0u8; 32]).expect("bls").public.to_bytes(),
+            );
         }
 
         let derived = config.registry();

@@ -146,7 +146,11 @@ fn generate_graph(seed: u64, include_fork: bool) -> GeneratedGraph {
 
     let mut registry = MembershipRegistry::new();
     for (member, key) in members.iter().zip(&keys) {
-        registry.register(*member, key.verifying_key(), [0u8; 48]);
+        registry.register(
+            *member,
+            key.verifying_key(),
+            crypto::BlsIdentity::from_ikm(&[0u8; 32]).expect("bls").public.to_bytes(),
+        );
     }
     let mut builder = GraphBuilder {
         hashgraph: Hashgraph::new(&registry),
@@ -227,7 +231,11 @@ fn fork_branch_selected_from_observers_ancestry_can_strongly_see() {
     let keys = vec![SigningKey::from_bytes(&[1; 32]), SigningKey::from_bytes(&[2; 32])];
     let mut registry = MembershipRegistry::new();
     for (member, key) in members.iter().zip(&keys) {
-        registry.register(*member, key.verifying_key(), [0u8; 48]);
+        registry.register(
+            *member,
+            key.verifying_key(),
+            crypto::BlsIdentity::from_ikm(&[0u8; 32]).expect("bls").public.to_bytes(),
+        );
     }
     let member_count = members.len();
 

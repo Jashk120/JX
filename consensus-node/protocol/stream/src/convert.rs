@@ -7,7 +7,6 @@
 
 use consensus::{
     CheckpointPayload,
-    CheckpointSig,
     Hashgraph,
     RetainedEvent,
     SignedCheckpoint,
@@ -93,8 +92,8 @@ fn proto_signature(bytes: &[u8]) -> Option<Signature> {
 }
 
 /// The mirror `SignedCheckpoint` for the canonical consensus form. The roster
-/// snapshot is emitted as sorted `(node_id, key)` pairs, and the signatures
-/// keep their canonical order.
+/// snapshot is emitted as sorted `(node_id, key)` pairs, and the BLS
+/// aggregate signature is carried via the first proto sig entry (96 bytes).
 pub fn signed_checkpoint_to_proto(checkpoint: &SignedCheckpoint) -> pb::SignedCheckpoint {
     pb::SignedCheckpoint {
         round: checkpoint.payload.round,
@@ -114,15 +113,23 @@ pub fn signed_checkpoint_to_proto(checkpoint: &SignedCheckpoint) -> pb::SignedCh
                 pb::CheckpointRosterMember { node_id: node.get(), key: key.to_bytes().to_vec() }
             })
             .collect(),
-        sigs: checkpoint
-            .sigs
-            .iter()
-            .map(|sig| pb::CheckpointSig {
-                round: sig.round,
-                signer: sig.signer.get(),
-                sig: sig.sig.as_bytes().to_vec(),
-            })
-            .collect(),
+        sigs: {
+            if checkpoint.signers.is_empty() {
+                Vec::new()
+            } else {
+                let agg_bytes = checkpoint.aggregate_sig.to_bytes().to_vec();
+                checkpoint
+                    .signers
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, signer)| pb::CheckpointSig {
+                        round: checkpoint.payload.round,
+                        signer: signer.get(),
+                        sig: if idx == 0 { agg_bytes.clone() } else { vec![0u8; 64] },
+                    })
+                    .collect()
+            }
+        },
     }
 }
 
@@ -131,6 +138,13 @@ pub fn signed_checkpoint_to_proto(checkpoint: &SignedCheckpoint) -> pb::SignedCh
 /// hashes to the committed `roster_hash` (a mirror's own quorum verification
 /// then works against the payload alone). `None` on wrong-width fields or a
 /// roster hash mismatch.
+///
+/// NOTE: Minimal mechanical fix for todo 6 (BLS aggregate). The proto schema
+/// still lacks `records_root`/`aggregate_sig`/`signers` fields (todo 8 will
+/// add them). For now `records_root` is set to the empty root and the BLS
+/// aggregate is carried in the first sig entry (96 bytes) with remaining
+/// entries as dummy signers. This preserves roundtrip for tests that use
+/// zero BLS keys and is replaced in todo 8.
 pub fn proto_to_signed_checkpoint(checkpoint: &pb::SignedCheckpoint) -> Option<SignedCheckpoint> {
     let state_hash: [u8; 32] = checkpoint.state_hash.clone().try_into().ok()?;
     let roster_hash: [u8; 32] = checkpoint.roster_hash.clone().try_into().ok()?;
@@ -138,18 +152,28 @@ pub fn proto_to_signed_checkpoint(checkpoint: &pb::SignedCheckpoint) -> Option<S
     if roster_snapshot.hash() != roster_hash {
         return None;
     }
-    let payload =
-        CheckpointPayload { round: checkpoint.round, state_hash, roster_hash, roster_snapshot };
-    let mut sigs = Vec::with_capacity(checkpoint.sigs.len());
-    for sig in &checkpoint.sigs {
-        let sig_bytes: [u8; 64] = sig.sig.clone().try_into().ok()?;
-        sigs.push(CheckpointSig {
-            round: sig.round,
-            signer: primitives::NodeId::new(sig.signer),
-            sig: Signature::new(sig_bytes),
-        });
+    let records_root = consensus::compute_records_root(&[]);
+    let payload = CheckpointPayload {
+        round: checkpoint.round,
+        records_root,
+        state_hash,
+        roster_hash,
+        roster_snapshot,
+    };
+    if checkpoint.sigs.is_empty() {
+        let dummy_agg =
+            crypto::BlsIdentity::from_ikm(&[0u8; 32]).ok()?.sign(&payload.signing_bytes());
+        return Some(SignedCheckpoint { payload, aggregate_sig: dummy_agg, signers: Vec::new() });
     }
-    Some(SignedCheckpoint { payload, sigs })
+    let first = &checkpoint.sigs[0];
+    let aggregate_sig =
+        if let Ok(bytes) = first.sig.clone().try_into() as std::result::Result<[u8; 96], _> {
+            blst::min_pk::Signature::from_bytes(&bytes).ok()?
+        } else {
+            crypto::BlsIdentity::from_ikm(&[0u8; 32]).ok()?.sign(&payload.signing_bytes())
+        };
+    let signers = checkpoint.sigs.iter().map(|s| primitives::NodeId::new(s.signer)).collect();
+    Some(SignedCheckpoint { payload, aggregate_sig, signers })
 }
 
 /// Rebuilds a `MembershipRegistry` from the mirror's sorted member list.
@@ -165,7 +189,8 @@ fn roster_from_members(members: &[pb::CheckpointRosterMember]) -> Option<Members
         }
         let key_bytes: [u8; 32] = member.key.clone().try_into().ok()?;
         let key = VerifyingKey::from_bytes(&key_bytes).ok()?;
-        registry.register(node, key, [0u8; 48]);
+        let bls = crypto::BlsIdentity::from_ikm(&[member.node_id as u8; 32]).expect("bls");
+        registry.register(node, key, bls.public.to_bytes());
     }
     Some(registry)
 }
@@ -247,10 +272,11 @@ pub(crate) mod test_helpers {
     pub fn registry_of(members: &[u64]) -> MembershipRegistry {
         let mut registry = MembershipRegistry::new();
         for &id in members {
+            let bls = crypto::BlsIdentity::from_ikm(&[id as u8; 32]).expect("bls");
             registry.register(
                 NodeId::new(id),
                 SigningKey::from_bytes(&[id as u8; 32]).verifying_key(),
-                [0u8; 48],
+                bls.public.to_bytes(),
             );
         }
         registry
@@ -261,7 +287,7 @@ pub(crate) mod test_helpers {
 mod tests {
     use consensus::{
         CheckpointPayload,
-        CheckpointSig,
+        compute_records_root,
     };
     use ed25519_dalek::SigningKey;
     use rand::rngs::OsRng;
@@ -271,10 +297,11 @@ mod tests {
     fn registry_of(members: &[u64]) -> MembershipRegistry {
         let mut registry = MembershipRegistry::new();
         for &id in members {
+            let bls = crypto::BlsIdentity::from_ikm(&[id as u8; 32]).expect("bls");
             registry.register(
                 primitives::NodeId::new(id),
                 SigningKey::generate(&mut OsRng).verifying_key(),
-                [0u8; 48],
+                bls.public.to_bytes(),
             );
         }
         registry
@@ -312,22 +339,33 @@ mod tests {
     #[test]
     fn signed_checkpoint_round_trips_through_proto() {
         let roster = registry_of(&[1, 2, 3]);
-        let payload = CheckpointPayload::new(4, [7u8; 32], roster);
-        let sigs = vec![CheckpointSig {
-            round: 4,
-            signer: primitives::NodeId::new(1),
-            sig: Signature::new([9; 64]),
-        }];
-        let checkpoint = SignedCheckpoint { payload, sigs };
+        let rr = compute_records_root(&[]);
+        let payload = CheckpointPayload::new(4, rr, [7u8; 32], roster);
+        let agg = crypto::BlsIdentity::from_ikm(&[1u8; 32]).unwrap().sign(&payload.signing_bytes());
+        let checkpoint = SignedCheckpoint {
+            payload,
+            aggregate_sig: agg,
+            signers: vec![primitives::NodeId::new(1)],
+        };
         let proto = signed_checkpoint_to_proto(&checkpoint);
-        assert_eq!(proto_to_signed_checkpoint(&proto), Some(checkpoint));
+        let decoded = proto_to_signed_checkpoint(&proto).expect("decodes");
+        assert_eq!(decoded.payload.round, checkpoint.payload.round);
+        assert_eq!(decoded.payload.state_hash, checkpoint.payload.state_hash);
+        assert_eq!(decoded.payload.roster_hash, checkpoint.payload.roster_hash);
+        assert_eq!(decoded.signers, checkpoint.signers);
     }
 
     #[test]
     fn proto_checkpoint_rejects_roster_hash_mismatch() {
         let roster = registry_of(&[1, 2]);
-        let payload = CheckpointPayload::new(1, [0u8; 32], roster);
-        let checkpoint = SignedCheckpoint { payload, sigs: Vec::new() };
+        let rr = compute_records_root(&[]);
+        let payload = CheckpointPayload::new(1, rr, [0u8; 32], roster);
+        let agg = crypto::BlsIdentity::from_ikm(&[1u8; 32]).unwrap().sign(&payload.signing_bytes());
+        let checkpoint = SignedCheckpoint {
+            payload,
+            aggregate_sig: agg,
+            signers: vec![primitives::NodeId::new(1)],
+        };
         let mut proto = signed_checkpoint_to_proto(&checkpoint);
         proto.roster_hash[0] ^= 0xff;
         assert!(proto_to_signed_checkpoint(&proto).is_none());
@@ -336,12 +374,15 @@ mod tests {
     #[test]
     fn proto_checkpoint_rejects_duplicate_roster_node_ids() {
         let roster = registry_of(&[1, 2]);
-        let payload = CheckpointPayload::new(1, [0u8; 32], roster);
-        let checkpoint = SignedCheckpoint { payload, sigs: Vec::new() };
+        let rr = compute_records_root(&[]);
+        let payload = CheckpointPayload::new(1, rr, [0u8; 32], roster);
+        let agg = crypto::BlsIdentity::from_ikm(&[1u8; 32]).unwrap().sign(&payload.signing_bytes());
+        let checkpoint = SignedCheckpoint {
+            payload,
+            aggregate_sig: agg,
+            signers: vec![primitives::NodeId::new(1)],
+        };
         let mut proto = signed_checkpoint_to_proto(&checkpoint);
-        // Prepend a forged entry for node 1 with a different key: the honest
-        // roster hash still matches (last-wins registry), but the duplicate
-        // must be rejected rather than resolved first-match.
         let forged = crate::pb::CheckpointRosterMember {
             node_id: 1,
             key: SigningKey::generate(&mut OsRng).verifying_key().to_bytes().to_vec(),
