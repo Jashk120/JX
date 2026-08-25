@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -86,8 +87,21 @@ func main() {
 	}
 	trustedBytes := trustedHash[:]
 
-	// Store: in-memory for now; swap for persistent backend when available.
-	st := store.NewMemStore()
+	// Store: in-memory by default. A MIRROR_DB_PATH / --db value starting
+	// with postgres:// (or postgresql://) selects the persistent backend.
+	var st store.Store = store.NewMemStore()
+	if strings.HasPrefix(cfg.DBPath, "postgres://") || strings.HasPrefix(cfg.DBPath, "postgresql://") {
+		pgCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		pgst, err := store.NewPostgresStore(pgCtx, cfg.DBPath)
+		cancel()
+		if err != nil {
+			h.Error("postgres store init failed", "err", err)
+			os.Exit(1)
+		}
+		defer pgst.Close()
+		st = pgst
+		h.Info("using postgresql store")
+	}
 
 	ing := ingest.New(ingest.Config{
 		StreamsDir:        cfg.StreamsDir,
