@@ -34,6 +34,7 @@ pub struct MemberEntry {
     pub reconnect_addr: Option<SocketAddr>,
     pub verifying_key: VerifyingKey,
     pub spki_fingerprint: [u8; 32],
+    pub bls_verifying_key: [u8; 48],
 }
 
 impl ClusterConfig {
@@ -47,11 +48,7 @@ impl ClusterConfig {
     pub fn registry(&self) -> MembershipRegistry {
         let mut registry = MembershipRegistry::new();
         for member in &self.members {
-            registry.register(
-                member.node_id,
-                member.verifying_key,
-                crypto::BlsIdentity::from_ikm(&[0u8; 32]).expect("bls").public.to_bytes(),
-            );
+            registry.register(member.node_id, member.verifying_key, member.bls_verifying_key);
         }
         registry
     }
@@ -90,6 +87,10 @@ mod tests {
             reconnect_addr: None,
             verifying_key: key.verifying_key(),
             spki_fingerprint: [spki_fingerprint; 32],
+            bls_verifying_key: crypto::BlsIdentity::from_ikm(&[node_id as u8; 32])
+                .expect("bls")
+                .public
+                .to_bytes(),
         }
     }
 

@@ -81,13 +81,13 @@ impl ClusterConfigFile {
             let bls_bytes = decode_bls_hex(&member.bls_verifying_key).ok_or_else(|| {
                 anyhow::anyhow!("member {}: invalid bls_verifying_key hex", member.node_id)
             })?;
-            let _ = bls_bytes;
             members.push(gossip::MemberEntry {
                 node_id: NodeId::new(member.node_id),
                 addr: member.gossip_addr,
                 reconnect_addr: member.reconnect_addr,
                 verifying_key,
                 spki_fingerprint,
+                bls_verifying_key: bls_bytes,
             });
         }
         if members.is_empty() {
