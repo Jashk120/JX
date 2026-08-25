@@ -45,7 +45,7 @@ pub fn restore_state(state_db: &StateDb, bytes: &[u8]) -> Option<state::State> {
 /// which mutated the shared `StateDb` used by the running executor and made
 /// concurrent verification destructive.
 pub fn verify_persisted(state: &PersistedCheckpoint, state_db: &StateDb) -> bool {
-    if !gossip::verify_signed_checkpoint(&state.checkpoint, state.checkpoint.payload.roster_hash) {
+    if !state.checkpoint.verify() {
         return false;
     }
     let Some(bytes) = state_db.snapshot_for(state.checkpoint.payload.round).ok().flatten() else {
