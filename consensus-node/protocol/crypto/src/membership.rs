@@ -106,7 +106,11 @@ mod tests {
         let verifying_key = signing_key.verifying_key();
 
         let mut registry = MembershipRegistry::new();
-        registry.register(NodeId::new(1), verifying_key, [0u8; 48]);
+        registry.register(
+            NodeId::new(1),
+            verifying_key,
+            crate::BlsIdentity::from_ikm(&[1u8; 32]).expect("bls").public.to_bytes(),
+        );
 
         assert_eq!(registry.key_for(&NodeId::new(1)), Ok(&verifying_key));
     }
@@ -126,7 +130,11 @@ mod tests {
         let verifying_key = signing_key.verifying_key();
 
         let mut registry = MembershipRegistry::new();
-        registry.register(NodeId::new(1), verifying_key, [0u8; 48]);
+        registry.register(
+            NodeId::new(1),
+            verifying_key,
+            crate::BlsIdentity::from_ikm(&[1u8; 32]).expect("bls").public.to_bytes(),
+        );
 
         assert!(registry.contains(&NodeId::new(1)));
     }
@@ -221,10 +229,18 @@ mod tests {
         let key2 = SigningKey::generate(&mut OsRng).verifying_key();
 
         let mut registry = MembershipRegistry::new();
-        registry.register(NodeId::new(1), key1, [0u8; 48]);
+        registry.register(
+            NodeId::new(1),
+            key1,
+            crate::BlsIdentity::from_ikm(&[1u8; 32]).expect("bls").public.to_bytes(),
+        );
         assert_eq!(registry.key_for(&NodeId::new(1)), Ok(&key1));
 
-        registry.register(NodeId::new(1), key2, [0u8; 48]);
+        registry.register(
+            NodeId::new(1),
+            key2,
+            crate::BlsIdentity::from_ikm(&[1u8; 32]).expect("bls").public.to_bytes(),
+        );
         assert_eq!(registry.key_for(&NodeId::new(1)), Ok(&key2));
         assert_eq!(registry.len(), 1, "duplicate register should not increase member count");
     }
@@ -298,7 +314,11 @@ mod tests {
     fn lookup_after_clear_and_re_register() {
         let mut registry = MembershipRegistry::new();
         let key = SigningKey::generate(&mut OsRng).verifying_key();
-        registry.register(NodeId::new(1), key, [0u8; 48]);
+        registry.register(
+            NodeId::new(1),
+            key,
+            crate::BlsIdentity::from_ikm(&[1u8; 32]).expect("bls").public.to_bytes(),
+        );
         assert!(registry.contains(&NodeId::new(1)));
 
         // Remove the entry and re-register with a new key.
@@ -306,7 +326,11 @@ mod tests {
         assert!(!registry.contains(&NodeId::new(1)));
 
         let new_key = SigningKey::generate(&mut OsRng).verifying_key();
-        registry.register(NodeId::new(1), new_key, [0u8; 48]);
+        registry.register(
+            NodeId::new(1),
+            new_key,
+            crate::BlsIdentity::from_ikm(&[1u8; 32]).expect("bls").public.to_bytes(),
+        );
         assert_eq!(registry.key_for(&NodeId::new(1)), Ok(&new_key));
     }
 

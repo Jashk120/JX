@@ -7,15 +7,11 @@
 
 use consensus::{
     CheckpointPayload,
-    CheckpointSig,
     RetainedEvent,
     SignedCheckpoint,
 };
 use crypto::MembershipRegistry;
-use ed25519_dalek::{
-    Signer,
-    SigningKey,
-};
+use ed25519_dalek::SigningKey;
 use primitives::{
     NodeId,
     Signature,
@@ -33,29 +29,39 @@ pub fn node_key(id: u64) -> SigningKey {
 pub fn registry_of(members: &[u64]) -> MembershipRegistry {
     let mut registry = MembershipRegistry::new();
     for &id in members {
-        registry.register(NodeId::new(id), node_key(id).verifying_key(), [0u8; 48]);
+        let bls = crypto::BlsIdentity::from_ikm(&[id as u8; 32]).expect("bls");
+        registry.register(NodeId::new(id), node_key(id).verifying_key(), bls.public.to_bytes());
     }
     registry
 }
 
-/// A checkpoint for `round` with real Ed25519 signatures from `signers`.
+/// A checkpoint for `round` with real BLS signatures from `signers`.
 /// `members` is the roster active at the round; the returned checkpoint is
 /// quorum-valid whenever `signers` exceeds 2/3 of `members`.
 pub fn signed_checkpoint(round: u64, members: &[u64], signers: &[u64]) -> SignedCheckpoint {
-    let payload = CheckpointPayload::new(round, [round as u8; 32], registry_of(members));
+    let payload = CheckpointPayload::new(
+        round,
+        consensus::compute_records_root(&[]),
+        [round as u8; 32],
+        registry_of(members),
+    );
     let signing_bytes = payload.signing_bytes();
-    let sigs = signers
-        .iter()
-        .map(|&signer| {
-            let signature = node_key(signer).sign(&signing_bytes);
-            CheckpointSig {
-                round,
-                signer: NodeId::new(signer),
-                sig: Signature::new(signature.to_bytes()),
-            }
-        })
-        .collect();
-    SignedCheckpoint { payload, sigs }
+    let mut sigs = Vec::new();
+    for &signer in signers {
+        let bls = crypto::BlsIdentity::from_ikm(&[signer as u8; 32]).expect("bls");
+        sigs.push(bls.sign(&signing_bytes));
+    }
+    let mut pairs: Vec<(NodeId, blst::min_pk::Signature)> =
+        signers.iter().zip(sigs).map(|(&id, s)| (NodeId::new(id), s)).collect();
+    pairs.sort_by_key(|(id, _)| *id);
+    let refs: Vec<&blst::min_pk::Signature> = pairs.iter().map(|(_, s)| s).collect();
+    let agg = crypto::bls::aggregate(&refs).expect("aggregate");
+    let signers_sorted: Vec<NodeId> = {
+        let mut v: Vec<NodeId> = signers.iter().map(|&id| NodeId::new(id)).collect();
+        v.sort();
+        v
+    };
+    SignedCheckpoint { payload, aggregate_sig: agg, signers: signers_sorted }
 }
 
 /// A `RetainedEvent` carrying one transaction, with deterministic metadata.

@@ -188,10 +188,12 @@ checksum = "ea0095f6103c2a8b44acd6fd15960c801dafebf02e21940360833e0673f48ba7"
 name = "consensus"
 version = "0.0.1"
 dependencies = [
+ "blst",
  "crypto",
  "ed25519-dalek",
  "primitives",
  "rand",
+ "sha2",
  "thiserror",
 ]
 
@@ -533,6 +535,7 @@ checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
 name = "gossip"
 version = "0.0.1"
 dependencies = [
+ "blst",
  "consensus",
  "crypto",
  "ed25519-dalek",
@@ -743,6 +746,7 @@ name = "node"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "blst",
  "consensus",
  "crypto",
  "ed25519-dalek",
@@ -1385,6 +1389,7 @@ dependencies = [
 name = "stream"
 version = "0.0.1"
 dependencies = [
+ "blst",
  "consensus",
  "crypto",
  "ed25519-dalek",

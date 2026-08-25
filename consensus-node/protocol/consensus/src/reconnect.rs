@@ -27,7 +27,6 @@ use primitives::{
 
 use crate::checkpoint::{
     CheckpointPayload,
-    CheckpointSig,
     SignedCheckpoint,
 };
 
@@ -197,15 +196,18 @@ fn take_optional_hash(cursor: &mut &[u8]) -> Option<Option<EventHash>> {
 /// Encodes `sc` as:
 /// ```text
 /// [round: u64 BE]
+/// [records_root: 32 bytes]
 /// [state_hash: 32 bytes]
 /// [roster_hash: 32 bytes]
 /// [roster_snapshot_len: u32 BE][roster_snapshot bytes]
-/// [sig_count: u32 BE]
-///   per sig: [round: u64 BE][signer_id: u64 BE][sig: 64 bytes]
+/// [signer_count: u32 BE]
+///   per signer: [signer_id: u64 BE]
+/// [aggregate_sig: 96 bytes]
 /// ```
 pub fn encode_signed_checkpoint(sc: &SignedCheckpoint) -> Vec<u8> {
     let mut buf = Vec::new();
     buf.extend_from_slice(&sc.payload.round.to_be_bytes());
+    buf.extend_from_slice(&sc.payload.records_root);
     buf.extend_from_slice(&sc.payload.state_hash);
     buf.extend_from_slice(&sc.payload.roster_hash);
     let roster_bytes = sc.payload.roster_snapshot.to_bytes();
@@ -221,33 +223,33 @@ pub fn encode_signed_checkpoint(sc: &SignedCheckpoint) -> Vec<u8> {
     };
     buf.extend_from_slice(&roster_len.to_be_bytes());
     buf.extend_from_slice(&roster_bytes);
-    let sig_count = match u32::try_from(sc.sigs.len()) {
+    let signer_count = match u32::try_from(sc.signers.len()) {
         Ok(v) => v,
         Err(_) => panic!(
             "{}",
             primitives::Error::OutOfRange {
-                field: "SignedCheckpoint sigs length",
-                got: sc.sigs.len().to_string()
+                field: "SignedCheckpoint signers length",
+                got: sc.signers.len().to_string()
             }
         ),
     };
-    buf.extend_from_slice(&sig_count.to_be_bytes());
-    for sig in &sc.sigs {
-        buf.extend_from_slice(&sig.round.to_be_bytes());
-        buf.extend_from_slice(&sig.signer.get().to_be_bytes());
-        buf.extend_from_slice(sig.sig.as_bytes());
+    buf.extend_from_slice(&signer_count.to_be_bytes());
+    for signer in &sc.signers {
+        buf.extend_from_slice(&signer.get().to_be_bytes());
     }
+    buf.extend_from_slice(&sc.aggregate_sig.to_bytes());
     buf
 }
 
 /// The inverse of [`encode_signed_checkpoint`]. Rebuilds the
 /// [`CheckpointPayload`] (reconstructing `roster_snapshot` from the embedded
-/// registry bytes) and the `Vec<CheckpointSig>`. Returns `None` on any parse
+/// registry bytes) and the aggregate signature. Returns `None` on any parse
 /// failure, truncation, trailing bytes, or a roster snapshot that does not
 /// hash to the committed `roster_hash`.
 pub fn decode_signed_checkpoint(bytes: &[u8]) -> Option<SignedCheckpoint> {
     let mut cursor = bytes;
     let round = take_u64(&mut cursor)?;
+    let records_root = take_exact(&mut cursor, 32)?.try_into().ok()?;
     let state_hash = take_exact(&mut cursor, 32)?.try_into().ok()?;
     let roster_hash = take_exact(&mut cursor, 32)?.try_into().ok()?;
     let roster_len = take_u32(&mut cursor)? as usize;
@@ -256,26 +258,27 @@ pub fn decode_signed_checkpoint(bytes: &[u8]) -> Option<SignedCheckpoint> {
     if roster_snapshot.hash() != roster_hash {
         return None;
     }
-    let payload = CheckpointPayload { round, state_hash, roster_hash, roster_snapshot };
+    let payload =
+        CheckpointPayload { round, records_root, state_hash, roster_hash, roster_snapshot };
 
-    let sig_count = take_u32(&mut cursor)? as usize;
-    const MIN_SIG: usize = 8 + 8 + 64;
-    if sig_count > cursor.len() / MIN_SIG {
+    let signer_count = take_u32(&mut cursor)? as usize;
+    const MIN_SIGNER: usize = 8;
+    if signer_count > cursor.len().saturating_sub(96) / MIN_SIGNER {
         return None;
     }
-    let mut sigs = Vec::with_capacity(sig_count);
-    for _ in 0..sig_count {
-        let sig_round = take_u64(&mut cursor)?;
+    let mut signers = Vec::with_capacity(signer_count);
+    for _ in 0..signer_count {
         let signer = NodeId::new(take_u64(&mut cursor)?);
-        let sig_bytes = take_exact(&mut cursor, 64)?;
-        let mut sig_array = [0u8; 64];
-        sig_array.copy_from_slice(sig_bytes);
-        sigs.push(CheckpointSig { round: sig_round, signer, sig: Signature::new(sig_array) });
+        signers.push(signer);
     }
+    let sig_bytes = take_exact(&mut cursor, 96)?;
+    let mut sig_array = [0u8; 96];
+    sig_array.copy_from_slice(sig_bytes);
+    let aggregate_sig = blst::min_pk::Signature::from_bytes(&sig_array).ok()?;
     if !cursor.is_empty() {
         return None;
     }
-    Some(SignedCheckpoint { payload, sigs })
+    Some(SignedCheckpoint { payload, aggregate_sig, signers })
 }
 
 /// Encodes `rh` as:
@@ -368,24 +371,39 @@ mod tests {
     fn registry_of(members: &[u64]) -> MembershipRegistry {
         let mut registry = MembershipRegistry::new();
         for &id in members {
+            let bls = crypto::bls::BlsIdentity::from_ikm(&[id as u8; 32]).expect("bls");
             registry.register(
                 NodeId::new(id),
                 SigningKey::generate(&mut OsRng).verifying_key(),
-                [0u8; 48],
+                bls.public.to_bytes(),
             );
         }
         registry
     }
 
-    fn dummy_sig(round: u64, signer: u64) -> CheckpointSig {
-        CheckpointSig { round, signer: NodeId::new(signer), sig: Signature::new([1u8; 64]) }
-    }
-
     fn signed_checkpoint(round: u64, signers: &[u64]) -> SignedCheckpoint {
         let roster_snapshot = registry_of(signers);
-        let payload = CheckpointPayload::new(round, [7u8; 32], roster_snapshot);
-        let sigs = signers.iter().map(|&signer| dummy_sig(round, signer)).collect();
-        SignedCheckpoint { payload, sigs }
+        let payload = CheckpointPayload::new(
+            round,
+            crate::checkpoint::compute_records_root(&[]),
+            [7u8; 32],
+            roster_snapshot.clone(),
+        );
+        let mut sigs = Vec::new();
+        for &signer in signers {
+            let bls = crypto::bls::BlsIdentity::from_ikm(&[signer as u8; 32]).expect("bls");
+            sigs.push(bls.sign(&payload.signing_bytes()));
+        }
+        let _sig_refs: Vec<&blst::min_pk::Signature> = sigs.iter().collect();
+        let mut sorted_signers: Vec<primitives::NodeId> =
+            signers.iter().map(|&id| primitives::NodeId::new(id)).collect();
+        sorted_signers.sort();
+        let mut pairs: Vec<(primitives::NodeId, blst::min_pk::Signature)> =
+            signers.iter().zip(sigs).map(|(&id, sig)| (primitives::NodeId::new(id), sig)).collect();
+        pairs.sort_by_key(|(id, _)| *id);
+        let sorted_refs: Vec<&blst::min_pk::Signature> = pairs.iter().map(|(_, s)| s).collect();
+        let agg = crypto::bls::aggregate(&sorted_refs).expect("aggregate");
+        SignedCheckpoint { payload, aggregate_sig: agg, signers: sorted_signers }
     }
 
     #[test]
@@ -395,8 +413,10 @@ mod tests {
         assert_eq!(decoded.payload.round, sc.payload.round);
         assert_eq!(decoded.payload.state_hash, sc.payload.state_hash);
         assert_eq!(decoded.payload.roster_hash, sc.payload.roster_hash);
+        assert_eq!(decoded.payload.records_root, sc.payload.records_root);
         assert_eq!(decoded.payload.roster_snapshot, sc.payload.roster_snapshot);
-        assert_eq!(decoded.sigs, sc.sigs);
+        assert_eq!(decoded.aggregate_sig, sc.aggregate_sig);
+        assert_eq!(decoded.signers, sc.signers);
     }
 
     #[test]
@@ -406,8 +426,9 @@ mod tests {
             let decoded =
                 decode_signed_checkpoint(&encode_signed_checkpoint(&sc)).expect("decodes");
             assert_eq!(decoded.payload.roster_snapshot, sc.payload.roster_snapshot);
-            assert_eq!(decoded.sigs.len(), signers.len());
-            assert_eq!(decoded.sigs, sc.sigs);
+            assert_eq!(decoded.signers.len(), signers.len());
+            assert_eq!(decoded.aggregate_sig, sc.aggregate_sig);
+            assert_eq!(decoded.signers, sc.signers);
         }
     }
 
@@ -581,8 +602,9 @@ mod tests {
         let sc = signed_checkpoint(3, &[1]);
         let mut bytes = encode_signed_checkpoint(&sc);
         let roster_len =
-            u32::from_be_bytes(bytes[8 + 32 + 32..8 + 32 + 32 + 4].try_into().unwrap()) as usize;
-        let sig_count_offset = 8 + 32 + 32 + 4 + roster_len;
+            u32::from_be_bytes(bytes[8 + 32 + 32 + 32..8 + 32 + 32 + 32 + 4].try_into().unwrap())
+                as usize;
+        let sig_count_offset = 8 + 32 + 32 + 32 + 4 + roster_len;
         bytes[sig_count_offset..sig_count_offset + 4].copy_from_slice(&u32::MAX.to_be_bytes());
         assert_eq!(decode_signed_checkpoint(&bytes), None);
     }

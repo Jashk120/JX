@@ -249,11 +249,7 @@ mod tests {
         MembershipRegistry,
         Signable,
     };
-    use ed25519_dalek::{
-        Signer,
-        SigningKey,
-    };
-    use primitives::Signature;
+    use ed25519_dalek::SigningKey;
     use state::StateDb;
     use tempfile::TempDir;
 
@@ -280,7 +276,8 @@ mod tests {
             .iter()
             .map(|&id| {
                 let key = SigningKey::from_bytes(&[id as u8; 32]);
-                registry.register(NodeId::new(id), key.verifying_key(), [0u8; 48]);
+                let bls = crypto::BlsIdentity::from_ikm(&[id as u8; 32]).expect("bls");
+                registry.register(NodeId::new(id), key.verifying_key(), bls.public.to_bytes());
                 (id, key)
             })
             .collect();
@@ -292,15 +289,20 @@ mod tests {
     /// signatures are required (2/3 of 2 = 2), so adding them tips quorum.
     fn quorum_checkpoint(round: u64, state_hash: [u8; 32], ids: &[u64]) -> SignedCheckpoint {
         let (registry, keys) = cluster_of(ids);
-        let payload = CheckpointPayload::new(round, state_hash, registry);
+        let payload = CheckpointPayload::new(
+            round,
+            consensus::compute_records_root(&[]),
+            state_hash,
+            registry,
+        );
         let mut accumulator = CheckpointAccumulator::new(payload.clone(), Vec::new());
         let mut accepted = None;
-        for (id, key) in keys {
-            let sig = key.sign(&payload.signing_bytes());
+        for (id, _key) in keys {
+            let bls = crypto::BlsIdentity::from_ikm(&[id as u8; 32]).expect("bls");
             let sig = consensus::CheckpointSig {
                 round,
                 signer: NodeId::new(id),
-                sig: Signature::new(sig.to_bytes()),
+                sig: bls.sign(&payload.signing_bytes()),
             };
             accepted = accumulator.add_sig(sig, &payload.roster_snapshot);
         }

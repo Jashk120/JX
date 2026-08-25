@@ -21,7 +21,6 @@ use common::{
     signed_checkpoint,
 };
 use crypto::Hashable;
-use ed25519_dalek::Signer;
 use prost::Message;
 use storage::EventSink;
 use stream::record::read_record_stream_file;
@@ -219,21 +218,26 @@ async fn forged_roster_rejected_with_trusted_hash() {
         // Forged roster: attacker keys 10, 11, 12 plus the compromised
         // node 1.  3-of-4 = quorum in the attacker's own roster.
         let forged_roster = registry_of(&[1, 10, 11, 12]);
-        let forged_payload = consensus::CheckpointPayload::new(*round, [0xaa; 32], forged_roster);
+        let forged_payload = consensus::CheckpointPayload::new(
+            *round,
+            consensus::compute_records_root(&[]),
+            [0xaa; 32],
+            forged_roster,
+        );
         let signing_bytes = forged_payload.signing_bytes();
-        let forged_sigs: Vec<_> = [1, 10, 11]
+        let mut forged_s_tuples: Vec<(primitives::NodeId, blst::min_pk::Signature)> = [1, 10, 11]
             .iter()
             .map(|&signer| {
-                let sig = node_key(signer).sign(&signing_bytes);
-                consensus::CheckpointSig {
-                    round: *round,
-                    signer: primitives::NodeId::new(signer),
-                    sig: primitives::Signature::new(sig.to_bytes()),
-                }
+                let bls = crypto::BlsIdentity::from_ikm(&[signer as u8; 32]).expect("bls");
+                (primitives::NodeId::new(signer), bls.sign(&signing_bytes))
             })
             .collect();
+        forged_s_tuples.sort_by_key(|(id, _)| *id);
+        let refs: Vec<&blst::min_pk::Signature> = forged_s_tuples.iter().map(|(_, s)| s).collect();
+        let agg = crypto::bls::aggregate(&refs).expect("aggregate");
+        let signers: Vec<primitives::NodeId> = forged_s_tuples.iter().map(|(id, _)| *id).collect();
         let forged_checkpoint =
-            consensus::SignedCheckpoint { payload: forged_payload, sigs: forged_sigs };
+            consensus::SignedCheckpoint { payload: forged_payload, aggregate_sig: agg, signers };
 
         // Swap the checkpoint inside the protobuf message.
         file.checkpoint = Some(stream::convert::signed_checkpoint_to_proto(&forged_checkpoint));

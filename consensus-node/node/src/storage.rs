@@ -167,10 +167,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
 mod tests {
     use crypto::MembershipRegistry;
     use ed25519_dalek::SigningKey;
-    use primitives::{
-        NodeId,
-        Signature,
-    };
+    use primitives::NodeId;
     use rand::rngs::OsRng;
 
     use super::*;
@@ -178,10 +175,11 @@ mod tests {
     fn registry_of(members: &[u64]) -> MembershipRegistry {
         let mut registry = MembershipRegistry::new();
         for &id in members {
+            let bls = crypto::BlsIdentity::from_ikm(&[id as u8; 32]).expect("bls");
             registry.register(
                 NodeId::new(id),
                 SigningKey::generate(&mut OsRng).verifying_key(),
-                [0u8; 48],
+                bls.public.to_bytes(),
             );
         }
         registry
@@ -189,16 +187,28 @@ mod tests {
 
     fn signed_checkpoint(round: u64, members: &[u64]) -> SignedCheckpoint {
         let roster = registry_of(members);
-        let payload = consensus::CheckpointPayload::new(round, [round as u8; 32], roster);
-        let sigs = members
-            .iter()
-            .map(|&signer| consensus::CheckpointSig {
-                round,
-                signer: NodeId::new(signer),
-                sig: Signature::new([signer as u8; 64]),
-            })
-            .collect();
-        SignedCheckpoint { payload, sigs }
+        let payload = consensus::CheckpointPayload::new(
+            round,
+            consensus::compute_records_root(&[]),
+            [round as u8; 32],
+            roster,
+        );
+        let mut sigs = Vec::new();
+        for &signer in members {
+            let bls = crypto::BlsIdentity::from_ikm(&[signer as u8; 32]).expect("bls");
+            sigs.push(bls.sign(&payload.signing_bytes()));
+        }
+        let mut pairs: Vec<(NodeId, blst::min_pk::Signature)> =
+            members.iter().zip(sigs).map(|(&id, s)| (NodeId::new(id), s)).collect();
+        pairs.sort_by_key(|(id, _)| *id);
+        let refs: Vec<&blst::min_pk::Signature> = pairs.iter().map(|(_, s)| s).collect();
+        let agg = crypto::bls::aggregate(&refs).expect("aggregate");
+        let signers: Vec<NodeId> = {
+            let mut v: Vec<NodeId> = members.iter().map(|&id| NodeId::new(id)).collect();
+            v.sort();
+            v
+        };
+        SignedCheckpoint { payload, aggregate_sig: agg, signers }
     }
 
     fn temp_dir() -> tempfile::TempDir {

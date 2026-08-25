@@ -99,6 +99,7 @@ pub struct ReconnectResponse {
 
 /// One unit of wire traffic on a gossip connection.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
 pub enum Frame {
     SyncRequest(SyncRequest),
     SyncResponse(SyncResponse),
@@ -666,12 +667,27 @@ mod tests {
 
     #[test]
     fn checkpoint_sig_frame_round_trips() {
+        let bls = crypto::BlsIdentity::from_ikm(&[7u8; 32]).expect("bls");
+        let payload = consensus::CheckpointPayload::new(
+            42,
+            consensus::compute_records_root(&[]),
+            [0u8; 32],
+            {
+                let mut r = crypto::MembershipRegistry::new();
+                r.register(
+                    NodeId::new(7),
+                    SigningKey::from_bytes(&[7u8; 32]).verifying_key(),
+                    bls.public.to_bytes(),
+                );
+                r
+            },
+        );
         let sig = consensus::CheckpointSig {
             round: 42,
             signer: NodeId::new(7),
-            sig: Signature::new([9; 64]),
+            sig: bls.sign(&payload.signing_bytes()),
         };
-        let frame = Frame::CheckpointSig(sig.clone());
+        let frame = Frame::CheckpointSig(sig);
         let decoded = Frame::from_bytes(&frame.to_bytes()).expect("parses");
         assert_eq!(decoded, Frame::CheckpointSig(sig));
         assert_eq!(frame.message_type(), MessageType::CheckpointSig);
@@ -735,17 +751,31 @@ mod tests {
         let mut registry = crypto::MembershipRegistry::new();
         for id in [1u64, 2, 3] {
             let key = SigningKey::from_bytes(&[id as u8; 32]);
-            registry.register(NodeId::new(id), key.verifying_key(), [0u8; 48]);
+            registry.register(
+                NodeId::new(id),
+                key.verifying_key(),
+                crypto::BlsIdentity::from_ikm(&[id as u8; 32]).expect("bls").public.to_bytes(),
+            );
         }
-        let payload = consensus::CheckpointPayload::new(4, [7u8; 32], registry.clone());
-        let sigs = vec![consensus::CheckpointSig {
-            round: 4,
-            signer: NodeId::new(1),
-            sig: Signature::new([9; 64]),
-        }];
+        let payload = consensus::CheckpointPayload::new(
+            4,
+            consensus::compute_records_root(&[]),
+            [7u8; 32],
+            registry.clone(),
+        );
+        let bls1 = crypto::BlsIdentity::from_ikm(&[1u8; 32]).expect("bls");
+        let sig = bls1.sign(&payload.signing_bytes());
+        let agg = {
+            let refs: Vec<&blst::min_pk::Signature> = vec![&sig];
+            crypto::bls::aggregate(&refs).expect("aggregate")
+        };
         let roster_history = crypto::RosterHistory::new(registry);
         ReconnectResponse {
-            signed_checkpoint: consensus::SignedCheckpoint { payload, sigs },
+            signed_checkpoint: consensus::SignedCheckpoint {
+                payload,
+                aggregate_sig: agg,
+                signers: vec![NodeId::new(1)],
+            },
             state_bytes: vec![0xDE, 0xAD, 0xBE, 0xEF],
             roster_history_bytes: consensus::reconnect::encode_roster_history(&roster_history),
             decided_round: 6,

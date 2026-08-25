@@ -308,7 +308,11 @@ mod tests {
     fn registry_of(nodes: &[(NodeId, &SigningKey)]) -> MembershipRegistry {
         let mut registry = MembershipRegistry::new();
         for (id, key) in nodes {
-            registry.register(*id, key.verifying_key(), [0u8; 48]);
+            registry.register(
+                *id,
+                key.verifying_key(),
+                crypto::BlsIdentity::from_ikm(&[0u8; 32]).expect("bls").public.to_bytes(),
+            );
         }
         registry
     }
@@ -349,7 +353,11 @@ mod tests {
             for (i, &name) in members.iter().enumerate() {
                 let key = SigningKey::generate(&mut OsRng);
                 let node = NodeId::new((i + 1) as u64);
-                registry.register(node, key.verifying_key(), [0u8; 48]);
+                registry.register(
+                    node,
+                    key.verifying_key(),
+                    crypto::BlsIdentity::from_ikm(&[0u8; 32]).expect("bls").public.to_bytes(),
+                );
                 nodes.insert(name, (node, key));
             }
             let hg = Hashgraph::new(&registry);
@@ -490,7 +498,11 @@ mod tests {
         let nodes: Vec<NodeId> = (0..member_count).map(|i| NodeId::new((i + 1) as u64)).collect();
         let mut registry = MembershipRegistry::new();
         for (node, key) in nodes.iter().zip(&keys) {
-            registry.register(*node, key.verifying_key(), [0u8; 48]);
+            registry.register(
+                *node,
+                key.verifying_key(),
+                crypto::BlsIdentity::from_ikm(&[0u8; 32]).expect("bls").public.to_bytes(),
+            );
         }
 
         let mut hg = Hashgraph::new(&registry);

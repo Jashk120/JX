@@ -164,7 +164,11 @@ mod tests {
     #[test]
     fn membership_registry_hash_is_deterministic() {
         let mut reg = MembershipRegistry::new();
-        reg.register(NodeId::new(1), SigningKey::generate(&mut OsRng).verifying_key(), [0u8; 48]);
+        reg.register(
+            NodeId::new(1),
+            SigningKey::generate(&mut OsRng).verifying_key(),
+            crate::BlsIdentity::from_ikm(&[0u8; 32]).expect("bls").public.to_bytes(),
+        );
         let h1 = reg.hash();
         let h2 = reg.hash();
         assert_eq!(h1, h2);
@@ -173,10 +177,18 @@ mod tests {
     #[test]
     fn membership_registry_hash_changes_with_different_members() {
         let mut reg1 = MembershipRegistry::new();
-        reg1.register(NodeId::new(1), SigningKey::generate(&mut OsRng).verifying_key(), [0u8; 48]);
+        reg1.register(
+            NodeId::new(1),
+            SigningKey::generate(&mut OsRng).verifying_key(),
+            crate::BlsIdentity::from_ikm(&[0u8; 32]).expect("bls").public.to_bytes(),
+        );
 
         let mut reg2 = MembershipRegistry::new();
-        reg2.register(NodeId::new(2), SigningKey::generate(&mut OsRng).verifying_key(), [0u8; 48]);
+        reg2.register(
+            NodeId::new(2),
+            SigningKey::generate(&mut OsRng).verifying_key(),
+            crate::BlsIdentity::from_ikm(&[0u8; 32]).expect("bls").public.to_bytes(),
+        );
 
         assert_ne!(reg1.hash(), reg2.hash());
     }
@@ -184,14 +196,30 @@ mod tests {
     #[test]
     fn membership_registry_hash_independent_of_insertion_order() {
         let mut reg1 = MembershipRegistry::new();
-        reg1.register(NodeId::new(3), SigningKey::generate(&mut OsRng).verifying_key(), [0u8; 48]);
-        reg1.register(NodeId::new(1), SigningKey::generate(&mut OsRng).verifying_key(), [0u8; 48]);
+        reg1.register(
+            NodeId::new(3),
+            SigningKey::generate(&mut OsRng).verifying_key(),
+            crate::BlsIdentity::from_ikm(&[0u8; 32]).expect("bls").public.to_bytes(),
+        );
+        reg1.register(
+            NodeId::new(1),
+            SigningKey::generate(&mut OsRng).verifying_key(),
+            crate::BlsIdentity::from_ikm(&[0u8; 32]).expect("bls").public.to_bytes(),
+        );
 
         let mut reg2 = MembershipRegistry::new();
         let key1 = reg1.key_for(&NodeId::new(1)).unwrap().to_owned();
         let key3 = reg1.key_for(&NodeId::new(3)).unwrap().to_owned();
-        reg2.register(NodeId::new(1), key1, [0u8; 48]);
-        reg2.register(NodeId::new(3), key3, [0u8; 48]);
+        reg2.register(
+            NodeId::new(1),
+            key1,
+            crate::BlsIdentity::from_ikm(&[0u8; 32]).expect("bls").public.to_bytes(),
+        );
+        reg2.register(
+            NodeId::new(3),
+            key3,
+            crate::BlsIdentity::from_ikm(&[0u8; 32]).expect("bls").public.to_bytes(),
+        );
 
         assert_eq!(reg1.hash(), reg2.hash());
     }

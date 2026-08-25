@@ -60,7 +60,7 @@ pub fn registry_for(ids: &[u64]) -> MembershipRegistry {
         registry.register(
             NodeId::new(id),
             SigningKey::from_bytes(&consensus_seed(id)).verifying_key(),
-            [0u8; 48],
+            crypto::BlsIdentity::from_ikm(&consensus_seed(id)).expect("bls").public.to_bytes(),
         );
     }
     registry

@@ -420,7 +420,11 @@ mod tests {
     fn test_node() -> Arc<GossipNode> {
         let seed = [7u8; 32];
         let mut registry = MembershipRegistry::new();
-        registry.register(NodeId::new(1), SigningKey::from_bytes(&seed).verifying_key(), [0u8; 48]);
+        registry.register(
+            NodeId::new(1),
+            SigningKey::from_bytes(&seed).verifying_key(),
+            crypto::BlsIdentity::from_ikm(&[1u8; 32]).expect("bls").public.to_bytes(),
+        );
         Arc::new(GossipNode::new(
             NodeId::new(1),
             SigningKey::from_bytes(&seed),
