@@ -1001,7 +1001,7 @@ mod tests {
     fn registry_of(nodes: &[(NodeId, &SigningKey)]) -> MembershipRegistry {
         let mut registry = MembershipRegistry::new();
         for (id, key) in nodes {
-            registry.register(*id, key.verifying_key());
+            registry.register(*id, key.verifying_key(), [0u8; 48]);
         }
         registry
     }
@@ -1298,7 +1298,7 @@ mod tests {
     fn registry_plus_fourth(registry: &MembershipRegistry) -> MembershipRegistry {
         let new_key = SigningKey::generate(&mut OsRng);
         let mut new_registry = registry.clone();
-        new_registry.register(NodeId::new(4), new_key.verifying_key());
+        new_registry.register(NodeId::new(4), new_key.verifying_key(), [0u8; 48]);
         new_registry
     }
 
@@ -1329,7 +1329,7 @@ mod tests {
         let new_key = SigningKey::generate(&mut OsRng);
         let new_node = NodeId::new(2);
         let mut new_registry = registry;
-        new_registry.register(new_node, new_key.verifying_key());
+        new_registry.register(new_node, new_key.verifying_key(), [0u8; 48]);
         hg.add_member(new_node, 10, new_registry);
 
         let new_idx = hg.member_index_of(&new_node).unwrap();
@@ -1373,7 +1373,7 @@ mod tests {
         let new_key = SigningKey::generate(&mut OsRng);
         let new_node = NodeId::new(2);
         let mut new_registry = registry;
-        new_registry.register(new_node, new_key.verifying_key());
+        new_registry.register(new_node, new_key.verifying_key(), [0u8; 48]);
         hg.add_member(new_node, 10, new_registry);
 
         // A pre-join event's record was backfilled to the expanded width.

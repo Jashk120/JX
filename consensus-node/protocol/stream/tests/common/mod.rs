@@ -33,7 +33,7 @@ pub fn node_key(id: u64) -> SigningKey {
 pub fn registry_of(members: &[u64]) -> MembershipRegistry {
     let mut registry = MembershipRegistry::new();
     for &id in members {
-        registry.register(NodeId::new(id), node_key(id).verifying_key());
+        registry.register(NodeId::new(id), node_key(id).verifying_key(), [0u8; 48]);
     }
     registry
 }

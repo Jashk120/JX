@@ -165,7 +165,7 @@ fn roster_from_members(members: &[pb::CheckpointRosterMember]) -> Option<Members
         }
         let key_bytes: [u8; 32] = member.key.clone().try_into().ok()?;
         let key = VerifyingKey::from_bytes(&key_bytes).ok()?;
-        registry.register(node, key);
+        registry.register(node, key, [0u8; 48]);
     }
     Some(registry)
 }
@@ -247,8 +247,11 @@ pub(crate) mod test_helpers {
     pub fn registry_of(members: &[u64]) -> MembershipRegistry {
         let mut registry = MembershipRegistry::new();
         for &id in members {
-            registry
-                .register(NodeId::new(id), SigningKey::from_bytes(&[id as u8; 32]).verifying_key());
+            registry.register(
+                NodeId::new(id),
+                SigningKey::from_bytes(&[id as u8; 32]).verifying_key(),
+                [0u8; 48],
+            );
         }
         registry
     }
@@ -271,6 +274,7 @@ mod tests {
             registry.register(
                 primitives::NodeId::new(id),
                 SigningKey::generate(&mut OsRng).verifying_key(),
+                [0u8; 48],
             );
         }
         registry

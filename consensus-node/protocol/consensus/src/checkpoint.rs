@@ -181,7 +181,11 @@ mod tests {
     fn registry_of(members: &[u64]) -> MembershipRegistry {
         let mut registry = MembershipRegistry::new();
         for &id in members {
-            registry.register(NodeId::new(id), SigningKey::generate(&mut OsRng).verifying_key());
+            registry.register(
+                NodeId::new(id),
+                SigningKey::generate(&mut OsRng).verifying_key(),
+                [0u8; 48],
+            );
         }
         registry
     }
@@ -248,7 +252,11 @@ mod tests {
         // bigger, but quorum must use the 4-node roster active at round 1.
         let live_roster = {
             let mut reg = round_roster.clone();
-            reg.register(NodeId::new(5), SigningKey::generate(&mut OsRng).verifying_key());
+            reg.register(
+                NodeId::new(5),
+                SigningKey::generate(&mut OsRng).verifying_key(),
+                [0u8; 48],
+            );
             reg
         };
         // 3-of-4 is a supermajority (9 > 8); 3-of-5 is not (9 ≤ 10).

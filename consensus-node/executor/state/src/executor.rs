@@ -296,6 +296,8 @@ mod tests {
         let op = MembershipOp::Add {
             node: NodeId::new(7),
             key: Box::new(SigningKey::from_bytes(&[1u8; 32]).verifying_key()),
+            bls_key: [0u8; 48],
+            pop: [0u8; 96],
             addr: "127.0.0.1:7000".parse().expect("valid addr"),
             reconnect_addr: None,
         };

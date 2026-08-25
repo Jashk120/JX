@@ -50,7 +50,7 @@ fn key_for(id: u64) -> SigningKey {
 fn registry_for(ids: &[u64]) -> MembershipRegistry {
     let mut registry = MembershipRegistry::new();
     for &id in ids {
-        registry.register(NodeId::new(id), key_for(id).verifying_key());
+        registry.register(NodeId::new(id), key_for(id).verifying_key(), [0u8; 48]);
     }
     registry
 }
@@ -59,6 +59,8 @@ fn membership_add_tx(new_node: u64) -> Transaction {
     let op = MembershipOp::Add {
         node: NodeId::new(new_node),
         key: Box::new(key_for(new_node).verifying_key()),
+        bls_key: [0u8; 48],
+        pop: [0u8; 96],
         addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7000),
         reconnect_addr: Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7001)),
     };

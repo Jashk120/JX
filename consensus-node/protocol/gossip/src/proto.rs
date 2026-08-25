@@ -735,7 +735,7 @@ mod tests {
         let mut registry = crypto::MembershipRegistry::new();
         for id in [1u64, 2, 3] {
             let key = SigningKey::from_bytes(&[id as u8; 32]);
-            registry.register(NodeId::new(id), key.verifying_key());
+            registry.register(NodeId::new(id), key.verifying_key(), [0u8; 48]);
         }
         let payload = consensus::CheckpointPayload::new(4, [7u8; 32], registry.clone());
         let sigs = vec![consensus::CheckpointSig {

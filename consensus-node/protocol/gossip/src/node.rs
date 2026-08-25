@@ -723,7 +723,9 @@ impl GossipNode {
                 };
 
                 for op in ops {
-                    if let MembershipOp::Add { node, key, addr, reconnect_addr } = op {
+                    if let MembershipOp::Add { node, key, bls_key, pop: _, addr, reconnect_addr } =
+                        op
+                    {
                         let already_member = {
                             let hg = self.hashgraph.lock().await;
                             hg.is_member(&node)
@@ -739,7 +741,7 @@ impl GossipNode {
                             let hg = self.hashgraph.lock().await;
                             hg.registry_at_round(activation_round)
                         };
-                        new_registry.register(node, key);
+                        new_registry.register(node, key, bls_key);
 
                         // Atomic: structural growth + roster schedule in one call.
                         {
@@ -763,7 +765,7 @@ impl GossipNode {
                         // node's events can be verified and inserted.
                         {
                             let mut registry = self.registry.lock().await;
-                            registry.register(node, key);
+                            registry.register(node, key, bls_key);
                         }
 
                         // TLS-pin the new peer, deriving the fingerprint from its
@@ -1604,7 +1606,7 @@ mod pending_sig_tests {
         let mut keys = Vec::new();
         for &id in nodes {
             let k = SigningKey::from_bytes(&[id as u8; 32]);
-            registry.register(NodeId::new(id), k.verifying_key());
+            registry.register(NodeId::new(id), k.verifying_key(), [0u8; 48]);
             keys.push(k);
         }
         (registry, keys)

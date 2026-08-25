@@ -58,7 +58,7 @@ mod tests {
 
     fn registry_with(node: NodeId, key: &SigningKey) -> MembershipRegistry {
         let mut registry = MembershipRegistry::new();
-        registry.register(node, key.verifying_key());
+        registry.register(node, key.verifying_key(), [0u8; 48]);
         registry
     }
 

@@ -194,6 +194,8 @@ pub(crate) async fn add_member(args: &[String]) -> Result<()> {
     let op = MembershipOp::Add {
         node: NodeId::new(node_id),
         key: Box::new(key),
+        bls_key: [0u8; 48],
+        pop: [0u8; 96],
         addr: gossip,
         reconnect_addr: reconnect,
     };

@@ -55,7 +55,7 @@ fn new_executor() -> Executor {
 fn registry_for(ids: &[u64]) -> MembershipRegistry {
     let mut registry = MembershipRegistry::new();
     for &id in ids {
-        registry.register(NodeId::new(id), key_for(id).verifying_key());
+        registry.register(NodeId::new(id), key_for(id).verifying_key(), [0u8; 48]);
     }
     registry
 }
