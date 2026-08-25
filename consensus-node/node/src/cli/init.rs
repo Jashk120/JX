@@ -97,27 +97,40 @@ pub(crate) fn init(args: &[String]) -> Result<()> {
     let mut member_files = Vec::new();
     for &(node_id, gossip_addr, reconnect_addr) in &members {
         let secret_path = out_dir.join(format!("secret-{node_id}.bin"));
-        if secret_path.exists() && !force {
+        let bls_path = out_dir.join(format!("secret-{node_id}.bls.bin"));
+        if (secret_path.exists() || bls_path.exists()) && !force {
+            let existing = if secret_path.exists() {
+                secret_path.display().to_string()
+            } else {
+                bls_path.display().to_string()
+            };
             bail!(
-                "{} already exists; use --force to regenerate (refusing to overwrite secrets)",
-                secret_path.display()
+                "{existing} already exists; use --force to regenerate (refusing to overwrite secrets)"
             );
         }
         let mut secret = [0u8; SECRET_LEN];
         OsRng.fill_bytes(&mut secret);
         write_secret_bytes(&secret_path, &secret)
             .with_context(|| format!("writing {}", secret_path.display()))?;
+        let mut bls_ikm = [0u8; 32];
+        OsRng.fill_bytes(&mut bls_ikm);
+        let bls_identity = crypto::BlsIdentity::from_ikm(&bls_ikm)
+            .with_context(|| format!("generating BLS identity for node {node_id}"))?;
+        write_secret_bytes(&bls_path, &bls_ikm)
+            .with_context(|| format!("writing {}", bls_path.display()))?;
         let signing_key =
             SigningKey::from_bytes(&secret[..32].try_into().expect("32-byte consensus seed"));
         let identity =
             TlsIdentity::from_seed(secret[32..].try_into().expect("32-byte TLS seed"), node_id)
                 .with_context(|| format!("building TLS identity for node {node_id}"))?;
+        let bls_pub = bls_identity.public.to_bytes();
         member_files.push(MemberFile::new(
             node_id,
             gossip_addr,
             reconnect_addr,
             &signing_key.verifying_key(),
             identity.spki_fingerprint(),
+            bls_pub,
         ));
     }
     let config = ClusterConfigFile { members: member_files };

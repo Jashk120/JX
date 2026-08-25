@@ -101,8 +101,8 @@ pub fn deploy_cmd(args: &[String]) -> Result<()> {
 
 /// `jkaind keygen`: generates one member's secret **on the machine running
 /// this command** and prints `JKAIN_KEYGEN <verifying-key-hex>
-/// <spki-fingerprint-hex>` on stdout for `deploy genesis` to collect. The
-/// secret never appears in the output.
+/// <spki-fingerprint-hex> <bls-verifying-key-hex>` on stdout for `deploy
+/// genesis` to collect. The secret never appears in the output.
 pub fn keygen(args: &[String]) -> Result<()> {
     let mut node_id: Option<u64> = None;
     let mut out_dir = PathBuf::from(DEFAULT_CONFIG_DIR);
@@ -126,23 +126,35 @@ pub fn keygen(args: &[String]) -> Result<()> {
     let node_id = node_id.context("keygen: --node-id <id> is required")?;
 
     let secret_path = out_dir.join(format!("secret-{node_id}.bin"));
-    if secret_path.exists() && !force {
+    let bls_path = out_dir.join(format!("secret-{node_id}.bls.bin"));
+    if (secret_path.exists() || bls_path.exists()) && !force {
+        let existing = if secret_path.exists() {
+            secret_path.display().to_string()
+        } else {
+            bls_path.display().to_string()
+        };
         bail!(
-            "{} already exists; refusing to overwrite an existing secret \
-             (pass --force only when regenerating a broken deployment)",
-            secret_path.display()
+            "{existing} already exists; refusing to overwrite an existing secret \
+             (pass --force only when regenerating a broken deployment)"
         );
     }
     fs::create_dir_all(&out_dir)
         .with_context(|| format!("creating output dir {}", out_dir.display()))?;
 
-    let (seed, verifying_key, fingerprint) = generate_member_material(node_id)?;
-    write_secret_file(&secret_path, &seed)?;
+    let keys = generate_member_material(node_id)?;
+    write_secret_file(&secret_path, &keys.seed)?;
+    write_secret_file(&bls_path, &keys.bls_ikm)?;
 
-    println!("{KEYGEN_LINE_PREFIX}{} {}", encode_hex(&verifying_key), encode_hex(&fingerprint));
+    println!(
+        "{KEYGEN_LINE_PREFIX}{} {} {}",
+        encode_hex(&keys.verifying_key),
+        encode_hex(&keys.fingerprint),
+        encode_hex(&keys.bls_pub)
+    );
     eprintln!(
-        "keygen: wrote {} (mode 0600); only the public keys above were printed",
-        secret_path.display()
+        "keygen: wrote {} and {} (mode 0600); only the public keys above were printed",
+        secret_path.display(),
+        bls_path.display()
     );
     Ok(())
 }
@@ -291,6 +303,7 @@ struct KeyMaterial {
     id: u64,
     verifying_key: VerifyingKey,
     spki_fingerprint: [u8; 32],
+    bls_verifying_key: [u8; 48],
 }
 
 fn run_genesis(plan: GenesisPlan) -> Result<()> {
@@ -369,6 +382,7 @@ fn prepare_host(plan: &GenesisPlan, member: &MemberTarget) -> Result<()> {
 /// collects the public keys it prints.
 fn keygen_remote(plan: &GenesisPlan, member: &MemberTarget) -> Result<KeyMaterial> {
     let secret_path = format!("{}/secret-{}.bin", plan.config_dir, member.id);
+    let bls_secret_path = format!("{}/secret-{}.bls.bin", plan.config_dir, member.id);
     if !plan.force {
         let absent = format!("test ! -e '{}'", shell_quote(&secret_path));
         ssh_capture(&member.ssh_target, &["sudo", "-n", "sh", "-c", &absent], None)
@@ -380,6 +394,16 @@ fn keygen_remote(plan: &GenesisPlan, member: &MemberTarget) -> Result<KeyMateria
                     member.id, secret_path
                 )
             })?;
+        let bls_absent = format!("test ! -e '{}'", shell_quote(&bls_secret_path));
+        ssh_capture(&member.ssh_target, &["sudo", "-n", "sh", "-c", &bls_absent], None)
+            .map(drop)
+            .with_context(|| {
+            format!(
+                "node {}: {} already exists; pass --force to regenerate \
+                     (invalidates any checkpoints on this node)",
+                member.id, bls_secret_path
+            )
+        })?;
         let checkpoints_dir = format!("{}/checkpoints", plan.data_dir);
         let no_checkpoints =
             format!("test -z \"$(ls -A '{}' 2>/dev/null)\"", shell_quote(&checkpoints_dir));
@@ -400,9 +424,13 @@ fn keygen_remote(plan: &GenesisPlan, member: &MemberTarget) -> Result<KeyMateria
         &["sudo", "-n", REMOTE_BINARY, "keygen", "--node-id", &node_id, "--out", &plan.config_dir],
         None,
     )?;
-    let (vk_hex, fp_hex) = parse_keygen_output(&stdout)
+    let (vk_hex, fp_hex, bls_hex) = parse_keygen_output(&stdout)
         .with_context(|| format!("node {}: unexpected keygen output", member.id))?;
-    let chown = format!("chown '{SERVICE_USER}:{SERVICE_USER}' '{}'", shell_quote(&secret_path));
+    let chown = format!(
+        "chown '{SERVICE_USER}:{SERVICE_USER}' '{}' '{}'",
+        shell_quote(&secret_path),
+        shell_quote(&bls_secret_path)
+    );
     ssh_capture(&member.ssh_target, &["sudo", "-n", "sh", "-c", &chown], None).map(drop)?;
 
     let verifying_key_bytes = decode_hex(&vk_hex)
@@ -411,7 +439,10 @@ fn keygen_remote(plan: &GenesisPlan, member: &MemberTarget) -> Result<KeyMateria
         .map_err(|e| anyhow::anyhow!("node {}: invalid Ed25519 key: {e}", member.id))?;
     let spki_fingerprint = decode_hex(&fp_hex)
         .with_context(|| format!("node {}: keygen returned invalid SPKI fingerprint", member.id))?;
-    Ok(KeyMaterial { id: member.id, verifying_key, spki_fingerprint })
+    let bls_verifying_key = crate::config::decode_bls_hex(&bls_hex).with_context(|| {
+        format!("node {}: keygen returned invalid BLS verifying key", member.id)
+    })?;
+    Ok(KeyMaterial { id: member.id, verifying_key, spki_fingerprint, bls_verifying_key })
 }
 
 /// Assembles the shared `cluster.toml` from the collected public keys and
@@ -428,6 +459,7 @@ fn assemble_config(plan: &GenesisPlan, materials: &[KeyMaterial]) -> Result<Path
             reconnect_addr,
             &material.verifying_key,
             material.spki_fingerprint,
+            material.bls_verifying_key,
         ));
     }
     let config = ClusterConfigFile { members };
@@ -561,15 +593,33 @@ fn print_summary(plan: &GenesisPlan, config_path: &Path) {
 
 // --- key material ------------------------------------------------------------
 
-/// Generates one member's unified 32-byte seed plus derived keys.
-/// Returns `(seed, verifying_key, spki_fingerprint)`.
-fn generate_member_material(node_id: u64) -> Result<([u8; GENESIS_SEED_LEN], [u8; 32], [u8; 32])> {
+/// Generates one member's unified 32-byte seed plus derived keys plus BLS material.
+/// Returns `(seed, verifying_key, spki_fingerprint, bls_ikm, bls_pubkey)`.
+struct GeneratedKeys {
+    seed: [u8; GENESIS_SEED_LEN],
+    verifying_key: [u8; 32],
+    fingerprint: [u8; 32],
+    bls_ikm: [u8; 32],
+    bls_pub: [u8; 48],
+}
+
+fn generate_member_material(node_id: u64) -> Result<GeneratedKeys> {
     let mut seed = [0u8; GENESIS_SEED_LEN];
     OsRng.fill_bytes(&mut seed);
     let signing_key = SigningKey::from_bytes(&seed);
     let identity = TlsIdentity::from_seed(seed, node_id)
         .with_context(|| format!("node {node_id}: building TLS identity"))?;
-    Ok((seed, signing_key.verifying_key().to_bytes(), identity.spki_fingerprint()))
+    let mut bls_ikm = [0u8; 32];
+    OsRng.fill_bytes(&mut bls_ikm);
+    let bls_identity = crypto::BlsIdentity::from_ikm(&bls_ikm)
+        .with_context(|| format!("node {node_id}: generating BLS identity"))?;
+    Ok(GeneratedKeys {
+        seed,
+        verifying_key: signing_key.verifying_key().to_bytes(),
+        fingerprint: identity.spki_fingerprint(),
+        bls_ikm,
+        bls_pub: bls_identity.public.to_bytes(),
+    })
 }
 
 fn write_secret_file(path: &Path, seed: &[u8]) -> Result<()> {
@@ -604,7 +654,7 @@ fn write_secret_file(path: &Path, seed: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn parse_keygen_output(stdout: &str) -> Result<(String, String)> {
+fn parse_keygen_output(stdout: &str) -> Result<(String, String, String)> {
     let line = stdout
         .lines()
         .rev()
@@ -613,7 +663,8 @@ fn parse_keygen_output(stdout: &str) -> Result<(String, String)> {
     let mut fields = line[KEYGEN_LINE_PREFIX.len()..].split_whitespace();
     let vk = fields.next().context("keygen line missing verifying key")?;
     let fp = fields.next().context("keygen line missing SPKI fingerprint")?;
-    Ok((vk.to_owned(), fp.to_owned()))
+    let bls = fields.next().context("keygen line missing BLS verifying key")?;
+    Ok((vk.to_owned(), fp.to_owned(), bls.to_owned()))
 }
 
 // --- templates ---------------------------------------------------------------
@@ -808,10 +859,11 @@ mod tests {
 
     #[test]
     fn keygen_line_round_trips() {
-        let stdout = "some log noise\nJKAIN_KEYGEN aa..bb cc..dd\n";
-        let (vk, fp) = parse_keygen_output(stdout).expect("parses");
+        let stdout = "some log noise\nJKAIN_KEYGEN aa..bb cc..dd ee..ff\n";
+        let (vk, fp, bls) = parse_keygen_output(stdout).expect("parses");
         assert_eq!(vk, "aa..bb");
         assert_eq!(fp, "cc..dd");
+        assert_eq!(bls, "ee..ff");
         assert!(parse_keygen_output("nothing here").is_err());
     }
 

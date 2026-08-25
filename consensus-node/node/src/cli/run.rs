@@ -45,7 +45,9 @@ use crate::cli::keys::{
 };
 use crate::config::{
     ClusterConfigFile,
+    decode_bls_hex,
     decode_hex,
+    encode_hex,
 };
 
 const DEFAULT_SYNC_INTERVAL: Duration = Duration::from_millis(500);
@@ -149,6 +151,19 @@ struct RunOptions {
     log_file: Option<String>,
 }
 
+fn bls_path_for(secret_path: &std::path::Path) -> PathBuf {
+    let file_name = secret_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    if let Some(stripped) = file_name.strip_suffix(".bin") {
+        let mut p = secret_path.to_path_buf();
+        p.set_file_name(format!("{stripped}.bls.bin"));
+        p
+    } else {
+        let mut p = secret_path.to_path_buf();
+        p.set_extension("bls.bin");
+        p
+    }
+}
+
 async fn run_node(opts: &RunOptions) -> Result<()> {
     let default_log_path = opts.data_dir.join("logs").join("jkaind.log");
     let log_path = match opts.log_file.as_deref() {
@@ -246,6 +261,34 @@ async fn run_node(opts: &RunOptions) -> Result<()> {
             opts.node_id
         );
     }
+
+    let bls_secret_path = bls_path_for(&opts.secret_path);
+    let bls_bytes = std::fs::read(&bls_secret_path)
+        .with_context(|| format!("missing BLS identity file at {}", bls_secret_path.display()))?;
+    if bls_bytes.len() != 32 {
+        bail!(
+            "BLS identity file at {} has invalid length: expected 32, got {}",
+            bls_secret_path.display(),
+            bls_bytes.len()
+        );
+    }
+    let bls_ikm: [u8; 32] = bls_bytes.try_into().expect("32-byte BLS IKM");
+    let bls_identity = crypto::BlsIdentity::from_ikm(&bls_ikm).with_context(|| {
+        format!("failed to derive BLS identity from {}", bls_secret_path.display())
+    })?;
+    let derived_bls_hex = encode_hex(&bls_identity.public.to_bytes());
+    let expected_bls = decode_bls_hex(&member.bls_verifying_key)
+        .with_context(|| format!("member {}: invalid bls_verifying_key hex", opts.node_id))?;
+    let expected_bls_hex = member.bls_verifying_key.to_ascii_lowercase();
+    if bls_identity.public.to_bytes() != expected_bls {
+        bail!(
+            "BLS identity mismatch for member {}: derived {} != configured {}",
+            opts.node_id,
+            derived_bls_hex,
+            expected_bls_hex
+        );
+    }
+    let _ = &bls_identity;
 
     let gossip_port = opts.gossip_port.unwrap_or(member.gossip_addr.port());
     // A member may have no dedicated reconnect port (gossip-only). Such a node
