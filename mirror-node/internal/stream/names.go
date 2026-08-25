@@ -3,7 +3,7 @@ package stream
 import "fmt"
 
 const (
-	Version              = 1
+	Version              = 2
 	StreamsSubdir        = "streams"
 	DefaultEventsPerFile = 10000
 
@@ -14,6 +14,9 @@ const (
 	RecordFilePrefix = "round-"
 	RecordFileSuffix = ".rsf"
 	RecordSigSuffix  = ".rsf_sig"
+
+	CkptFilePrefix = "checkpoint-"
+	CkptFileSuffix = ".ckpt"
 
 	EventFileIndexWidth = 8
 )
@@ -38,6 +41,14 @@ func EventFileIndex(name string) (index uint64, ok bool) {
 // names that are not record stream files. Inverse of RecordFileName.
 func RecordFileRound(name string) (round uint64, ok bool) {
 	return streamIndex(name, RecordFilePrefix, RecordFileSuffix)
+}
+
+func CkptFileName(round uint64) string {
+	return fmt.Sprintf("%s%d%s", CkptFilePrefix, round, CkptFileSuffix)
+}
+
+func CkptFileRound(name string) (uint64, bool) {
+	return streamIndex(name, CkptFilePrefix, CkptFileSuffix)
 }
 
 // SignatureFileName returns the companion .sig name for a stream file.

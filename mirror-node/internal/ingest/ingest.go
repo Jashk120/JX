@@ -135,7 +135,7 @@ func (ing *Ingester) runOnceRemote(ctx context.Context) error {
 		if trimmed == "" {
 			continue
 		}
-		if strings.HasSuffix(trimmed, stream.EventFileSuffix) || strings.HasSuffix(trimmed, stream.RecordFileSuffix) || strings.HasSuffix(trimmed, stream.EventSigSuffix) || strings.HasSuffix(trimmed, stream.RecordSigSuffix) {
+		if strings.HasSuffix(trimmed, stream.EventFileSuffix) || strings.HasSuffix(trimmed, stream.RecordFileSuffix) || strings.HasSuffix(trimmed, stream.EventSigSuffix) || strings.HasSuffix(trimmed, stream.RecordSigSuffix) || strings.HasSuffix(trimmed, stream.CkptFileSuffix) {
 			filtered = append(filtered, trimmed)
 			listed[trimmed] = struct{}{}
 		}
@@ -163,6 +163,16 @@ func (ing *Ingester) runOnceRemote(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
+		}
+		ckptName := stream.CkptFileName(r.index)
+		if _, ok := listed[ckptName]; ok {
+			ckptBytes, cErr := remote.Fetch(ctx, ckptName)
+			if cErr == nil {
+				if vErr := stream.VerifyCheckpointFile(ckptBytes, ing.cfg.TrustedRosterHash); vErr != nil {
+					ing.log.Warn("ckpt verification failed", "name", ckptName, "err", vErr)
+					continue
+				}
+			}
 		}
 		if err := ing.ingestRecordRemote(ctx, r.name, listed, remote); err != nil {
 			ing.log.Warn("record ingest failed", "name", r.name, "err", err)
@@ -290,14 +300,6 @@ func (ing *Ingester) ingestRecord(path string) error {
 		if err != nil {
 			return err
 		}
-		sig, err := ing.loadSig(path)
-		if err != nil {
-			return err
-		}
-		if sig == nil {
-			ing.log.Warn("missing signature file, deferring record ingestion", "path", path)
-			return fmt.Errorf("missing signature file for %s: deferring until sig arrives", path)
-		}
 		start, err := hashFromPB(f.StartRunningHash)
 		if err != nil {
 			return fmt.Errorf("record %s start hash: %w", path, err)
@@ -318,7 +320,7 @@ func (ing *Ingester) ingestRecord(path string) error {
 			ing.log.Warn("record chain continuity violation", "path", path, "expected", fmt.Sprintf("%x", expected), "got", fmt.Sprintf("%x", start))
 			return fmt.Errorf("record chain continuity violation for %s: expected start %x got %x", path, expected, start)
 		}
-		if err := stream.VerifyRecordFile(raw, sig, ing.cfg.PubKey, ing.cfg.TrustedRosterHash); err != nil {
+		if err := stream.VerifyRecordFile(raw, nil, ing.cfg.PubKey, ing.cfg.TrustedRosterHash); err != nil {
 			return fmt.Errorf("verify record %s: %w", path, err)
 		}
 		if err := ing.store.PutRecord(f); err != nil {
@@ -335,14 +337,6 @@ func (ing *Ingester) ingestRecord(path string) error {
 	f, raw, err := stream.ReadRecordFile(path)
 	if err != nil {
 		return err
-	}
-	sig, err := ing.loadSig(path)
-	if err != nil {
-		return err
-	}
-	if sig == nil {
-		ing.log.Warn("missing signature file, deferring record ingestion", "path", path)
-		return fmt.Errorf("missing signature file for %s: deferring until sig arrives", path)
 	}
 	start, err := hashFromPB(f.StartRunningHash)
 	if err != nil {
@@ -364,7 +358,7 @@ func (ing *Ingester) ingestRecord(path string) error {
 		ing.log.Warn("record chain continuity violation", "path", path, "expected", fmt.Sprintf("%x", expected), "got", fmt.Sprintf("%x", start))
 		return fmt.Errorf("record chain continuity violation for %s: expected start %x got %x", path, expected, start)
 	}
-	if err := stream.VerifyRecordFile(raw, sig, ing.cfg.PubKey, ing.cfg.TrustedRosterHash); err != nil {
+	if err := stream.VerifyRecordFile(raw, nil, ing.cfg.PubKey, ing.cfg.TrustedRosterHash); err != nil {
 		return fmt.Errorf("verify record %s: %w", path, err)
 	}
 	if err := ing.store.PutRecord(f); err != nil {
@@ -545,14 +539,6 @@ func (ing *Ingester) ingestRecordRemote(ctx context.Context, name string, listed
 		if err != nil {
 			return err
 		}
-		sig, err := ing.fetchRemoteSig(ctx, name, listed, remote)
-		if err != nil {
-			return err
-		}
-		if sig == nil {
-			ing.log.Warn("missing signature file, deferring record ingestion", "name", name)
-			return fmt.Errorf("missing signature file for %s: deferring until sig arrives", name)
-		}
 		var f pb.RecordStreamFile
 		if err := unmarshalStrictRemote(raw, &f); err != nil {
 			return fmt.Errorf("unmarshal %s: %w", name, err)
@@ -577,7 +563,7 @@ func (ing *Ingester) ingestRecordRemote(ctx context.Context, name string, listed
 			ing.log.Warn("record chain continuity violation", "name", name, "expected", fmt.Sprintf("%x", expected), "got", fmt.Sprintf("%x", start))
 			return fmt.Errorf("record chain continuity violation for %s: expected start %x got %x", name, expected, start)
 		}
-		if err := stream.VerifyRecordFile(raw, sig, ing.cfg.PubKey, ing.cfg.TrustedRosterHash); err != nil {
+		if err := stream.VerifyRecordFile(raw, nil, ing.cfg.PubKey, ing.cfg.TrustedRosterHash); err != nil {
 			return fmt.Errorf("verify record %s: %w", name, err)
 		}
 		if err := ing.store.PutRecord(&f); err != nil {
@@ -594,14 +580,6 @@ func (ing *Ingester) ingestRecordRemote(ctx context.Context, name string, listed
 	raw, err := remote.Fetch(ctx, name)
 	if err != nil {
 		return err
-	}
-	sig, err := ing.fetchRemoteSig(ctx, name, listed, remote)
-	if err != nil {
-		return err
-	}
-	if sig == nil {
-		ing.log.Warn("missing signature file, deferring record ingestion", "name", name)
-		return fmt.Errorf("missing signature file for %s: deferring until sig arrives", name)
 	}
 	var f pb.RecordStreamFile
 	if err := unmarshalStrictRemote(raw, &f); err != nil {
@@ -627,7 +605,7 @@ func (ing *Ingester) ingestRecordRemote(ctx context.Context, name string, listed
 		ing.log.Warn("record chain continuity violation", "name", name, "expected", fmt.Sprintf("%x", expected), "got", fmt.Sprintf("%x", start))
 		return fmt.Errorf("record chain continuity violation for %s: expected start %x got %x", name, expected, start)
 	}
-	if err := stream.VerifyRecordFile(raw, sig, ing.cfg.PubKey, ing.cfg.TrustedRosterHash); err != nil {
+	if err := stream.VerifyRecordFile(raw, nil, ing.cfg.PubKey, ing.cfg.TrustedRosterHash); err != nil {
 		return fmt.Errorf("verify record %s: %w", name, err)
 	}
 	if err := ing.store.PutRecord(&f); err != nil {

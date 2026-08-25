@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 
+	blst "github.com/supranational/blst/bindings/go"
+
 	"google.golang.org/protobuf/proto"
 
 	"github.com/JKaIN/mirror-node/internal/store"
@@ -94,34 +96,40 @@ func buildRecordFileBytes(t *testing.T, round uint64, priv ed25519.PrivateKey, s
 		TxIndex:   0,
 		TxPayload: []byte("put"),
 	}
-	b, err := proto.MarshalOptions{Deterministic: true}.Marshal(item)
-	if err != nil {
-		t.Fatalf("marshal item: %v", err)
-	}
-	serialized := [][]byte{b}
+	mb, _ := proto.MarshalOptions{Deterministic: true}.Marshal(item)
+	serialized := [][]byte{mb}
 	end = stream.RunningHash(start, serialized)
 	pub := priv.Public().(ed25519.PublicKey)
-	var rosterBuf [40]byte
-	binary.BigEndian.PutUint64(rosterBuf[:8], 0)
-	copy(rosterBuf[8:], pub)
-	rosterHash := sha256.Sum256(rosterBuf[:])
+	blsPub, sec := blsKeyForTestRemote(priv)
+	var rosterHash [32]byte
+	{
+		var buf []byte
+		var be [8]byte
+		binary.BigEndian.PutUint64(be[:], 0)
+		buf = append(buf, be[:]...)
+		buf = append(buf, pub...)
+		buf = append(buf, blsPub...)
+		rosterHash = sha256.Sum256(buf)
+	}
+	items := []*pb.RecordItem{item}
+	recordsRoot := stream.ComputeRecordsRoot(items)
 	stateHash := sha256.Sum256([]byte("state"))
-	signing := make([]byte, 0, 72)
-	var roundBE [8]byte
-	binary.BigEndian.PutUint64(roundBE[:], round)
-	signing = append(signing, roundBE[:]...)
-	signing = append(signing, stateHash[:]...)
-	signing = append(signing, rosterHash[:]...)
+	var signingBytes [104]byte
+	binary.BigEndian.PutUint64(signingBytes[0:8], round)
+	copy(signingBytes[8:40], recordsRoot[:])
+	copy(signingBytes[40:72], stateHash[:])
+	copy(signingBytes[72:104], rosterHash[:])
+	sigAff := new(blst.P2Affine).Sign(sec.sk, signingBytes[:], stream.CheckpointDST)
 	cp := &pb.SignedCheckpoint{
-		Round:      round,
-		StateHash:  stateHash[:],
-		RosterHash: rosterHash[:],
+		Round:       round,
+		StateHash:   stateHash[:],
+		RosterHash:  rosterHash[:],
+		RecordsRoot: recordsRoot[:],
 		RosterSnapshot: []*pb.CheckpointRosterMember{
-			{NodeId: 0, Key: pub},
+			{NodeId: 0, Key: pub, BlsKey: blsPub},
 		},
-		Sigs: []*pb.CheckpointSig{
-			{Round: round, Signer: 0, Sig: ed25519.Sign(priv, signing)},
-		},
+		AggregateSig: sigAff.Compress(),
+		Signers:      []uint64{0},
 	}
 	rsf := &pb.RecordStreamFile{
 		Version:          stream.Version,
@@ -135,17 +143,21 @@ func buildRecordFileBytes(t *testing.T, round uint64, priv ed25519.PrivateKey, s
 	if err != nil {
 		t.Fatalf("marshal rsf: %v", err)
 	}
-	meta := make([]byte, 0, 76)
-	var ver [4]byte
-	binary.BigEndian.PutUint32(ver[:], stream.Version)
-	meta = append(meta, ver[:]...)
-	meta = append(meta, start[:]...)
-	meta = append(meta, end[:]...)
-	var rbe [8]byte
-	binary.BigEndian.PutUint64(rbe[:], round)
-	meta = append(meta, rbe[:]...)
-	sig := buildSigBytes(t, raw, meta, priv)
-	return raw, sig, end
+	return raw, nil, end
+}
+
+func blsKeyForTestRemote(priv ed25519.PrivateKey) ([]byte, *blstSecretRemote) {
+	seed := priv.Seed()
+	var ikm [32]byte
+	copy(ikm[:], seed)
+	sk := blst.KeyGen(ikm[:])
+	pk := new(blst.P1Affine).From(sk).Compress()
+	return pk, &blstSecretRemote{sk: sk, pk: pk}
+}
+
+type blstSecretRemote struct {
+	sk *blst.SecretKey
+	pk []byte
 }
 
 func fakeBlockNode(t *testing.T, files map[string][]byte) *httptest.Server {
@@ -201,13 +213,12 @@ func TestRemoteHappyFirstPollIngests(t *testing.T) {
 	trusted := trustedHashForPriv(priv)
 
 	eventRaw, eventSig, _ := buildEventFileBytes(t, 0, [][2]uint64{{1, 0}, {1, 1}}, priv, stream.ChainSeed)
-	recordRaw, recordSig, _ := buildRecordFileBytes(t, 0, priv, stream.ChainSeed)
+	recordRaw, _, _ := buildRecordFileBytes(t, 0, priv, stream.ChainSeed)
 
 	files := map[string][]byte{
-		stream.EventFileName(0):                            eventRaw,
-		stream.SignatureFileName(stream.EventFileName(0)):  eventSig,
-		stream.RecordFileName(0):                           recordRaw,
-		stream.SignatureFileName(stream.RecordFileName(0)): recordSig,
+		stream.EventFileName(0):                           eventRaw,
+		stream.SignatureFileName(stream.EventFileName(0)): eventSig,
+		stream.RecordFileName(0):                          recordRaw,
 	}
 	srv := fakeBlockNode(t, files)
 	defer srv.Close()
@@ -226,13 +237,12 @@ func TestRemoteSecondPollAddsNothingNew(t *testing.T) {
 	trusted := trustedHashForPriv(priv)
 
 	eventRaw, eventSig, _ := buildEventFileBytes(t, 0, [][2]uint64{{1, 0}, {1, 1}}, priv, stream.ChainSeed)
-	recordRaw, recordSig, _ := buildRecordFileBytes(t, 0, priv, stream.ChainSeed)
+	recordRaw, _, _ := buildRecordFileBytes(t, 0, priv, stream.ChainSeed)
 
 	files := map[string][]byte{
-		stream.EventFileName(0):                            eventRaw,
-		stream.SignatureFileName(stream.EventFileName(0)):  eventSig,
-		stream.RecordFileName(0):                           recordRaw,
-		stream.SignatureFileName(stream.RecordFileName(0)): recordSig,
+		stream.EventFileName(0):                           eventRaw,
+		stream.SignatureFileName(stream.EventFileName(0)): eventSig,
+		stream.RecordFileName(0):                          recordRaw,
 	}
 	srv := fakeBlockNode(t, files)
 	defer srv.Close()
@@ -286,16 +296,15 @@ func TestRemoteOneName404SkippedRestIngested(t *testing.T) {
 	trusted := trustedHashForPriv(priv)
 
 	eventRaw, eventSig, _ := buildEventFileBytes(t, 0, [][2]uint64{{1, 0}}, priv, stream.ChainSeed)
-	recordRaw, recordSig, _ := buildRecordFileBytes(t, 0, priv, stream.ChainSeed)
+	recordRaw, _, _ := buildRecordFileBytes(t, 0, priv, stream.ChainSeed)
 
 	files := map[string][]byte{
-		stream.EventFileName(0):                            eventRaw,
-		stream.SignatureFileName(stream.EventFileName(0)):  eventSig,
-		stream.RecordFileName(0):                           recordRaw,
-		stream.SignatureFileName(stream.RecordFileName(0)): recordSig,
+		stream.EventFileName(0):                           eventRaw,
+		stream.SignatureFileName(stream.EventFileName(0)): eventSig,
+		stream.RecordFileName(0):                          recordRaw,
 	}
 	missingName := stream.RecordFileName(99)
-	list := []string{stream.EventFileName(0), stream.SignatureFileName(stream.EventFileName(0)), stream.RecordFileName(0), stream.SignatureFileName(stream.RecordFileName(0)), missingName, stream.SignatureFileName(missingName)}
+	list := []string{stream.EventFileName(0), stream.SignatureFileName(stream.EventFileName(0)), stream.RecordFileName(0), missingName}
 	srv := fakeBlockNodeWithList(t, files, list)
 	defer srv.Close()
 
@@ -377,16 +386,15 @@ func TestRemoteWhitespaceTrimming(t *testing.T) {
 	trusted := trustedHashForPriv(priv)
 
 	eventRaw, eventSig, _ := buildEventFileBytes(t, 0, [][2]uint64{{1, 0}}, priv, stream.ChainSeed)
-	recordRaw, recordSig, _ := buildRecordFileBytes(t, 0, priv, stream.ChainSeed)
+	recordRaw, _, _ := buildRecordFileBytes(t, 0, priv, stream.ChainSeed)
 	files := map[string][]byte{
-		stream.EventFileName(0):                            eventRaw,
-		stream.SignatureFileName(stream.EventFileName(0)):  eventSig,
-		stream.RecordFileName(0):                           recordRaw,
-		stream.SignatureFileName(stream.RecordFileName(0)): recordSig,
+		stream.EventFileName(0):                           eventRaw,
+		stream.SignatureFileName(stream.EventFileName(0)): eventSig,
+		stream.RecordFileName(0):                          recordRaw,
 	}
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/v1/blocks" {
-			body := fmt.Sprintf("  %s  \n\n  %s \n %s\n%s\n", stream.EventFileName(0), stream.SignatureFileName(stream.EventFileName(0)), stream.RecordFileName(0), stream.SignatureFileName(stream.RecordFileName(0)))
+			body := fmt.Sprintf("  %s  \n\n  %s \n %s\n", stream.EventFileName(0), stream.SignatureFileName(stream.EventFileName(0)), stream.RecordFileName(0))
 			_, _ = w.Write([]byte(body))
 			return
 		}
