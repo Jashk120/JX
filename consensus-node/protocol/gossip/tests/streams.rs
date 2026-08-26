@@ -38,7 +38,7 @@ use stream::{
 fn checkpoint_sig_for(
     signer: u64,
     round: u64,
-    signing_bytes: &[u8; 104],
+    signing_bytes: &[u8; 136],
 ) -> consensus::CheckpointSig {
     let bls = crypto::BlsIdentity::from_ikm(&consensus_seed(signer)).expect("bls");
     let sig = bls.sign(signing_bytes);

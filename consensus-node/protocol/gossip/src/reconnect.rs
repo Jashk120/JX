@@ -131,7 +131,7 @@ mod tests {
         }
 
         #[allow(dead_code)]
-        fn signing_bytes(&self, round: u64) -> [u8; 104] {
+        fn signing_bytes(&self, round: u64) -> [u8; 136] {
             let rr = compute_records_root(&[]);
             let payload = CheckpointPayload::new(round, rr, [7u8; 32], self.registry.clone());
             payload.signing_bytes()

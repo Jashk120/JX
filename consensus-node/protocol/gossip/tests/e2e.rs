@@ -1092,9 +1092,10 @@ async fn reconnect_existing_node_catches_up() {
 
 // --- Phase 4: reconnect with a non-empty state ------------------------------
 
-/// The `state_hash` field (bytes 40..72) of a checkpoint's 104-byte signing
-/// bytes (round 8 || records_root 32 || state_hash 32 || roster_hash 32).
-fn state_hash_of(signing_bytes: &[u8; 104]) -> [u8; 32] {
+/// The `state_hash` field (bytes 40..72) of a checkpoint's 136-byte signing
+/// bytes (round 8 || records_root 32 || state_hash 32 || roster_hash 32 ||
+/// prev_checkpoint_hash 32).
+fn state_hash_of(signing_bytes: &[u8; 136]) -> [u8; 32] {
     let mut hash = [0u8; 32];
     hash.copy_from_slice(&signing_bytes[40..72]);
     hash
@@ -1104,7 +1105,7 @@ fn state_hash_of(signing_bytes: &[u8; 104]) -> [u8; 32] {
 fn checkpoint_sig_for(
     signer: u64,
     round: u64,
-    signing_bytes: &[u8; 104],
+    signing_bytes: &[u8; 136],
 ) -> consensus::CheckpointSig {
     let bls = crypto::BlsIdentity::from_ikm(&consensus_seed(signer)).expect("bls");
     let sig = bls.sign(signing_bytes);

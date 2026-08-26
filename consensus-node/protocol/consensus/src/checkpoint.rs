@@ -101,6 +101,11 @@ pub struct CheckpointPayload {
     pub state_hash: [u8; 32],
     /// SHA-256 of the canonical roster bytes active at `round`.
     pub roster_hash: [u8; 32],
+    /// SHA-256 of the previous round's [`CheckpointPayload::signing_bytes`].
+    /// A pure function of decided history (PLAN-2 B): every honest node
+    /// derives the identical value for round `R` regardless of local
+    /// acceptance progress. All-zero at genesis.
+    pub prev_checkpoint_hash: [u8; 32],
     /// The roster active at `round`, for self-description.
     pub roster_snapshot: MembershipRegistry,
 }
@@ -115,19 +120,43 @@ impl CheckpointPayload {
         roster_snapshot: MembershipRegistry,
     ) -> Self {
         let roster_hash = roster_snapshot.hash();
-        Self { round, records_root, state_hash, roster_hash, roster_snapshot }
+        Self {
+            round,
+            records_root,
+            state_hash,
+            roster_hash,
+            // Genesis sentinel: a payload built without explicit chaining is
+            // its own history root.
+            prev_checkpoint_hash: [0u8; 32],
+            roster_snapshot,
+        }
+    }
+
+    /// Chains this payload to its predecessor: `hash` must be
+    /// `SHA256(prev_round_payload.signing_bytes())`, derived from decided
+    /// history — never from local acceptance state (PLAN-2 Rule 1).
+    pub fn with_prev_checkpoint_hash(mut self, hash: [u8; 32]) -> Self {
+        self.prev_checkpoint_hash = hash;
+        self
     }
 
     /// Canonical bytes signed by each node: `round (8 BE) || records_root (32)
-    /// || state_hash (32) || roster_hash (32)`. Compact and unambiguous — every
-    /// node derives the identical 104 bytes for the same decided round.
-    pub fn signing_bytes(&self) -> [u8; 104] {
-        let mut buf = [0u8; 104];
+    /// || state_hash (32) || roster_hash (32) || prev_checkpoint_hash (32)`.
+    /// Compact and unambiguous — every node derives the identical 136 bytes
+    /// for the same decided round.
+    pub fn signing_bytes(&self) -> [u8; 136] {
+        let mut buf = [0u8; 136];
         buf[..8].copy_from_slice(&self.round.to_be_bytes());
         buf[8..40].copy_from_slice(&self.records_root);
         buf[40..72].copy_from_slice(&self.state_hash);
         buf[72..104].copy_from_slice(&self.roster_hash);
+        buf[104..136].copy_from_slice(&self.prev_checkpoint_hash);
         buf
+    }
+    /// `SHA256(signing_bytes())` — exactly what round `R + 1` embeds as its
+    /// `prev_checkpoint_hash`.
+    pub fn signing_bytes_hash(&self) -> [u8; 32] {
+        Sha256::digest(self.signing_bytes()).into()
     }
 }
 
@@ -270,7 +299,7 @@ impl CheckpointAccumulator {
     }
 
     /// The signing bytes every collected signature is over.
-    pub fn signing_bytes(&self) -> [u8; 104] {
+    pub fn signing_bytes(&self) -> [u8; 136] {
         self.payload.signing_bytes()
     }
 
@@ -370,7 +399,7 @@ mod tests {
         let a = CheckpointPayload::new(3, rr, [7u8; 32], roster.clone());
         let b = CheckpointPayload::new(3, rr, [7u8; 32], roster);
         assert_eq!(a.signing_bytes(), b.signing_bytes());
-        assert_eq!(a.signing_bytes().len(), 104);
+        assert_eq!(a.signing_bytes().len(), 136);
         assert_ne!(
             a.signing_bytes(),
             CheckpointPayload::new(4, rr, [7u8; 32], a.roster_snapshot.clone()).signing_bytes()
@@ -392,10 +421,34 @@ mod tests {
     }
 
     #[test]
-    fn signing_bytes_length_is_104() {
+    fn signing_bytes_length_is_136() {
         let roster = registry_of(&[1]);
         let payload = CheckpointPayload::new(1, [0u8; 32], [0u8; 32], roster);
-        assert_eq!(payload.signing_bytes().len(), 104);
+        assert_eq!(payload.signing_bytes().len(), 136);
+    }
+    #[test]
+    fn prev_checkpoint_hash_defaults_to_genesis_and_binds_signing() {
+        let roster = registry_of(&[1]);
+        let genesis = CheckpointPayload::new(1, [0u8; 32], [0u8; 32], roster.clone());
+        // `new` leaves the chain anchor at the genesis sentinel.
+        assert_eq!(genesis.prev_checkpoint_hash, [0u8; 32]);
+
+        let chained = genesis.clone().with_prev_checkpoint_hash([9u8; 32]);
+        // Chaining changes the signed bytes — but only in the tail 32.
+        assert_ne!(genesis.signing_bytes(), chained.signing_bytes());
+        assert_eq!(&genesis.signing_bytes()[..104], &chained.signing_bytes()[..104]);
+        assert_eq!(&chained.signing_bytes()[104..], &[9u8; 32][..]);
+    }
+    #[test]
+    fn signing_bytes_hash_binds_the_full_chain() {
+        let roster = registry_of(&[1]);
+        let a = CheckpointPayload::new(1, [0u8; 32], [0u8; 32], roster.clone())
+            .with_prev_checkpoint_hash([1u8; 32]);
+        let b = CheckpointPayload::new(1, [0u8; 32], [0u8; 32], roster)
+            .with_prev_checkpoint_hash([2u8; 32]);
+        // Different ancestry ⇒ different commitment, even for an otherwise
+        // identical round. This is the property that kills history splices.
+        assert_ne!(a.signing_bytes_hash(), b.signing_bytes_hash());
     }
 
     #[test]
