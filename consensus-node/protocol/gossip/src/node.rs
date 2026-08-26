@@ -1142,7 +1142,7 @@ impl GossipNode {
 
     /// The signing bytes the node's checkpoint for `round` is over, if one
     /// has been produced. Tests use this to craft valid signatures.
-    pub async fn checkpoint_signing_bytes(&self, round: u64) -> Option<[u8; 104]> {
+    pub async fn checkpoint_signing_bytes(&self, round: u64) -> Option<[u8; 136]> {
         self.checkpoint_accumulators
             .lock()
             .await
@@ -1648,7 +1648,7 @@ fn verify_pop_bytes(bls_key: &[u8; 48], pop: &[u8; 96]) -> bool {
 /// from a member not in that roster is rejected.
 fn verify_checkpoint_sig(
     sig: &CheckpointSig,
-    signing_bytes: &[u8; 104],
+    signing_bytes: &[u8; 136],
     roster: &MembershipRegistry,
 ) -> bool {
     let Some(bls_bytes) = roster.bls_key_for(&sig.signer) else {
@@ -1719,7 +1719,7 @@ mod pending_sig_tests {
     fn sig(round: u64, signer: u64) -> CheckpointSig {
         let bls = crypto::BlsIdentity::from_ikm(&[signer as u8; 32]).expect("bls");
         // Dummy payload for signing not validated in pending tests; sign a fixed message.
-        let dummy = [0u8; 104];
+        let dummy = [0u8; 136];
         CheckpointSig { round, signer: NodeId::new(signer), sig: bls.sign(&dummy) }
     }
 

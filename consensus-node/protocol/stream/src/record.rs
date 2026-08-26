@@ -199,6 +199,7 @@ fn write_record_file(
         items: items.to_vec(),
         end_running_hash: Some(digest_hash_object(end_hash)),
         checkpoint: Some(signed_checkpoint_to_proto(checkpoint)),
+        state_diffs: Vec::new(),
     };
     let file_bytes = file.encode_to_vec();
     let file_name = record_file_name(round);

@@ -94,7 +94,7 @@ fn proto_signature(bytes: &[u8]) -> Option<Signature> {
 /// The mirror `SignedCheckpoint` for the canonical consensus form. The roster
 /// snapshot is emitted as sorted `(node_id, key)` triples, and the BLS
 /// aggregate signature covers `payload.signing_bytes()` (round || records_root
-/// || state_hash || roster_hash).
+/// || state_hash || roster_hash || prev_checkpoint_hash).
 pub fn signed_checkpoint_to_proto(checkpoint: &SignedCheckpoint) -> pb::SignedCheckpoint {
     pb::SignedCheckpoint {
         round: checkpoint.payload.round,
@@ -127,6 +127,7 @@ pub fn signed_checkpoint_to_proto(checkpoint: &SignedCheckpoint) -> pb::SignedCh
         records_root: checkpoint.payload.records_root.to_vec(),
         aggregate_sig: checkpoint.aggregate_sig.to_bytes().to_vec(),
         signers: checkpoint.signers.iter().map(|n| n.get()).collect(),
+        prev_checkpoint_hash: checkpoint.payload.prev_checkpoint_hash.to_vec(),
     }
 }
 
@@ -138,6 +139,7 @@ pub fn proto_to_signed_checkpoint(checkpoint: &pb::SignedCheckpoint) -> Option<S
     let state_hash: [u8; 32] = checkpoint.state_hash.clone().try_into().ok()?;
     let roster_hash: [u8; 32] = checkpoint.roster_hash.clone().try_into().ok()?;
     let records_root: [u8; 32] = checkpoint.records_root.clone().try_into().ok()?;
+    let prev_checkpoint_hash: [u8; 32] = checkpoint.prev_checkpoint_hash.clone().try_into().ok()?;
     let agg_bytes: [u8; 96] = checkpoint.aggregate_sig.clone().try_into().ok()?;
     let aggregate_sig = blst::min_pk::Signature::from_bytes(&agg_bytes).ok()?;
     let roster_snapshot = roster_from_members(&checkpoint.roster_snapshot)?;
@@ -149,6 +151,7 @@ pub fn proto_to_signed_checkpoint(checkpoint: &pb::SignedCheckpoint) -> Option<S
         records_root,
         state_hash,
         roster_hash,
+        prev_checkpoint_hash,
         roster_snapshot,
     };
     let signers = checkpoint.signers.iter().map(|s| primitives::NodeId::new(*s)).collect();
