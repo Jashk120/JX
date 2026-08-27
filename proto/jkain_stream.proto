@@ -9,8 +9,11 @@
 //     round's finalized transactions in consensus order plus the round's
 //     threshold-signed `SignedCheckpoint` (the state-root anchor).
 //
-// Both file types are chained by a running hash (§5 of PHASE8_MIRROR_STREAMS.md)
-// and accompanied by an Ed25519 signature file (`.esf_sig` / `.rsf_sig`).
+// Both file types are chained by a running hash (§5 of PHASE8_MIRROR_STREAMS.md).
+// Event files are accompanied by an Ed25519 `.esf_sig` sidecar; record files
+// have no `.rsf_sig` — since 1313db5/PLAN-1 they are authenticated via
+// `records_root` + BLS aggregate over 136 B signing_bytes, with a
+// `.rsf_proofs` Merkle sidecar for selective disclosure. STREAM_VERSION 3.
 //
 // This schema lives at the monorepo root `proto/` so it can be shared
 // between `consensus-node` (Rust, `protocol/stream`) and future crates

@@ -26,9 +26,12 @@ every step.
 │  storage (protocol/storage)       DURABLE EVENT LOG             │
 │  EventLog · EventSink · atomic::atomic_write                    │
 │  stream  (protocol/stream)        MIRROR STREAM FILES           │
-│  EventStreamWriter · RecordStreamWriter · running_hash          │
+│  EventStreamWriter · RecordStreamWriter · running_hash · proof  │
+│    STREAM_VERSION 3: .esf (+.esf_sig) + .rsf (+.rsf_proofs) +   │
+│    Merkle records_root + 136B chained checkpoint + state_diffs  │
 │  state   (executor/state)        DETERMINISTIC EXECUTOR        │
-│  State · StateDb · SparseMerkleTree · Executor · DidOp          │
+│  State · StateDb · SparseMerkleTree · Executor · StateDiff     │
+│  bucket_finalized_with_diffs · DidOp                            │
 └──────────────────────────┬──────────────────────────────────────┘
                             │ depends on
 ┌──────────────────────────▼──────────────────────────────────────┐
@@ -230,10 +233,9 @@ The sync driver calls `GossipNode::process_finalized_rounds()`
   (`roundReceived + 1`) is fully decided: grow the hashgraph, register the
   key, and add the peer via `PeerManager::add_peer_from_key` (TLS pin derived
   from the Ed25519 key).
-- **D** — produce a signed checkpoint per newly decided round
-  (`produce_checkpoint`); when >2/3 of members' signatures accumulate in a
-  `CheckpointAccumulator`, accept it (`accept_checkpoint`) and prune history
-  below `round - RETENTION_ROUNDS`.
+- **D** — produce a chained signed checkpoint per newly decided round
+   (`produce_checkpoint` → 136-byte `round||records_root||state_hash||roster_hash||prev_checkpoint_hash` with Merkle `records_root` and PLAN-2 Rule 1 `prev` chaining); when >2/3 of members' signatures accumulate in a
+   `CheckpointAccumulator`, accept it (`accept_checkpoint`) carrying the round's sorted after-image `state_diffs` and emit `.rsf` + `.rsf_proofs` sidecar, then prune history below `round - RETENTION_ROUNDS`.
 
 ## 5. Scaling — gossip and execution (design locked)
 
