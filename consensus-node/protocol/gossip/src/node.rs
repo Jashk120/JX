@@ -182,6 +182,14 @@ pub struct GossipNode {
     /// notified with every newly accepted checkpoint, so each decided round's
     /// record file is emitted. `None` means no record stream.
     record_sink: Mutex<Option<Arc<stream::RecordStreamWriter>>>,
+    /// Sidecar sink for the record proof files (`.rsf_proofs`): notified
+    /// alongside `record_sink` with the same checkpoint/diffs so each decided
+    /// round's Merkle inclusion proofs are emitted. `None` means no proof
+    /// stream. The record writer itself already emits the sidecar
+    /// atomically, so this sink is optional and typically points at the same
+    /// writer as `record_sink`; keeping it separate allows a dedicated proof
+    /// writer if desired without blocking consensus.
+    record_proof_sink: Mutex<Option<Arc<stream::RecordStreamWriter>>>,
 }
 
 impl GossipNode {
@@ -254,6 +262,7 @@ impl GossipNode {
             event_sink: Mutex::new(None),
             event_stream_sink: Mutex::new(None),
             record_sink: Mutex::new(None),
+            record_proof_sink: Mutex::new(None),
         }
     }
 
@@ -379,6 +388,10 @@ impl GossipNode {
         *self.record_sink.lock().await = Some(sink);
     }
 
+    pub async fn set_record_proof_sink(&self, sink: Arc<stream::RecordStreamWriter>) {
+        *self.record_proof_sink.lock().await = Some(sink);
+    }
+
     /// Flushes the event stream's buffered window to disk alongside the
     /// event-log flush, so a checkpoint and its events are durably co-located.
     async fn flush_event_stream_sink(&self) {
@@ -396,12 +409,20 @@ impl GossipNode {
         }
         let event_writer = self.event_stream_sink.lock().await.clone();
         let record_writer = self.record_sink.lock().await.clone();
+        let proof_writer = self.record_proof_sink.lock().await.clone();
         let flush_fut = async move {
             if let Some(writer) = event_writer {
                 writer.barrier().await;
             }
-            if let Some(writer) = record_writer {
+            if let Some(writer) = record_writer.as_ref() {
                 writer.barrier().await;
+            }
+            if let Some(writer) = proof_writer.as_ref() {
+                let is_duplicate =
+                    record_writer.as_ref().is_some_and(|record| Arc::ptr_eq(writer, record));
+                if !is_duplicate {
+                    writer.barrier().await;
+                }
             }
         };
         tokio::time::timeout(timeout, flush_fut).await.is_ok()
@@ -689,7 +710,7 @@ impl GossipNode {
             // serialized state is captured at the same point, so a reconnect
             // learner can be served the state exactly as it stood at the
             // checkpoint round.
-            let (state_hashes, snapshots) = {
+            let (state_hashes, snapshots, diffs) = {
                 let (pre_batch_hash, pre_batch_bytes) = {
                     let executor = self.executor.lock().await;
                     (executor.state().root(), executor.state().to_bytes())
@@ -700,33 +721,67 @@ impl GossipNode {
                 for pair in &finalized {
                     by_round.entry(pair.1).or_default().push(pair.clone());
                 }
-                // Round 0 never exists as an event round; it is the sentinel
-                // holding the state root before this batch, which is the
-                // correct value for any decided round that ordered no events.
                 let mut hashes: BTreeMap<u64, [u8; 32]> = BTreeMap::new();
                 let mut snapshots: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
+                let mut diffs: BTreeMap<u64, Vec<stream::pb::StateDiff>> = BTreeMap::new();
                 hashes.insert(0, pre_batch_hash);
                 snapshots.insert(0, pre_batch_bytes);
                 let ActivationState { pending, processed_through_round, .. } = &mut *activation;
                 let original_watermark = *processed_through_round;
                 for (round, events) in by_round {
                     let before_root = executor.state().root();
-                    if let Err(e) =
-                        executor.bucket_finalized(pending, processed_through_round, &events)
-                    {
-                        tracing::error!(round, error = %e, "bucket_finalized failed");
-                        continue;
-                    }
+                    let round_diffs_map = match executor.bucket_finalized_with_diffs(
+                        pending,
+                        processed_through_round,
+                        &events,
+                    ) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            tracing::error!(round, error = %e, "bucket_finalized failed");
+                            continue;
+                        }
+                    };
+                    let pb_diffs: Vec<stream::pb::StateDiff> = round_diffs_map
+                        .get(&round)
+                        .map(|vec| {
+                            vec.iter()
+                                .map(|d| stream::pb::StateDiff {
+                                    key: d.key.clone(),
+                                    value: d.value.clone(),
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
                     let after_root = executor.state().root();
                     if round > original_watermark {
                         hashes.insert(round, after_root);
                         snapshots.insert(round, executor.state().to_bytes());
-                    } else if after_root != before_root {
-                        hashes.insert(*processed_through_round, after_root);
-                        snapshots.insert(*processed_through_round, executor.state().to_bytes());
+                        diffs.insert(round, pb_diffs);
+                    } else {
+                        if after_root != before_root {
+                            hashes.insert(*processed_through_round, after_root);
+                            snapshots.insert(*processed_through_round, executor.state().to_bytes());
+                        }
+                        if !pb_diffs.is_empty() {
+                            let target = *processed_through_round;
+                            let mut merged: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
+                            if let Some(existing) = diffs.remove(&target) {
+                                for d in existing {
+                                    merged.insert(d.key, d.value);
+                                }
+                            }
+                            for d in pb_diffs {
+                                merged.insert(d.key, d.value);
+                            }
+                            let merged_vec = merged
+                                .into_iter()
+                                .map(|(k, v)| stream::pb::StateDiff { key: k, value: v })
+                                .collect();
+                            diffs.insert(target, merged_vec);
+                        }
                     }
                 }
-                (hashes, snapshots)
+                (hashes, snapshots, diffs)
             };
 
             // Phase C: activate ops whose activation round is now fully decided.
@@ -817,18 +872,16 @@ impl GossipNode {
 
             // Phase D: produce checkpoints for every round decided since the
             // last pass, using the per-round state hashes captured above.
-            self.produce_pending_checkpoints(&state_hashes, &snapshots).await;
+            self.produce_pending_checkpoints(&state_hashes, &snapshots, &diffs).await;
         } else {
-            // No newly finalized events: no rounds were newly ordered, but a
-            // round may still have just been decided. The per-pass maps'
-            // round-0 sentinel falls back to the current (unchanged) state.
             let (bytes, root) = {
                 let executor = self.executor.lock().await;
                 (executor.state().to_bytes(), executor.state().root())
             };
             let state_hashes = BTreeMap::from([(0, root)]);
             let snapshots = BTreeMap::from([(0, bytes)]);
-            self.produce_pending_checkpoints(&state_hashes, &snapshots).await;
+            let diffs: BTreeMap<u64, Vec<stream::pb::StateDiff>> = BTreeMap::new();
+            self.produce_pending_checkpoints(&state_hashes, &snapshots, &diffs).await;
         }
         self.checkpoint_notify.notify_waiters();
     }
@@ -842,6 +895,7 @@ impl GossipNode {
         &self,
         state_hashes: &BTreeMap<u64, [u8; 32]>,
         snapshots: &BTreeMap<u64, Vec<u8>>,
+        diffs: &BTreeMap<u64, Vec<stream::pb::StateDiff>>,
     ) {
         loop {
             let round = self.activation.lock().await.checkpoint_watermark + 1;
@@ -856,7 +910,7 @@ impl GossipNode {
                 let mut activation = self.activation.lock().await;
                 activation.checkpoint_watermark = round;
             }
-            self.produce_checkpoint(round, state_hashes, snapshots).await;
+            self.produce_checkpoint(round, state_hashes, snapshots, diffs).await;
         }
     }
 
@@ -873,15 +927,14 @@ impl GossipNode {
         round: u64,
         state_hashes: &BTreeMap<u64, [u8; 32]>,
         snapshots: &BTreeMap<u64, Vec<u8>>,
+        diffs: &BTreeMap<u64, Vec<stream::pb::StateDiff>>,
     ) {
-        // The exact serialized state whose root is `state_hash`, captured in
-        // the same producing pass. Carried through the accumulator so
-        // acceptance persists exactly the committed bytes — no second lookup.
         let snapshot_bytes = snapshots
             .range(..=round)
             .next_back()
             .map(|(_, bytes)| bytes.clone())
             .expect("the round-0 sentinel always present");
+        let diffs_for_round = diffs.get(&round).cloned().unwrap_or_default();
         let signed_snapshot = self.signed_checkpoints.lock().await.clone();
         let payload = {
             let hg = self.hashgraph.lock().await;
@@ -925,7 +978,7 @@ impl GossipNode {
             (accepted, snapshot)
         };
         if let (Some(accepted), Some(snapshot)) = (accepted, snapshot) {
-            self.accept_checkpoint(accepted, snapshot).await;
+            self.accept_checkpoint(accepted, snapshot, diffs_for_round).await;
         }
     }
 
@@ -1044,7 +1097,7 @@ impl GossipNode {
             accepted
         };
         if let Some((accepted, snapshot)) = accepted {
-            self.accept_checkpoint(accepted, snapshot).await;
+            self.accept_checkpoint(accepted, snapshot, Vec::new()).await;
         }
     }
 
@@ -1056,7 +1109,12 @@ impl GossipNode {
     /// is always served the highest accepted checkpoint (round ≥ `round -
     /// RETENTION_ROUNDS`), so anything below the floor can never be served
     /// again and keeping it would only grow memory.
-    async fn accept_checkpoint(&self, accepted: SignedCheckpoint, snapshot: Vec<u8>) {
+    async fn accept_checkpoint(
+        &self,
+        accepted: SignedCheckpoint,
+        snapshot: Vec<u8>,
+        diffs: Vec<stream::pb::StateDiff>,
+    ) {
         let round = accepted.payload.round;
         // Defensive: refuse to persist a snapshot that does not rebuild to the
         // committed root. The accumulator carries the bytes captured in the same
@@ -1096,8 +1154,18 @@ impl GossipNode {
         // pruning only removes rounds already ordered, so the assembly
         // is race-free even when it runs concurrently.
         let record_sink = self.record_sink.lock().await.clone();
+        let proof_sink = self.record_proof_sink.lock().await.clone();
+        let proof_is_duplicate = match (&record_sink, &proof_sink) {
+            (Some(r), Some(p)) => Arc::ptr_eq(r, p),
+            _ => false,
+        };
         if let Some(record_sink) = record_sink {
-            stream::RecordSink::persist(&*record_sink, &accepted).await;
+            stream::RecordSink::persist(&*record_sink, &accepted, diffs.clone()).await;
+        }
+        if let Some(proof_sink) = proof_sink
+            && !proof_is_duplicate
+        {
+            stream::RecordSink::persist(&*proof_sink, &accepted, diffs).await;
         }
         {
             let mut signed = self.signed_checkpoints.lock().await;
@@ -1851,7 +1919,7 @@ mod pending_sig_tests {
             aggregate_sig: agg,
             signers: vec![NodeId::new(1)],
         };
-        node.accept_checkpoint(accepted, snapshot).await;
+        node.accept_checkpoint(accepted, snapshot, Vec::new()).await;
         assert!(
             node.state_snapshots.lock().await.contains_key(&5),
             "accepted round must be recorded for reconnect serving"

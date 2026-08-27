@@ -1,0 +1,277 @@
+{
+  "records_root_vectors": [
+    {
+      "name": "empty_0",
+      "items": [],
+      "expected_root_hex": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d"
+    },
+    {
+      "name": "single_1_ab_payload",
+      "items": [
+        {
+          "event_hash_hex": "abababababababababababababababababababababababababababababababab",
+          "tx_index": 7,
+          "tx_payload_hex": "7061796c6f6164"
+        }
+      ],
+      "expected_root_hex": "7ec5ae5220842edfe9bbe902a72359eeecc67d49964054bc6aa315c880b27762"
+    },
+    {
+      "name": "two_items",
+      "items": [
+        {
+          "event_hash_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+          "tx_index": 0,
+          "tx_payload_hex": "61"
+        },
+        {
+          "event_hash_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+          "tx_index": 1,
+          "tx_payload_hex": "62"
+        }
+      ],
+      "expected_root_hex": "f3760fad0cf3349f6f6832f371e8bfc939404ad6c409b5c5cd4bf995e8436acc"
+    },
+    {
+      "name": "three_items_padded",
+      "items": [
+        {
+          "event_hash_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+          "tx_index": 0,
+          "tx_payload_hex": "61"
+        },
+        {
+          "event_hash_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+          "tx_index": 0,
+          "tx_payload_hex": "62"
+        },
+        {
+          "event_hash_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+          "tx_index": 0,
+          "tx_payload_hex": "63"
+        }
+      ],
+      "expected_root_hex": "0ec1b2fbd69c71ada7c15c505eab63ef17840835b697221820db21e7940e0528"
+    },
+    {
+      "name": "four_items_with_empty_payload",
+      "items": [
+        {
+          "event_hash_hex": "101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f",
+          "tx_index": 0,
+          "tx_payload_hex": "616c706861"
+        },
+        {
+          "event_hash_hex": "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+          "tx_index": 1,
+          "tx_payload_hex": "62657461"
+        },
+        {
+          "event_hash_hex": "303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f",
+          "tx_index": 2,
+          "tx_payload_hex": ""
+        },
+        {
+          "event_hash_hex": "404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f",
+          "tx_index": 3,
+          "tx_payload_hex": "ff00ab"
+        }
+      ],
+      "expected_root_hex": "1144dfd82d9106207de984b1e872e6176d63a5544cd4843cc5b74543fe9b1ddf"
+    },
+    {
+      "name": "five_items_padded_to_8",
+      "items": [
+        {
+          "event_hash_hex": "1112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f30",
+          "tx_index": 0,
+          "tx_payload_hex": "6f6e65"
+        },
+        {
+          "event_hash_hex": "22232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f4041",
+          "tx_index": 1,
+          "tx_payload_hex": "74776f"
+        },
+        {
+          "event_hash_hex": "333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152",
+          "tx_index": 2,
+          "tx_payload_hex": "7468726565"
+        },
+        {
+          "event_hash_hex": "4445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f60616263",
+          "tx_index": 3,
+          "tx_payload_hex": "666f7572"
+        },
+        {
+          "event_hash_hex": "55565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f7071727374",
+          "tx_index": 4,
+          "tx_payload_hex": "66697665"
+        }
+      ],
+      "expected_root_hex": "28be85b6a0c049eefb5c83b24136cfa1614ef8f846035975a6919abc1a56f563"
+    },
+    {
+      "name": "two_empty_payloads",
+      "items": [
+        {
+          "event_hash_hex": "aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9",
+          "tx_index": 0,
+          "tx_payload_hex": ""
+        },
+        {
+          "event_hash_hex": "bbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9da",
+          "tx_index": 99,
+          "tx_payload_hex": ""
+        }
+      ],
+      "expected_root_hex": "f5fc285471e999ef0d05ce669d02a91b7798ca3bd85b9855b8126d009933e69d"
+    }
+  ],
+  "signing_bytes_vectors": [
+    {
+      "name": "genesis_zeros",
+      "round": 0,
+      "records_root_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+      "state_hash_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+      "roster_hash_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+      "prev_checkpoint_hash_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+      "expected_signing_bytes_hex": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "name": "round1_distinct",
+      "round": 1,
+      "records_root_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+      "state_hash_hex": "2222222222222222222222222222222222222222222222222222222222222222",
+      "roster_hash_hex": "3333333333333333333333333333333333333333333333333333333333333333",
+      "prev_checkpoint_hash_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+      "expected_signing_bytes_hex": "00000000000000011111111111111111111111111111111111111111111111111111111111111111222222222222222222222222222222222222222222222222222222222222222233333333333333333333333333333333333333333333333333333333333333330000000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "name": "round42_chained",
+      "round": 42,
+      "records_root_hex": "aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9",
+      "state_hash_hex": "bbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9da",
+      "roster_hash_hex": "cccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaeb",
+      "prev_checkpoint_hash_hex": "dddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfc",
+      "expected_signing_bytes_hex": "000000000000002aaaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9bbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dacccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfc"
+    },
+    {
+      "name": "round7_prev_nonzero",
+      "round": 7,
+      "records_root_hex": "4444444444444444444444444444444444444444444444444444444444444444",
+      "state_hash_hex": "5555555555555555555555555555555555555555555555555555555555555555",
+      "roster_hash_hex": "6666666666666666666666666666666666666666666666666666666666666666",
+      "prev_checkpoint_hash_hex": "9999999999999999999999999999999999999999999999999999999999999999",
+      "expected_signing_bytes_hex": "00000000000000074444444444444444444444444444444444444444444444444444444444444444555555555555555555555555555555555555555555555555555555555555555566666666666666666666666666666666666666666666666666666666666666669999999999999999999999999999999999999999999999999999999999999999"
+    },
+    {
+      "name": "round_max_with_hashes",
+      "round": 999,
+      "records_root_hex": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "state_hash_hex": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "roster_hash_hex": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "prev_checkpoint_hash_hex": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "expected_signing_bytes_hex": "00000000000003e7ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    },
+    {
+      "name": "round3_records_root_from_items",
+      "round": 3,
+      "records_root_hex": "0ec1b2fbd69c71ada7c15c505eab63ef17840835b697221820db21e7940e0528",
+      "state_hash_hex": "abababababababababababababababababababababababababababababababab",
+      "roster_hash_hex": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+      "prev_checkpoint_hash_hex": "0e837efd5bb43906fcc87a71781e62220225b8bb9bb4a07b8e12dd7d72d3640d",
+      "expected_signing_bytes_hex": "00000000000000030ec1b2fbd69c71ada7c15c505eab63ef17840835b697221820db21e7940e0528ababababababababababababababababababababababababababababababababcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd0e837efd5bb43906fcc87a71781e62220225b8bb9bb4a07b8e12dd7d72d3640d"
+    }
+  ],
+  "diff_encoding_vectors": [
+    {
+      "name": "empty",
+      "diffs": []
+    },
+    {
+      "name": "single_put",
+      "diffs": [
+        {
+          "key_hex": "6161",
+          "value_hex": "7631",
+          "proto_hex": "0a02616112027631"
+        }
+      ]
+    },
+    {
+      "name": "two_sorted_puts",
+      "diffs": [
+        {
+          "key_hex": "6170706c65",
+          "value_hex": "6672756974",
+          "proto_hex": "0a056170706c6512056672756974"
+        },
+        {
+          "key_hex": "62616e616e61",
+          "value_hex": "79656c6c6f77",
+          "proto_hex": "0a0662616e616e61120679656c6c6f77"
+        }
+      ]
+    },
+    {
+      "name": "with_tombstone",
+      "diffs": [
+        {
+          "key_hex": "6b657931",
+          "value_hex": "76616c31",
+          "proto_hex": "0a046b657931120476616c31"
+        },
+        {
+          "key_hex": "6b657932",
+          "value_hex": null,
+          "proto_hex": "0a046b657932"
+        },
+        {
+          "key_hex": "6b657933",
+          "value_hex": "76616c33",
+          "proto_hex": "0a046b657933120476616c33"
+        }
+      ]
+    },
+    {
+      "name": "binary_keys_with_tombstone",
+      "diffs": [
+        {
+          "key_hex": "00ff",
+          "value_hex": "0001",
+          "proto_hex": "0a0200ff12020001"
+        },
+        {
+          "key_hex": "61",
+          "value_hex": "31",
+          "proto_hex": "0a0161120131"
+        },
+        {
+          "key_hex": "6161",
+          "value_hex": "32",
+          "proto_hex": "0a026161120132"
+        },
+        {
+          "key_hex": "6162",
+          "value_hex": null,
+          "proto_hex": "0a026162"
+        }
+      ]
+    },
+    {
+      "name": "two_keys_sorted",
+      "diffs": [
+        {
+          "key_hex": "6d616e676f",
+          "value_hex": "6f72616e6765",
+          "proto_hex": "0a056d616e676f12066f72616e6765"
+        },
+        {
+          "key_hex": "7a65627261",
+          "value_hex": "737472697065",
+          "proto_hex": "0a057a656272611206737472697065"
+        }
+      ]
+    }
+  ]
+}

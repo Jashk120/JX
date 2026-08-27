@@ -54,7 +54,7 @@ async fn record_streams_are_byte_identical_across_writers() {
 
     let files_a = read_all_files(dir_a.path());
     let files_b = read_all_files(dir_b.path());
-    assert_eq!(files_a.len(), 3, "one `.rsf` per round");
+    assert_eq!(files_a.len(), 6, "one `.rsf` + one `.rsf_proofs` per round");
     // no `.rsf_sig` files should exist
     let rsf_sig_count = std::fs::read_dir(dir_a.path())
         .expect("read dir")
@@ -62,6 +62,12 @@ async fn record_streams_are_byte_identical_across_writers() {
         .filter(|e| e.file_name().to_string_lossy().ends_with(".rsf_sig"))
         .count();
     assert_eq!(rsf_sig_count, 0, ".rsf_sig files must not be produced");
+    let proof_count = std::fs::read_dir(dir_a.path())
+        .expect("read dir")
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".rsf_proofs"))
+        .count();
+    assert_eq!(proof_count, 3, "one `.rsf_proofs` per round");
     assert_eq!(files_a, files_b, "two independent record writers must be byte-identical");
 }
 

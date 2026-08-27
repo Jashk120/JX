@@ -52,7 +52,7 @@ func buildBLSPayload(t *testing.T, round uint64, items []*pb.RecordItem, members
 	rosterHash := sha256.Sum256(buf)
 	recordsRoot := stream.ComputeRecordsRoot(items)
 	stateHash := sha256.Sum256([]byte("state-for-bls-tests"))
-	var signingBytes [104]byte
+	var signingBytes [136]byte
 	binary.BigEndian.PutUint64(signingBytes[0:8], round)
 	copy(signingBytes[8:40], recordsRoot[:])
 	copy(signingBytes[40:72], stateHash[:])
@@ -66,6 +66,7 @@ func buildBLSPayload(t *testing.T, round uint64, items []*pb.RecordItem, members
 	agg.Aggregate(sigs, false)
 	ckpt := &pb.SignedCheckpoint{
 		Round: round, StateHash: stateHash[:], RosterHash: rosterHash[:], RecordsRoot: recordsRoot[:],
+		PrevCheckpointHash: make([]byte, 32),
 		RosterSnapshot: members, AggregateSig: agg.ToAffine().Compress(),
 		Signers: []uint64{0, 1, 2},
 	}
@@ -93,7 +94,7 @@ func TestBLSRecordsRootTamperedItemFails(t *testing.T) {
 	// But checkpoint's records_root is for original items, so verification should fail via records_root mismatch
 	// Use non-tampered ckpt but tampered items in file
 	rsf := &pb.RecordStreamFile{
-		Version: 2, Round: 5,
+		Version: stream.Version, Round: 5,
 		StartRunningHash: hashObj(stream.ChainSeed),
 		EndRunningHash:   hashObj(end),
 		Items:            tamperedItems, Checkpoint: ckpt,
@@ -121,7 +122,7 @@ func TestBLSWrongAggregateFails(t *testing.T) {
 	}
 	end := stream.RunningHash(stream.ChainSeed, ser)
 	rsf := &pb.RecordStreamFile{
-		Version: 2, Round: 7,
+		Version: stream.Version, Round: 7,
 		StartRunningHash: hashObj(stream.ChainSeed),
 		EndRunningHash:   hashObj(end),
 		Items:            items, Checkpoint: ckpt,
@@ -146,7 +147,7 @@ func TestBLSUnanchoredRosterRejectedWhenTrustedSet(t *testing.T) {
 	}
 	end := stream.RunningHash(stream.ChainSeed, ser)
 	rsf := &pb.RecordStreamFile{
-		Version: 2, Round: 9,
+		Version: stream.Version, Round: 9,
 		StartRunningHash: hashObj(stream.ChainSeed),
 		EndRunningHash:   hashObj(end),
 		Items:            items, Checkpoint: ckpt,
@@ -181,7 +182,7 @@ func TestBLSQuorumRequiresTwoThirds(t *testing.T) {
 	rosterHash2 := sha256.Sum256(buf)
 	recordsRoot := stream.ComputeRecordsRoot(items)
 	stateHash := sha256.Sum256([]byte("state-for-bls-tests"))
-	var signingBytes [104]byte
+	var signingBytes [136]byte
 	binary.BigEndian.PutUint64(signingBytes[0:8], 11)
 	copy(signingBytes[8:40], recordsRoot[:])
 	copy(signingBytes[40:72], stateHash[:])
@@ -190,6 +191,7 @@ func TestBLSQuorumRequiresTwoThirds(t *testing.T) {
 	ckpt.AggregateSig = sig.Compress()
 	ckpt.RecordsRoot = recordsRoot[:]
 	ckpt.RosterHash = rosterHash2[:]
+	ckpt.PrevCheckpointHash = make([]byte, 32)
 	var ser [][]byte
 	for _, it := range items {
 		b, _ := proto.MarshalOptions{Deterministic: true}.Marshal(it)
@@ -197,7 +199,7 @@ func TestBLSQuorumRequiresTwoThirds(t *testing.T) {
 	}
 	end := stream.RunningHash(stream.ChainSeed, ser)
 	rsf := &pb.RecordStreamFile{
-		Version: 2, Round: 11,
+		Version: stream.Version, Round: 11,
 		StartRunningHash: hashObj(stream.ChainSeed),
 		EndRunningHash:   hashObj(end),
 		Items:            items, Checkpoint: ckpt,
@@ -225,7 +227,7 @@ func TestRemoteBLSHappyPathAgainstHttptestServingFixtures(t *testing.T) {
 	}
 	end := stream.RunningHash(stream.ChainSeed, ser)
 	rsf := &pb.RecordStreamFile{
-		Version: 2, Round: 20,
+		Version: stream.Version, Round: 20,
 		StartRunningHash: hashObj(stream.ChainSeed),
 		EndRunningHash:   hashObj(end),
 		Items:            items, Checkpoint: ckpt,
@@ -238,7 +240,7 @@ func TestRemoteBLSHappyPathAgainstHttptestServingFixtures(t *testing.T) {
 	evb, _ := proto.MarshalOptions{Deterministic: true}.Marshal(event)
 	evEnd := stream.RunningHash(stream.ChainSeed, [][]byte{evb})
 	esf := &pb.EventStreamFile{
-		Version: 2, StartRunningHash: hashObj(stream.ChainSeed),
+		Version: stream.Version, StartRunningHash: hashObj(stream.ChainSeed),
 		Events: []*pb.Event{event}, EndRunningHash: hashObj(evEnd),
 	}
 	esfBytes, _ := proto.Marshal(esf)

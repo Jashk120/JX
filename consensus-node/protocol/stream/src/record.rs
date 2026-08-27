@@ -49,6 +49,7 @@ use crate::{
     RECORD_FILE_SUFFIX,
     STREAM_VERSION,
     pb,
+    proof,
     record_file_name,
     running_hash,
     signature,
@@ -58,10 +59,10 @@ use crate::{
 /// reaches the threshold-signed quorum. Implementations must not block on disk
 /// (the writer queues the file for its background task).
 pub trait RecordSink: Send + Sync {
-    /// Assembles the round's record items and queues the `.rsf` file.
     fn persist(
         &self,
         checkpoint: &SignedCheckpoint,
+        diffs: Vec<pb::StateDiff>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>>;
 }
 
@@ -71,6 +72,7 @@ enum RecordStreamMsg {
     Write {
         checkpoint: SignedCheckpoint,
         items: Vec<pb::RecordItem>,
+        diffs: Vec<pb::StateDiff>,
     },
     /// A test/daemon barrier: acknowledged once every earlier message has been
     /// written to disk.
@@ -111,20 +113,29 @@ impl RecordStreamWriter {
     /// assembled from the hashgraph's consensus order for that round — which is
     /// final and immutable by the time a checkpoint for it is accepted. A
     /// duplicate or older round is a no-op.
-    pub async fn submit(&self, checkpoint: &SignedCheckpoint) {
+    pub async fn submit(&self, checkpoint: &SignedCheckpoint, diffs: Vec<pb::StateDiff>) {
         let round = checkpoint.payload.round;
         let items = {
             let hashgraph = self.hashgraph.lock().await;
             record_items_for_round(&hashgraph, round)
         };
-        self.submit_items(checkpoint.clone(), items);
+        self.submit_items_with_diffs(checkpoint.clone(), items, diffs);
     }
 
     /// Queues a fully assembled record file (used directly by tests and by
     /// [`Self::submit`], which assembles the items from the hashgraph).
     pub fn submit_items(&self, checkpoint: SignedCheckpoint, items: Vec<pb::RecordItem>) {
+        self.submit_items_with_diffs(checkpoint, items, Vec::new());
+    }
+
+    pub fn submit_items_with_diffs(
+        &self,
+        checkpoint: SignedCheckpoint,
+        items: Vec<pb::RecordItem>,
+        diffs: Vec<pb::StateDiff>,
+    ) {
         let round = checkpoint.payload.round;
-        let msg = RecordStreamMsg::Write { checkpoint, items };
+        let msg = RecordStreamMsg::Write { checkpoint, items, diffs };
         if self.sender.try_send(msg).is_err() {
             eprintln!("[stream] record writer task is gone or full; dropping round {round}");
         }
@@ -144,9 +155,10 @@ impl RecordSink for RecordStreamWriter {
     fn persist(
         &self,
         checkpoint: &SignedCheckpoint,
+        diffs: Vec<pb::StateDiff>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
         let checkpoint = checkpoint.clone();
-        Box::pin(async move { self.submit(&checkpoint).await })
+        Box::pin(async move { self.submit(&checkpoint, diffs).await })
     }
 }
 
@@ -159,14 +171,19 @@ async fn run_writer(
 ) {
     while let Some(message) = receiver.recv().await {
         match message {
-            RecordStreamMsg::Write { checkpoint, items } => {
+            RecordStreamMsg::Write { checkpoint, items, diffs } => {
                 let round = checkpoint.payload.round;
                 if round < state.0 {
-                    // Already written (e.g. a duplicate notification).
                     continue;
                 }
-                let write =
-                    write_record_file(&dir, &signing_key, &checkpoint, &items, &mut state.1);
+                let write = write_record_file(
+                    &dir,
+                    &signing_key,
+                    &checkpoint,
+                    &items,
+                    &diffs,
+                    &mut state.1,
+                );
                 if let Err(e) = write {
                     eprintln!("[stream] failed to write record stream file for round {round}: {e}");
                     continue;
@@ -181,12 +198,13 @@ async fn run_writer(
 }
 
 /// Builds and atomically writes one record file, advancing `running_hash` past
-/// the round.
+/// the round, then writes the `.rsf_proofs` sidecar for the same round.
 fn write_record_file(
     dir: &Path,
     _signing_key: &SigningKey,
     checkpoint: &SignedCheckpoint,
     items: &[pb::RecordItem],
+    diffs: &[pb::StateDiff],
     running_hash: &mut [u8; 32],
 ) -> Result<()> {
     let round = checkpoint.payload.round;
@@ -199,13 +217,29 @@ fn write_record_file(
         items: items.to_vec(),
         end_running_hash: Some(digest_hash_object(end_hash)),
         checkpoint: Some(signed_checkpoint_to_proto(checkpoint)),
-        state_diffs: Vec::new(),
+        state_diffs: diffs.to_vec(),
     };
     let file_bytes = file.encode_to_vec();
     let file_name = record_file_name(round);
     signature::write_atomic(&dir.join(file_name), &file_bytes)?;
+    if let Err(e) = write_proof_sidecar(dir, round, items) {
+        eprintln!("[stream] failed to write proof sidecar for round {round}: {e}");
+    }
     *running_hash = end_hash;
     Ok(())
+}
+
+fn write_proof_sidecar(dir: &Path, round: u64, items: &[pb::RecordItem]) -> Result<()> {
+    let proofs = proof::build_records_proofs_from_items(items);
+    proof::write_records_proof_file(dir, round, &proofs)
+}
+
+pub fn record_proof_files_in(dir: &Path) -> Result<Vec<(u64, PathBuf)>> {
+    proof::proof_files_in(dir)
+}
+
+pub fn read_records_proof_file(bytes: &[u8]) -> Result<pb::RecordsProofFile> {
+    proof::read_records_proof_file(bytes)
 }
 
 /// Folds every item's serialized form into the chain, returning the running
@@ -464,5 +498,106 @@ mod tests {
         let (next_round, hash) = resume_state(dir.path()).expect("resume");
         assert_eq!(next_round, 1);
         assert_eq!(hash, running_hash::CHAIN_SEED);
+    }
+
+    #[tokio::test]
+    async fn writer_produces_proof_sidecar_that_verifies() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let writer = RecordStreamWriter::open(
+            dir.path(),
+            SigningKey::from_bytes(&[1; 32]),
+            empty_hashgraph(),
+        )
+        .expect("opens");
+        let items = vec![
+            pb::RecordItem { event_hash: vec![1u8; 32], tx_index: 0, tx_payload: b"a".to_vec() },
+            pb::RecordItem { event_hash: vec![2u8; 32], tx_index: 1, tx_payload: b"b".to_vec() },
+            pb::RecordItem { event_hash: vec![3u8; 32], tx_index: 0, tx_payload: b"c".to_vec() },
+        ];
+        let rr_items: Vec<consensus::RecordsRootItem> = items
+            .iter()
+            .map(|it| consensus::RecordsRootItem {
+                event_hash: it.event_hash.clone().try_into().expect("32"),
+                tx_index: it.tx_index,
+                tx_payload: it.tx_payload.clone(),
+            })
+            .collect();
+        let root = consensus::compute_records_root(&rr_items);
+        let cp = {
+            let roster = registry_of(&[1, 2, 3]);
+            let payload = consensus::CheckpointPayload::new(5, root, [5u8; 32], roster);
+            let agg = crypto::BlsIdentity::from_ikm(&[0u8; 32])
+                .expect("bls")
+                .sign(&payload.signing_bytes());
+            SignedCheckpoint { payload, aggregate_sig: agg, signers: Vec::new() }
+        };
+        writer.submit_items(cp, items.clone());
+        writer.barrier().await;
+        let proof_path = dir.path().join(crate::record_proof_file_name(5));
+        assert!(proof_path.exists(), "sidecar must exist alongside .rsf");
+        let proof_bytes = fs::read(&proof_path).expect("read proof");
+        let proof_file = crate::proof::read_records_proof_file(&proof_bytes).expect("decode proof");
+        assert_eq!(proof_file.version, crate::STREAM_VERSION);
+        assert_eq!(proof_file.round, 5);
+        assert_eq!(proof_file.proofs.len(), items.len());
+        for (idx, entry) in proof_file.proofs.iter().enumerate() {
+            assert_eq!(entry.item_index as usize, idx);
+            let rr = &rr_items[idx];
+            assert!(crate::proof::verify_proof(&root, rr, entry));
+            assert_eq!(entry.proof_steps.len(), 2, "3 items => 2 steps each");
+        }
+        // Tampered sibling must fail
+        let mut tampered = proof_file.proofs[0].clone();
+        if !tampered.proof_steps.is_empty() {
+            tampered.proof_steps[0].sibling_hash[0] ^= 0xff;
+            assert!(!crate::proof::verify_proof(&root, &rr_items[0], &tampered));
+        }
+        // Existing .rsf still readable
+        let rsf_bytes = fs::read(dir.path().join(record_file_name(5))).expect("rsf");
+        let rsf = read_record_stream_file(&rsf_bytes).expect("rsf decodes");
+        assert_eq!(rsf.round, 5);
+    }
+
+    #[tokio::test]
+    async fn empty_round_produces_empty_proof_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let writer = RecordStreamWriter::open(
+            dir.path(),
+            SigningKey::from_bytes(&[1; 32]),
+            empty_hashgraph(),
+        )
+        .expect("opens");
+        writer.submit_items(checkpoint_for(1, &[1, 2, 3]), Vec::new());
+        writer.barrier().await;
+        let proof_path = dir.path().join(crate::record_proof_file_name(1));
+        let bytes = fs::read(&proof_path).expect("proof file for empty round");
+        let file = crate::proof::read_records_proof_file(&bytes).expect("decode empty proof");
+        assert_eq!(file.round, 1);
+        assert!(file.proofs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn proof_sidecar_ignores_malformed_without_blocking() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let writer = RecordStreamWriter::open(
+            dir.path(),
+            SigningKey::from_bytes(&[1; 32]),
+            empty_hashgraph(),
+        )
+        .expect("opens");
+        // Write a valid empty round
+        writer.submit_items(checkpoint_for(1, &[1, 2, 3]), Vec::new());
+        writer.barrier().await;
+        let proof_path = dir.path().join(crate::record_proof_file_name(1));
+        fs::write(&proof_path, b"truncated garbage").expect("corrupt proof");
+        // Writer should still proceed for next round
+        writer.submit_items(checkpoint_for(2, &[1, 2, 3]), Vec::new());
+        writer.barrier().await;
+        let proof2 = fs::read(dir.path().join(crate::record_proof_file_name(2))).expect("proof2");
+        let file2 = crate::proof::read_records_proof_file(&proof2).expect("decode2");
+        assert_eq!(file2.round, 2);
+        // Reading the corrupted file fails
+        let bad = fs::read(&proof_path).expect("read corrupt");
+        assert!(crate::proof::read_records_proof_file(&bad).is_err());
     }
 }
