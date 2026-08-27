@@ -3,7 +3,7 @@ package stream
 import "fmt"
 
 const (
-	Version              = 2
+	Version              = 3
 	StreamsSubdir        = "streams"
 	DefaultEventsPerFile = 10000
 
@@ -14,6 +14,8 @@ const (
 	RecordFilePrefix = "round-"
 	RecordFileSuffix = ".rsf"
 	RecordSigSuffix  = ".rsf_sig"
+
+	RecordProofSuffix = ".rsf_proofs"
 
 	CkptFilePrefix = "checkpoint-"
 	CkptFileSuffix = ".ckpt"
@@ -63,4 +65,14 @@ func SignatureFileName(streamFileName string) string {
 	default:
 		return streamFileName + RecordSigSuffix
 	}
+}
+
+// RecordProofFileName returns the sidecar name for a record round's proofs.
+func RecordProofFileName(round uint64) string {
+	return fmt.Sprintf("%s%d%s", RecordFilePrefix, round, RecordProofSuffix)
+}
+
+// RecordProofFileRound extracts the round from a proof sidecar name.
+func RecordProofFileRound(name string) (uint64, bool) {
+	return streamIndex(name, RecordFilePrefix, RecordProofSuffix)
 }

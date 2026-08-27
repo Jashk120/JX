@@ -40,6 +40,7 @@ pub use error::{
 pub use executor::{
     ExecuteResult,
     Executor,
+    StateDiff,
     finalized_events,
 };
 pub use merkle::{

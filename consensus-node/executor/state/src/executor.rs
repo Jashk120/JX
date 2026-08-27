@@ -56,6 +56,16 @@ pub struct Executor {
     executed: HashSet<EventHash>,
 }
 
+/// After-image KV diff for a single key within a round.
+///
+/// `value` is `Some` for a `Put` (including DID `Put` path) and `None` for a
+/// `Delete` tombstone. MembershipOps never produce a diff.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StateDiff {
+    pub key: Vec<u8>,
+    pub value: Option<Vec<u8>>,
+}
+
 /// The result of executing a single event's transactions.
 pub struct ExecuteResult {
     /// Deterministic decode errors for individual payloads.
@@ -160,6 +170,80 @@ impl Executor {
             *processed_through_round = new_max;
         }
         Ok(())
+    }
+
+    pub fn bucket_finalized_with_diffs(
+        &mut self,
+        pending: &mut BTreeMap<u64, Vec<MembershipOp>>,
+        processed_through_round: &mut u64,
+        finalized: &[(Event, u64)],
+    ) -> StateDbResult<BTreeMap<u64, Vec<StateDiff>>> {
+        if finalized.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let mut diffs_by_round: BTreeMap<u64, BTreeMap<Vec<u8>, Option<Vec<u8>>>> = BTreeMap::new();
+        let new_max = finalized.iter().map(|(_, round)| *round).max().unwrap_or(0);
+        let mut any_new = false;
+        for (event, round_received) in finalized {
+            let hash = event.hash();
+            if self.executed.contains(&hash) {
+                continue;
+            }
+            let round_diffs = diffs_by_round.entry(*round_received).or_default();
+            let result = self.execute_event_with_diffs(event, round_diffs)?;
+            if !result.membership_ops.is_empty() {
+                pending.entry(*round_received).or_default().extend(result.membership_ops);
+            }
+            self.executed.insert(hash);
+            any_new = true;
+        }
+        if any_new && new_max > *processed_through_round {
+            *processed_through_round = new_max;
+        }
+        let mut out: BTreeMap<u64, Vec<StateDiff>> = BTreeMap::new();
+        for (round, map) in diffs_by_round {
+            if map.is_empty() {
+                continue;
+            }
+            let vec = map.into_iter().map(|(key, value)| StateDiff { key, value }).collect();
+            out.insert(round, vec);
+        }
+        Ok(out)
+    }
+
+    fn execute_event_with_diffs(
+        &mut self,
+        event: &Event,
+        diffs: &mut BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    ) -> StateDbResult<ExecuteResult> {
+        let mut errors = Vec::new();
+        let mut membership_ops = Vec::new();
+        let mut did_errors = Vec::new();
+        for tx in event.payload() {
+            match DecodedOp::decode(tx.payload()) {
+                Ok(DecodedOp::Kv(op)) => {
+                    let entry = match &op {
+                        Op::Put { key, value } => (key.clone(), Some(value.clone())),
+                        Op::Delete { key } => (key.clone(), None),
+                    };
+                    self.state.apply(&op)?;
+                    diffs.insert(entry.0, entry.1);
+                }
+                Ok(DecodedOp::Membership(mem_op)) => membership_ops.push(mem_op),
+                Ok(DecodedOp::Did(did_op)) => {
+                    let did_key = did_op.id().encode();
+                    let did_value = did_op.document().encode();
+                    match self.apply_did_op(did_op)? {
+                        Ok(()) => {
+                            diffs.insert(did_key, Some(did_value));
+                        }
+                        Err(e) => did_errors.push(e),
+                    }
+                }
+                Err(e) => errors.push(e),
+            }
+        }
+        Ok(ExecuteResult { errors, membership_ops, did_errors })
     }
 
     /// Applies a DID operation to the state after verifying the signature.
@@ -797,5 +881,61 @@ mod tests {
         assert!(exec.bucket_finalized(&mut pending, &mut wm, &late).is_ok());
         assert_eq!(pending.get(&3).map(Vec::len), Some(1));
         assert_eq!(wm, 5);
+    }
+
+    #[test]
+    fn bucket_finalized_with_diffs_sorted_lww_tombstone_and_membership_excluded() {
+        let mut exec = new_executor();
+        let mut pending: BTreeMap<u64, Vec<MembershipOp>> = BTreeMap::new();
+        let mut wm = 0u64;
+        let put = |k: &[u8], v: &[u8]| Op::Put { key: k.to_vec(), value: v.to_vec() }.encode();
+        let del = |k: &[u8]| Op::Delete { key: k.to_vec() }.encode();
+        let did = did_tx("alice", 1, &[1], false, true);
+        let did_key = did_id("alice").encode();
+        let event1 = event_with(vec![
+            Transaction::from_bytes(put(b"z", b"1")),
+            Transaction::from_bytes(put(b"a", b"2")),
+            Transaction::from_bytes(del(b"a")),
+            membership_tx(),
+            did,
+        ]);
+        let event2 = event_with(vec![
+            Transaction::from_bytes(put(b"a", b"final")),
+            Transaction::from_bytes(del(b"z")),
+            Transaction::from_bytes(put(b"m", b"mid")),
+        ]);
+        let finalized = vec![(event1, 7), (event2, 7)];
+        let diffs =
+            exec.bucket_finalized_with_diffs(&mut pending, &mut wm, &finalized).expect("diffs");
+        assert_eq!(wm, 7);
+        assert_eq!(pending.get(&7).map(Vec::len), Some(1));
+        let round_diffs = diffs.get(&7).expect("has diffs");
+        let keys: Vec<Vec<u8>> = round_diffs.iter().map(|d| d.key.clone()).collect();
+        let mut sorted_keys = keys.clone();
+        sorted_keys.sort();
+        assert_eq!(keys, sorted_keys, "diffs must be sorted ascending");
+        let find = |k: &[u8]| round_diffs.iter().find(|d| d.key == k).expect("key present");
+        assert_eq!(find(b"a").value, Some(b"final".to_vec()));
+        assert_eq!(find(b"z").value, None);
+        assert_eq!(find(b"m").value, Some(b"mid".to_vec()));
+        assert!(find(&did_key).value.is_some());
+        assert!(round_diffs.iter().all(|d| d.key != b"membership"), "membership excluded");
+        assert!(!keys.iter().any(|k| k.is_empty()), "keys non-empty");
+        let lww_check = {
+            let mut map: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
+            for d in round_diffs {
+                map.insert(d.key.clone(), d.value.clone());
+            }
+            map.len() == round_diffs.len()
+        };
+        assert!(lww_check, "per distinct key LWW");
+        let diffs2 = exec
+            .bucket_finalized_with_diffs(&mut pending, &mut wm, &finalized)
+            .expect("idempotent");
+        assert!(diffs2.is_empty(), "second call idempotent via executed set");
+        assert_eq!(exec.state().get(b"a"), Some(b"final".to_vec()));
+        assert_eq!(exec.state().get(b"z"), None);
+        assert_eq!(exec.state().get(b"m"), Some(b"mid".to_vec()));
+        assert!(exec.state().contains(&did_key));
     }
 }

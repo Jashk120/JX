@@ -208,7 +208,7 @@ func writeRecordFileWithSig(t *testing.T, dir string, round uint64, priv ed25519
 	}()
 	recordsRoot := stream.ComputeRecordsRoot(items)
 	stateHash := sha256.Sum256([]byte("state"))
-	var signingBytes [104]byte
+	var signingBytes [136]byte
 	binary.BigEndian.PutUint64(signingBytes[0:8], round)
 	copy(signingBytes[8:40], recordsRoot[:])
 	copy(signingBytes[40:72], stateHash[:])
@@ -416,7 +416,7 @@ func TestMissingSigRecordDeferred(t *testing.T) {
 	items := []*pb.RecordItem{item}
 	recordsRoot := stream.ComputeRecordsRoot(items)
 	stateHash := sha256.Sum256([]byte("state"))
-	var signingBytes [104]byte
+	var signingBytes [136]byte
 	binary.BigEndian.PutUint64(signingBytes[0:8], 0)
 	copy(signingBytes[8:40], recordsRoot[:])
 	copy(signingBytes[40:72], stateHash[:])
@@ -561,7 +561,7 @@ func TestUntrustedRosterFails(t *testing.T) {
 	items := []*pb.RecordItem{item}
 	recordsRoot := stream.ComputeRecordsRoot(items)
 	stateHash := sha256.Sum256([]byte("state"))
-	var signingBytes [104]byte
+	var signingBytes [136]byte
 	binary.BigEndian.PutUint64(signingBytes[0:8], 0)
 	copy(signingBytes[8:40], recordsRoot[:])
 	copy(signingBytes[40:72], stateHash[:])

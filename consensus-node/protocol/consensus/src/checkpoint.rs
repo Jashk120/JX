@@ -94,6 +94,99 @@ pub fn compute_records_root(items: &[RecordsRootItem]) -> [u8; 32] {
     level[0]
 }
 
+/// One step in a Merkle inclusion proof for a [`RecordsRootItem`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecordsProofStep {
+    /// The sibling hash at this level (32 bytes).
+    pub sibling_hash: [u8; 32],
+    /// True if the sibling is to the right of the current node, false if to
+    /// the left. Determines the combine order: `(cur, sib)` when right, else
+    /// `(sib, cur)`.
+    pub sibling_is_right: bool,
+}
+
+/// A Merkle inclusion proof for a single [`RecordsRootItem`] in the padded
+/// binary tree defined by [`compute_records_root`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecordsProof {
+    /// The item index (consensus order) this proof corresponds to.
+    pub item_index: u32,
+    /// Sibling steps from leaf up to but not including the root.
+    pub steps: Vec<RecordsProofStep>,
+}
+
+/// Builds Merkle inclusion proofs for every item in `items` (consensus order).
+///
+/// Uses the identical padding and combine logic as [`compute_records_root`]:
+/// padded to the next power of two with `empty_hash()`, bottom-up `combine`.
+/// Empty rounds produce an empty vector (no proofs). A singleton round yields
+/// one entry with zero steps.
+pub fn build_records_proofs(items: &[RecordsRootItem]) -> Vec<RecordsProof> {
+    if items.is_empty() {
+        return Vec::new();
+    }
+    let leaves: Vec<[u8; 32]> = items.iter().map(leaf_hash).collect();
+    let padded_len = leaves.len().next_power_of_two();
+    let mut padded = leaves;
+    padded.resize(padded_len, empty_hash());
+    // Build all levels bottom-up, storing each level's node hashes.
+    let mut levels: Vec<Vec<[u8; 32]>> = Vec::new();
+    levels.push(padded);
+    while levels.last().is_some_and(|l| l.len() > 1) {
+        let Some(prev) = levels.last() else {
+            break;
+        };
+        let mut next = Vec::with_capacity(prev.len() / 2);
+        for chunk in prev.chunks(2) {
+            next.push(combine_hash(chunk[0], chunk[1]));
+        }
+        levels.push(next);
+    }
+    let mut proofs = Vec::with_capacity(items.len());
+    for (idx, _) in items.iter().enumerate() {
+        let mut steps = Vec::with_capacity(levels.len().saturating_sub(1));
+        let mut cur_idx = idx;
+        for level in &levels[..levels.len().saturating_sub(1)] {
+            let sibling_idx = cur_idx ^ 1;
+            if sibling_idx < level.len() {
+                let sibling_hash = level[sibling_idx];
+                let sibling_is_right = cur_idx % 2 == 0;
+                steps.push(RecordsProofStep { sibling_hash, sibling_is_right });
+            }
+            cur_idx /= 2;
+        }
+        proofs.push(RecordsProof { item_index: idx as u32, steps });
+    }
+    proofs
+}
+
+/// Computes the records root and the inclusion proofs in one pass.
+///
+/// Returns `(root, proofs)` where `proofs` is `build_records_proofs(items)`.
+pub fn compute_records_root_with_proofs(
+    items: &[RecordsRootItem],
+) -> ([u8; 32], Vec<RecordsProof>) {
+    let root = compute_records_root(items);
+    let proofs = build_records_proofs(items);
+    (root, proofs)
+}
+
+/// Verifies a single [`RecordsProof`] against `root` for `item`.
+///
+/// Recomputes the leaf hash and walks the proof steps using the same
+/// `combine_hash` as [`compute_records_root`].
+pub fn verify_records_proof(root: &[u8; 32], item: &RecordsRootItem, proof: &RecordsProof) -> bool {
+    let mut cur = leaf_hash(item);
+    for step in &proof.steps {
+        cur = if step.sibling_is_right {
+            combine_hash(cur, step.sibling_hash)
+        } else {
+            combine_hash(step.sibling_hash, cur)
+        };
+    }
+    &cur == root
+}
+
 fn empty_hash() -> [u8; 32] {
     Sha256::digest([0x00u8]).into()
 }

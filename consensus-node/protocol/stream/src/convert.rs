@@ -241,6 +241,36 @@ pub fn digest_hash_object(digest: [u8; 32]) -> pb::HashObject {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StateDiff {
+    pub key: Vec<u8>,
+    pub value: Option<Vec<u8>>,
+}
+
+pub fn state_diff_to_proto(diff: &StateDiff) -> pb::StateDiff {
+    pb::StateDiff { key: diff.key.clone(), value: diff.value.clone() }
+}
+
+pub fn proto_to_state_diff(proto: &pb::StateDiff) -> Option<StateDiff> {
+    if proto.key.is_empty() {
+        return None;
+    }
+    Some(StateDiff { key: proto.key.clone(), value: proto.value.clone() })
+}
+
+pub fn state_diffs_to_proto(diffs: &[StateDiff]) -> Vec<pb::StateDiff> {
+    diffs.iter().map(state_diff_to_proto).collect()
+}
+
+pub fn proto_to_state_diffs(protos: &[pb::StateDiff]) -> Option<Vec<StateDiff>> {
+    let mut out = Vec::with_capacity(protos.len());
+    for proto in protos {
+        let diff = proto_to_state_diff(proto)?;
+        out.push(diff);
+    }
+    Some(out)
+}
+
 /// Validates the embedded `round` fields of a record stream file against its
 /// checkpoint anchor: both must agree.
 pub fn check_round_consistency(file: &pb::RecordStreamFile) -> Result<()> {

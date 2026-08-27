@@ -51,7 +51,7 @@ func main() {
 	}
 	recordsRoot := stream.ComputeRecordsRoot(items)
 	stateHash := sha256.Sum256([]byte("test-state-root"))
-	var signingBytes [104]byte
+	var signingBytes [136]byte
 	binary.BigEndian.PutUint64(signingBytes[0:8], 1)
 	copy(signingBytes[8:40], recordsRoot[:])
 	copy(signingBytes[40:72], stateHash[:])
@@ -66,6 +66,7 @@ func main() {
 	aggSig := agg.ToAffine().Compress()
 	ckpt := &pb.SignedCheckpoint{
 		Round: 1, StateHash: stateHash[:], RosterHash: rosterHash[:], RecordsRoot: recordsRoot[:],
+		PrevCheckpointHash: make([]byte, 32),
 		RosterSnapshot: members, AggregateSig: aggSig, Signers: []uint64{0, 1, 2},
 	}
 	ckptBytes, err := proto.Marshal(ckpt)
@@ -82,7 +83,7 @@ func main() {
 	}
 	end := stream.RunningHash(start, serialized)
 	rsf := &pb.RecordStreamFile{
-		Version: 2, Round: 1,
+		Version: stream.Version, Round: 1,
 		StartRunningHash: &pb.HashObject{Algorithm: 0, Length: 32, Hash: start[:]},
 		EndRunningHash:   &pb.HashObject{Algorithm: 0, Length: 32, Hash: end[:]},
 		Items:            items, Checkpoint: ckpt,

@@ -1398,6 +1398,8 @@ dependencies = [
  "prost",
  "prost-build",
  "rand",
+ "serde",
+ "serde_json",
  "sha2",
  "storage",
  "tempfile",
