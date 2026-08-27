@@ -20,7 +20,9 @@ use anyhow::{
 /// per-round `.snap` files being replaced by the Fjall state database).
 /// 4 = BLS aggregate checkpoints with `records_root` binding (hard genesis
 /// break; roster canonical bytes grew and the checkpoint codec changed).
-pub const CURRENT_FORMAT: u32 = 4;
+/// 5 = chained checkpoints via `prev_checkpoint_hash` (hard genesis break;
+/// signing_bytes carry the previous round's hash, binding history).
+pub const CURRENT_FORMAT: u32 = 5;
 
 /// The filename of the version stamp inside the data directory.
 const FORMAT_VERSION_FILE: &str = "FORMAT_VERSION";
@@ -42,7 +44,7 @@ pub fn check_or_init_data_dir(data_dir: &Path) -> Result<()> {
             bail!(
                 "data/ format version {version} is incompatible with this binary \
                  (expects {CURRENT_FORMAT}). This is a hard genesis break \
-                 (FORMAT_VERSION 3→4: BLS aggregate checkpoints); wipe data/ and \
+                 (FORMAT_VERSION 4→5: chained checkpoints via prev_checkpoint_hash); wipe data/ and \
                  re-run `jkaind init` for a fresh genesis to continue."
             );
         }
@@ -92,7 +94,22 @@ mod tests {
         let err = check_or_init_data_dir(dir.path()).expect_err("version 3 must be rejected");
         let msg = err.to_string();
         assert!(msg.contains("incompatible"), "must mention incompatible: {msg}");
-        assert!(msg.contains("3") || msg.contains("4"), "must mention version numbers: {msg}");
+        assert!(msg.contains("3") || msg.contains("5"), "must mention version numbers: {msg}");
+        assert!(
+            msg.contains("fresh genesis") || msg.contains("wipe data"),
+            "must point at fresh genesis: {msg}"
+        );
+    }
+
+    #[test]
+    fn old_version_4_is_rejected_with_fresh_genesis_hint() {
+        let dir = tempdir().expect("temp dir");
+        fs::create_dir_all(dir.path()).expect("create dir");
+        fs::write(dir.path().join(FORMAT_VERSION_FILE), "4").expect("write 4");
+        let err = check_or_init_data_dir(dir.path()).expect_err("version 4 must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("incompatible"), "must mention incompatible: {msg}");
+        assert!(msg.contains("4") || msg.contains("5"), "must mention version numbers: {msg}");
         assert!(
             msg.contains("fresh genesis") || msg.contains("wipe data"),
             "must point at fresh genesis: {msg}"

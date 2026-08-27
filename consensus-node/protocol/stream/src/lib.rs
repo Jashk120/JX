@@ -45,8 +45,9 @@ pub use record::{
 };
 
 /// The version stamped inside every `EventStreamFile` / `RecordStreamFile`
-/// message.
-pub const STREAM_VERSION: u32 = 2;
+/// message. 3 = chained checkpoints via `prev_checkpoint_hash` (signing_bytes
+/// grew to 136 B and now bind history; see `protocol/consensus/src/checkpoint.rs`).
+pub const STREAM_VERSION: u32 = 3;
 
 /// Subdirectory (under the data dir) holding the stream files.
 pub const STREAMS_SUBDIR: &str = "streams";
