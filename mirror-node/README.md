@@ -1,8 +1,9 @@
 # mirror-node
 
 Go mirror node for JKaIN. It tails the consensus node's **mirror stream files**
-(`.esf` / `.rsf` + `.sig`) emitted into `<data>/streams/` and exposes a
-read-only HTTP API over the verified history.
+emitted into `<data>/streams/` (`.esf` + `.esf_sig`, `.rsf` + `.rsf_proofs`,
+`.ckpt`) and exposes a read-only HTTP API over the verified history.
+`STREAM_VERSION` 3, `FORMAT_VERSION` 5 on the consensus side.
 
 Protobuf schema: [`../proto/jkain_stream.proto`](../proto/jkain_stream.proto)
 — the single shared schema, compiled directly from the repo root (no vendored
@@ -99,10 +100,18 @@ Each stream file is checked before ingestion:
 - **Running hash** (`SHA256(DOMAIN||"item"||item)` → `SHA256(DOMAIN||"chain"||prev||item)`,
   seed `[0;32]`) – continuity across items and `end == next.start`.
 - **Event signature file** (`.esf_sig`) – `file_signature` over `SHA256(file)`
-  and `metadata_signature` over header hash, both Ed25519.
-- **BLS checkpoint** (record files) – roster hash anchoring (optional `trusted_roster_hash` check), `records_root = compute_records_root(items)` binding (`h_0 = SHA256("JKAIN-RECORDS-ROOT-V1"||u32BE(count))`, `h_i chain`), and BLS12-381 aggregate signature verification over `round||records_root||state_hash||roster_hash` with DST `JKAIN-CHECKPOINT-BLS-V1` (48-byte G1 bls_keys, 96-byte G2 aggregate_sig, quorum `count*3>total*2`). No `.rsf_sig` file.
+  and `metadata_signature` over header hash, both Ed25519. No `.rsf_sig` file
+  exists — record authenticity is content-bound.
+- **BLS checkpoint** (record files) – roster hash anchoring (optional `trusted_roster_hash` check), **Merkle `records_root`** (padded power-of-two, Hiero domain-separated: `empty=SHA256(0x00)`, `leaf=SHA256(0x00||event_hash||tx_index||len||payload)`, `internal=SHA256(0x02||l||r)`, `singleton=SHA256(0x01||c)`) recomputed via `ComputeRecordsRoot` and checked against the checkpoint's `records_root`, and BLS12-381 aggregate signature verification over **136 B** `round||records_root||state_hash||roster_hash||prev_checkpoint_hash` with DST `JKAIN-CHECKPOINT-BLS-V1` (48-byte G1 bls_keys, 96-byte G2 aggregate_sig, quorum `count*3>total*2`). No `.rsf_sig` file.
+- **Chained history** – `prev_checkpoint_hash` continuity: each `.rsf`'s checkpoint must commit to `SHA256(prev_signing_bytes)` (genesis `[0;32]`), enforced across consecutive rounds.
+- **State diffs** – `ValidateStateDiffs`: sorted ascending by key, no duplicates, non-empty keys, LWW within the round; `value=None` is a tombstone.
+- **Proofs sidecar** (`.rsf_proofs` / `RecordsProofFile`) – per-item Merkle inclusion proofs (`item_index`, `ProofStep{sibling_hash[32], sibling_is_right}`), count == items, `VerifyRecordsProof` per item against the `records_root`. Missing sidecar file is tolerated as empty-verify; tampered proofs fail.
 
-Matches `consensus-node/protocol/stream/src/verify.rs` and `protocol/consensus/src/checkpoint.rs:compute_records_root`.
+Matches `consensus-node/protocol/stream/src/verify.rs`, `protocol/consensus/src/checkpoint.rs:compute_records_root` / `verify_records_proof`, `protocol/stream/src/proof.rs`, and `mirror-node/internal/stream/verify.go:ValidateStateDiffs` / `VerifyRecordsProof` / `VerifyPrevCheckpointHash`.
+
+Remote vs local inputs:
+- **Local mode** (`MIRROR_STREAMS_DIR`): scans `<streams_dir>` for `.esf`/`.rsf`/`.rsf_proofs`.
+- **Remote mode** (`MIRROR_BLOCK_NODE_URL` set, e.g. block-node): same verification from bytes fetched via `GET /v1/blocks`; see Remote block-node mode above. BLS + Merkle + prev + diffs + proofs verification is identical in both modes.
 
 ## PostgreSQL persistence
 

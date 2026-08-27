@@ -57,6 +57,14 @@ for the state's LSM backing.
   touch `State`. `bucket_finalized` feeds a finalized `(event,
   roundReceived)` batch through the executor once, bucketing membership ops
   by roundReceived behind a processed-round watermark (idempotent).
+  `bucket_finalized_with_diffs` is the PLAN-2 variant that also returns
+  per-round **after-image `StateDiff`s**: for each round a
+  `BTreeMap<key, Option<value>>` capturing the **final value per distinct
+  key** after the round's events (last-write-wins), `Some(value)` for `Put`
+  (including DID puts) and `None` for `Delete` tombstones, **canonically
+  sorted ascending by key, deduped, non-empty keys**, and excluding
+  `MembershipOp`. The caller persists them as `RecordStreamFile.state_diffs`
+  and they are validated mirror-side (`ValidateStateDiffs`) for sort/dedup.
 - `finalized_events` — bridges to the consensus layer: walks a `Hashgraph`'s
   rounds in increasing order and returns each round's events in the exact
   order `Hashgraph::consensus_order` produces, so the executor never invents
@@ -73,6 +81,10 @@ for the state's LSM backing.
   the next accepted checkpoint snapshot. The same finalized event order and
   the same starting state produce bit-identical resulting state on every
   node.
+- After-image diffs: the record stream ships the final state effect per round
+  rather than the execution trace. Within a round a key touched multiple times
+  collapses to its last value; across rounds the mirror replays diffs in
+  round order to reconstruct state without re-executing.
 - Membership changes ride the consensus ordering as `0x02` payloads. They are
   never applied to `State`: the gossip layer collects them from the side
   channel and drives activation through `RosterHistory` /
