@@ -31,9 +31,6 @@ use sha2::{
 /// `Hashgraph::prune_before_round`.
 pub const RETENTION_ROUNDS: u64 = 2;
 
-/// Domain separation prefix for records-root computation.
-const RECORDS_ROOT_DST: &[u8] = b"JKAIN-RECORDS-ROOT-V1";
-
 /// One record item's content for [`compute_records_root`].
 ///
 /// Corresponds field-for-field to `proto::RecordItem` defined in
@@ -55,38 +52,85 @@ pub struct RecordsRootItem {
 
 /// Computes the records root for a round's record items in **consensus order**
 /// (`Hashgraph::consensus_order(round)` derived, which is final and deterministic
-/// once the round is decided). The construction is normative and mirrored
-/// byte-for-byte in the Go stream/mirror crates:
+/// once the round is decided). Padded binary Merkle tree, Hiero-style
+/// domain separation (mirror of `executor/state/src/merkle.rs`):
 ///
 /// ```text
-/// h_0 = SHA256(b"JKAIN-RECORDS-ROOT-V1" || u32_BE(count))
-/// h_i = SHA256(h_{i-1} || SHA256(event_hash[32] || u32_BE(tx_index) || u32_BE(len(tx_payload)) || tx_payload))
+/// empty                = SHA256(0x00)
+/// leaf(item)           = SHA256(0x00 || event_hash[32] || u32_BE(tx_index) || u32_BE(len(tx_payload)) || tx_payload)
+/// internal(l, r)       = SHA256(0x02 || l || r)
+/// singleton(c)         = SHA256(0x01 || c)
+/// combine(l,r):
+///   (empty,empty) -> empty
+///   (empty,r)     -> singleton(r)
+///   (l,empty)     -> singleton(l)
+///   (l,r)         -> internal(l,r)
 /// ```
-/// Empty round ⇒ `h_0` alone. Each item's inner hash is over the exact triple
-/// that `RecordItem` carries; `event_hash` is the 32-byte event hash, `tx_index`
-/// is the index of the transaction in that event's payload, and `tx_payload` is
-/// the raw transaction bytes. Determinism: signer sorting before aggregation;
-/// consensus-order items for root computation (documented here and at the call
-/// site in `gossip::node`).
+///
+/// Leaves are `leaf(item)` in consensus order, padded to the next power of two
+/// with `empty`. The tree is then folded bottom-up with `combine`. Empty round
+/// ⇒ `empty` alone (stable). This construction is normative and mirrored
+/// byte-for-byte in the Go mirror crate.
+///
+/// Determinism: consensus-order items for root; signer sorting before aggregation
+/// (documented at the call site in `gossip::node`).
 pub fn compute_records_root(items: &[RecordsRootItem]) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(RECORDS_ROOT_DST);
-    hasher.update((items.len() as u32).to_be_bytes());
-    let mut cur: [u8; 32] = hasher.finalize().into();
-    for item in items {
-        let mut inner = Sha256::new();
-        inner.update(item.event_hash);
-        inner.update(item.tx_index.to_be_bytes());
-        let len = item.tx_payload.len() as u32;
-        inner.update(len.to_be_bytes());
-        inner.update(&item.tx_payload);
-        let inner_hash: [u8; 32] = inner.finalize().into();
-        let mut outer = Sha256::new();
-        outer.update(cur);
-        outer.update(inner_hash);
-        cur = outer.finalize().into();
+    if items.is_empty() {
+        return empty_hash();
     }
-    cur
+    let mut leaves: Vec<[u8; 32]> = items.iter().map(leaf_hash).collect();
+    let padded_len = leaves.len().next_power_of_two();
+    leaves.resize(padded_len, empty_hash());
+    let mut level = leaves;
+    while level.len() > 1 {
+        let mut next = Vec::with_capacity(level.len() / 2);
+        for chunk in level.chunks(2) {
+            let left = chunk[0];
+            let right = chunk[1];
+            next.push(combine_hash(left, right));
+        }
+        level = next;
+    }
+    level[0]
+}
+
+fn empty_hash() -> [u8; 32] {
+    Sha256::digest([0x00u8]).into()
+}
+
+fn leaf_hash(item: &RecordsRootItem) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update([0x00u8]);
+    h.update(item.event_hash);
+    h.update(item.tx_index.to_be_bytes());
+    h.update((item.tx_payload.len() as u32).to_be_bytes());
+    h.update(&item.tx_payload);
+    h.finalize().into()
+}
+
+fn internal_hash(left: [u8; 32], right: [u8; 32]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update([0x02u8]);
+    h.update(left);
+    h.update(right);
+    h.finalize().into()
+}
+
+fn singleton_hash(child: [u8; 32]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update([0x01u8]);
+    h.update(child);
+    h.finalize().into()
+}
+
+fn combine_hash(left: [u8; 32], right: [u8; 32]) -> [u8; 32] {
+    let empty = empty_hash();
+    match (left == empty, right == empty) {
+        (true, true) => empty,
+        (true, false) => singleton_hash(right),
+        (false, true) => singleton_hash(left),
+        (false, false) => internal_hash(left, right),
+    }
 }
 
 /// The unsigned payload every node commits to for a given round.
@@ -478,12 +522,69 @@ mod tests {
         let r1 = compute_records_root(&[]);
         let r2 = compute_records_root(&[]);
         assert_eq!(r1, r2);
-        // Expected h0 = SHA256(DST || u32_BE(0))
-        let mut hasher = Sha256::new();
-        hasher.update(RECORDS_ROOT_DST);
-        hasher.update(0u32.to_be_bytes());
-        let expected: [u8; 32] = hasher.finalize().into();
+        let expected: [u8; 32] = Sha256::digest([0x00u8]).into();
         assert_eq!(r1, expected);
+    }
+
+    #[test]
+    fn records_root_single_item_is_leaf() {
+        let item = RecordsRootItem {
+            event_hash: [0xAB; 32],
+            tx_index: 7,
+            tx_payload: b"payload".to_vec(),
+        };
+        let root = compute_records_root(std::slice::from_ref(&item));
+        let mut h = Sha256::new();
+        h.update([0x00u8]);
+        h.update(item.event_hash);
+        h.update(item.tx_index.to_be_bytes());
+        h.update((item.tx_payload.len() as u32).to_be_bytes());
+        h.update(&item.tx_payload);
+        let expected: [u8; 32] = h.finalize().into();
+        assert_eq!(root, expected);
+    }
+
+    #[test]
+    fn records_root_two_items_is_internal_of_leaves() {
+        let a = RecordsRootItem { event_hash: [1u8; 32], tx_index: 0, tx_payload: b"a".to_vec() };
+        let b = RecordsRootItem { event_hash: [2u8; 32], tx_index: 1, tx_payload: b"b".to_vec() };
+        let root = compute_records_root(&[a.clone(), b.clone()]);
+        let leaf = |item: &RecordsRootItem| {
+            let mut h = Sha256::new();
+            h.update([0x00u8]);
+            h.update(item.event_hash);
+            h.update(item.tx_index.to_be_bytes());
+            h.update((item.tx_payload.len() as u32).to_be_bytes());
+            h.update(&item.tx_payload);
+            let out: [u8; 32] = h.finalize().into();
+            out
+        };
+        let la = leaf(&a);
+        let lb = leaf(&b);
+        let mut h = Sha256::new();
+        h.update([0x02u8]);
+        h.update(la);
+        h.update(lb);
+        let expected: [u8; 32] = h.finalize().into();
+        assert_eq!(root, expected);
+    }
+
+    #[test]
+    fn records_root_three_items_padded_with_empty() {
+        let items = vec![
+            RecordsRootItem { event_hash: [1u8; 32], tx_index: 0, tx_payload: b"a".to_vec() },
+            RecordsRootItem { event_hash: [2u8; 32], tx_index: 0, tx_payload: b"b".to_vec() },
+            RecordsRootItem { event_hash: [3u8; 32], tx_index: 0, tx_payload: b"c".to_vec() },
+        ];
+        let root3 = compute_records_root(&items);
+        let root4 = compute_records_root(&[
+            items[0].clone(),
+            items[1].clone(),
+            items[2].clone(),
+            RecordsRootItem { event_hash: [0u8; 32], tx_index: 0, tx_payload: Vec::new() },
+        ]);
+        assert_ne!(root3, root4);
+        assert_ne!(root3, compute_records_root(&items[..2]));
     }
 
     #[test]
