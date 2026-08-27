@@ -874,11 +874,6 @@ impl GossipNode {
         state_hashes: &BTreeMap<u64, [u8; 32]>,
         snapshots: &BTreeMap<u64, Vec<u8>>,
     ) {
-        let state_hash = *state_hashes
-            .range(..=round)
-            .next_back()
-            .map(|(_, hash)| hash)
-            .expect("the round-0 sentinel always present");
         // The exact serialized state whose root is `state_hash`, captured in
         // the same producing pass. Carried through the accumulator so
         // acceptance persists exactly the committed bytes — no second lookup.
@@ -887,25 +882,10 @@ impl GossipNode {
             .next_back()
             .map(|(_, bytes)| bytes.clone())
             .expect("the round-0 sentinel always present");
+        let signed_snapshot = self.signed_checkpoints.lock().await.clone();
         let payload = {
             let hg = self.hashgraph.lock().await;
-            // Determinism: records_root is over consensus-order items for the
-            // round (final/deterministic once the round is decided).
-            let order = hg.consensus_order(round);
-            let mut items = Vec::with_capacity(order.len());
-            for hash in &order {
-                if let Some(record) = hg.get(hash) {
-                    for (idx, tx) in record.event().payload().iter().enumerate() {
-                        items.push(RecordsRootItem {
-                            event_hash: *hash.as_bytes(),
-                            tx_index: idx as u32,
-                            tx_payload: tx.payload().to_vec(),
-                        });
-                    }
-                }
-            }
-            let records_root = consensus::compute_records_root(&items);
-            hg.checkpoint_payload(round, records_root, state_hash)
+            Self::canonical_checkpoint_payload_chained(&hg, round, state_hashes, &signed_snapshot)
         };
         let Some(payload) = payload else { return };
 
@@ -947,6 +927,79 @@ impl GossipNode {
         if let (Some(accepted), Some(snapshot)) = (accepted, snapshot) {
             self.accept_checkpoint(accepted, snapshot).await;
         }
+    }
+
+    /// Pure helper: the canonical checkpoint payload for `round` derived
+    /// solely from decided history — the hashgraph's consensus order and
+    /// the deterministic `state_hashes` map. Determinism is critical:
+    /// every honest node must derive byte-identical payloads for the same
+    /// round regardless of local acceptance progress (PLAN-2 Rule 1).
+    ///
+    /// Returns `None` while `round` is not yet decided or when no
+    /// `state_hash` is available at or below `round`.
+    fn canonical_checkpoint_payload(
+        hg: &consensus::Hashgraph,
+        round: u64,
+        state_hashes: &BTreeMap<u64, [u8; 32]>,
+    ) -> Option<consensus::CheckpointPayload> {
+        let state_hash = *state_hashes.range(..=round).next_back()?.1;
+        // Determinism: records_root is over consensus-order items for the round
+        // (final/deterministic once the round is decided).
+        let order = hg.consensus_order(round);
+        let mut items = Vec::with_capacity(order.len());
+        for hash in &order {
+            if let Some(record) = hg.get(hash) {
+                for (idx, tx) in record.event().payload().iter().enumerate() {
+                    items.push(RecordsRootItem {
+                        event_hash: *hash.as_bytes(),
+                        tx_index: idx as u32,
+                        tx_payload: tx.payload().to_vec(),
+                    });
+                }
+            }
+        }
+        let records_root = consensus::compute_records_root(&items);
+        hg.checkpoint_payload(round, records_root, state_hash)
+    }
+
+    /// PLAN-2 Rule 1: the chained payload for `round`, where `prev_checkpoint_hash`
+    /// is a pure function of decided history (plus a stored-checkpoint fallback
+    /// for the restart-from-K pruned-graph case). Every honest node derives the
+    /// identical bytes for the same `round` regardless of local acceptance lag.
+    fn canonical_checkpoint_payload_chained(
+        hg: &consensus::Hashgraph,
+        round: u64,
+        state_hashes: &BTreeMap<u64, [u8; 32]>,
+        signed: &[SignedCheckpoint],
+    ) -> Option<consensus::CheckpointPayload> {
+        let base = Self::canonical_checkpoint_payload(hg, round, state_hashes)?;
+        let prev = Self::prev_checkpoint_hash_for(hg, round, state_hashes, signed);
+        Some(base.with_prev_checkpoint_hash(prev))
+    }
+
+    /// `prev_checkpoint_hash(R)` — the hash honest nodes sign for round `R`.
+    /// Priority: stored checkpoint for `R-1` (covers restart-from-K where the
+    /// hashgraph is pruned and cannot rebuild `K`), else the rebuilt chained
+    /// payload for `R-1` from decided history, else genesis zeros.
+    fn prev_checkpoint_hash_for(
+        hg: &consensus::Hashgraph,
+        round: u64,
+        state_hashes: &BTreeMap<u64, [u8; 32]>,
+        signed: &[SignedCheckpoint],
+    ) -> [u8; 32] {
+        if round == 0 {
+            return [0u8; 32];
+        }
+        let prev_round = round - 1;
+        if let Some(sc) = signed.iter().find(|sc| sc.payload.round == prev_round) {
+            return sc.payload.signing_bytes_hash();
+        }
+        if let Some(prev_payload) =
+            Self::canonical_checkpoint_payload_chained(hg, prev_round, state_hashes, signed)
+        {
+            return prev_payload.signing_bytes_hash();
+        }
+        [0u8; 32]
     }
 
     /// Feeds an inbound `CheckpointSig` into the accumulator for its round.
@@ -1808,5 +1861,95 @@ mod pending_sig_tests {
         let pending = node.pending_checkpoint_sigs.lock().await;
         assert!(!pending.contains_key(&3));
         assert!(!pending.contains_key(&5));
+    }
+}
+
+#[cfg(test)]
+mod rule1_chain_tests {
+    use std::collections::BTreeMap;
+
+    use crypto::MembershipRegistry;
+    use ed25519_dalek::SigningKey;
+    use primitives::NodeId;
+
+    use super::*;
+
+    fn registry_with(nodes: &[u64]) -> MembershipRegistry {
+        let mut registry = MembershipRegistry::new();
+        for &id in nodes {
+            let k = SigningKey::from_bytes(&[id as u8; 32]);
+            let bls = crypto::BlsIdentity::from_ikm(&[id as u8; 32]).expect("bls");
+            registry.register(NodeId::new(id), k.verifying_key(), bls.public.to_bytes());
+        }
+        registry
+    }
+
+    #[tokio::test]
+    async fn chained_payload_identical_despite_acceptance_lag() {
+        let registry = registry_with(&[1, 2, 3, 4]);
+        let hg = {
+            let mut hg = consensus::Hashgraph::new(&registry);
+            hg.mark_decided_through(2);
+            hg
+        };
+        let mut state_hashes = BTreeMap::new();
+        state_hashes.insert(0, [0xAA; 32]);
+        state_hashes.insert(1, [0x11; 32]);
+        state_hashes.insert(2, [0x22; 32]);
+
+        let payload_via_rebuild =
+            GossipNode::canonical_checkpoint_payload_chained(&hg, 2, &state_hashes, &[])
+                .expect("round 2 decided");
+
+        let payload_round1 =
+            GossipNode::canonical_checkpoint_payload_chained(&hg, 1, &state_hashes, &[])
+                .expect("round 1 decided");
+        let sig = {
+            let bls = crypto::BlsIdentity::from_ikm(&[1u8; 32]).expect("bls");
+            bls.sign(&payload_round1.signing_bytes())
+        };
+        let stored = consensus::SignedCheckpoint {
+            payload: payload_round1.clone(),
+            aggregate_sig: sig,
+            signers: vec![NodeId::new(1)],
+        };
+        let payload_via_stored = GossipNode::canonical_checkpoint_payload_chained(
+            &hg,
+            2,
+            &state_hashes,
+            std::slice::from_ref(&stored),
+        )
+        .expect("round 2 via stored");
+
+        assert_eq!(
+            payload_via_rebuild.signing_bytes(),
+            payload_via_stored.signing_bytes(),
+            "lagging node (rebuild) and accepted node (stored) must sign identical bytes"
+        );
+        assert_eq!(
+            payload_via_rebuild.prev_checkpoint_hash,
+            payload_round1.signing_bytes_hash(),
+            "prev must be hash of round 1"
+        );
+    }
+
+    #[tokio::test]
+    async fn genesis_prev_is_zeros_and_chain_is_pure() {
+        let registry = registry_with(&[1, 2, 3, 4]);
+        let mut hg = consensus::Hashgraph::new(&registry);
+        hg.mark_decided_through(1);
+        let mut state_hashes = BTreeMap::new();
+        state_hashes.insert(0, [0xAA; 32]);
+        state_hashes.insert(1, [0x11; 32]);
+
+        let p1 = GossipNode::canonical_checkpoint_payload_chained(&hg, 1, &state_hashes, &[])
+            .expect("round 1");
+        assert_eq!(p1.prev_checkpoint_hash, [0u8; 32]);
+
+        hg.mark_decided_through(2);
+        state_hashes.insert(2, [0x22; 32]);
+        let p2 = GossipNode::canonical_checkpoint_payload_chained(&hg, 2, &state_hashes, &[])
+            .expect("round 2");
+        assert_eq!(p2.prev_checkpoint_hash, p1.signing_bytes_hash());
     }
 }
