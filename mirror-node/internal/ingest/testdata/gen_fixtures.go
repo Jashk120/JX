@@ -67,7 +67,7 @@ func main() {
 	ckpt := &pb.SignedCheckpoint{
 		Round: 1, StateHash: stateHash[:], RosterHash: rosterHash[:], RecordsRoot: recordsRoot[:],
 		PrevCheckpointHash: make([]byte, 32),
-		RosterSnapshot: members, AggregateSig: aggSig, Signers: []uint64{0, 1, 2},
+		RosterSnapshot:     members, AggregateSig: aggSig, Signers: []uint64{0, 1, 2},
 	}
 	ckptBytes, err := proto.Marshal(ckpt)
 	if err != nil {

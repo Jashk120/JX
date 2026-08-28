@@ -14,14 +14,14 @@ import (
 )
 
 type goldenFile struct {
-	RecordsRootVectors   []recordVector   `json:"records_root_vectors"`
-	SigningBytesVectors  []signingVector  `json:"signing_bytes_vectors"`
-	DiffEncodingVectors  []diffVector     `json:"diff_encoding_vectors"`
+	RecordsRootVectors  []recordVector  `json:"records_root_vectors"`
+	SigningBytesVectors []signingVector `json:"signing_bytes_vectors"`
+	DiffEncodingVectors []diffVector    `json:"diff_encoding_vectors"`
 }
 type recordVector struct {
-	Name            string            `json:"name"`
-	Items           []recordItemJSON  `json:"items"`
-	ExpectedRootHex string            `json:"expected_root_hex"`
+	Name            string           `json:"name"`
+	Items           []recordItemJSON `json:"items"`
+	ExpectedRootHex string           `json:"expected_root_hex"`
 }
 type recordItemJSON struct {
 	EventHashHex string `json:"event_hash_hex"`
@@ -29,13 +29,13 @@ type recordItemJSON struct {
 	TxPayloadHex string `json:"tx_payload_hex"`
 }
 type signingVector struct {
-	Name                      string `json:"name"`
-	Round                     uint64 `json:"round"`
-	RecordsRootHex            string `json:"records_root_hex"`
-	StateHashHex              string `json:"state_hash_hex"`
-	RosterHashHex             string `json:"roster_hash_hex"`
-	PrevCheckpointHashHex     string `json:"prev_checkpoint_hash_hex"`
-	ExpectedSigningBytesHex   string `json:"expected_signing_bytes_hex"`
+	Name                    string `json:"name"`
+	Round                   uint64 `json:"round"`
+	RecordsRootHex          string `json:"records_root_hex"`
+	StateHashHex            string `json:"state_hash_hex"`
+	RosterHashHex           string `json:"roster_hash_hex"`
+	PrevCheckpointHashHex   string `json:"prev_checkpoint_hash_hex"`
+	ExpectedSigningBytesHex string `json:"expected_signing_bytes_hex"`
 }
 type diffVector struct {
 	Name  string      `json:"name"`

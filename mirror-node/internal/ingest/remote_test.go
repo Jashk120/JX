@@ -121,10 +121,10 @@ func buildRecordFileBytes(t *testing.T, round uint64, priv ed25519.PrivateKey, s
 	copy(signingBytes[72:104], rosterHash[:])
 	sigAff := new(blst.P2Affine).Sign(sec.sk, signingBytes[:], stream.CheckpointDST)
 	cp := &pb.SignedCheckpoint{
-		Round:       round,
-		StateHash:   stateHash[:],
-		RosterHash:  rosterHash[:],
-		RecordsRoot: recordsRoot[:],
+		Round:              round,
+		StateHash:          stateHash[:],
+		RosterHash:         rosterHash[:],
+		RecordsRoot:        recordsRoot[:],
 		PrevCheckpointHash: make([]byte, 32),
 		RosterSnapshot: []*pb.CheckpointRosterMember{
 			{NodeId: 0, Key: pub, BlsKey: blsPub},
