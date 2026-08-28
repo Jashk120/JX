@@ -1,3 +1,3 @@
 module github.com/JKaIN/block-node
 
-go 1.23
+go 1.26

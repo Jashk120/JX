@@ -67,7 +67,7 @@ func buildBLSPayload(t *testing.T, round uint64, items []*pb.RecordItem, members
 	ckpt := &pb.SignedCheckpoint{
 		Round: round, StateHash: stateHash[:], RosterHash: rosterHash[:], RecordsRoot: recordsRoot[:],
 		PrevCheckpointHash: make([]byte, 32),
-		RosterSnapshot: members, AggregateSig: agg.ToAffine().Compress(),
+		RosterSnapshot:     members, AggregateSig: agg.ToAffine().Compress(),
 		Signers: []uint64{0, 1, 2},
 	}
 	return ckpt, rosterHash
