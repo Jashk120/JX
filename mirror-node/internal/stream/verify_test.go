@@ -1,9 +1,11 @@
 package stream
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/binary"
+	"strings"
 	"testing"
 
 	blst "github.com/supranational/blst/bindings/go"
@@ -125,14 +127,14 @@ func buildBLSSignedCheckpoint(t *testing.T, round uint64, items []*pb.RecordItem
 	}
 	aggSig := agg.ToAffine().Compress()
 	return &pb.SignedCheckpoint{
-		Round:          round,
-		StateHash:      stateHash[:],
-		RosterHash:     rosterHash[:],
-		RosterSnapshot: rosterMembers,
-		RecordsRoot:    recordsRoot[:],
+		Round:              round,
+		StateHash:          stateHash[:],
+		RosterHash:         rosterHash[:],
+		RosterSnapshot:     rosterMembers,
+		RecordsRoot:        recordsRoot[:],
 		PrevCheckpointHash: make([]byte, 32),
-		AggregateSig:   aggSig,
-		Signers:        signerIDs,
+		AggregateSig:       aggSig,
+		Signers:            signerIDs,
 	}, rosterHash
 }
 
@@ -254,5 +256,47 @@ func TestVerifyRecordFileNilPubKeyFails(t *testing.T) {
 	_ = pub
 	if err := VerifyRecordFile(raw, nil, nil, rosterHash[:]); err != nil {
 		t.Fatalf("record file should not require pubkey (BLS path): %v", err)
+	}
+}
+
+func TestValidateStateDiffsCaps(t *testing.T) {
+	if err := ValidateStateDiffs([]*pb.StateDiff{
+		{Key: []byte("a"), Value: []byte("1")},
+		{Key: []byte("b"), Value: nil},
+	}); err != nil {
+		t.Fatalf("valid diffs must pass: %v", err)
+	}
+	if err := ValidateStateDiffs([]*pb.StateDiff{
+		{Key: bytes.Repeat([]byte{0x01}, 1025), Value: []byte("1")},
+	}); err == nil || !strings.Contains(err.Error(), "key") {
+		t.Fatalf("oversized key must be rejected, got %v", err)
+	}
+	if err := ValidateStateDiffs([]*pb.StateDiff{
+		{Key: []byte("a"), Value: bytes.Repeat([]byte{0x02}, (1<<20)+1)},
+	}); err == nil || !strings.Contains(err.Error(), "value") {
+		t.Fatalf("oversized value must be rejected, got %v", err)
+	}
+	tooMany := make([]*pb.StateDiff, maxStateDiffsPerRound+1)
+	for i := range tooMany {
+		tooMany[i] = &pb.StateDiff{Key: []byte{byte(i), byte(i >> 8)}, Value: []byte{1}}
+	}
+	if err := ValidateStateDiffs(tooMany); err == nil || !strings.Contains(err.Error(), "count") {
+		t.Fatalf("excessive diff count must be rejected, got %v", err)
+	}
+}
+
+func TestVerifyRecordFileItemsCap(t *testing.T) {
+	rsf := &pb.RecordStreamFile{
+		Version: Version,
+		Round:   0,
+		Items:   make([]*pb.RecordItem, maxRecordItemsPerFile+1),
+	}
+	raw, err := proto.Marshal(rsf)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	err = VerifyRecordFile(raw, nil, nil, nil)
+	if err == nil || !strings.Contains(err.Error(), "items") {
+		t.Fatalf("item-count cap must be rejected, got %v", err)
 	}
 }

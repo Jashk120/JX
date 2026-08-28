@@ -59,7 +59,7 @@ func New(cfg Config, st store.Store, log *slog.Logger) *Ingester {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Ingester{
+	ing := &Ingester{
 		cfg:             cfg,
 		store:           st,
 		log:             log,
@@ -67,6 +67,43 @@ func New(cfg Config, st store.Store, log *slog.Logger) *Ingester {
 		seenEvents:      make(map[uint64]struct{}),
 		inFlightRecords: make(map[uint64]struct{}),
 		inFlightEvents:  make(map[uint64]struct{}),
+	}
+	ing.seedFromStore()
+	return ing
+}
+
+func (ing *Ingester) seedFromStore() {
+	ing.mu.Lock()
+	defer ing.mu.Unlock()
+	if len(ing.seenRecords) != 0 {
+		return
+	}
+	if ing.store == nil {
+		return
+	}
+	recs := ing.store.ListRecords()
+	if recs == nil {
+		return
+	}
+	var highest *pb.RecordStreamFile
+	for _, f := range recs {
+		if f == nil {
+			continue
+		}
+		ing.seenRecords[f.Round] = struct{}{}
+		if highest == nil || f.Round > highest.Round {
+			highest = f
+		}
+	}
+	if highest == nil {
+		return
+	}
+	if end, err := hashFromPB(highest.EndRunningHash); err == nil {
+		ing.lastRecordEnd = &end
+	}
+	if highest.Checkpoint != nil {
+		h := stream.CheckpointSigningBytesHash(highest.Checkpoint)
+		ing.expectedPrev = &h
 	}
 }
 
@@ -235,10 +272,14 @@ func hashFromPB(h *pb.HashObject) ([32]byte, error) {
 	return out, nil
 }
 
-func (ing *Ingester) checkPrevContinuity(cp *pb.SignedCheckpoint) error {
-	if len(cp.PrevCheckpointHash) == 0 {
-		return nil
-	}
+// checkPrev validates cp's prev_checkpoint_hash commitment against the
+// ingester's expected value. A record must carry exactly 32 bytes: the
+// genesis round commits [32]byte{} (never an empty slice), and every later
+// round must commit SHA256(prev_signing_bytes) of the previously accepted
+// checkpoint. With commit=true the expectation is advanced in the same
+// critical section, so a concurrent ingest can never observe a torn
+// check-then-advance state.
+func (ing *Ingester) checkPrev(cp *pb.SignedCheckpoint, commit bool) error {
 	ing.mu.Lock()
 	defer ing.mu.Unlock()
 	var expected [32]byte
@@ -246,21 +287,18 @@ func (ing *Ingester) checkPrevContinuity(cp *pb.SignedCheckpoint) error {
 		expected = *ing.expectedPrev
 	}
 	if len(cp.PrevCheckpointHash) != 32 {
-		return fmt.Errorf("prev_checkpoint_hash is %d bytes, want 32", len(cp.PrevCheckpointHash))
+		return fmt.Errorf("prev_checkpoint_hash is %d bytes, want 32 (genesis is 32 zero bytes, not empty)", len(cp.PrevCheckpointHash))
 	}
 	var got [32]byte
 	copy(got[:], cp.PrevCheckpointHash)
 	if got != expected {
 		return fmt.Errorf("prev_checkpoint_hash mismatch: expected %x got %x", expected, got)
 	}
+	if commit {
+		h := stream.CheckpointSigningBytesHash(cp)
+		ing.expectedPrev = &h
+	}
 	return nil
-}
-
-func (ing *Ingester) advancePrev(cp *pb.SignedCheckpoint) {
-	h := stream.CheckpointSigningBytesHash(cp)
-	ing.mu.Lock()
-	defer ing.mu.Unlock()
-	ing.expectedPrev = &h
 }
 
 func verifyProofSidecarLocal(dir string, f *pb.RecordStreamFile) error {
@@ -366,13 +404,17 @@ func (ing *Ingester) ingestRecord(path string) error {
 		}
 		ing.mu.Lock()
 		var expected [32]byte
-		if ing.lastRecordEnd == nil {
+		hasAnchor := ing.lastRecordEnd != nil
+		if !hasAnchor {
 			expected = stream.ChainSeed
 		} else {
 			expected = *ing.lastRecordEnd
 		}
 		ing.mu.Unlock()
 		if start != expected {
+			if !hasAnchor {
+				return fmt.Errorf("no record chain anchor for %s: start %x has no anchor; start from genesis or restore a store with accepted records", path, start)
+			}
 			ing.log.Warn("record chain continuity violation", "path", path, "expected", fmt.Sprintf("%x", expected), "got", fmt.Sprintf("%x", start))
 			return fmt.Errorf("record chain continuity violation for %s: expected start %x got %x", path, expected, start)
 		}
@@ -380,7 +422,7 @@ func (ing *Ingester) ingestRecord(path string) error {
 			return fmt.Errorf("verify record %s: %w", path, err)
 		}
 		if f.Checkpoint != nil {
-			if err := ing.checkPrevContinuity(f.Checkpoint); err != nil {
+			if err := ing.checkPrev(f.Checkpoint, false); err != nil {
 				return fmt.Errorf("prev chain %s: %w", path, err)
 			}
 		}
@@ -394,7 +436,9 @@ func (ing *Ingester) ingestRecord(path string) error {
 			return err
 		}
 		if f.Checkpoint != nil {
-			ing.advancePrev(f.Checkpoint)
+			if err := ing.checkPrev(f.Checkpoint, true); err != nil {
+				return fmt.Errorf("prev chain %s: %w", path, err)
+			}
 		}
 		ing.mu.Lock()
 		ing.lastRecordEnd = &end
@@ -418,13 +462,17 @@ func (ing *Ingester) ingestRecord(path string) error {
 	}
 	ing.mu.Lock()
 	var expected [32]byte
-	if ing.lastRecordEnd == nil {
+	hasAnchor := ing.lastRecordEnd != nil
+	if !hasAnchor {
 		expected = stream.ChainSeed
 	} else {
 		expected = *ing.lastRecordEnd
 	}
 	ing.mu.Unlock()
 	if start != expected {
+		if !hasAnchor {
+			return fmt.Errorf("no record chain anchor for %s: start %x has no anchor; start from genesis or restore a store with accepted records", path, start)
+		}
 		ing.log.Warn("record chain continuity violation", "path", path, "expected", fmt.Sprintf("%x", expected), "got", fmt.Sprintf("%x", start))
 		return fmt.Errorf("record chain continuity violation for %s: expected start %x got %x", path, expected, start)
 	}
@@ -432,7 +480,7 @@ func (ing *Ingester) ingestRecord(path string) error {
 		return fmt.Errorf("verify record %s: %w", path, err)
 	}
 	if f.Checkpoint != nil {
-		if err := ing.checkPrevContinuity(f.Checkpoint); err != nil {
+		if err := ing.checkPrev(f.Checkpoint, false); err != nil {
 			return fmt.Errorf("prev chain %s: %w", path, err)
 		}
 	}
@@ -446,7 +494,9 @@ func (ing *Ingester) ingestRecord(path string) error {
 		return err
 	}
 	if f.Checkpoint != nil {
-		ing.advancePrev(f.Checkpoint)
+		if err := ing.checkPrev(f.Checkpoint, true); err != nil {
+			return fmt.Errorf("prev chain %s: %w", path, err)
+		}
 	}
 	ing.mu.Lock()
 	ing.lastRecordEnd = &end
@@ -637,13 +687,17 @@ func (ing *Ingester) ingestRecordRemote(ctx context.Context, name string, listed
 		}
 		ing.mu.Lock()
 		var expected [32]byte
-		if ing.lastRecordEnd == nil {
+		hasAnchor := ing.lastRecordEnd != nil
+		if !hasAnchor {
 			expected = stream.ChainSeed
 		} else {
 			expected = *ing.lastRecordEnd
 		}
 		ing.mu.Unlock()
 		if start != expected {
+			if !hasAnchor {
+				return fmt.Errorf("no record chain anchor for %s: start %x has no anchor; start from genesis or restore a store with accepted records", name, start)
+			}
 			ing.log.Warn("record chain continuity violation", "name", name, "expected", fmt.Sprintf("%x", expected), "got", fmt.Sprintf("%x", start))
 			return fmt.Errorf("record chain continuity violation for %s: expected start %x got %x", name, expected, start)
 		}
@@ -651,7 +705,7 @@ func (ing *Ingester) ingestRecordRemote(ctx context.Context, name string, listed
 			return fmt.Errorf("verify record %s: %w", name, err)
 		}
 		if f.Checkpoint != nil {
-			if err := ing.checkPrevContinuity(f.Checkpoint); err != nil {
+			if err := ing.checkPrev(f.Checkpoint, false); err != nil {
 				return fmt.Errorf("prev chain %s: %w", name, err)
 			}
 		}
@@ -665,7 +719,9 @@ func (ing *Ingester) ingestRecordRemote(ctx context.Context, name string, listed
 			return err
 		}
 		if f.Checkpoint != nil {
-			ing.advancePrev(f.Checkpoint)
+			if err := ing.checkPrev(f.Checkpoint, true); err != nil {
+				return fmt.Errorf("prev chain %s: %w", name, err)
+			}
 		}
 		ing.mu.Lock()
 		ing.lastRecordEnd = &end
@@ -693,13 +749,17 @@ func (ing *Ingester) ingestRecordRemote(ctx context.Context, name string, listed
 	}
 	ing.mu.Lock()
 	var expected [32]byte
-	if ing.lastRecordEnd == nil {
+	hasAnchor := ing.lastRecordEnd != nil
+	if !hasAnchor {
 		expected = stream.ChainSeed
 	} else {
 		expected = *ing.lastRecordEnd
 	}
 	ing.mu.Unlock()
 	if start != expected {
+		if !hasAnchor {
+			return fmt.Errorf("no record chain anchor for %s: start %x has no anchor; start from genesis or restore a store with accepted records", name, start)
+		}
 		ing.log.Warn("record chain continuity violation", "name", name, "expected", fmt.Sprintf("%x", expected), "got", fmt.Sprintf("%x", start))
 		return fmt.Errorf("record chain continuity violation for %s: expected start %x got %x", name, expected, start)
 	}
@@ -707,7 +767,7 @@ func (ing *Ingester) ingestRecordRemote(ctx context.Context, name string, listed
 		return fmt.Errorf("verify record %s: %w", name, err)
 	}
 	if f.Checkpoint != nil {
-		if err := ing.checkPrevContinuity(f.Checkpoint); err != nil {
+		if err := ing.checkPrev(f.Checkpoint, false); err != nil {
 			return fmt.Errorf("prev chain %s: %w", name, err)
 		}
 	}
@@ -721,7 +781,9 @@ func (ing *Ingester) ingestRecordRemote(ctx context.Context, name string, listed
 		return err
 	}
 	if f.Checkpoint != nil {
-		ing.advancePrev(f.Checkpoint)
+		if err := ing.checkPrev(f.Checkpoint, true); err != nil {
+			return fmt.Errorf("prev chain %s: %w", name, err)
+		}
 	}
 	ing.mu.Lock()
 	ing.lastRecordEnd = &end

@@ -21,6 +21,14 @@ const (
 	hashLengthSHA256    = 32
 	sigTypeEd25519      = 0
 	sigLengthEd25519    = 64
+
+	// Resource caps bounding memory use when a mirror ingests untrusted
+	// stream files: a round may carry at most maxRecordItemsPerFile items,
+	// and state diffs are capped by count, key size, and value size.
+	maxStateDiffsPerRound = 10_000
+	maxDiffKeyBytes       = 1024
+	maxDiffValueBytes     = 1 << 20 // 1 MiB
+	maxRecordItemsPerFile = 1 << 16 // 64K items
 )
 
 var CheckpointDST = []byte("JKAIN-CHECKPOINT-BLS-V1")
@@ -64,6 +72,9 @@ func VerifyRecordFile(fileBytes []byte, sig *pb.SignatureFile, pubKey ed25519.Pu
 	}
 	if rsf.Version != Version {
 		return fmt.Errorf("unsupported version %d", rsf.Version)
+	}
+	if len(rsf.Items) > maxRecordItemsPerFile {
+		return fmt.Errorf("record stream file has %d items, want at most %d", len(rsf.Items), maxRecordItemsPerFile)
 	}
 	start, err := runningHashOrErr(rsf.StartRunningHash)
 	if err != nil {
@@ -318,11 +329,20 @@ func ValidateStateDiffs(diffs []*pb.StateDiff) error {
 	if len(diffs) == 0 {
 		return nil
 	}
+	if len(diffs) > maxStateDiffsPerRound {
+		return fmt.Errorf("state_diffs count %d exceeds limit %d", len(diffs), maxStateDiffsPerRound)
+	}
 	seen := make(map[string]struct{}, len(diffs))
 	var prev []byte
 	for i, d := range diffs {
 		if len(d.Key) == 0 {
 			return fmt.Errorf("state_diff[%d] has empty key", i)
+		}
+		if len(d.Key) > maxDiffKeyBytes {
+			return fmt.Errorf("state_diff[%d] key is %d bytes, want at most %d", i, len(d.Key), maxDiffKeyBytes)
+		}
+		if len(d.Value) > maxDiffValueBytes {
+			return fmt.Errorf("state_diff[%d] value is %d bytes, want at most %d", i, len(d.Value), maxDiffValueBytes)
 		}
 		if _, dup := seen[string(d.Key)]; dup {
 			return fmt.Errorf("state_diff duplicate key %x at index %d", d.Key, i)
@@ -362,9 +382,6 @@ func VerifyPrevCheckpointHash(cur *pb.SignedCheckpoint, prev *pb.SignedCheckpoin
 		expected = CheckpointSigningBytesHash(prev)
 	}
 	if len(cur.PrevCheckpointHash) != 32 {
-		if prev == nil && len(cur.PrevCheckpointHash) == 0 {
-			return nil
-		}
 		return fmt.Errorf("prev_checkpoint_hash is %d bytes, want 32", len(cur.PrevCheckpointHash))
 	}
 	if !bytes.Equal(cur.PrevCheckpointHash, expected[:]) {
@@ -485,7 +502,7 @@ func verifyCheckpointBinding(cp *pb.SignedCheckpoint, items []*pb.RecordItem, tr
 	if len(cp.RecordsRoot) != hashLengthSHA256 {
 		return fmt.Errorf("checkpoint records_root is %d bytes, want %d", len(cp.RecordsRoot), hashLengthSHA256)
 	}
-	if len(cp.PrevCheckpointHash) != 0 && len(cp.PrevCheckpointHash) != hashLengthSHA256 {
+	if len(cp.PrevCheckpointHash) != hashLengthSHA256 {
 		return fmt.Errorf("checkpoint prev_checkpoint_hash is %d bytes, want %d", len(cp.PrevCheckpointHash), hashLengthSHA256)
 	}
 	computed := ComputeRecordsRoot(items)
@@ -505,7 +522,7 @@ func verifyCheckpointQuorum(cp *pb.SignedCheckpoint, trustedRosterHash []byte) e
 	if len(cp.RecordsRoot) != hashLengthSHA256 && len(cp.RecordsRoot) != 0 {
 		return fmt.Errorf("checkpoint records_root is %d bytes, want %d", len(cp.RecordsRoot), hashLengthSHA256)
 	}
-	if len(cp.PrevCheckpointHash) != 0 && len(cp.PrevCheckpointHash) != hashLengthSHA256 {
+	if len(cp.PrevCheckpointHash) != hashLengthSHA256 {
 		return fmt.Errorf("checkpoint prev_checkpoint_hash is %d bytes, want %d", len(cp.PrevCheckpointHash), hashLengthSHA256)
 	}
 	rosterBytes, err := rosterCanonicalBytes(cp.RosterSnapshot)
@@ -586,18 +603,9 @@ func verifyCheckpointQuorum(cp *pb.SignedCheckpoint, trustedRosterHash []byte) e
 	copy(signingBytes[8:40], cp.RecordsRoot)
 	copy(signingBytes[40:72], cp.StateHash)
 	copy(signingBytes[72:104], cp.RosterHash)
-	if len(cp.PrevCheckpointHash) == 32 {
-		copy(signingBytes[104:136], cp.PrevCheckpointHash)
-	}
+	copy(signingBytes[104:136], cp.PrevCheckpointHash)
 	if sig.FastAggregateVerify(false, pks, signingBytes[:], CheckpointDST) {
 		return nil
-	}
-	if len(cp.PrevCheckpointHash) == 0 {
-		var signingBytes104 [104]byte
-		copy(signingBytes104[:], signingBytes[:104])
-		if sig.FastAggregateVerify(false, pks, signingBytes104[:], CheckpointDST) {
-			return nil
-		}
 	}
 	return fmt.Errorf("BLS aggregate verification failed")
 }

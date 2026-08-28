@@ -173,26 +173,19 @@ type blstSecret struct {
 	pk []byte
 }
 
-func writeRecordFileWithSig(t *testing.T, dir string, round uint64, priv ed25519.PrivateKey, start [32]byte) [32]byte {
+func writeRecordFileWithSig(t *testing.T, dir string, round uint64, priv ed25519.PrivateKey, start [32]byte, prev [32]byte) ([32]byte, *pb.SignedCheckpoint) {
 	t.Helper()
 	item := &pb.RecordItem{
 		EventHash: make([]byte, 32),
 		TxIndex:   0,
 		TxPayload: []byte("put"),
 	}
-	b, err := proto.MarshalOptions{Deterministic: true}.Marshal(item)
+	mb, err := proto.MarshalOptions{Deterministic: true}.Marshal(item)
 	if err != nil {
 		t.Fatalf("marshal item: %v", err)
 	}
-	_ = b
-	// Running hash computed via deterministic marshal of items
-	serialized := [][]byte{}
-	// Need actual RFS items for hash
+	serialized := [][]byte{mb}
 	items := []*pb.RecordItem{item}
-	for _, it := range items {
-		mb, _ := proto.MarshalOptions{Deterministic: true}.Marshal(it)
-		serialized = append(serialized, mb)
-	}
 	end := stream.RunningHash(start, serialized)
 	pub := priv.Public().(ed25519.PublicKey)
 	blsPub, sec := blsKeyForTest(priv)
@@ -213,17 +206,18 @@ func writeRecordFileWithSig(t *testing.T, dir string, round uint64, priv ed25519
 	copy(signingBytes[8:40], recordsRoot[:])
 	copy(signingBytes[40:72], stateHash[:])
 	copy(signingBytes[72:104], rosterHash[:])
+	copy(signingBytes[104:136], prev[:])
 	sigAff := new(blst.P2Affine).Sign(sec.sk, signingBytes[:], stream.CheckpointDST)
-	sigBytes := sigAff.Compress()
 	cp := &pb.SignedCheckpoint{
-		Round:       round,
-		StateHash:   stateHash[:],
-		RosterHash:  rosterHash[:],
-		RecordsRoot: recordsRoot[:],
+		Round:              round,
+		StateHash:          stateHash[:],
+		RosterHash:         rosterHash[:],
+		RecordsRoot:        recordsRoot[:],
+		PrevCheckpointHash: prev[:],
 		RosterSnapshot: []*pb.CheckpointRosterMember{
 			{NodeId: 0, Key: pub, BlsKey: blsPub},
 		},
-		AggregateSig: sigBytes,
+		AggregateSig: sigAff.Compress(),
 		Signers:      []uint64{0},
 	}
 	rsf := &pb.RecordStreamFile{
@@ -243,11 +237,7 @@ func writeRecordFileWithSig(t *testing.T, dir string, round uint64, priv ed25519
 		t.Fatalf("write %s: %v", path, err)
 	}
 	// No .rsf_sig file anymore (BLS binding); do not write sig file
-	return end
-}
-
-func writeRecordFile(t *testing.T, dir string, round uint64, priv ed25519.PrivateKey) {
-	writeRecordFileWithSig(t, dir, round, priv, stream.ChainSeed)
+	return end, cp
 }
 
 func assertCounts(t *testing.T, st *store.MemStore, wantEvents, wantRecords int) {
@@ -267,7 +257,7 @@ func TestRunOnceDoesNotReingestOnLaterPolls(t *testing.T) {
 	trusted := trustedHashForPriv(priv)
 
 	end0events := writeEventFileWithSig(t, dir, 0, [][2]uint64{{1, 0}, {1, 1}}, priv, stream.ChainSeed)
-	writeRecordFileWithSig(t, dir, 0, priv, stream.ChainSeed)
+	_, cp0 := writeRecordFileWithSig(t, dir, 0, priv, stream.ChainSeed, [32]byte{})
 
 	st := store.NewMemStore()
 	ing := New(Config{StreamsDir: dir, PubKey: pub, TrustedRosterHash: trusted[:]}, st, quietLogger())
@@ -289,7 +279,7 @@ func TestRunOnceDoesNotReingestOnLaterPolls(t *testing.T) {
 		b, _ := proto.MarshalOptions{Deterministic: true}.Marshal(item)
 		return b
 	}()})
-	writeRecordFileWithSig(t, dir, 1, priv, end0records)
+	writeRecordFileWithSig(t, dir, 1, priv, end0records, stream.CheckpointSigningBytesHash(cp0))
 	if err := ing.RunOnce(ctx); err != nil {
 		t.Fatalf("third RunOnce: %v", err)
 	}
@@ -302,7 +292,7 @@ func TestReingestIntoPopulatedStoreIsNoop(t *testing.T) {
 	pub := priv.Public().(ed25519.PublicKey)
 	trusted := trustedHashForPriv(priv)
 	writeEventFileWithSig(t, dir, 0, [][2]uint64{{1, 0}}, priv, stream.ChainSeed)
-	writeRecordFileWithSig(t, dir, 0, priv, stream.ChainSeed)
+	writeRecordFileWithSig(t, dir, 0, priv, stream.ChainSeed, [32]byte{})
 
 	st := store.NewMemStore()
 	ctx := context.Background()
@@ -423,10 +413,11 @@ func TestMissingSigRecordDeferred(t *testing.T) {
 	copy(signingBytes[72:104], rosterHash[:])
 	sigAff := new(blst.P2Affine).Sign(sec.sk, signingBytes[:], stream.CheckpointDST)
 	cp := &pb.SignedCheckpoint{
-		Round:       0,
-		StateHash:   stateHash[:],
-		RosterHash:  rosterHash[:],
-		RecordsRoot: recordsRoot[:],
+		Round:              0,
+		StateHash:          stateHash[:],
+		RosterHash:         rosterHash[:],
+		RecordsRoot:        recordsRoot[:],
+		PrevCheckpointHash: make([]byte, 32),
 		RosterSnapshot: []*pb.CheckpointRosterMember{
 			{NodeId: 0, Key: pub, BlsKey: blsPub},
 		},
@@ -568,10 +559,11 @@ func TestUntrustedRosterFails(t *testing.T) {
 	copy(signingBytes[72:104], rosterHash[:])
 	sigAff := new(blst.P2Affine).Sign(sec.sk, signingBytes[:], stream.CheckpointDST)
 	cp := &pb.SignedCheckpoint{
-		Round:       0,
-		StateHash:   stateHash[:],
-		RosterHash:  rosterHash[:],
-		RecordsRoot: recordsRoot[:],
+		Round:              0,
+		StateHash:          stateHash[:],
+		RosterHash:         rosterHash[:],
+		RecordsRoot:        recordsRoot[:],
+		PrevCheckpointHash: make([]byte, 32),
 		RosterSnapshot: []*pb.CheckpointRosterMember{
 			{NodeId: 0, Key: pub, BlsKey: blsPub},
 		},
