@@ -53,13 +53,21 @@ implemented.
   and the async machinery (inbound accept loop + a sync driver on a fixed
   interval + dedicated reconnect port). A per-round timeout bounds how long a
   silent peer can stall the driver; a `stop` flag lets the driver drain
-  in-flight syncs and exit cleanly. Three durable sinks are pluggable:
-  `CheckpointSink`, `EventSink` (event log), `EventStreamSink` + `RecordSink`
-  (mirror streams). Finalized events carrying a `MembershipOp::Add` payload
-  are decoded and activated (hashgraph growth, roster schedule, peer pin) once
-  the round after their `roundReceived` is fully decided; checkpoints are
-  produced per decided round from the deterministic per-round Merkle root and
-  gossiped as `Frame::CheckpointSig` on every successful sync until quorum.
+  in-flight syncs and exit cleanly. Pluggable durable sinks:
+  `CheckpointSink`, `EventSink` (event log), `EventStreamSink` +
+  `RecordSink` (mirror streams) + `RecordProofSink` (proof sidecar). Finalized
+  events carrying a `MembershipOp::Add` payload are decoded and activated
+  (hashgraph growth, roster schedule, peer pin) once the round after their
+  `roundReceived` is fully decided; checkpoints are produced per decided
+  round from the deterministic per-round Merkle root, the per-round
+  `state_diffs` (after-image, sorted LWW, via
+  `Executor::bucket_finalized_with_diffs`), and a padded Merkle
+  `records_root`, then gossiped as `Frame::CheckpointSig` on every successful
+  sync until quorum. Chained payloads embed `prev_checkpoint_hash`
+  (PLAN-2 Rule 1: pure function of decided history — the hash of the
+  previous round's 136-byte signing_bytes — with a stored-checkpoint fallback
+  for pruned-K restarts and genesis `[0;32]`); the gossip hot path never
+  invents a chain hash from local acceptance progress.
 
 ## Design
 
@@ -76,6 +84,18 @@ implemented.
 - Checkpoint signatures are gossiped on the same stream as events
   (`Frame::CheckpointSig`), re-sent until quorum (`valid * 3 > total * 2`).
   A node that has not yet produced its own payload buffers inbound sigs.
+- Per-round `state_diffs` are captured alongside the state hash in
+  `process_finalized_rounds` (one call to `bucket_finalized_with_diffs` per
+  round, LWW within the round, sorted for determinism) and carried through
+  `produce_checkpoint` → `accept_checkpoint` → `RecordSink::persist` → the
+  `.rsf` file's `state_diffs` field and the `.rsf_proofs` sidecar writer.
+  Empty rounds produce an empty diff list; a late-arriving event below the
+  watermark still drains into the round's diff map.
+- `prev_checkpoint_hash` Rule 1: the payload for round `R` always commits to
+  the decided history alone (`canonical_checkpoint_payload_chained`), with
+  priority `stored checkpoint(R-1)` → `rebuilt chained payload(R-1)` →
+  `[0;32]`. This preserves determinism after a reconnect that pruned `K`
+  behind genesis.
 - Recovery is log-first: the durable `EventLog` is the primary restart path;
   `Frame::Behind` / `MissingParent` triggers a `fetch_checkpoint` reconnect
   only as fallback. The reconnect port is separate from the gossip port.
@@ -91,6 +111,7 @@ implemented.
   with only a bounded in-flight window separating them. A partition/rejoin
   test seeds divergent histories and verifies reconciliation, including
   that each node's isolated events reach the other. `tests/streams.rs`
-  verifies the live mirror-stream wiring; `tests/activation.rs` covers
-  dynamic membership via `MembershipOp::Add`; `tests/checkpoint.rs` covers
-  quorum and retrieval.
+  verifies the live mirror-stream wiring including `.rsf_proofs` sidecars;
+  `tests/activation.rs` covers dynamic membership via `MembershipOp::Add`;
+  `tests/checkpoint.rs` covers chained checkpoints (Rule 1, `prev` continuity)
+  and the Merkle `records_root` / proof vectors.

@@ -13,10 +13,7 @@ use crypto::{
     Signable,
     Verifiable,
 };
-use ed25519_dalek::{
-    Signer,
-    SigningKey,
-};
+use ed25519_dalek::SigningKey;
 use gossip::{
     GossipNode,
     SyncTiming,
@@ -37,19 +34,15 @@ use stream::{
     verify,
 };
 
-/// Signs the node's checkpoint signing bytes for `round` with `signer`'s key.
+/// Signs the node's checkpoint signing bytes for `round` with `signer`'s BLS key.
 fn checkpoint_sig_for(
     signer: u64,
     round: u64,
-    signing_bytes: &[u8; 72],
+    signing_bytes: &[u8; 136],
 ) -> consensus::CheckpointSig {
-    let key = SigningKey::from_bytes(&consensus_seed(signer));
-    let signature = key.sign(signing_bytes);
-    consensus::CheckpointSig {
-        round,
-        signer: NodeId::new(signer),
-        sig: primitives::Signature::new(signature.to_bytes()),
-    }
+    let bls = crypto::BlsIdentity::from_ikm(&consensus_seed(signer)).expect("bls");
+    let sig = bls.sign(signing_bytes);
+    consensus::CheckpointSig { round, signer: NodeId::new(signer), sig }
 }
 
 /// The deterministic 4-member deep clique from `consensus`'s `order.rs`:

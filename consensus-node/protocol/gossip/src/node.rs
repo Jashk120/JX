@@ -16,16 +16,17 @@ use consensus::{
     CheckpointAccumulator,
     CheckpointSig,
     RETENTION_ROUNDS,
+    RecordsRootItem,
     SignedCheckpoint,
 };
 use crypto::{
+    BlsIdentity,
     Hashable,
     MembershipOp,
     MembershipRegistry,
     Verifiable,
 };
 use ed25519_dalek::{
-    Signer,
     SigningKey,
     VerifyingKey,
 };
@@ -113,6 +114,7 @@ pub struct GossipNode {
     pub node_id: NodeId,
     pub hashgraph: Arc<Mutex<consensus::Hashgraph>>,
     signing_key: SigningKey,
+    bls_identity: BlsIdentity,
     registry: Mutex<MembershipRegistry>,
     identity: TlsIdentity,
     peers: Mutex<PeerManager>,
@@ -180,6 +182,21 @@ pub struct GossipNode {
     /// notified with every newly accepted checkpoint, so each decided round's
     /// record file is emitted. `None` means no record stream.
     record_sink: Mutex<Option<Arc<stream::RecordStreamWriter>>>,
+    /// Sidecar sink for the record proof files (`.rsf_proofs`): notified
+    /// alongside `record_sink` with the same checkpoint/diffs so each decided
+    /// round's Merkle inclusion proofs are emitted. `None` means no proof
+    /// stream. The record writer itself already emits the sidecar
+    /// atomically, so this sink is optional and typically points at the same
+    /// writer as `record_sink`; keeping it separate allows a dedicated proof
+    /// writer if desired without blocking consensus.
+    record_proof_sink: Mutex<Option<Arc<stream::RecordStreamWriter>>>,
+    /// Cumulative per-round state hashes for every finalized round.
+    /// Unlike the per-pass `state_hashes` built in `process_finalized_rounds`,
+    /// this map is never truncated on the hot path: `canonical_checkpoint_payload`
+    /// and `prev_checkpoint_hash_for` read from it, so a node always derives
+    /// the true per-round state hash regardless of which rounds finalized
+    /// together in a given pass (PLAN-2 Rule 1).
+    cumulative_state_hashes: Mutex<BTreeMap<u64, [u8; 32]>>,
 }
 
 impl GossipNode {
@@ -199,6 +216,31 @@ impl GossipNode {
         sync_timing: SyncTiming,
         state_db: Arc<state::StateDb>,
     ) -> Self {
+        let bls_identity =
+            BlsIdentity::from_ikm(&signing_key.to_bytes()).expect("BLS identity from signing key");
+        Self::new_with_bls(
+            node_id,
+            signing_key,
+            bls_identity,
+            registry,
+            identity,
+            peers,
+            sync_timing,
+            state_db,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_bls(
+        node_id: NodeId,
+        signing_key: SigningKey,
+        bls_identity: BlsIdentity,
+        registry: MembershipRegistry,
+        identity: TlsIdentity,
+        peers: Vec<PeerInfo>,
+        sync_timing: SyncTiming,
+        state_db: Arc<state::StateDb>,
+    ) -> Self {
         let peers: Vec<PeerInfo> =
             peers.into_iter().filter(|peer| peer.node_id != node_id).collect();
         let hashgraph = consensus::Hashgraph::new(&registry);
@@ -206,6 +248,7 @@ impl GossipNode {
             node_id,
             hashgraph: Arc::new(Mutex::new(hashgraph)),
             signing_key,
+            bls_identity,
             registry: Mutex::new(registry),
             identity,
             peers: Mutex::new(PeerManager::new(peers)),
@@ -226,6 +269,12 @@ impl GossipNode {
             event_sink: Mutex::new(None),
             event_stream_sink: Mutex::new(None),
             record_sink: Mutex::new(None),
+            record_proof_sink: Mutex::new(None),
+            cumulative_state_hashes: Mutex::new({
+                let mut m = BTreeMap::new();
+                m.insert(0, state::SparseMerkleTree::new().root());
+                m
+            }),
         }
     }
 
@@ -351,6 +400,10 @@ impl GossipNode {
         *self.record_sink.lock().await = Some(sink);
     }
 
+    pub async fn set_record_proof_sink(&self, sink: Arc<stream::RecordStreamWriter>) {
+        *self.record_proof_sink.lock().await = Some(sink);
+    }
+
     /// Flushes the event stream's buffered window to disk alongside the
     /// event-log flush, so a checkpoint and its events are durably co-located.
     async fn flush_event_stream_sink(&self) {
@@ -368,12 +421,20 @@ impl GossipNode {
         }
         let event_writer = self.event_stream_sink.lock().await.clone();
         let record_writer = self.record_sink.lock().await.clone();
+        let proof_writer = self.record_proof_sink.lock().await.clone();
         let flush_fut = async move {
             if let Some(writer) = event_writer {
                 writer.barrier().await;
             }
-            if let Some(writer) = record_writer {
+            if let Some(writer) = record_writer.as_ref() {
                 writer.barrier().await;
+            }
+            if let Some(writer) = proof_writer.as_ref() {
+                let is_duplicate =
+                    record_writer.as_ref().is_some_and(|record| Arc::ptr_eq(writer, record));
+                if !is_duplicate {
+                    writer.barrier().await;
+                }
             }
         };
         tokio::time::timeout(timeout, flush_fut).await.is_ok()
@@ -661,7 +722,7 @@ impl GossipNode {
             // serialized state is captured at the same point, so a reconnect
             // learner can be served the state exactly as it stood at the
             // checkpoint round.
-            let (state_hashes, snapshots) = {
+            let (state_hashes, snapshots, diffs) = {
                 let (pre_batch_hash, pre_batch_bytes) = {
                     let executor = self.executor.lock().await;
                     (executor.state().root(), executor.state().to_bytes())
@@ -672,33 +733,67 @@ impl GossipNode {
                 for pair in &finalized {
                     by_round.entry(pair.1).or_default().push(pair.clone());
                 }
-                // Round 0 never exists as an event round; it is the sentinel
-                // holding the state root before this batch, which is the
-                // correct value for any decided round that ordered no events.
                 let mut hashes: BTreeMap<u64, [u8; 32]> = BTreeMap::new();
                 let mut snapshots: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
+                let mut diffs: BTreeMap<u64, Vec<stream::pb::StateDiff>> = BTreeMap::new();
                 hashes.insert(0, pre_batch_hash);
                 snapshots.insert(0, pre_batch_bytes);
                 let ActivationState { pending, processed_through_round, .. } = &mut *activation;
                 let original_watermark = *processed_through_round;
                 for (round, events) in by_round {
                     let before_root = executor.state().root();
-                    if let Err(e) =
-                        executor.bucket_finalized(pending, processed_through_round, &events)
-                    {
-                        tracing::error!(round, error = %e, "bucket_finalized failed");
-                        continue;
-                    }
+                    let round_diffs_map = match executor.bucket_finalized_with_diffs(
+                        pending,
+                        processed_through_round,
+                        &events,
+                    ) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            tracing::error!(round, error = %e, "bucket_finalized failed");
+                            continue;
+                        }
+                    };
+                    let pb_diffs: Vec<stream::pb::StateDiff> = round_diffs_map
+                        .get(&round)
+                        .map(|vec| {
+                            vec.iter()
+                                .map(|d| stream::pb::StateDiff {
+                                    key: d.key.clone(),
+                                    value: d.value.clone(),
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
                     let after_root = executor.state().root();
                     if round > original_watermark {
                         hashes.insert(round, after_root);
                         snapshots.insert(round, executor.state().to_bytes());
-                    } else if after_root != before_root {
-                        hashes.insert(*processed_through_round, after_root);
-                        snapshots.insert(*processed_through_round, executor.state().to_bytes());
+                        diffs.insert(round, pb_diffs);
+                    } else {
+                        if after_root != before_root {
+                            hashes.insert(*processed_through_round, after_root);
+                            snapshots.insert(*processed_through_round, executor.state().to_bytes());
+                        }
+                        if !pb_diffs.is_empty() {
+                            let target = *processed_through_round;
+                            let mut merged: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
+                            if let Some(existing) = diffs.remove(&target) {
+                                for d in existing {
+                                    merged.insert(d.key, d.value);
+                                }
+                            }
+                            for d in pb_diffs {
+                                merged.insert(d.key, d.value);
+                            }
+                            let merged_vec = merged
+                                .into_iter()
+                                .map(|(k, v)| stream::pb::StateDiff { key: k, value: v })
+                                .collect();
+                            diffs.insert(target, merged_vec);
+                        }
                     }
                 }
-                (hashes, snapshots)
+                (hashes, snapshots, diffs)
             };
 
             // Phase C: activate ops whose activation round is now fully decided.
@@ -723,12 +818,21 @@ impl GossipNode {
                 };
 
                 for op in ops {
-                    if let MembershipOp::Add { node, key, addr, reconnect_addr } = op {
+                    if let MembershipOp::Add { node, key, bls_key, pop, addr, reconnect_addr } = op
+                    {
                         let already_member = {
                             let hg = self.hashgraph.lock().await;
                             hg.is_member(&node)
                         };
                         if already_member {
+                            continue;
+                        }
+
+                        if !verify_pop_bytes(&bls_key, &pop) {
+                            tracing::warn!(
+                                node_id = node.get(),
+                                "invalid BLS PoP for add-member; skipping activation"
+                            );
                             continue;
                         }
 
@@ -739,7 +843,7 @@ impl GossipNode {
                             let hg = self.hashgraph.lock().await;
                             hg.registry_at_round(activation_round)
                         };
-                        new_registry.register(node, key);
+                        new_registry.register(node, key, bls_key);
 
                         // Atomic: structural growth + roster schedule in one call.
                         {
@@ -763,7 +867,7 @@ impl GossipNode {
                         // node's events can be verified and inserted.
                         {
                             let mut registry = self.registry.lock().await;
-                            registry.register(node, key);
+                            registry.register(node, key, bls_key);
                         }
 
                         // TLS-pin the new peer, deriving the fingerprint from its
@@ -779,19 +883,28 @@ impl GossipNode {
             }
 
             // Phase D: produce checkpoints for every round decided since the
-            // last pass, using the per-round state hashes captured above.
-            self.produce_pending_checkpoints(&state_hashes, &snapshots).await;
+            // last pass. State hashes are cumulative so `prev_checkpoint_hash_for`
+            // rebuilds read true per-round hashes (Rule 1), not the pass-local
+            // pre-batch sentinel.
+            let cumulative_state_hashes = {
+                let mut cumulative = self.cumulative_state_hashes.lock().await;
+                for (round, hash) in &state_hashes {
+                    if *round != 0 {
+                        cumulative.insert(*round, *hash);
+                    }
+                }
+                cumulative.clone()
+            };
+            self.produce_pending_checkpoints(&cumulative_state_hashes, &snapshots, &diffs).await;
         } else {
-            // No newly finalized events: no rounds were newly ordered, but a
-            // round may still have just been decided. The per-pass maps'
-            // round-0 sentinel falls back to the current (unchanged) state.
-            let (bytes, root) = {
+            let (bytes, _root) = {
                 let executor = self.executor.lock().await;
                 (executor.state().to_bytes(), executor.state().root())
             };
-            let state_hashes = BTreeMap::from([(0, root)]);
+            let cumulative_state_hashes = self.cumulative_state_hashes.lock().await.clone();
             let snapshots = BTreeMap::from([(0, bytes)]);
-            self.produce_pending_checkpoints(&state_hashes, &snapshots).await;
+            let diffs: BTreeMap<u64, Vec<stream::pb::StateDiff>> = BTreeMap::new();
+            self.produce_pending_checkpoints(&cumulative_state_hashes, &snapshots, &diffs).await;
         }
         self.checkpoint_notify.notify_waiters();
     }
@@ -805,6 +918,7 @@ impl GossipNode {
         &self,
         state_hashes: &BTreeMap<u64, [u8; 32]>,
         snapshots: &BTreeMap<u64, Vec<u8>>,
+        diffs: &BTreeMap<u64, Vec<stream::pb::StateDiff>>,
     ) {
         loop {
             let round = self.activation.lock().await.checkpoint_watermark + 1;
@@ -819,7 +933,7 @@ impl GossipNode {
                 let mut activation = self.activation.lock().await;
                 activation.checkpoint_watermark = round;
             }
-            self.produce_checkpoint(round, state_hashes, snapshots).await;
+            self.produce_checkpoint(round, state_hashes, snapshots, diffs).await;
         }
     }
 
@@ -836,33 +950,24 @@ impl GossipNode {
         round: u64,
         state_hashes: &BTreeMap<u64, [u8; 32]>,
         snapshots: &BTreeMap<u64, Vec<u8>>,
+        diffs: &BTreeMap<u64, Vec<stream::pb::StateDiff>>,
     ) {
-        let state_hash = *state_hashes
-            .range(..=round)
-            .next_back()
-            .map(|(_, hash)| hash)
-            .expect("the round-0 sentinel always present");
-        // The exact serialized state whose root is `state_hash`, captured in
-        // the same producing pass. Carried through the accumulator so
-        // acceptance persists exactly the committed bytes — no second lookup.
         let snapshot_bytes = snapshots
             .range(..=round)
             .next_back()
             .map(|(_, bytes)| bytes.clone())
             .expect("the round-0 sentinel always present");
+        let diffs_for_round = diffs.get(&round).cloned().unwrap_or_default();
+        let signed_snapshot = self.signed_checkpoints.lock().await.clone();
         let payload = {
             let hg = self.hashgraph.lock().await;
-            hg.checkpoint_payload(round, state_hash)
+            Self::canonical_checkpoint_payload_chained(&hg, round, state_hashes, &signed_snapshot)
         };
         let Some(payload) = payload else { return };
 
-        let signature = self.signing_key.sign(&payload.signing_bytes());
-        let own_sig = CheckpointSig {
-            round,
-            signer: self.node_id,
-            sig: primitives::Signature::new(signature.to_bytes()),
-        };
-        self.outbound_checkpoint_sigs.lock().await.push(own_sig.clone());
+        let sig = self.bls_identity.sign(&payload.signing_bytes());
+        let own_sig = CheckpointSig { round, signer: self.node_id, sig };
+        self.outbound_checkpoint_sigs.lock().await.push(own_sig);
 
         let roster = {
             let hg = self.hashgraph.lock().await;
@@ -896,8 +1001,81 @@ impl GossipNode {
             (accepted, snapshot)
         };
         if let (Some(accepted), Some(snapshot)) = (accepted, snapshot) {
-            self.accept_checkpoint(accepted, snapshot).await;
+            self.accept_checkpoint(accepted, snapshot, diffs_for_round).await;
         }
+    }
+
+    /// Pure helper: the canonical checkpoint payload for `round` derived
+    /// solely from decided history — the hashgraph's consensus order and
+    /// the deterministic `state_hashes` map. Determinism is critical:
+    /// every honest node must derive byte-identical payloads for the same
+    /// round regardless of local acceptance progress (PLAN-2 Rule 1).
+    ///
+    /// Returns `None` while `round` is not yet decided or when no
+    /// `state_hash` is available at or below `round`.
+    fn canonical_checkpoint_payload(
+        hg: &consensus::Hashgraph,
+        round: u64,
+        state_hashes: &BTreeMap<u64, [u8; 32]>,
+    ) -> Option<consensus::CheckpointPayload> {
+        let state_hash = *state_hashes.range(..=round).next_back()?.1;
+        // Determinism: records_root is over consensus-order items for the round
+        // (final/deterministic once the round is decided).
+        let order = hg.consensus_order(round);
+        let mut items = Vec::with_capacity(order.len());
+        for hash in &order {
+            if let Some(record) = hg.get(hash) {
+                for (idx, tx) in record.event().payload().iter().enumerate() {
+                    items.push(RecordsRootItem {
+                        event_hash: *hash.as_bytes(),
+                        tx_index: idx as u32,
+                        tx_payload: tx.payload().to_vec(),
+                    });
+                }
+            }
+        }
+        let records_root = consensus::compute_records_root(&items);
+        hg.checkpoint_payload(round, records_root, state_hash)
+    }
+
+    /// PLAN-2 Rule 1: the chained payload for `round`, where `prev_checkpoint_hash`
+    /// is a pure function of decided history (plus a stored-checkpoint fallback
+    /// for the restart-from-K pruned-graph case). Every honest node derives the
+    /// identical bytes for the same `round` regardless of local acceptance lag.
+    fn canonical_checkpoint_payload_chained(
+        hg: &consensus::Hashgraph,
+        round: u64,
+        state_hashes: &BTreeMap<u64, [u8; 32]>,
+        signed: &[SignedCheckpoint],
+    ) -> Option<consensus::CheckpointPayload> {
+        let base = Self::canonical_checkpoint_payload(hg, round, state_hashes)?;
+        let prev = Self::prev_checkpoint_hash_for(hg, round, state_hashes, signed);
+        Some(base.with_prev_checkpoint_hash(prev))
+    }
+
+    /// `prev_checkpoint_hash(R)` — the hash honest nodes sign for round `R`.
+    /// Priority: stored checkpoint for `R-1` (covers restart-from-K where the
+    /// hashgraph is pruned and cannot rebuild `K`), else the rebuilt chained
+    /// payload for `R-1` from decided history, else genesis zeros.
+    fn prev_checkpoint_hash_for(
+        hg: &consensus::Hashgraph,
+        round: u64,
+        state_hashes: &BTreeMap<u64, [u8; 32]>,
+        signed: &[SignedCheckpoint],
+    ) -> [u8; 32] {
+        if round == 0 {
+            return [0u8; 32];
+        }
+        let prev_round = round - 1;
+        if let Some(sc) = signed.iter().find(|sc| sc.payload.round == prev_round) {
+            return sc.payload.signing_bytes_hash();
+        }
+        if let Some(prev_payload) =
+            Self::canonical_checkpoint_payload_chained(hg, prev_round, state_hashes, signed)
+        {
+            return prev_payload.signing_bytes_hash();
+        }
+        [0u8; 32]
     }
 
     /// Feeds an inbound `CheckpointSig` into the accumulator for its round.
@@ -942,7 +1120,7 @@ impl GossipNode {
             accepted
         };
         if let Some((accepted, snapshot)) = accepted {
-            self.accept_checkpoint(accepted, snapshot).await;
+            self.accept_checkpoint(accepted, snapshot, Vec::new()).await;
         }
     }
 
@@ -954,7 +1132,12 @@ impl GossipNode {
     /// is always served the highest accepted checkpoint (round ≥ `round -
     /// RETENTION_ROUNDS`), so anything below the floor can never be served
     /// again and keeping it would only grow memory.
-    async fn accept_checkpoint(&self, accepted: SignedCheckpoint, snapshot: Vec<u8>) {
+    async fn accept_checkpoint(
+        &self,
+        accepted: SignedCheckpoint,
+        snapshot: Vec<u8>,
+        diffs: Vec<stream::pb::StateDiff>,
+    ) {
         let round = accepted.payload.round;
         // Defensive: refuse to persist a snapshot that does not rebuild to the
         // committed root. The accumulator carries the bytes captured in the same
@@ -994,8 +1177,18 @@ impl GossipNode {
         // pruning only removes rounds already ordered, so the assembly
         // is race-free even when it runs concurrently.
         let record_sink = self.record_sink.lock().await.clone();
+        let proof_sink = self.record_proof_sink.lock().await.clone();
+        let proof_is_duplicate = match (&record_sink, &proof_sink) {
+            (Some(r), Some(p)) => Arc::ptr_eq(r, p),
+            _ => false,
+        };
         if let Some(record_sink) = record_sink {
-            stream::RecordSink::persist(&*record_sink, &accepted).await;
+            stream::RecordSink::persist(&*record_sink, &accepted, diffs.clone()).await;
+        }
+        if let Some(proof_sink) = proof_sink
+            && !proof_is_duplicate
+        {
+            stream::RecordSink::persist(&*proof_sink, &accepted, diffs).await;
         }
         {
             let mut signed = self.signed_checkpoints.lock().await;
@@ -1017,6 +1210,10 @@ impl GossipNode {
         {
             let mut snapshots = self.state_snapshots.lock().await;
             snapshots.retain(|&snap_round, _| snap_round >= prune_before_round);
+        }
+        {
+            let mut cumulative = self.cumulative_state_hashes.lock().await;
+            cumulative.retain(|&r, _| r == 0 || r >= prune_before_round);
         }
         if let Err(e) = self.state_db.prune_snapshots_before(prune_before_round) {
             tracing::warn!(prune_before_round, error = %e, "failed to prune state snapshots");
@@ -1093,7 +1290,7 @@ impl GossipNode {
 
     /// The signing bytes the node's checkpoint for `round` is over, if one
     /// has been produced. Tests use this to craft valid signatures.
-    pub async fn checkpoint_signing_bytes(&self, round: u64) -> Option<[u8; 72]> {
+    pub async fn checkpoint_signing_bytes(&self, round: u64) -> Option<[u8; 136]> {
         self.checkpoint_accumulators
             .lock()
             .await
@@ -1225,9 +1422,36 @@ impl GossipNode {
         response: ReconnectResponse,
         state_db: Arc<state::StateDb>,
     ) -> Result<Self> {
-        let shell = Self::new(
+        let bls_identity =
+            BlsIdentity::from_ikm(&signing_key.to_bytes()).expect("BLS identity from signing key");
+        Self::from_checkpoint_with_bls(
             node_id,
             signing_key,
+            bls_identity,
+            identity,
+            peers,
+            sync_timing,
+            response,
+            state_db,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn from_checkpoint_with_bls(
+        node_id: NodeId,
+        signing_key: SigningKey,
+        bls_identity: BlsIdentity,
+        identity: TlsIdentity,
+        peers: Vec<PeerInfo>,
+        sync_timing: SyncTiming,
+        response: ReconnectResponse,
+        state_db: Arc<state::StateDb>,
+    ) -> Result<Self> {
+        let shell = Self::new_with_bls(
+            node_id,
+            signing_key,
+            bls_identity,
             MembershipRegistry::new(),
             identity,
             peers,
@@ -1333,6 +1557,12 @@ impl GossipNode {
             return false;
         }
         self.state_snapshots.lock().await.insert(cp_round, response.state_bytes.clone());
+        {
+            let mut cumulative = self.cumulative_state_hashes.lock().await;
+            cumulative.clear();
+            cumulative.insert(0, state::SparseMerkleTree::new().root());
+            cumulative.insert(cp_round, checkpoint.payload.state_hash);
+        }
 
         // 5. Rebuild the hashgraph scaffold and load the teacher's retained
         //    graph into it. The retained events carry their full record
@@ -1557,20 +1787,32 @@ impl GossipNode {
     }
 }
 
-/// Verifies `sig` over `signing_bytes` against the key registered for
-/// `sig.signer` in the roster active at the signature's round. A signature
-/// from a member not in that roster (e.g. a node that joined later) is
-/// rejected.
-fn verify_checkpoint_sig(
-    sig: &CheckpointSig,
-    signing_bytes: &[u8; 72],
-    roster: &MembershipRegistry,
-) -> bool {
-    let Ok(key) = roster.key_for(&sig.signer) else {
+fn verify_pop_bytes(bls_key: &[u8; 48], pop: &[u8; 96]) -> bool {
+    let Ok(pk) = blst::min_pk::PublicKey::from_bytes(bls_key) else {
         return false;
     };
-    let signature = ed25519_dalek::Signature::from_bytes(sig.sig.as_bytes());
-    key.verify_strict(signing_bytes, &signature).is_ok()
+    let Ok(sig) = blst::min_pk::Signature::from_bytes(pop) else {
+        return false;
+    };
+    crypto::bls::verify_pop(&pk, &sig)
+}
+
+/// Verifies `sig` over `signing_bytes` against the BLS key registered for
+/// `sig.signer` in the roster active at the signature's round. A signature
+/// from a member not in that roster is rejected.
+fn verify_checkpoint_sig(
+    sig: &CheckpointSig,
+    signing_bytes: &[u8; 136],
+    roster: &MembershipRegistry,
+) -> bool {
+    let Some(bls_bytes) = roster.bls_key_for(&sig.signer) else {
+        return false;
+    };
+    let Ok(pk) = blst::min_pk::PublicKey::from_bytes(bls_bytes) else {
+        return false;
+    };
+    sig.sig.verify(true, signing_bytes, crypto::bls::CHECKPOINT_DST, &[], &pk, true)
+        == blst::BLST_ERROR::BLST_SUCCESS
 }
 
 /// Persists an accepted [`SignedCheckpoint`]. Implemented by the embedding
@@ -1591,10 +1833,7 @@ mod pending_sig_tests {
     use consensus::CheckpointSig;
     use crypto::MembershipRegistry;
     use ed25519_dalek::SigningKey;
-    use primitives::{
-        NodeId,
-        Signature,
-    };
+    use primitives::NodeId;
     use tempfile::tempdir;
 
     use super::*;
@@ -1604,7 +1843,8 @@ mod pending_sig_tests {
         let mut keys = Vec::new();
         for &id in nodes {
             let k = SigningKey::from_bytes(&[id as u8; 32]);
-            registry.register(NodeId::new(id), k.verifying_key());
+            let bls = crypto::BlsIdentity::from_ikm(&[id as u8; 32]).expect("bls");
+            registry.register(NodeId::new(id), k.verifying_key(), bls.public.to_bytes());
             keys.push(k);
         }
         (registry, keys)
@@ -1631,7 +1871,10 @@ mod pending_sig_tests {
     }
 
     fn sig(round: u64, signer: u64) -> CheckpointSig {
-        CheckpointSig { round, signer: NodeId::new(signer), sig: Signature::new([1u8; 64]) }
+        let bls = crypto::BlsIdentity::from_ikm(&[signer as u8; 32]).expect("bls");
+        // Dummy payload for signing not validated in pending tests; sign a fixed message.
+        let dummy = [0u8; 136];
+        CheckpointSig { round, signer: NodeId::new(signer), sig: bls.sign(&dummy) }
     }
 
     #[tokio::test]
@@ -1664,11 +1907,16 @@ mod pending_sig_tests {
     async fn pending_drops_round_at_or_below_watermark() {
         let (registry, _) = registry_with(&[1, 2, 3]);
         let node = make_node(registry.clone()).await;
-        let payload = consensus::CheckpointPayload::new(10, [0u8; 32], registry);
-        node.signed_checkpoints
-            .lock()
-            .await
-            .push(consensus::SignedCheckpoint { payload, sigs: vec![sig(10, 1)] });
+        let payload = consensus::CheckpointPayload::new(10, [0u8; 32], [0u8; 32], registry);
+        let agg = {
+            let bls = crypto::BlsIdentity::from_ikm(&[1u8; 32]).expect("bls");
+            bls.sign(&payload.signing_bytes())
+        };
+        node.signed_checkpoints.lock().await.push(consensus::SignedCheckpoint {
+            payload,
+            aggregate_sig: agg,
+            signers: vec![NodeId::new(1)],
+        });
         node.submit_checkpoint_sig(sig(10, 2)).await;
         node.submit_checkpoint_sig(sig(9, 2)).await;
         node.submit_checkpoint_sig(sig(11, 2)).await;
@@ -1689,10 +1937,22 @@ mod pending_sig_tests {
         node.hashgraph.lock().await.mark_decided_through(5);
         let snapshot = node.executor.lock().await.state().to_bytes();
         let state_hash = state::State::root_of_bytes(&snapshot).expect("empty state hashes");
-        let payload =
-            consensus::CheckpointPayload::new(5, state_hash, node.registry.lock().await.clone());
-        let accepted = consensus::SignedCheckpoint { payload, sigs: vec![sig(5, 1)] };
-        node.accept_checkpoint(accepted, snapshot).await;
+        let payload = consensus::CheckpointPayload::new(
+            5,
+            [0u8; 32],
+            state_hash,
+            node.registry.lock().await.clone(),
+        );
+        let agg = {
+            let bls = crypto::BlsIdentity::from_ikm(&[1u8; 32]).expect("bls");
+            bls.sign(&payload.signing_bytes())
+        };
+        let accepted = consensus::SignedCheckpoint {
+            payload,
+            aggregate_sig: agg,
+            signers: vec![NodeId::new(1)],
+        };
+        node.accept_checkpoint(accepted, snapshot, Vec::new()).await;
         assert!(
             node.state_snapshots.lock().await.contains_key(&5),
             "accepted round must be recorded for reconnect serving"
@@ -1702,5 +1962,138 @@ mod pending_sig_tests {
         let pending = node.pending_checkpoint_sigs.lock().await;
         assert!(!pending.contains_key(&3));
         assert!(!pending.contains_key(&5));
+    }
+}
+
+#[cfg(test)]
+mod rule1_chain_tests {
+    use std::collections::BTreeMap;
+
+    use crypto::MembershipRegistry;
+    use ed25519_dalek::SigningKey;
+    use primitives::NodeId;
+
+    use super::*;
+
+    fn registry_with(nodes: &[u64]) -> MembershipRegistry {
+        let mut registry = MembershipRegistry::new();
+        for &id in nodes {
+            let k = SigningKey::from_bytes(&[id as u8; 32]);
+            let bls = crypto::BlsIdentity::from_ikm(&[id as u8; 32]).expect("bls");
+            registry.register(NodeId::new(id), k.verifying_key(), bls.public.to_bytes());
+        }
+        registry
+    }
+
+    #[tokio::test]
+    async fn chained_payload_identical_despite_acceptance_lag() {
+        let registry = registry_with(&[1, 2, 3, 4]);
+        let hg = {
+            let mut hg = consensus::Hashgraph::new(&registry);
+            hg.mark_decided_through(2);
+            hg
+        };
+        let mut state_hashes = BTreeMap::new();
+        state_hashes.insert(0, [0xAA; 32]);
+        state_hashes.insert(1, [0x11; 32]);
+        state_hashes.insert(2, [0x22; 32]);
+
+        let payload_via_rebuild =
+            GossipNode::canonical_checkpoint_payload_chained(&hg, 2, &state_hashes, &[])
+                .expect("round 2 decided");
+
+        let payload_round1 =
+            GossipNode::canonical_checkpoint_payload_chained(&hg, 1, &state_hashes, &[])
+                .expect("round 1 decided");
+        let sig = {
+            let bls = crypto::BlsIdentity::from_ikm(&[1u8; 32]).expect("bls");
+            bls.sign(&payload_round1.signing_bytes())
+        };
+        let stored = consensus::SignedCheckpoint {
+            payload: payload_round1.clone(),
+            aggregate_sig: sig,
+            signers: vec![NodeId::new(1)],
+        };
+        let payload_via_stored = GossipNode::canonical_checkpoint_payload_chained(
+            &hg,
+            2,
+            &state_hashes,
+            std::slice::from_ref(&stored),
+        )
+        .expect("round 2 via stored");
+
+        assert_eq!(
+            payload_via_rebuild.signing_bytes(),
+            payload_via_stored.signing_bytes(),
+            "lagging node (rebuild) and accepted node (stored) must sign identical bytes"
+        );
+        assert_eq!(
+            payload_via_rebuild.prev_checkpoint_hash,
+            payload_round1.signing_bytes_hash(),
+            "prev must be hash of round 1"
+        );
+    }
+
+    #[tokio::test]
+    async fn genesis_prev_is_zeros_and_chain_is_pure() {
+        let registry = registry_with(&[1, 2, 3, 4]);
+        let mut hg = consensus::Hashgraph::new(&registry);
+        hg.mark_decided_through(1);
+        let mut state_hashes = BTreeMap::new();
+        state_hashes.insert(0, [0xAA; 32]);
+        state_hashes.insert(1, [0x11; 32]);
+
+        let p1 = GossipNode::canonical_checkpoint_payload_chained(&hg, 1, &state_hashes, &[])
+            .expect("round 1");
+        assert_eq!(p1.prev_checkpoint_hash, [0u8; 32]);
+
+        hg.mark_decided_through(2);
+        state_hashes.insert(2, [0x22; 32]);
+        let p2 = GossipNode::canonical_checkpoint_payload_chained(&hg, 2, &state_hashes, &[])
+            .expect("round 2");
+        assert_eq!(p2.prev_checkpoint_hash, p1.signing_bytes_hash());
+    }
+
+    #[tokio::test]
+    async fn chained_payload_deterministic_across_pass_groupings() {
+        let registry = registry_with(&[1, 2, 3, 4]);
+        let mut hg = consensus::Hashgraph::new(&registry);
+        hg.mark_decided_through(3);
+        let mut cumulative = BTreeMap::new();
+        cumulative.insert(0, [0xAA; 32]);
+        cumulative.insert(1, [0x11; 32]);
+        cumulative.insert(2, [0x22; 32]);
+        cumulative.insert(3, [0x33; 32]);
+
+        let payload3_cumulative =
+            GossipNode::canonical_checkpoint_payload_chained(&hg, 3, &cumulative, &[])
+                .expect("round 3 via cumulative");
+
+        let mut map_a = BTreeMap::new();
+        map_a.insert(0, [0x22; 32]);
+        map_a.insert(3, [0x33; 32]);
+        let payload3_a = GossipNode::canonical_checkpoint_payload_chained(&hg, 3, &map_a, &[])
+            .expect("round 3 via map_a");
+
+        let mut map_b = BTreeMap::new();
+        map_b.insert(0, [0x11; 32]);
+        map_b.insert(2, [0x22; 32]);
+        map_b.insert(3, [0x33; 32]);
+        let payload3_b = GossipNode::canonical_checkpoint_payload_chained(&hg, 3, &map_b, &[])
+            .expect("round 3 via map_b");
+
+        assert_ne!(
+            payload3_a.signing_bytes(),
+            payload3_b.signing_bytes(),
+            "per-pass maps with different floors must diverge (the bug)"
+        );
+
+        let payload2 = GossipNode::canonical_checkpoint_payload_chained(&hg, 2, &cumulative, &[])
+            .expect("round 2");
+        let payload1 = GossipNode::canonical_checkpoint_payload_chained(&hg, 1, &cumulative, &[])
+            .expect("round 1");
+        assert_eq!(payload2.prev_checkpoint_hash, payload1.signing_bytes_hash());
+        assert_eq!(payload3_cumulative.prev_checkpoint_hash, payload2.signing_bytes_hash());
+        assert_ne!(payload3_a.prev_checkpoint_hash, payload2.signing_bytes_hash());
     }
 }

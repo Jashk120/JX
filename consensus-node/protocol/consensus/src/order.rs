@@ -362,7 +362,11 @@ mod tests {
             for (i, &name) in members.iter().enumerate() {
                 let key = SigningKey::generate(&mut OsRng);
                 let node = NodeId::new((i + 1) as u64);
-                registry.register(node, key.verifying_key());
+                registry.register(
+                    node,
+                    key.verifying_key(),
+                    crypto::BlsIdentity::from_ikm(&[0u8; 32]).expect("bls").public.to_bytes(),
+                );
                 nodes.insert(name, (node, key));
             }
             let hg = Hashgraph::new(&registry);

@@ -1,3 +1,4 @@
+pub mod bls;
 pub mod canonical;
 pub mod canonical_impls;
 mod error;
@@ -8,6 +9,15 @@ pub mod roster;
 pub mod signable;
 pub mod signable_impls;
 
+pub use bls::{
+    BlsIdentity,
+    CHECKPOINT_DST,
+    POP_DST,
+    aggregate,
+    sign_pop,
+    verify_aggregate,
+    verify_pop,
+};
 pub use canonical::CanonicalEncode;
 pub use error::{
     CryptoError,

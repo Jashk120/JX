@@ -1,8 +1,9 @@
 # mirror-node
 
 Go mirror node for JKaIN. It tails the consensus node's **mirror stream files**
-(`.esf` / `.rsf` + `.sig`) emitted into `<data>/streams/` and exposes a
-read-only HTTP API over the verified history.
+emitted into `<data>/streams/` (`.esf` + `.esf_sig`, `.rsf` + `.rsf_proofs`,
+`.ckpt`) and exposes a read-only HTTP API over the verified history.
+`STREAM_VERSION` 3, `FORMAT_VERSION` 5 on the consensus side.
 
 Protobuf schema: [`../proto/jkain_stream.proto`](../proto/jkain_stream.proto)
 — the single shared schema, compiled directly from the repo root (no vendored
@@ -28,12 +29,19 @@ mirror-node/
 
 ```bash
 cd mirror-node
-go build ./...
-go vet ./...
-go test ./...          # stream hash tests, etc.
+CGO_ENABLED=1 go build ./...
+CGO_ENABLED=1 go vet ./...
+CGO_ENABLED=1 go test ./...          # stream hash tests, BLS verification, etc.
 
 # regenerate protobuf (requires protoc + protoc-gen-go)
 make proto
+
+# BLS (blst) bindings: pure Go fetch, CGO builds via cgo_server.c
+# Linux: CGO_ENABLED=1 is the default where gcc is available; no extra lib build needed.
+# macOS: brew install llvm && CGO_ENABLED=1 go build ./...
+# If you hit illegal-instruction crashes on older CPUs: CGO_CFLAGS="-O2 -D__BLST_PORTABLE__" CGO_ENABLED=1 go build ./...
+# Verify blst dependency:
+make blst
 
 # run locally against a consensus data dir
 go run ./cmd/mirrord --streams ../consensus-node/data/streams --addr :8080
@@ -70,8 +78,9 @@ When `block_node_url` is set (or `--block-node-url` is passed), the ingester pol
 
 - `GET /v1/blocks` lists files (newline-separated names; whitespace trimmed, empties dropped).
 - `GET /v1/blocks/{name}` fetches a file; name validation rejects empty, `/`, or `..`; `404` maps to `ErrNotFound`.
-- Each poll filters to `{.esf,.rsf,.esf_sig,.rsf_sig}`, sorts by numeric index ascending, and applies the same skip/dedupe semantics as the local scan (per-round/per-index `seen` + `in-flight` guards, chain continuity, `VerifyRecordFile`/`VerifyEventFile`, `PutRecord`/`PutEvents`). Missing companion sig defers ingestion (transient); per-file verify/store errors are logged and skipped; listing failure returns an error like the local `ReadDir` path.
+- Each poll filters to `{.esf,.esf_sig,.rsf,.ckpt}`, sorts by numeric index ascending, and applies the same skip/dedupe semantics as the local scan (per-round/per-index `seen` + `in-flight` guards, chain continuity, `VerifyRecordFile`/`VerifyEventFile`, `PutRecord`/`PutEvents`). `.rsf_sig` no longer exists (records are BLS-bound). For events, missing companion sig defers ingestion (transient); for records, BLS `records_root` + aggregate verification is authoritative and needs no companion file. Per-file verify/store errors are logged and skipped; listing failure returns an error like the local `ReadDir` path.
 - Default HTTP client timeout is 10s and context is honored.
+- Remote roster anchoring: when `trusted_roster_hash` is set, the embedded `roster_hash` must equal it (fail-closed). When empty/unset the mirror accepts whatever roster hash is embedded as the trust anchor for that poll (preserving the embedded-snapshot behavior for single-node local repro), but still checks BLS aggregate and `records_root`.
 
 When `block_node_url` is empty the legacy local-directory behavior is 100% unchanged.
 
@@ -90,11 +99,19 @@ Each stream file is checked before ingestion:
 
 - **Running hash** (`SHA256(DOMAIN||"item"||item)` → `SHA256(DOMAIN||"chain"||prev||item)`,
   seed `[0;32]`) – continuity across items and `end == next.start`.
-- **Signature file** (`.esf_sig`/`.rsf_sig`) – `file_signature` over `SHA256(file)`
-  and `metadata_signature` over header hash, both Ed25519.
-- **Checkpoint quorum** (`valid*3 > total*2` over roster snapshot) for record files.
+- **Event signature file** (`.esf_sig`) – `file_signature` over `SHA256(file)`
+  and `metadata_signature` over header hash, both Ed25519. No `.rsf_sig` file
+  exists — record authenticity is content-bound.
+- **BLS checkpoint** (record files) – roster hash anchoring (optional `trusted_roster_hash` check), **Merkle `records_root`** (padded power-of-two, Hiero domain-separated: `empty=SHA256(0x00)`, `leaf=SHA256(0x00||event_hash||tx_index||len||payload)`, `internal=SHA256(0x02||l||r)`, `singleton=SHA256(0x01||c)`) recomputed via `ComputeRecordsRoot` and checked against the checkpoint's `records_root`, and BLS12-381 aggregate signature verification over **136 B** `round||records_root||state_hash||roster_hash||prev_checkpoint_hash` with DST `JKAIN-CHECKPOINT-BLS-V1` (48-byte G1 bls_keys, 96-byte G2 aggregate_sig, quorum `count*3>total*2`). No `.rsf_sig` file.
+- **Chained history** – `prev_checkpoint_hash` continuity: each `.rsf`'s checkpoint must commit to `SHA256(prev_signing_bytes)` (genesis `[0;32]`), enforced across consecutive rounds.
+- **State diffs** – `ValidateStateDiffs`: sorted ascending by key, no duplicates, non-empty keys, LWW within the round; `value=None` is a tombstone.
+- **Proofs sidecar** (`.rsf_proofs` / `RecordsProofFile`) – per-item Merkle inclusion proofs (`item_index`, `ProofStep{sibling_hash[32], sibling_is_right}`), count == items, `VerifyRecordsProof` per item against the `records_root`. Missing sidecar file is tolerated as empty-verify; tampered proofs fail.
 
-Matches `consensus-node/protocol/stream/src/verify.rs`.
+Matches `consensus-node/protocol/stream/src/verify.rs`, `protocol/consensus/src/checkpoint.rs:compute_records_root` / `verify_records_proof`, `protocol/stream/src/proof.rs`, and `mirror-node/internal/stream/verify.go:ValidateStateDiffs` / `VerifyRecordsProof` / `VerifyPrevCheckpointHash`.
+
+Remote vs local inputs:
+- **Local mode** (`MIRROR_STREAMS_DIR`): scans `<streams_dir>` for `.esf`/`.rsf`/`.rsf_proofs`.
+- **Remote mode** (`MIRROR_BLOCK_NODE_URL` set, e.g. block-node): same verification from bytes fetched via `GET /v1/blocks`; see Remote block-node mode above. BLS + Merkle + prev + diffs + proofs verification is identical in both modes.
 
 ## PostgreSQL persistence
 

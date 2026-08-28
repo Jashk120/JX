@@ -13,7 +13,14 @@ pub use checkpoint::{
     CheckpointPayload,
     CheckpointSig,
     RETENTION_ROUNDS,
+    RecordsProof,
+    RecordsProofStep,
+    RecordsRootItem,
     SignedCheckpoint,
+    build_records_proofs,
+    compute_records_root,
+    compute_records_root_with_proofs,
+    verify_records_proof,
 };
 pub use error::{
     ConsensusError,

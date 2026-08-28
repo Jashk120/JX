@@ -30,7 +30,11 @@ use rand::rngs::OsRng;
 fn registry_of(nodes: &[(NodeId, &SigningKey)]) -> MembershipRegistry {
     let mut registry = MembershipRegistry::new();
     for (id, key) in nodes {
-        registry.register(*id, key.verifying_key());
+        registry.register(
+            *id,
+            key.verifying_key(),
+            crypto::BlsIdentity::from_ikm(&[0u8; 32]).expect("bls").public.to_bytes(),
+        );
     }
     registry
 }
@@ -78,7 +82,11 @@ fn single_hashgraph_crosses_membership_transition() {
     let key_d = SigningKey::generate(&mut OsRng);
     let node_d = NodeId::new(4);
     let mut expanded = initial.clone();
-    expanded.register(node_d, key_d.verifying_key());
+    expanded.register(
+        node_d,
+        key_d.verifying_key(),
+        crypto::BlsIdentity::from_ikm(&[0u8; 32]).expect("bls").public.to_bytes(),
+    );
     hg.add_member(node_d, 2, expanded.clone());
 
     assert_eq!(hg.member_count(), 4);

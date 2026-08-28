@@ -32,21 +32,22 @@ use crate::config::{
 /// seed) and its own local `cluster.toml` (genesis members + the new member).
 /// The shared genesis `cluster.toml` is never modified. Prints the `--key` hex
 /// to pass to `add-member` on an existing node, plus firewall instructions.
-pub(crate) fn member_cmd(args: &[String]) -> Result<()> {
+pub(crate) async fn member_cmd(args: &[String]) -> Result<()> {
     let sub = args.first().context("member requires a subcommand: init")?;
     match sub.as_str() {
-        "init" => member_init(&args[1..]),
+        "init" => member_init(&args[1..]).await,
         other => bail!("member: unknown subcommand '{other}'"),
     }
 }
 
-fn member_init(args: &[String]) -> Result<()> {
+async fn member_init(args: &[String]) -> Result<()> {
     let mut node_id: Option<u64> = None;
     let mut gossip: Option<SocketAddr> = None;
     let mut reconnect: Option<SocketAddr> = None;
     let mut cluster_path: Option<PathBuf> = None;
     let mut out_dir: Option<PathBuf> = None;
     let mut force = false;
+    let mut socket_path: Option<PathBuf> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -74,6 +75,9 @@ fn member_init(args: &[String]) -> Result<()> {
                 force = true;
                 i += 1;
             }
+            "--socket" => {
+                socket_path = Some(PathBuf::from(next_value(args, &mut i, "--socket")?));
+            }
             other => bail!("member init: unknown argument '{other}'"),
         }
     }
@@ -100,15 +104,33 @@ fn member_init(args: &[String]) -> Result<()> {
     let identity = TlsIdentity::from_seed(seed, node_id)
         .with_context(|| format!("building TLS identity for node {node_id}"))?;
 
+    // BLS identity: separate 32-byte IKM, derives the BLS public key for checkpoints.
+    let mut bls_ikm = [0u8; 32];
+    OsRng.fill_bytes(&mut bls_ikm);
+    let bls_identity = crypto::BlsIdentity::from_ikm(&bls_ikm)
+        .with_context(|| format!("generating BLS identity for node {node_id}"))?;
+    let bls_pub = bls_identity.public.to_bytes();
+    let pop_check = crypto::sign_pop(&bls_identity);
+    if !crypto::verify_pop(&bls_identity.public, &pop_check) {
+        bail!("member init: BLS PoP self-check failed for node {node_id}");
+    }
+
     let secret_path = out_dir.join(format!("secret-{node_id}.bin"));
-    if secret_path.exists() && !force {
+    let bls_path = out_dir.join(format!("secret-{node_id}.bls.bin"));
+    if (secret_path.exists() || bls_path.exists()) && !force {
+        let existing = if secret_path.exists() {
+            secret_path.display().to_string()
+        } else {
+            bls_path.display().to_string()
+        };
         bail!(
-            "{} already exists; use --force to regenerate (refusing to overwrite secrets)",
-            secret_path.display()
+            "{existing} already exists; use --force to regenerate (refusing to overwrite secrets)"
         );
     }
     write_secret_bytes(&secret_path, &seed)
         .with_context(|| format!("writing {}", secret_path.display()))?;
+    write_secret_bytes(&bls_path, &bls_ikm)
+        .with_context(|| format!("writing {}", bls_path.display()))?;
 
     // The new member's LOCAL cluster.toml = genesis members + itself, written
     // under a node-specific filename so it can never clobber the shared
@@ -122,6 +144,7 @@ fn member_init(args: &[String]) -> Result<()> {
         Some(reconnect),
         &signing_key.verifying_key(),
         identity.spki_fingerprint(),
+        bls_pub,
     ));
     let config = ClusterConfigFile { members };
     let config_path = out_dir.join(format!("cluster-{node_id}.toml"));
@@ -139,9 +162,15 @@ fn member_init(args: &[String]) -> Result<()> {
     );
     tracing::info!(
         node_id,
+        secret = %bls_path.display(),
+        "BLS secret file written"
+    );
+    tracing::info!(
+        node_id,
         gossip = %gossip,
         reconnect = %reconnect,
         key = encode_hex(&signing_key.verifying_key().to_bytes()),
+        bls_key = encode_hex(&bls_pub),
         "add-member command"
     );
     tracing::info!(
@@ -157,5 +186,35 @@ fn member_init(args: &[String]) -> Result<()> {
         .map(|member| (member.node_id, member.gossip_addr, member.reconnect_addr))
         .collect();
     print_firewall_plan(node_id, gossip, reconnect, &existing);
+
+    if let Some(socket) = socket_path {
+        let pop = crypto::sign_pop(&bls_identity).to_bytes();
+        let op = crypto::MembershipOp::Add {
+            node: primitives::NodeId::new(node_id),
+            key: Box::new(signing_key.verifying_key()),
+            bls_key: bls_pub,
+            pop,
+            addr: gossip,
+            reconnect_addr: Some(reconnect),
+        };
+        let payload = crate::control::membership_op_payload(&op);
+        let payload_hex = encode_hex(&payload);
+        let request = crate::control::ControlRequest::SubmitTx { payload_hex };
+        match crate::control::request(&socket, &request).await {
+            Ok(resp) if resp.ok => {
+                tracing::info!(socket = %socket.display(), node_id, "member init auto-submitted Add via control socket");
+            }
+            Ok(resp) => {
+                tracing::warn!(
+                    socket = %socket.display(),
+                    error = resp.error.as_deref().unwrap_or("unknown"),
+                    "member init auto-submit failed (control request error)"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(socket = %socket.display(), error = %e, "member init auto-submit failed (connection error)");
+            }
+        }
+    }
     Ok(())
 }

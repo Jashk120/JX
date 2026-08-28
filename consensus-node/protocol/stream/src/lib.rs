@@ -26,6 +26,7 @@ pub mod running_hash;
 pub mod signature;
 
 pub mod event;
+pub mod proof;
 pub mod record;
 pub mod verify;
 
@@ -34,6 +35,7 @@ pub mod pb {
     include!(concat!(env!("OUT_DIR"), "/jkain.stream.rs"));
 }
 
+pub use convert::StateDiff;
 pub use error::{
     Result,
     StreamError,
@@ -45,8 +47,9 @@ pub use record::{
 };
 
 /// The version stamped inside every `EventStreamFile` / `RecordStreamFile`
-/// message.
-pub const STREAM_VERSION: u32 = 1;
+/// message. 3 = chained checkpoints via `prev_checkpoint_hash` (signing_bytes
+/// grew to 136 B and now bind history; see `protocol/consensus/src/checkpoint.rs`).
+pub const STREAM_VERSION: u32 = 3;
 
 /// Subdirectory (under the data dir) holding the stream files.
 pub const STREAMS_SUBDIR: &str = "streams";
@@ -67,6 +70,8 @@ pub const RECORD_FILE_PREFIX: &str = "round-";
 pub const RECORD_FILE_SUFFIX: &str = ".rsf";
 /// Record signature file suffix.
 pub const RECORD_SIG_SUFFIX: &str = ".rsf_sig";
+/// Record proof sidecar suffix, e.g. `round-7.rsf_proofs`.
+pub const RECORD_PROOF_SUFFIX: &str = ".rsf_proofs";
 
 /// The width used for the zero-padded event file index.
 const EVENT_FILE_INDEX_WIDTH: usize = 8;
@@ -80,6 +85,11 @@ pub fn event_file_name(index: u64) -> String {
 /// The name of the record file for `round`.
 pub fn record_file_name(round: u64) -> String {
     format!("{RECORD_FILE_PREFIX}{round}{RECORD_FILE_SUFFIX}")
+}
+
+/// The name of the proof sidecar for `round`.
+pub fn record_proof_file_name(round: u64) -> String {
+    format!("{RECORD_FILE_PREFIX}{round}{RECORD_PROOF_SUFFIX}")
 }
 
 /// The signature file name accompanying `stream_file_name`.

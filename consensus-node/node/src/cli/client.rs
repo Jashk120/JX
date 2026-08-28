@@ -151,15 +151,19 @@ async fn tx_delete(args: &[String]) -> Result<()> {
 
 /// `jkaind add-member`: submits a `MembershipOp::Add` transaction to a running
 /// node. The `--key` hex is the new member's Ed25519 verifying key (printed by
-/// `jkaind member init`). After the op is ordered and activated, the existing
-/// cluster can gossip with the new node; the new node itself is provisioned by
-/// `member init` and its own local `cluster.toml`.
+/// `jkaind member init`). `--bls-key` and one of `--bls-secret` or `--pop`
+/// are required for the BLS proof-of-possession. After the op is ordered and
+/// activated, the existing cluster can gossip with the new node; the new node
+/// itself is provisioned by `member init` and its own local `cluster.toml`.
 pub(crate) async fn add_member(args: &[String]) -> Result<()> {
     let mut socket = default_socket();
     let mut node_id: Option<u64> = None;
     let mut gossip: Option<SocketAddr> = None;
     let mut reconnect: Option<SocketAddr> = None;
     let mut key_hex: Option<String> = None;
+    let mut bls_key_hex: Option<String> = None;
+    let mut bls_secret_path: Option<PathBuf> = None;
+    let mut pop_hex: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -180,6 +184,11 @@ pub(crate) async fn add_member(args: &[String]) -> Result<()> {
                 )?);
             }
             "--key" => key_hex = Some(next_value(args, &mut i, "--key")?),
+            "--bls-key" => bls_key_hex = Some(next_value(args, &mut i, "--bls-key")?),
+            "--bls-secret" => {
+                bls_secret_path = Some(PathBuf::from(next_value(args, &mut i, "--bls-secret")?));
+            }
+            "--pop" => pop_hex = Some(next_value(args, &mut i, "--pop")?),
             other => bail!("add-member: unknown argument '{other}'"),
         }
     }
@@ -190,10 +199,53 @@ pub(crate) async fn add_member(args: &[String]) -> Result<()> {
         .context("add-member: --key must be a 64-char hex Ed25519 verifying key")?;
     let key = VerifyingKey::from_bytes(&key_bytes)
         .context("add-member: --key is not a valid Ed25519 verifying key")?;
+    let bls_key_hex = bls_key_hex.context("add-member: --bls-key <96 hex chars> is required")?;
+    let bls_key = crate::config::decode_bls_hex(&bls_key_hex)
+        .context("add-member: --bls-key must be 96 hex chars (48 bytes)")?;
+
+    let has_bls_secret = bls_secret_path.is_some();
+    let has_pop = pop_hex.is_some();
+    if has_bls_secret == has_pop {
+        bail!(
+            "add-member: exactly one of --bls-secret <path> or --pop <hex> is required when --bls-key is present"
+        );
+    }
+    let pop: [u8; 96] = if let Some(path) = bls_secret_path {
+        let ikm_bytes = std::fs::read(&path)
+            .with_context(|| format!("add-member: reading --bls-secret {}", path.display()))?;
+        if ikm_bytes.len() != 32 {
+            bail!(
+                "add-member: --bls-secret file must be exactly 32 bytes (IKM), got {}",
+                ikm_bytes.len()
+            );
+        }
+        let ikm: [u8; 32] = ikm_bytes.try_into().expect("32 bytes");
+        let identity = crypto::BlsIdentity::from_ikm(&ikm)
+            .context("add-member: --bls-secret is not a valid BLS IKM")?;
+        let derived_bls = identity.public.to_bytes();
+        if derived_bls != bls_key {
+            bail!(
+                "add-member: --bls-secret derives a different bls_key than --bls-key (cross-check failed)"
+            );
+        }
+        crypto::sign_pop(&identity).to_bytes()
+    } else {
+        let hex = pop_hex.expect("one pop source required");
+        let bytes =
+            crate::config::decode_hex_bytes(&hex).context("add-member: --pop must be hex")?;
+        if bytes.len() != 96 {
+            bail!("add-member: --pop must be 192 hex chars (96 bytes), got {} bytes", bytes.len());
+        }
+        let mut arr = [0u8; 96];
+        arr.copy_from_slice(&bytes);
+        arr
+    };
 
     let op = MembershipOp::Add {
         node: NodeId::new(node_id),
         key: Box::new(key),
+        bls_key,
+        pop,
         addr: gossip,
         reconnect_addr: reconnect,
     };

@@ -254,7 +254,11 @@ mod tests {
     fn registry_of(nodes: &[(NodeId, &SigningKey)]) -> MembershipRegistry {
         let mut registry = MembershipRegistry::new();
         for (id, key) in nodes {
-            registry.register(*id, key.verifying_key());
+            registry.register(
+                *id,
+                key.verifying_key(),
+                crypto::BlsIdentity::from_ikm(&[0u8; 32]).expect("bls").public.to_bytes(),
+            );
         }
         registry
     }

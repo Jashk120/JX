@@ -1,10 +1,11 @@
 module github.com/JKaIN/mirror-node
 
-go 1.25.0
+go 1.26
 
 require (
 	github.com/BurntSushi/toml v1.6.0
 	github.com/jackc/pgx/v5 v5.10.0
+	github.com/supranational/blst v0.3.17
 	google.golang.org/protobuf v1.36.5
 )
 

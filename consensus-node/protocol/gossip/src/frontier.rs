@@ -152,7 +152,14 @@ mod tests {
                 .iter()
                 .map(|&id| {
                     let key = SigningKey::generate(&mut OsRng);
-                    registry.register(NodeId::new(id), key.verifying_key());
+                    registry.register(
+                        NodeId::new(id),
+                        key.verifying_key(),
+                        crypto::BlsIdentity::from_ikm(&[id as u8; 32])
+                            .expect("bls")
+                            .public
+                            .to_bytes(),
+                    );
                     (NodeId::new(id), key)
                 })
                 .collect();

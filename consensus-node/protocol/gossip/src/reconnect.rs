@@ -8,7 +8,6 @@
 //! and [`verify_signed_checkpoint`] checks it before the response is
 //! returned.
 
-use std::collections::HashSet;
 use std::net::SocketAddr;
 
 use consensus::SignedCheckpoint;
@@ -74,27 +73,10 @@ pub async fn fetch_checkpoint(
     }
 }
 
-/// Verifies the >2/3 quorum proof embedded in `checkpoint`:
-///
-/// 1. Recompute [`consensus::CheckpointPayload::signing_bytes`] from the
-///    embedded payload.
-/// 2. For each [`consensus::CheckpointSig`], look up the signer's key in
-///    `checkpoint.payload.roster_snapshot` — the payload is self-describing,
-///    so no external roster lookup is needed.
-/// 3. Count distinct *valid* signers; reject if `signers * 3 <= total * 2`.
+/// Verifies the >2/3 BLS aggregate proof embedded in `checkpoint`.
 ///
 /// The checkpoint's `roster_hash` is compared against `expected_roster_hash`
-/// first. A mismatch means the peer supplied a roster the caller does not
-/// recognise — the quorum proof is rejected without even checking signatures,
-/// because a fabricated roster could make the self-referential quorum
-/// trivially pass.
-///
-/// A signature is a no-op (not evidence against the checkpoint) if its round
-/// disagrees with the payload, its signer is not in the snapshot roster, or
-/// its Ed25519 signature does not verify — exactly like a duplicate signer.
-/// Only the count of distinct, valid signatures determines acceptance, so a
-/// quorum'd checkpoint is not rejected just because an extra stale or forged
-/// signature was appended.
+/// first; a mismatch rejects before any BLS verification.
 pub fn verify_signed_checkpoint(
     checkpoint: &SignedCheckpoint,
     expected_roster_hash: [u8; 32],
@@ -102,23 +84,7 @@ pub fn verify_signed_checkpoint(
     if checkpoint.payload.roster_hash != expected_roster_hash {
         return false;
     }
-    let total = checkpoint.payload.roster_snapshot.len();
-    let signing_bytes = checkpoint.payload.signing_bytes();
-    let mut valid = 0usize;
-    let mut seen = HashSet::new();
-    for sig in &checkpoint.sigs {
-        if sig.round != checkpoint.payload.round {
-            continue;
-        }
-        let Ok(key) = checkpoint.payload.roster_snapshot.key_for(&sig.signer) else {
-            continue;
-        };
-        let signature = ed25519_dalek::Signature::from_bytes(sig.sig.as_bytes());
-        if key.verify_strict(&signing_bytes, &signature).is_ok() && seen.insert(sig.signer) {
-            valid += 1;
-        }
-    }
-    valid * 3 > total * 2
+    checkpoint.verify()
 }
 
 fn frame_name(frame: &Frame) -> &'static str {
@@ -137,59 +103,63 @@ fn frame_name(frame: &Frame) -> &'static str {
 mod tests {
     use consensus::{
         CheckpointPayload,
-        CheckpointSig,
+        compute_records_root,
     };
     use crypto::Hashable;
-    use ed25519_dalek::{
-        Signer,
-        SigningKey,
-    };
-    use primitives::{
-        NodeId,
-        Signature,
-    };
+    use primitives::NodeId;
 
     use super::*;
 
     struct Cluster {
         registry: crypto::MembershipRegistry,
-        keys: Vec<(u64, SigningKey)>,
+        bls_ids: Vec<(u64, crypto::BlsIdentity)>,
     }
 
     impl Cluster {
         fn of(ids: &[u64]) -> Self {
             let mut registry = crypto::MembershipRegistry::new();
-            let keys: Vec<(u64, SigningKey)> = ids
+            let bls_ids: Vec<(u64, crypto::BlsIdentity)> = ids
                 .iter()
                 .map(|&id| {
-                    let key = SigningKey::from_bytes(&[id as u8; 32]);
-                    registry.register(NodeId::new(id), key.verifying_key());
-                    (id, key)
+                    let bls = crypto::BlsIdentity::from_ikm(&[id as u8; 32]).expect("bls");
+                    let ed = ed25519_dalek::SigningKey::from_bytes(&[id as u8; 32]);
+                    registry.register(NodeId::new(id), ed.verifying_key(), bls.public.to_bytes());
+                    (id, bls)
                 })
                 .collect();
-            Self { registry, keys }
+            Self { registry, bls_ids }
         }
 
-        fn real_sig(&self, round: u64, signer: u64) -> CheckpointSig {
-            let signing_bytes = self.signing_bytes(round);
-            let key = &self.keys.iter().find(|(id, _)| *id == signer).unwrap().1;
-            let sig = key.sign(&signing_bytes);
-            CheckpointSig {
-                round,
-                signer: NodeId::new(signer),
-                sig: Signature::new(sig.to_bytes()),
-            }
-        }
-
-        fn signing_bytes(&self, round: u64) -> [u8; 72] {
-            let payload = CheckpointPayload::new(round, [7u8; 32], self.registry.clone());
+        #[allow(dead_code)]
+        fn signing_bytes(&self, round: u64) -> [u8; 136] {
+            let rr = compute_records_root(&[]);
+            let payload = CheckpointPayload::new(round, rr, [7u8; 32], self.registry.clone());
             payload.signing_bytes()
         }
 
         fn checkpoint(&self, round: u64, signers: &[u64]) -> SignedCheckpoint {
-            let payload = CheckpointPayload::new(round, [7u8; 32], self.registry.clone());
-            let sigs = signers.iter().map(|&s| self.real_sig(round, s)).collect();
-            SignedCheckpoint { payload, sigs }
+            let rr = compute_records_root(&[]);
+            let payload = CheckpointPayload::new(round, rr, [7u8; 32], self.registry.clone());
+            let mut sigs: Vec<&blst::min_pk::Signature> = Vec::new();
+            let mut sig_owned = Vec::new();
+            for &s in signers {
+                let bls = self.bls_ids.iter().find(|(id, _)| *id == s).unwrap();
+                sig_owned.push(bls.1.sign(&payload.signing_bytes()));
+            }
+            for sig in &sig_owned {
+                sigs.push(sig);
+            }
+            let _refs: Vec<&blst::min_pk::Signature> = sigs.to_vec();
+            let mut sorted_signers: Vec<NodeId> =
+                signers.iter().map(|&id| NodeId::new(id)).collect();
+            sorted_signers.sort();
+            // Need to sort sigs according to sorted_signers order for determinism
+            let mut pairs: Vec<(NodeId, blst::min_pk::Signature)> =
+                signers.iter().zip(sig_owned).map(|(&id, sig)| (NodeId::new(id), sig)).collect();
+            pairs.sort_by_key(|(id, _)| *id);
+            let sorted_refs: Vec<&blst::min_pk::Signature> = pairs.iter().map(|(_, s)| s).collect();
+            let agg = crypto::bls::aggregate(&sorted_refs).expect("aggregate");
+            SignedCheckpoint { payload, aggregate_sig: agg, signers: sorted_signers }
         }
     }
 
@@ -208,112 +178,143 @@ mod tests {
     }
 
     #[test]
-    fn forged_signature_is_not_counted_toward_quorum() {
+    fn forged_signature_fails_verify() {
         let cluster = Cluster::of(&[1, 2, 3, 4]);
-        let mut checkpoint = cluster.checkpoint(3, &[1, 2]);
-        // A forged third signature: wrong bytes, so it must not tip quorum.
-        checkpoint.sigs.push(CheckpointSig {
-            round: 3,
-            signer: NodeId::new(3),
-            sig: Signature::new([0x42; 64]),
-        });
+        let rr = compute_records_root(&[]);
+        let payload = CheckpointPayload::new(3, rr, [7u8; 32], cluster.registry.clone());
+        // Two honest sigs
+        let s1 = cluster
+            .bls_ids
+            .iter()
+            .find(|(id, _)| *id == 1)
+            .unwrap()
+            .1
+            .sign(&payload.signing_bytes());
+        let s2 = cluster
+            .bls_ids
+            .iter()
+            .find(|(id, _)| *id == 2)
+            .unwrap()
+            .1
+            .sign(&payload.signing_bytes());
+        // Forge third sig with wrong key for signer 3
+        let forger = crypto::BlsIdentity::from_ikm(&[0xEEu8; 32]).expect("forger");
+        let s3 = forger.sign(&payload.signing_bytes());
+        let agg = crypto::bls::aggregate(&[&s1, &s2, &s3]).expect("agg");
+        let checkpoint = SignedCheckpoint {
+            payload,
+            aggregate_sig: agg,
+            signers: vec![NodeId::new(1), NodeId::new(2), NodeId::new(3)],
+        };
         assert!(!verify_signed_checkpoint(&checkpoint, checkpoint.payload.roster_hash));
     }
 
     #[test]
-    fn signer_not_in_roster_is_not_counted() {
+    fn signer_not_in_roster_fails() {
         let cluster = Cluster::of(&[1, 2, 3, 4]);
-        // Two valid signers + a rogue not in the roster: still below quorum.
-        let mut checkpoint = cluster.checkpoint(3, &[1, 2]);
-        let rogue_key = SigningKey::from_bytes(&[5u8; 32]);
-        let rogue_sig = rogue_key.sign(&cluster.signing_bytes(3));
-        checkpoint.sigs.push(CheckpointSig {
-            round: 3,
-            signer: NodeId::new(5),
-            sig: Signature::new(rogue_sig.to_bytes()),
-        });
+        let rr = compute_records_root(&[]);
+        let payload = CheckpointPayload::new(3, rr, [7u8; 32], cluster.registry.clone());
+        let s1 = cluster
+            .bls_ids
+            .iter()
+            .find(|(id, _)| *id == 1)
+            .unwrap()
+            .1
+            .sign(&payload.signing_bytes());
+        let s2 = cluster
+            .bls_ids
+            .iter()
+            .find(|(id, _)| *id == 2)
+            .unwrap()
+            .1
+            .sign(&payload.signing_bytes());
+        let rogue = crypto::BlsIdentity::from_ikm(&[5u8; 32]).expect("rogue");
+        let s3 = rogue.sign(&payload.signing_bytes());
+        let agg = crypto::bls::aggregate(&[&s1, &s2, &s3]).expect("agg");
+        let checkpoint = SignedCheckpoint {
+            payload: payload.clone(),
+            aggregate_sig: agg,
+            signers: vec![NodeId::new(1), NodeId::new(2), NodeId::new(5)],
+        };
         assert!(!verify_signed_checkpoint(&checkpoint, checkpoint.payload.roster_hash));
 
-        // A rogue signature appended to a genuine quorum must not reject it.
-        let mut checkpoint = cluster.checkpoint(3, &[1, 2, 3]);
-        let rogue_key = SigningKey::from_bytes(&[6u8; 32]);
-        let rogue_sig = rogue_key.sign(&cluster.signing_bytes(3));
-        checkpoint.sigs.push(CheckpointSig {
-            round: 3,
-            signer: NodeId::new(6),
-            sig: Signature::new(rogue_sig.to_bytes()),
-        });
-        assert!(verify_signed_checkpoint(&checkpoint, checkpoint.payload.roster_hash));
+        // Even a genuine quorum with an extra rogue signer should fail because
+        // aggregate includes the rogue and signer not in roster.
+        let s3_honest = cluster
+            .bls_ids
+            .iter()
+            .find(|(id, _)| *id == 3)
+            .unwrap()
+            .1
+            .sign(&payload.signing_bytes());
+        let rogue2 = crypto::BlsIdentity::from_ikm(&[6u8; 32]).expect("rogue2");
+        let s4 = rogue2.sign(&payload.signing_bytes());
+        let agg2 = crypto::bls::aggregate(&[&s1, &s2, &s3_honest, &s4]).expect("agg2");
+        let checkpoint2 = SignedCheckpoint {
+            payload,
+            aggregate_sig: agg2,
+            signers: vec![NodeId::new(1), NodeId::new(2), NodeId::new(3), NodeId::new(6)],
+        };
+        assert!(!verify_signed_checkpoint(&checkpoint2, checkpoint2.payload.roster_hash));
     }
 
     #[test]
-    fn duplicate_signer_counts_once() {
+    fn duplicate_signer_fails() {
         let cluster = Cluster::of(&[1, 2, 3, 4]);
-        let mut checkpoint = cluster.checkpoint(3, &[1, 2]);
-        checkpoint.sigs.push(cluster.real_sig(3, 2));
-        // Still only two distinct valid signers: below quorum.
+        let rr = compute_records_root(&[]);
+        let payload = CheckpointPayload::new(3, rr, [7u8; 32], cluster.registry.clone());
+        let s1 = cluster
+            .bls_ids
+            .iter()
+            .find(|(id, _)| *id == 1)
+            .unwrap()
+            .1
+            .sign(&payload.signing_bytes());
+        let s2 = cluster
+            .bls_ids
+            .iter()
+            .find(|(id, _)| *id == 2)
+            .unwrap()
+            .1
+            .sign(&payload.signing_bytes());
+        // Duplicate signer 2
+        let agg = crypto::bls::aggregate(&[&s1, &s2, &s2]).expect("agg dup");
+        let checkpoint = SignedCheckpoint {
+            payload,
+            aggregate_sig: agg,
+            signers: vec![NodeId::new(1), NodeId::new(2), NodeId::new(2)],
+        };
         assert!(!verify_signed_checkpoint(&checkpoint, checkpoint.payload.roster_hash));
-    }
-
-    #[test]
-    fn wrong_round_sig_is_not_counted() {
-        let cluster = Cluster::of(&[1, 2, 3, 4]);
-        // A stale sig over a different round appended to a genuine quorum.
-        let mut checkpoint = cluster.checkpoint(3, &[1, 2, 3]);
-        checkpoint.sigs.push(cluster.real_sig(4, 4));
-        assert!(verify_signed_checkpoint(&checkpoint, checkpoint.payload.roster_hash));
     }
 
     #[test]
     fn roster_hash_mismatch_rejects_even_with_valid_quorum() {
         let cluster = Cluster::of(&[1, 2, 3, 4]);
         let checkpoint = cluster.checkpoint(3, &[1, 2, 3]);
-        // The checkpoint is quorum-valid, but the expected roster hash
-        // disagrees — a peer-supplied roster that does not match our trust
-        // anchor must be rejected.
         let wrong_hash = checkpoint.payload.roster_hash;
         let mut altered = wrong_hash;
         altered[0] ^= 0xff;
         assert!(!verify_signed_checkpoint(&checkpoint, altered));
-        // The correct hash passes.
         assert!(verify_signed_checkpoint(&checkpoint, wrong_hash));
     }
 
-    /// The exact attack from commit 3ec6744: a peer fabricates a roster
-    /// snapshot where it controls all seats, creates a checkpoint with a
-    /// valid self-referential quorum (3-of-3 attacker-controlled nodes),
-    /// and serves it to a learner that trusts a different roster.
-    /// The trusted_roster_hash check must reject this before any
-    /// signature verification runs.
     #[test]
     fn fabricated_roster_with_attacker_quorum_rejected_by_trusted_hash() {
-        // The legitimate roster the learner trusts.
         let legitimate = Cluster::of(&[1, 2, 3, 4]);
         let trusted_hash = legitimate.registry.hash();
-
-        // The attacker fabricates its own roster and signs a checkpoint
-        // with it — 3-of-3 attacker-controlled nodes is a self-referential
-        // supermajority that would pass without the hash anchor.
         let attacker = Cluster::of(&[99, 98, 97]);
         let checkpoint = attacker.checkpoint(5, &[99, 98, 97]);
-
-        // Rejected: the fabricated roster's hash disagrees with the
-        // trusted anchor. This must return false before any Ed25519
-        // verification runs (the roster hash check is at lines 113-115).
         assert!(
             !verify_signed_checkpoint(&checkpoint, trusted_hash),
             "fabricated roster with attacker quorum must be rejected against a trusted hash"
         );
     }
 
-    /// The fabricated checkpoint verified against its own roster hash —
-    /// caller explicitly trusts this roster, so it passes.
     #[test]
     fn fabricated_roster_passes_when_trusted_hash_matches() {
         let attacker = Cluster::of(&[99, 98, 97]);
         let checkpoint = attacker.checkpoint(5, &[99, 98, 97]);
         let attacker_hash = checkpoint.payload.roster_hash;
-
         assert!(
             verify_signed_checkpoint(&checkpoint, attacker_hash),
             "fabricated roster passes when its own hash is the trust anchor"

@@ -57,8 +57,11 @@ pub fn tls_seed(id: u64) -> [u8; 32] {
 pub fn registry_for(ids: &[u64]) -> MembershipRegistry {
     let mut registry = MembershipRegistry::new();
     for &id in ids {
-        registry
-            .register(NodeId::new(id), SigningKey::from_bytes(&consensus_seed(id)).verifying_key());
+        registry.register(
+            NodeId::new(id),
+            SigningKey::from_bytes(&consensus_seed(id)).verifying_key(),
+            crypto::BlsIdentity::from_ikm(&consensus_seed(id)).expect("bls").public.to_bytes(),
+        );
     }
     registry
 }

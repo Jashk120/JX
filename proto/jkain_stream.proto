@@ -9,8 +9,11 @@
 //     round's finalized transactions in consensus order plus the round's
 //     threshold-signed `SignedCheckpoint` (the state-root anchor).
 //
-// Both file types are chained by a running hash (§5 of PHASE8_MIRROR_STREAMS.md)
-// and accompanied by an Ed25519 signature file (`.esf_sig` / `.rsf_sig`).
+// Both file types are chained by a running hash (§5 of PHASE8_MIRROR_STREAMS.md).
+// Event files are accompanied by an Ed25519 `.esf_sig` sidecar; record files
+// have no `.rsf_sig` — since 1313db5/PLAN-1 they are authenticated via
+// `records_root` + BLS aggregate over 136 B signing_bytes, with a
+// `.rsf_proofs` Merkle sidecar for selective disclosure. STREAM_VERSION 3.
 //
 // This schema lives at the monorepo root `proto/` so it can be shared
 // between `consensus-node` (Rust, `protocol/stream`) and future crates
@@ -91,6 +94,10 @@ message RecordItem {
   bytes  tx_payload = 3; // Op::Put/Delete or MembershipOp bytes
 }
 
+message StateDiff{
+  bytes           key   = 1;  // raw state key, variable length
+  optional bytes  value = 2; // raw value after the round; absent ⇒ tombstone
+}
 message CheckpointSig {
   uint64 round  = 1;
   uint64 signer = 2;
@@ -100,6 +107,8 @@ message CheckpointSig {
 message CheckpointRosterMember {
   uint64 node_id = 1;
   bytes  key     = 2; // 32-byte Ed25519 verifying key
+  bytes  bls_key = 3; // 48-byte BLS12-381 G1 public key
+  bytes  pop     = 4; // 96-byte BLS proof-of-possession
 }
 
 // A mirror of `consensus::SignedCheckpoint` — the threshold-signed state-root
@@ -109,7 +118,12 @@ message SignedCheckpoint {
   bytes       state_hash  = 2; // Merkle root, 32 bytes
   bytes       roster_hash = 3; // 32 bytes
   repeated CheckpointRosterMember roster_snapshot = 4;
-  repeated CheckpointSig sigs = 5;
+  reserved 5;
+  reserved "sigs";
+  bytes       records_root  = 6; // 32 bytes, content binding
+  bytes       aggregate_sig = 7; // 96-byte BLS12-381 aggregate signature
+  repeated uint64 signers   = 8;
+  bytes prev_checkpoint_hash = 9; // 32 bytes, SHA-256 of previous checkpoint
 }
 
 message RecordStreamFile {
@@ -119,4 +133,21 @@ message RecordStreamFile {
   repeated RecordItem items     = 4;
   HashObject end_running_hash   = 5;
   SignedCheckpoint checkpoint   = 6; // the threshold-signed anchor
+  repeated StateDiff state_diffs= 7;
 }
+
+message ProofStep {
+  bytes sibling_hash = 1; // 32 bytes
+  bool sibling_is_right= 2;
+}
+message ProofEntry{
+  uint32 item_index = 1;
+  repeated ProofStep proof_steps = 2;
+}
+
+message RecordsProofFile{
+  uint32 version = 1;
+  uint64 round = 2;
+  repeated ProofEntry proofs = 3;
+}
+

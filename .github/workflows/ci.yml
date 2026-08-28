@@ -70,3 +70,34 @@ jobs:
         run: brew install protobuf
       - name: Test
         run: cargo test --workspace --locked
+
+  go:
+    name: go (${{ matrix.module }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        module: [block-node, block-relay, mirror-node]
+      fail-fast: false
+    defaults:
+      run:
+        working-directory: ${{ matrix.module }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: '${{ matrix.module }}/go.mod'
+          cache: true
+      - name: Check formatting (gofmt)
+        run: |
+          echo "go version: $(go version) (from ${{ matrix.module }}/go.mod)"
+          gofmt -l . | tee /tmp/gofmt.txt
+          output=$(cat /tmp/gofmt.txt)
+          if [ -n "$output" ]; then
+            echo "gofmt needs formatting on:"
+            echo "$output"
+            exit 1
+          fi
+      - name: Vet
+        run: go vet ./...
+      - name: Test
+        run: go test ./...

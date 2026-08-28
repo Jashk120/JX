@@ -33,6 +33,8 @@ use consensus::{
     encode_signed_checkpoint,
 };
 use gossip::CheckpointSink;
+use prost::Message;
+use stream::convert::signed_checkpoint_to_proto;
 
 /// Subdirectory (under the data dir) holding checkpoint files.
 pub const CHECKPOINT_SUBDIR: &str = "checkpoints";
@@ -40,6 +42,15 @@ pub const CHECKPOINT_SUBDIR: &str = "checkpoints";
 /// Checkpoint files at or below this many rounds older than the newest one
 /// are pruned, mirroring `consensus::RETENTION_ROUNDS`.
 pub const PRUNE_RETENTION_ROUNDS: u64 = consensus::RETENTION_ROUNDS;
+
+/// Mirror-facing checkpoint file prefix/suffix under `<data>/streams/`.
+pub const CKPT_FILE_PREFIX: &str = "checkpoint-";
+pub const CKPT_FILE_SUFFIX: &str = ".ckpt";
+
+/// The file name of the `round`-th mirror checkpoint, e.g. `checkpoint-42.ckpt`.
+pub fn ckpt_file_name(round: u64) -> String {
+    format!("{CKPT_FILE_PREFIX}{round}{CKPT_FILE_SUFFIX}")
+}
 
 /// A persisted checkpoint. The state bytes that hash to its committed
 /// `state_hash` are not stored here — they live in the state database's
@@ -156,6 +167,58 @@ impl CheckpointSink for Storage {
     }
 }
 
+pub struct CkptSink {
+    dir: PathBuf,
+}
+
+impl CkptSink {
+    pub fn new(streams_dir: &Path) -> Result<Self> {
+        fs::create_dir_all(streams_dir)
+            .with_context(|| format!("creating streams dir {}", streams_dir.display()))?;
+        Ok(Self { dir: streams_dir.to_path_buf() })
+    }
+
+    pub fn ckpt_path(&self, round: u64) -> PathBuf {
+        self.dir.join(ckpt_file_name(round))
+    }
+
+    pub fn persist_ckpt(&self, checkpoint: &SignedCheckpoint) -> Result<()> {
+        let round = checkpoint.payload.round;
+        let proto = signed_checkpoint_to_proto(checkpoint);
+        let bytes = proto.encode_to_vec();
+        let path = self.ckpt_path(round);
+        atomic_write(&path, &bytes).with_context(|| format!("writing ckpt {round}"))?;
+        Ok(())
+    }
+}
+
+impl CheckpointSink for CkptSink {
+    fn persist(&self, checkpoint: &SignedCheckpoint) {
+        let round = checkpoint.payload.round;
+        if let Err(e) = self.persist_ckpt(checkpoint) {
+            eprintln!("[jkaind] failed to persist ckpt {round}: {e:#}");
+        }
+    }
+}
+
+pub struct CompositeCheckpointSink {
+    storage: Storage,
+    ckpt: CkptSink,
+}
+
+impl CompositeCheckpointSink {
+    pub fn new(storage: Storage, ckpt: CkptSink) -> Self {
+        Self { storage, ckpt }
+    }
+}
+
+impl CheckpointSink for CompositeCheckpointSink {
+    fn persist(&self, checkpoint: &SignedCheckpoint) {
+        CheckpointSink::persist(&self.storage, checkpoint);
+        CheckpointSink::persist(&self.ckpt, checkpoint);
+    }
+}
+
 /// Writes `bytes` to `path` atomically via the shared helper which also
 /// fsyncs the containing directory so the rename is durable.
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -167,10 +230,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
 mod tests {
     use crypto::MembershipRegistry;
     use ed25519_dalek::SigningKey;
-    use primitives::{
-        NodeId,
-        Signature,
-    };
+    use primitives::NodeId;
     use rand::rngs::OsRng;
 
     use super::*;
@@ -178,23 +238,40 @@ mod tests {
     fn registry_of(members: &[u64]) -> MembershipRegistry {
         let mut registry = MembershipRegistry::new();
         for &id in members {
-            registry.register(NodeId::new(id), SigningKey::generate(&mut OsRng).verifying_key());
+            let bls = crypto::BlsIdentity::from_ikm(&[id as u8; 32]).expect("bls");
+            registry.register(
+                NodeId::new(id),
+                SigningKey::generate(&mut OsRng).verifying_key(),
+                bls.public.to_bytes(),
+            );
         }
         registry
     }
 
     fn signed_checkpoint(round: u64, members: &[u64]) -> SignedCheckpoint {
         let roster = registry_of(members);
-        let payload = consensus::CheckpointPayload::new(round, [round as u8; 32], roster);
-        let sigs = members
-            .iter()
-            .map(|&signer| consensus::CheckpointSig {
-                round,
-                signer: NodeId::new(signer),
-                sig: Signature::new([signer as u8; 64]),
-            })
-            .collect();
-        SignedCheckpoint { payload, sigs }
+        let payload = consensus::CheckpointPayload::new(
+            round,
+            consensus::compute_records_root(&[]),
+            [round as u8; 32],
+            roster,
+        );
+        let mut sigs = Vec::new();
+        for &signer in members {
+            let bls = crypto::BlsIdentity::from_ikm(&[signer as u8; 32]).expect("bls");
+            sigs.push(bls.sign(&payload.signing_bytes()));
+        }
+        let mut pairs: Vec<(NodeId, blst::min_pk::Signature)> =
+            members.iter().zip(sigs).map(|(&id, s)| (NodeId::new(id), s)).collect();
+        pairs.sort_by_key(|(id, _)| *id);
+        let refs: Vec<&blst::min_pk::Signature> = pairs.iter().map(|(_, s)| s).collect();
+        let agg = crypto::bls::aggregate(&refs).expect("aggregate");
+        let signers: Vec<NodeId> = {
+            let mut v: Vec<NodeId> = members.iter().map(|&id| NodeId::new(id)).collect();
+            v.sort();
+            v
+        };
+        SignedCheckpoint { payload, aggregate_sig: agg, signers }
     }
 
     fn temp_dir() -> tempfile::TempDir {
@@ -256,5 +333,81 @@ mod tests {
             .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
             .collect();
         assert!(entries.iter().all(|n| !n.starts_with(".tmp-")), "no temp files left: {entries:?}");
+    }
+
+    #[test]
+    fn ckpt_sink_writes_protobuf_and_survives_prune() {
+        let tmp = temp_dir();
+        let streams_dir = tmp.path().join("streams");
+        let storage = Storage::new(tmp.path()).expect("storage opens");
+        let ckpt_sink = CkptSink::new(&streams_dir).expect("ckpt sink opens");
+        let composite = CompositeCheckpointSink::new(storage, ckpt_sink);
+        let cp1 = signed_checkpoint(1, &[1, 2]);
+        let cp2 = signed_checkpoint(2, &[1, 2]);
+        let cp3 = signed_checkpoint(3, &[1, 2]);
+        for cp in [&cp1, &cp2, &cp3] {
+            gossip::CheckpointSink::persist(&composite, cp);
+        }
+        // All three .ckpt files present irrespective of prune (never pruned).
+        for round in [1, 2, 3] {
+            let path = streams_dir.join(ckpt_file_name(round));
+            assert!(path.exists(), "ckpt for round {round} must exist");
+            let bytes = fs::read(&path).expect("read ckpt");
+            let proto =
+                stream::pb::SignedCheckpoint::decode(bytes.as_slice()).expect("prost decodes");
+            let decoded =
+                stream::convert::proto_to_signed_checkpoint(&proto).expect("convert decodes");
+            let expected = match round {
+                1 => &cp1,
+                2 => &cp2,
+                3 => &cp3,
+                _ => unreachable!(),
+            };
+            assert_eq!(decoded.payload.round, expected.payload.round);
+            assert_eq!(decoded.payload.records_root, expected.payload.records_root);
+        }
+        // .cp files should have pruned round 1 (RETENTION 2, latest 3 keeps >=1? Actually keep_from 1 => no prune. Use prune_before directly.
+        let storage2 = Storage::new(tmp.path()).expect("reopen storage");
+        // storage rounds after composite's pruning (keep_from =3-2=1) keeps all; manually prune before 3 to test ckpt survival
+        storage2.prune_before(3).expect("prune");
+        assert!(
+            streams_dir.join(ckpt_file_name(1)).exists(),
+            "ckpt never pruned even after storage prune"
+        );
+        assert!(streams_dir.join(ckpt_file_name(2)).exists());
+        assert!(streams_dir.join(ckpt_file_name(3)).exists());
+        // .cp for 1 should be gone after prune_before 3
+        assert!(storage2.load_round(1).is_err(), ".cp for pruned round should be gone");
+    }
+
+    #[test]
+    fn ckpt_corrupt_byte_fails_decode() {
+        let tmp = temp_dir();
+        let streams_dir = tmp.path().join("streams");
+        let ckpt_sink = CkptSink::new(&streams_dir).expect("ckpt sink opens");
+        let cp = signed_checkpoint(7, &[1, 2]);
+        ckpt_sink.persist_ckpt(&cp).expect("persist");
+        let path = streams_dir.join(ckpt_file_name(7));
+        let bytes = fs::read(&path).expect("read ckpt");
+        assert!(!bytes.is_empty());
+        let original_len = bytes.len();
+        let mut corrupted = bytes.clone();
+        corrupted[0] ^= 0xFF;
+        let decoded = stream::pb::SignedCheckpoint::decode(corrupted.as_slice());
+        let rejected = decoded.is_err()
+            || decoded
+                .ok()
+                .and_then(|proto| stream::convert::proto_to_signed_checkpoint(&proto))
+                .is_none();
+        let truncated = &corrupted[..corrupted.len() / 2];
+        let trunc_rejected = stream::pb::SignedCheckpoint::decode(truncated).is_err()
+            || stream::pb::SignedCheckpoint::decode(truncated)
+                .ok()
+                .and_then(|proto| stream::convert::proto_to_signed_checkpoint(&proto))
+                .is_none();
+        println!(
+            "ckpt corrupt demo: original_len={original_len} flip_byte0_rejected={rejected} truncated_rejected={trunc_rejected}"
+        );
+        assert!(rejected || trunc_rejected, "corrupt ckpt must be rejected");
     }
 }

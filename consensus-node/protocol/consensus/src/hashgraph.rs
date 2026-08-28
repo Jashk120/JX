@@ -784,19 +784,20 @@ impl Hashgraph {
 
     /// Phase 3 — the checkpoint payload for `round`, once that round is fully
     /// decided. The caller supplies the Merkle root of the deterministic
-    /// state; the roster snapshot and its hash are taken from this node's
-    /// roster history at that round. Returns `None` while `round` is not yet
-    /// decided.
+    /// state and the `records_root` binding; the roster snapshot and its hash
+    /// are taken from this node's roster history at that round. Returns `None`
+    /// while `round` is not yet decided.
     pub fn checkpoint_payload(
         &self,
         round: u64,
+        records_root: [u8; 32],
         state_hash: [u8; 32],
     ) -> Option<CheckpointPayload> {
         if !self.is_round_decided(round) {
             return None;
         }
         let roster_snapshot = self.registry_at_round(round);
-        Some(CheckpointPayload::new(round, state_hash, roster_snapshot))
+        Some(CheckpointPayload::new(round, records_root, state_hash, roster_snapshot))
     }
 
     /// Phase 3 — removes every event with `round_received <
@@ -1001,7 +1002,11 @@ mod tests {
     fn registry_of(nodes: &[(NodeId, &SigningKey)]) -> MembershipRegistry {
         let mut registry = MembershipRegistry::new();
         for (id, key) in nodes {
-            registry.register(*id, key.verifying_key());
+            registry.register(
+                *id,
+                key.verifying_key(),
+                crypto::BlsIdentity::from_ikm(&[0u8; 32]).expect("bls").public.to_bytes(),
+            );
         }
         registry
     }
@@ -1298,7 +1303,11 @@ mod tests {
     fn registry_plus_fourth(registry: &MembershipRegistry) -> MembershipRegistry {
         let new_key = SigningKey::generate(&mut OsRng);
         let mut new_registry = registry.clone();
-        new_registry.register(NodeId::new(4), new_key.verifying_key());
+        new_registry.register(
+            NodeId::new(4),
+            new_key.verifying_key(),
+            crypto::BlsIdentity::from_ikm(&[4u8; 32]).expect("bls").public.to_bytes(),
+        );
         new_registry
     }
 
@@ -1329,7 +1338,11 @@ mod tests {
         let new_key = SigningKey::generate(&mut OsRng);
         let new_node = NodeId::new(2);
         let mut new_registry = registry;
-        new_registry.register(new_node, new_key.verifying_key());
+        new_registry.register(
+            new_node,
+            new_key.verifying_key(),
+            crypto::BlsIdentity::from_ikm(&[0u8; 32]).expect("bls").public.to_bytes(),
+        );
         hg.add_member(new_node, 10, new_registry);
 
         let new_idx = hg.member_index_of(&new_node).unwrap();
@@ -1373,7 +1386,11 @@ mod tests {
         let new_key = SigningKey::generate(&mut OsRng);
         let new_node = NodeId::new(2);
         let mut new_registry = registry;
-        new_registry.register(new_node, new_key.verifying_key());
+        new_registry.register(
+            new_node,
+            new_key.verifying_key(),
+            crypto::BlsIdentity::from_ikm(&[0u8; 32]).expect("bls").public.to_bytes(),
+        );
         hg.add_member(new_node, 10, new_registry);
 
         // A pre-join event's record was backfilled to the expanded width.
@@ -1564,7 +1581,12 @@ mod tests {
             (NodeId::new(1), &SigningKey::generate(&mut OsRng)),
             (NodeId::new(2), &SigningKey::generate(&mut OsRng)),
         ]);
-        let checkpoint = CheckpointPayload::new(5, [0u8; 32], registry.clone());
+        let checkpoint = CheckpointPayload::new(
+            5,
+            crate::checkpoint::compute_records_root(&[]),
+            [0u8; 32],
+            registry.clone(),
+        );
         let roster_history = RosterHistory::new(registry);
 
         let hg = Hashgraph::from_checkpoint(&checkpoint, roster_history);
@@ -1581,7 +1603,12 @@ mod tests {
     #[test]
     fn from_checkpoint_prune_before_round_does_not_panic() {
         let registry = registry_of(&[(NodeId::new(1), &SigningKey::generate(&mut OsRng))]);
-        let checkpoint = CheckpointPayload::new(5, [0u8; 32], registry.clone());
+        let checkpoint = CheckpointPayload::new(
+            5,
+            crate::checkpoint::compute_records_root(&[]),
+            [0u8; 32],
+            registry.clone(),
+        );
         let history = RosterHistory::new(registry);
         // Pruning at any round below next_round_to_order (6) is legal.
         for threshold in [1, 3, 5] {
@@ -1595,7 +1622,12 @@ mod tests {
         let key = SigningKey::generate(&mut OsRng);
         let node = NodeId::new(1);
         let registry = registry_of(&[(node, &key)]);
-        let checkpoint = CheckpointPayload::new(5, [0u8; 32], registry.clone());
+        let checkpoint = CheckpointPayload::new(
+            5,
+            crate::checkpoint::compute_records_root(&[]),
+            [0u8; 32],
+            registry.clone(),
+        );
         let mut hg = Hashgraph::from_checkpoint(&checkpoint, RosterHistory::new(registry));
 
         let event =
@@ -1635,7 +1667,12 @@ mod tests {
         let key = SigningKey::generate(&mut OsRng);
         let node = NodeId::new(1);
         let registry = registry_of(&[(node, &key)]);
-        let checkpoint = CheckpointPayload::new(5, [0u8; 32], registry.clone());
+        let checkpoint = CheckpointPayload::new(
+            5,
+            crate::checkpoint::compute_records_root(&[]),
+            [0u8; 32],
+            registry.clone(),
+        );
         let mut hg = Hashgraph::from_checkpoint(&checkpoint, RosterHistory::new(registry));
 
         let event =
@@ -1651,7 +1688,12 @@ mod tests {
     #[test]
     fn insert_accepted_unknown_creator_is_rejected() {
         let registry = registry_of(&[(NodeId::new(1), &SigningKey::generate(&mut OsRng))]);
-        let checkpoint = CheckpointPayload::new(1, [0u8; 32], registry.clone());
+        let checkpoint = CheckpointPayload::new(
+            1,
+            crate::checkpoint::compute_records_root(&[]),
+            [0u8; 32],
+            registry.clone(),
+        );
         let mut hg = Hashgraph::from_checkpoint(&checkpoint, RosterHistory::new(registry));
 
         let rogue = NodeId::new(99);
@@ -1668,7 +1710,12 @@ mod tests {
         let key = SigningKey::generate(&mut OsRng);
         let node = NodeId::new(1);
         let registry = registry_of(&[(node, &key)]);
-        let checkpoint = CheckpointPayload::new(1, [0u8; 32], registry.clone());
+        let checkpoint = CheckpointPayload::new(
+            1,
+            crate::checkpoint::compute_records_root(&[]),
+            [0u8; 32],
+            registry.clone(),
+        );
         let mut hg = Hashgraph::from_checkpoint(&checkpoint, RosterHistory::new(registry));
 
         let event =
@@ -1725,7 +1772,12 @@ mod tests {
     #[test]
     fn highest_decided_round_and_mark_decided_through() {
         let registry = registry_of(&[(NodeId::new(1), &SigningKey::generate(&mut OsRng))]);
-        let checkpoint = CheckpointPayload::new(3, [0u8; 32], registry.clone());
+        let checkpoint = CheckpointPayload::new(
+            3,
+            crate::checkpoint::compute_records_root(&[]),
+            [0u8; 32],
+            registry.clone(),
+        );
         let mut hg = Hashgraph::from_checkpoint(&checkpoint, RosterHistory::new(registry));
         assert_eq!(hg.highest_decided_round(), 3);
         assert!(!hg.is_round_decided(4));
@@ -1820,7 +1872,12 @@ mod tests {
         }
 
         // Learner reconstructs from checkpoint + retained
-        let checkpoint = crate::checkpoint::CheckpointPayload::new(1, [0u8; 32], registry.clone());
+        let checkpoint = crate::checkpoint::CheckpointPayload::new(
+            1,
+            crate::checkpoint::compute_records_root(&[]),
+            [0u8; 32],
+            registry.clone(),
+        );
         let history = crypto::RosterHistory::new(registry.clone());
         let mut learner = Hashgraph::from_checkpoint(&checkpoint, history);
         for re in retained {

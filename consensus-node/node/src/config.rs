@@ -40,6 +40,8 @@ pub struct MemberFile {
     pub verifying_key: String,
     /// Hex-encoded SHA-256 of the member's TLS SPKI (32 bytes).
     pub spki_fingerprint: String,
+    /// Hex-encoded BLS12-381 public key (compressed G1, 48 bytes → 96 hex chars).
+    pub bls_verifying_key: String,
 }
 
 impl ClusterConfigFile {
@@ -75,12 +77,17 @@ impl ClusterConfigFile {
             let spki_fingerprint = decode_hex(&member.spki_fingerprint).ok_or_else(|| {
                 anyhow::anyhow!("member {}: invalid spki_fingerprint hex", member.node_id)
             })?;
+            // Validate BLS public key encoding (96 hex chars -> 48 bytes).
+            let bls_bytes = decode_bls_hex(&member.bls_verifying_key).ok_or_else(|| {
+                anyhow::anyhow!("member {}: invalid bls_verifying_key hex", member.node_id)
+            })?;
             members.push(gossip::MemberEntry {
                 node_id: NodeId::new(member.node_id),
                 addr: member.gossip_addr,
                 reconnect_addr: member.reconnect_addr,
                 verifying_key,
                 spki_fingerprint,
+                bls_verifying_key: bls_bytes,
             });
         }
         if members.is_empty() {
@@ -108,6 +115,7 @@ impl MemberFile {
         reconnect_addr: Option<SocketAddr>,
         verifying_key: &VerifyingKey,
         spki_fingerprint: [u8; 32],
+        bls_verifying_key: [u8; 48],
     ) -> Self {
         Self {
             node_id,
@@ -115,6 +123,7 @@ impl MemberFile {
             reconnect_addr,
             verifying_key: encode_hex(&verifying_key.to_bytes()),
             spki_fingerprint: encode_hex(&spki_fingerprint),
+            bls_verifying_key: encode_hex(&bls_verifying_key),
         }
     }
 }
@@ -132,6 +141,12 @@ pub fn encode_hex(bytes: &[u8]) -> String {
 
 /// Decodes a lowercase or uppercase hex string of exactly 32 bytes.
 pub fn decode_hex(input: &str) -> Option<[u8; 32]> {
+    let bytes = decode_hex_bytes(input)?;
+    bytes.try_into().ok()
+}
+
+/// Decodes a lowercase or uppercase hex string of exactly 48 bytes (BLS public key).
+pub fn decode_bls_hex(input: &str) -> Option<[u8; 48]> {
     let bytes = decode_hex_bytes(input)?;
     bytes.try_into().ok()
 }
@@ -170,6 +185,8 @@ mod tests {
     fn sample_config() -> ClusterConfigFile {
         let key1 = SigningKey::generate(&mut OsRng);
         let key2 = SigningKey::generate(&mut OsRng);
+        let bls1 = crypto::BlsIdentity::from_ikm(&[1u8; 32]).expect("bls").public.to_bytes();
+        let bls2 = crypto::BlsIdentity::from_ikm(&[2u8; 32]).expect("bls").public.to_bytes();
         ClusterConfigFile {
             members: vec![
                 MemberFile::new(
@@ -178,6 +195,7 @@ mod tests {
                     Some("203.0.113.5:7001".parse().expect("addr")),
                     &key1.verifying_key(),
                     [1u8; 32],
+                    bls1,
                 ),
                 MemberFile::new(
                     2,
@@ -185,6 +203,7 @@ mod tests {
                     Some("203.0.113.6:7001".parse().expect("addr")),
                     &key2.verifying_key(),
                     [2u8; 32],
+                    bls2,
                 ),
             ],
         }

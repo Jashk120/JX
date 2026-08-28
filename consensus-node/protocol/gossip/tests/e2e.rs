@@ -32,10 +32,7 @@ use crypto::{
     Signable,
     Verifiable,
 };
-use ed25519_dalek::{
-    Signer,
-    SigningKey,
-};
+use ed25519_dalek::SigningKey;
 use gossip::{
     Frame,
     GossipError,
@@ -830,6 +827,11 @@ async fn membership_added_node_joins_live_cluster() {
     let op = MembershipOp::Add {
         node: node4_id,
         key: Box::new(key4.verifying_key()),
+        bls_key: crypto::BlsIdentity::from_ikm(&consensus_seed(4)).expect("bls").public.to_bytes(),
+        pop: crypto::bls::sign_pop(
+            &crypto::BlsIdentity::from_ikm(&consensus_seed(4)).expect("bls"),
+        )
+        .to_bytes(),
         addr: addr4,
         reconnect_addr: None,
     };
@@ -947,6 +949,11 @@ async fn reconnect_existing_node_catches_up() {
     let op = MembershipOp::Add {
         node: node4_id,
         key: Box::new(key4.verifying_key()),
+        bls_key: crypto::BlsIdentity::from_ikm(&consensus_seed(4)).expect("bls").public.to_bytes(),
+        pop: crypto::bls::sign_pop(
+            &crypto::BlsIdentity::from_ikm(&consensus_seed(4)).expect("bls"),
+        )
+        .to_bytes(),
         addr: addr4,
         reconnect_addr: Some(reconnect4.local_addr().expect("local addr")),
     };
@@ -1028,7 +1035,12 @@ async fn reconnect_existing_node_catches_up() {
     {
         let mut hashgraph = node4.hashgraph.lock().await;
         *hashgraph = consensus::Hashgraph::from_checkpoint(
-            &consensus::CheckpointPayload::new(0, [0u8; 32], registry4.clone()),
+            &consensus::CheckpointPayload::new(
+                0,
+                consensus::compute_records_root(&[]),
+                [0u8; 32],
+                registry4.clone(),
+            ),
             RosterHistory::new(registry4.clone()),
         );
     }
@@ -1080,27 +1092,24 @@ async fn reconnect_existing_node_catches_up() {
 
 // --- Phase 4: reconnect with a non-empty state ------------------------------
 
-/// The `state_hash` field (bytes 8..40) of a checkpoint's 72-byte signing
-/// bytes.
-fn state_hash_of(signing_bytes: &[u8; 72]) -> [u8; 32] {
+/// The `state_hash` field (bytes 40..72) of a checkpoint's 136-byte signing
+/// bytes (round 8 || records_root 32 || state_hash 32 || roster_hash 32 ||
+/// prev_checkpoint_hash 32).
+fn state_hash_of(signing_bytes: &[u8; 136]) -> [u8; 32] {
     let mut hash = [0u8; 32];
-    hash.copy_from_slice(&signing_bytes[8..40]);
+    hash.copy_from_slice(&signing_bytes[40..72]);
     hash
 }
 
-/// Signs the node's checkpoint signing bytes for `round` with `signer`'s key.
+/// Signs the node's checkpoint signing bytes for `round` with `signer`'s BLS key.
 fn checkpoint_sig_for(
     signer: u64,
     round: u64,
-    signing_bytes: &[u8; 72],
+    signing_bytes: &[u8; 136],
 ) -> consensus::CheckpointSig {
-    let key = SigningKey::from_bytes(&consensus_seed(signer));
-    let signature = key.sign(signing_bytes);
-    consensus::CheckpointSig {
-        round,
-        signer: NodeId::new(signer),
-        sig: primitives::Signature::new(signature.to_bytes()),
-    }
+    let bls = crypto::BlsIdentity::from_ikm(&consensus_seed(signer)).expect("bls");
+    let sig = bls.sign(signing_bytes);
+    consensus::CheckpointSig { round, signer: NodeId::new(signer), sig }
 }
 
 /// A node's committed state hash for `round`: from an accepted checkpoint if

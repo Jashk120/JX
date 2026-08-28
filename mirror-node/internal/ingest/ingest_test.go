@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	blst "github.com/supranational/blst/bindings/go"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/JKaIN/mirror-node/internal/store"
@@ -28,10 +29,14 @@ func hashObj(h [32]byte) *pb.HashObject {
 
 func trustedHashForPriv(priv ed25519.PrivateKey) [32]byte {
 	pub := priv.Public().(ed25519.PublicKey)
-	var buf [40]byte
-	binary.BigEndian.PutUint64(buf[:8], 0)
-	copy(buf[8:], pub)
-	return sha256.Sum256(buf[:])
+	blsPub, _ := blsKeyForTest(priv)
+	var buf []byte
+	var be [8]byte
+	binary.BigEndian.PutUint64(be[:], 0)
+	buf = append(buf, be[:]...)
+	buf = append(buf, pub...)
+	buf = append(buf, blsPub...)
+	return sha256.Sum256(buf)
 }
 
 func writeSigFile(t *testing.T, streamPath string, fileBytes, metadata []byte, priv ed25519.PrivateKey) {
@@ -153,47 +158,73 @@ func writeCorruptEventFile(t *testing.T, dir string, index uint64) {
 	writeCorruptEventFileWithSig(t, dir, index, priv, stream.ChainSeed)
 }
 
-func writeRecordFileWithSig(t *testing.T, dir string, round uint64, priv ed25519.PrivateKey, start [32]byte) [32]byte {
+func blsKeyForTest(priv ed25519.PrivateKey) ([]byte, *blstSecret) {
+	// Derive BLS key deterministically from ed25519 seed so each priv maps to a unique BLS key
+	seed := priv.Seed()
+	var ikm [32]byte
+	copy(ikm[:], seed)
+	sk := blst.KeyGen(ikm[:])
+	pk := new(blst.P1Affine).From(sk).Compress()
+	return pk, &blstSecret{sk: sk, pk: pk}
+}
+
+type blstSecret struct {
+	sk *blst.SecretKey
+	pk []byte
+}
+
+func writeRecordFileWithSig(t *testing.T, dir string, round uint64, priv ed25519.PrivateKey, start [32]byte, prev [32]byte) ([32]byte, *pb.SignedCheckpoint) {
 	t.Helper()
 	item := &pb.RecordItem{
 		EventHash: make([]byte, 32),
 		TxIndex:   0,
 		TxPayload: []byte("put"),
 	}
-	b, err := proto.MarshalOptions{Deterministic: true}.Marshal(item)
+	mb, err := proto.MarshalOptions{Deterministic: true}.Marshal(item)
 	if err != nil {
 		t.Fatalf("marshal item: %v", err)
 	}
-	serialized := [][]byte{b}
+	serialized := [][]byte{mb}
+	items := []*pb.RecordItem{item}
 	end := stream.RunningHash(start, serialized)
 	pub := priv.Public().(ed25519.PublicKey)
-	var rosterBuf [40]byte
-	binary.BigEndian.PutUint64(rosterBuf[:8], 0)
-	copy(rosterBuf[8:], pub)
-	rosterHash := sha256.Sum256(rosterBuf[:])
+	blsPub, sec := blsKeyForTest(priv)
+	// roster hash: 88/member = id(8)||edkey(32)||blskey(48)
+	rosterHash := func() [32]byte {
+		var buf []byte
+		var be [8]byte
+		binary.BigEndian.PutUint64(be[:], 0)
+		buf = append(buf, be[:]...)
+		buf = append(buf, pub...)
+		buf = append(buf, blsPub...)
+		return sha256.Sum256(buf)
+	}()
+	recordsRoot := stream.ComputeRecordsRoot(items)
 	stateHash := sha256.Sum256([]byte("state"))
-	signing := make([]byte, 0, 72)
-	var roundBE [8]byte
-	binary.BigEndian.PutUint64(roundBE[:], round)
-	signing = append(signing, roundBE[:]...)
-	signing = append(signing, stateHash[:]...)
-	signing = append(signing, rosterHash[:]...)
+	var signingBytes [136]byte
+	binary.BigEndian.PutUint64(signingBytes[0:8], round)
+	copy(signingBytes[8:40], recordsRoot[:])
+	copy(signingBytes[40:72], stateHash[:])
+	copy(signingBytes[72:104], rosterHash[:])
+	copy(signingBytes[104:136], prev[:])
+	sigAff := new(blst.P2Affine).Sign(sec.sk, signingBytes[:], stream.CheckpointDST)
 	cp := &pb.SignedCheckpoint{
-		Round:      round,
-		StateHash:  stateHash[:],
-		RosterHash: rosterHash[:],
+		Round:              round,
+		StateHash:          stateHash[:],
+		RosterHash:         rosterHash[:],
+		RecordsRoot:        recordsRoot[:],
+		PrevCheckpointHash: prev[:],
 		RosterSnapshot: []*pb.CheckpointRosterMember{
-			{NodeId: 0, Key: pub},
+			{NodeId: 0, Key: pub, BlsKey: blsPub},
 		},
-		Sigs: []*pb.CheckpointSig{
-			{Round: round, Signer: 0, Sig: ed25519.Sign(priv, signing)},
-		},
+		AggregateSig: sigAff.Compress(),
+		Signers:      []uint64{0},
 	}
 	rsf := &pb.RecordStreamFile{
 		Version:          stream.Version,
 		Round:            round,
 		StartRunningHash: hashObj(start),
-		Items:            []*pb.RecordItem{item},
+		Items:            items,
 		EndRunningHash:   hashObj(end),
 		Checkpoint:       cp,
 	}
@@ -205,21 +236,8 @@ func writeRecordFileWithSig(t *testing.T, dir string, round uint64, priv ed25519
 	if err := os.WriteFile(path, raw, 0o644); err != nil {
 		t.Fatalf("write %s: %v", path, err)
 	}
-	meta := make([]byte, 0, 76)
-	var ver [4]byte
-	binary.BigEndian.PutUint32(ver[:], stream.Version)
-	meta = append(meta, ver[:]...)
-	meta = append(meta, start[:]...)
-	meta = append(meta, end[:]...)
-	var rbe [8]byte
-	binary.BigEndian.PutUint64(rbe[:], round)
-	meta = append(meta, rbe[:]...)
-	writeSigFile(t, path, raw, meta, priv)
-	return end
-}
-
-func writeRecordFile(t *testing.T, dir string, round uint64, priv ed25519.PrivateKey) {
-	writeRecordFileWithSig(t, dir, round, priv, stream.ChainSeed)
+	// No .rsf_sig file anymore (BLS binding); do not write sig file
+	return end, cp
 }
 
 func assertCounts(t *testing.T, st *store.MemStore, wantEvents, wantRecords int) {
@@ -239,7 +257,7 @@ func TestRunOnceDoesNotReingestOnLaterPolls(t *testing.T) {
 	trusted := trustedHashForPriv(priv)
 
 	end0events := writeEventFileWithSig(t, dir, 0, [][2]uint64{{1, 0}, {1, 1}}, priv, stream.ChainSeed)
-	writeRecordFileWithSig(t, dir, 0, priv, stream.ChainSeed)
+	_, cp0 := writeRecordFileWithSig(t, dir, 0, priv, stream.ChainSeed, [32]byte{})
 
 	st := store.NewMemStore()
 	ing := New(Config{StreamsDir: dir, PubKey: pub, TrustedRosterHash: trusted[:]}, st, quietLogger())
@@ -261,7 +279,7 @@ func TestRunOnceDoesNotReingestOnLaterPolls(t *testing.T) {
 		b, _ := proto.MarshalOptions{Deterministic: true}.Marshal(item)
 		return b
 	}()})
-	writeRecordFileWithSig(t, dir, 1, priv, end0records)
+	writeRecordFileWithSig(t, dir, 1, priv, end0records, stream.CheckpointSigningBytesHash(cp0))
 	if err := ing.RunOnce(ctx); err != nil {
 		t.Fatalf("third RunOnce: %v", err)
 	}
@@ -274,7 +292,7 @@ func TestReingestIntoPopulatedStoreIsNoop(t *testing.T) {
 	pub := priv.Public().(ed25519.PublicKey)
 	trusted := trustedHashForPriv(priv)
 	writeEventFileWithSig(t, dir, 0, [][2]uint64{{1, 0}}, priv, stream.ChainSeed)
-	writeRecordFileWithSig(t, dir, 0, priv, stream.ChainSeed)
+	writeRecordFileWithSig(t, dir, 0, priv, stream.ChainSeed, [32]byte{})
 
 	st := store.NewMemStore()
 	ctx := context.Background()
@@ -372,26 +390,39 @@ func TestMissingSigRecordDeferred(t *testing.T) {
 	trusted := trustedHashForPriv(priv)
 
 	item := &pb.RecordItem{EventHash: make([]byte, 32), TxIndex: 0, TxPayload: []byte("put")}
-	b, _ := proto.MarshalOptions{Deterministic: true}.Marshal(item)
-	end := stream.RunningHash(stream.ChainSeed, [][]byte{b})
-	pub2 := pub
-	var rosterBuf [40]byte
-	binary.BigEndian.PutUint64(rosterBuf[:8], 0)
-	copy(rosterBuf[8:], pub2)
-	rosterHash := sha256.Sum256(rosterBuf[:])
+	bm, _ := proto.MarshalOptions{Deterministic: true}.Marshal(item)
+	end := stream.RunningHash(stream.ChainSeed, [][]byte{bm})
+	blsPub, sec := blsKeyForTest(priv)
+	var rosterHash [32]byte
+	{
+		var buf []byte
+		var be [8]byte
+		binary.BigEndian.PutUint64(be[:], 0)
+		buf = append(buf, be[:]...)
+		buf = append(buf, pub...)
+		buf = append(buf, blsPub...)
+		rosterHash = sha256.Sum256(buf)
+	}
+	items := []*pb.RecordItem{item}
+	recordsRoot := stream.ComputeRecordsRoot(items)
 	stateHash := sha256.Sum256([]byte("state"))
-	signing := make([]byte, 0, 72)
-	var roundBE [8]byte
-	binary.BigEndian.PutUint64(roundBE[:], 0)
-	signing = append(signing, roundBE[:]...)
-	signing = append(signing, stateHash[:]...)
-	signing = append(signing, rosterHash[:]...)
+	var signingBytes [136]byte
+	binary.BigEndian.PutUint64(signingBytes[0:8], 0)
+	copy(signingBytes[8:40], recordsRoot[:])
+	copy(signingBytes[40:72], stateHash[:])
+	copy(signingBytes[72:104], rosterHash[:])
+	sigAff := new(blst.P2Affine).Sign(sec.sk, signingBytes[:], stream.CheckpointDST)
 	cp := &pb.SignedCheckpoint{
-		Round:          0,
-		StateHash:      stateHash[:],
-		RosterHash:     rosterHash[:],
-		RosterSnapshot: []*pb.CheckpointRosterMember{{NodeId: 0, Key: pub2}},
-		Sigs:           []*pb.CheckpointSig{{Round: 0, Signer: 0, Sig: ed25519.Sign(priv, signing)}},
+		Round:              0,
+		StateHash:          stateHash[:],
+		RosterHash:         rosterHash[:],
+		RecordsRoot:        recordsRoot[:],
+		PrevCheckpointHash: make([]byte, 32),
+		RosterSnapshot: []*pb.CheckpointRosterMember{
+			{NodeId: 0, Key: pub, BlsKey: blsPub},
+		},
+		AggregateSig: sigAff.Compress(),
+		Signers:      []uint64{0},
 	}
 	rsf := &pb.RecordStreamFile{
 		Version:          stream.Version,
@@ -411,21 +442,6 @@ func TestMissingSigRecordDeferred(t *testing.T) {
 	ctx := context.Background()
 	if err := ing.RunOnce(ctx); err != nil {
 		t.Fatalf("RunOnce: %v", err)
-	}
-	assertCounts(t, st, 0, 0)
-
-	meta := make([]byte, 0, 76)
-	var ver [4]byte
-	binary.BigEndian.PutUint32(ver[:], stream.Version)
-	meta = append(meta, ver[:]...)
-	meta = append(meta, stream.ChainSeed[:]...)
-	meta = append(meta, end[:]...)
-	var rbe [8]byte
-	binary.BigEndian.PutUint64(rbe[:], 0)
-	meta = append(meta, rbe[:]...)
-	writeSigFile(t, path, raw, meta, priv)
-	if err := ing.RunOnce(ctx); err != nil {
-		t.Fatalf("RunOnce after sig: %v", err)
 	}
 	assertCounts(t, st, 0, 1)
 }
@@ -518,29 +534,41 @@ func TestUntrustedRosterFails(t *testing.T) {
 	dir := t.TempDir()
 	priv := ed25519.NewKeyFromSeed(make([]byte, ed25519.SeedSize))
 	pub := priv.Public().(ed25519.PublicKey)
-	// Real trusted is for priv, but file will embed different roster
 	trusted := sha256.Sum256([]byte("other roster"))
-
 	item := &pb.RecordItem{EventHash: make([]byte, 32), TxIndex: 0, TxPayload: []byte("put")}
-	b, _ := proto.MarshalOptions{Deterministic: true}.Marshal(item)
-	end := stream.RunningHash(stream.ChainSeed, [][]byte{b})
-	var rosterBuf [40]byte
-	binary.BigEndian.PutUint64(rosterBuf[:8], 0)
-	copy(rosterBuf[8:], pub)
-	rosterHash := sha256.Sum256(rosterBuf[:])
+	bm, _ := proto.MarshalOptions{Deterministic: true}.Marshal(item)
+	end := stream.RunningHash(stream.ChainSeed, [][]byte{bm})
+	blsPub, sec := blsKeyForTest(priv)
+	var rosterHash [32]byte
+	{
+		var buf []byte
+		var be [8]byte
+		binary.BigEndian.PutUint64(be[:], 0)
+		buf = append(buf, be[:]...)
+		buf = append(buf, pub...)
+		buf = append(buf, blsPub...)
+		rosterHash = sha256.Sum256(buf)
+	}
+	items := []*pb.RecordItem{item}
+	recordsRoot := stream.ComputeRecordsRoot(items)
 	stateHash := sha256.Sum256([]byte("state"))
-	signing := make([]byte, 0, 72)
-	var roundBE [8]byte
-	binary.BigEndian.PutUint64(roundBE[:], 0)
-	signing = append(signing, roundBE[:]...)
-	signing = append(signing, stateHash[:]...)
-	signing = append(signing, rosterHash[:]...)
+	var signingBytes [136]byte
+	binary.BigEndian.PutUint64(signingBytes[0:8], 0)
+	copy(signingBytes[8:40], recordsRoot[:])
+	copy(signingBytes[40:72], stateHash[:])
+	copy(signingBytes[72:104], rosterHash[:])
+	sigAff := new(blst.P2Affine).Sign(sec.sk, signingBytes[:], stream.CheckpointDST)
 	cp := &pb.SignedCheckpoint{
-		Round:          0,
-		StateHash:      stateHash[:],
-		RosterHash:     rosterHash[:],
-		RosterSnapshot: []*pb.CheckpointRosterMember{{NodeId: 0, Key: pub}},
-		Sigs:           []*pb.CheckpointSig{{Round: 0, Signer: 0, Sig: ed25519.Sign(priv, signing)}},
+		Round:              0,
+		StateHash:          stateHash[:],
+		RosterHash:         rosterHash[:],
+		RecordsRoot:        recordsRoot[:],
+		PrevCheckpointHash: make([]byte, 32),
+		RosterSnapshot: []*pb.CheckpointRosterMember{
+			{NodeId: 0, Key: pub, BlsKey: blsPub},
+		},
+		AggregateSig: sigAff.Compress(),
+		Signers:      []uint64{0},
 	}
 	rsf := &pb.RecordStreamFile{
 		Version:          stream.Version,
@@ -555,17 +583,6 @@ func TestUntrustedRosterFails(t *testing.T) {
 	if err := os.WriteFile(path, raw, 0o644); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	meta := make([]byte, 0, 76)
-	var ver [4]byte
-	binary.BigEndian.PutUint32(ver[:], stream.Version)
-	meta = append(meta, ver[:]...)
-	meta = append(meta, stream.ChainSeed[:]...)
-	meta = append(meta, end[:]...)
-	var rbe [8]byte
-	binary.BigEndian.PutUint64(rbe[:], 0)
-	meta = append(meta, rbe[:]...)
-	writeSigFile(t, path, raw, meta, priv)
-
 	st := store.NewMemStore()
 	ing := New(Config{StreamsDir: dir, PubKey: pub, TrustedRosterHash: trusted[:]}, st, quietLogger())
 	if err := ing.RunOnce(context.Background()); err != nil {

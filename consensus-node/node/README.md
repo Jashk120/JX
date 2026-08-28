@@ -73,9 +73,13 @@ key/config copy steps, and the add-a-third-member flow.
   The watermark is persisted per checkpoint (`StateDb::set_watermark`) and
   restored on reconnect/restart, taking the max of the persisted watermark
   and the newest retained own-event timestamp.
-- Mirror streams: `<data>/streams/` holds `.esf`/`.rsf` files plus
-  `.esf_sig`/`.rsf_sig` signature files (Ed25519, atomic writes). Both are
-  chained by a running hash and verified by `stream::verify`.
+- Mirror streams: `<data>/streams/` holds `.esf` (+ `.esf_sig` Ed25519) and
+  `.rsf` (+ `.rsf_proofs` Merkle sidecar) files plus `.ckpt` checkpoints.
+  **No `.rsf_sig`** — records are content-bound via Merkle `records_root` and
+  a 136-byte BLS aggregate checkpoint. Both stream types are chained by a
+  running hash and verified by `stream::verify` (+ `chain` + `BLS` + `Merkle`
+  + `prev` + `diffs` + `proofs`, `STREAM_VERSION` 3). Data dir format is
+  `FORMAT_VERSION` 5 (chained, hard genesis break).
 
 ## Boundaries
 

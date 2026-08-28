@@ -420,7 +420,11 @@ mod tests {
     fn test_node() -> Arc<GossipNode> {
         let seed = [7u8; 32];
         let mut registry = MembershipRegistry::new();
-        registry.register(NodeId::new(1), SigningKey::from_bytes(&seed).verifying_key());
+        registry.register(
+            NodeId::new(1),
+            SigningKey::from_bytes(&seed).verifying_key(),
+            crypto::BlsIdentity::from_ikm(&[1u8; 32]).expect("bls").public.to_bytes(),
+        );
         Arc::new(GossipNode::new(
             NodeId::new(1),
             SigningKey::from_bytes(&seed),
@@ -539,6 +543,8 @@ mod tests {
         let op = MembershipOp::Add {
             node: NodeId::new(3),
             key: Box::new(SigningKey::from_bytes(&[3u8; 32]).verifying_key()),
+            bls_key: [0u8; 48],
+            pop: [0u8; 96],
             addr: "127.0.0.1:7000".parse().expect("addr"),
             reconnect_addr: Some("127.0.0.1:7001".parse().expect("addr")),
         };

@@ -47,6 +47,7 @@ type Ingester struct {
 	inFlightEvents  map[uint64]struct{} // reserved while an .esf is being ingested
 	lastRecordEnd   *[32]byte           // last accepted .rsf end hash (M-5)
 	lastEventEnd    *[32]byte           // last accepted .esf end hash (M-5)
+	expectedPrev    *[32]byte           // expected prev_checkpoint_hash for next record (nil => genesis zeros)
 
 	runMu sync.Mutex // serializes concurrent RunOnce calls
 }
@@ -58,7 +59,7 @@ func New(cfg Config, st store.Store, log *slog.Logger) *Ingester {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Ingester{
+	ing := &Ingester{
 		cfg:             cfg,
 		store:           st,
 		log:             log,
@@ -66,6 +67,43 @@ func New(cfg Config, st store.Store, log *slog.Logger) *Ingester {
 		seenEvents:      make(map[uint64]struct{}),
 		inFlightRecords: make(map[uint64]struct{}),
 		inFlightEvents:  make(map[uint64]struct{}),
+	}
+	ing.seedFromStore()
+	return ing
+}
+
+func (ing *Ingester) seedFromStore() {
+	ing.mu.Lock()
+	defer ing.mu.Unlock()
+	if len(ing.seenRecords) != 0 {
+		return
+	}
+	if ing.store == nil {
+		return
+	}
+	recs := ing.store.ListRecords()
+	if recs == nil {
+		return
+	}
+	var highest *pb.RecordStreamFile
+	for _, f := range recs {
+		if f == nil {
+			continue
+		}
+		ing.seenRecords[f.Round] = struct{}{}
+		if highest == nil || f.Round > highest.Round {
+			highest = f
+		}
+	}
+	if highest == nil {
+		return
+	}
+	if end, err := hashFromPB(highest.EndRunningHash); err == nil {
+		ing.lastRecordEnd = &end
+	}
+	if highest.Checkpoint != nil {
+		h := stream.CheckpointSigningBytesHash(highest.Checkpoint)
+		ing.expectedPrev = &h
 	}
 }
 
@@ -135,7 +173,7 @@ func (ing *Ingester) runOnceRemote(ctx context.Context) error {
 		if trimmed == "" {
 			continue
 		}
-		if strings.HasSuffix(trimmed, stream.EventFileSuffix) || strings.HasSuffix(trimmed, stream.RecordFileSuffix) || strings.HasSuffix(trimmed, stream.EventSigSuffix) || strings.HasSuffix(trimmed, stream.RecordSigSuffix) {
+		if strings.HasSuffix(trimmed, stream.EventFileSuffix) || strings.HasSuffix(trimmed, stream.RecordFileSuffix) || strings.HasSuffix(trimmed, stream.EventSigSuffix) || strings.HasSuffix(trimmed, stream.RecordSigSuffix) || strings.HasSuffix(trimmed, stream.CkptFileSuffix) || strings.HasSuffix(trimmed, stream.RecordProofSuffix) {
 			filtered = append(filtered, trimmed)
 			listed[trimmed] = struct{}{}
 		}
@@ -163,6 +201,16 @@ func (ing *Ingester) runOnceRemote(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
+		}
+		ckptName := stream.CkptFileName(r.index)
+		if _, ok := listed[ckptName]; ok {
+			ckptBytes, cErr := remote.Fetch(ctx, ckptName)
+			if cErr == nil {
+				if vErr := stream.VerifyCheckpointFile(ckptBytes, ing.cfg.TrustedRosterHash); vErr != nil {
+					ing.log.Warn("ckpt verification failed", "name", ckptName, "err", vErr)
+					continue
+				}
+			}
 		}
 		if err := ing.ingestRecordRemote(ctx, r.name, listed, remote); err != nil {
 			ing.log.Warn("record ingest failed", "name", r.name, "err", err)
@@ -222,6 +270,62 @@ func hashFromPB(h *pb.HashObject) ([32]byte, error) {
 	}
 	copy(out[:], h.Hash)
 	return out, nil
+}
+
+// checkPrev validates cp's prev_checkpoint_hash commitment against the
+// ingester's expected value. A record must carry exactly 32 bytes: the
+// genesis round commits [32]byte{} (never an empty slice), and every later
+// round must commit SHA256(prev_signing_bytes) of the previously accepted
+// checkpoint. With commit=true the expectation is advanced in the same
+// critical section, so a concurrent ingest can never observe a torn
+// check-then-advance state.
+func (ing *Ingester) checkPrev(cp *pb.SignedCheckpoint, commit bool) error {
+	ing.mu.Lock()
+	defer ing.mu.Unlock()
+	var expected [32]byte
+	if ing.expectedPrev != nil {
+		expected = *ing.expectedPrev
+	}
+	if len(cp.PrevCheckpointHash) != 32 {
+		return fmt.Errorf("prev_checkpoint_hash is %d bytes, want 32 (genesis is 32 zero bytes, not empty)", len(cp.PrevCheckpointHash))
+	}
+	var got [32]byte
+	copy(got[:], cp.PrevCheckpointHash)
+	if got != expected {
+		return fmt.Errorf("prev_checkpoint_hash mismatch: expected %x got %x", expected, got)
+	}
+	if commit {
+		h := stream.CheckpointSigningBytesHash(cp)
+		ing.expectedPrev = &h
+	}
+	return nil
+}
+
+func verifyProofSidecarLocal(dir string, f *pb.RecordStreamFile) error {
+	proofPath := filepath.Join(dir, stream.RecordProofFileName(f.Round))
+	b, err := os.ReadFile(proofPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("read proof sidecar: %w", err)
+	}
+	return stream.VerifyRecordsProofFileBytes(b, f.Items, f.Checkpoint.RecordsRoot, f.Round)
+}
+
+func (ing *Ingester) verifyProofSidecarRemote(ctx context.Context, listed map[string]struct{}, remote *stream.RemoteSource, f *pb.RecordStreamFile) error {
+	name := stream.RecordProofFileName(f.Round)
+	if _, ok := listed[name]; !ok {
+		return nil
+	}
+	b, err := remote.Fetch(ctx, name)
+	if err != nil {
+		if errors.Is(err, stream.ErrNotFound) {
+			return nil
+		}
+		return fmt.Errorf("fetch proof sidecar %s: %w", name, err)
+	}
+	return stream.VerifyRecordsProofFileBytes(b, f.Items, f.Checkpoint.RecordsRoot, f.Round)
 }
 
 // markSeen records an ingested stream file by its numeric index. Callers
@@ -290,14 +394,6 @@ func (ing *Ingester) ingestRecord(path string) error {
 		if err != nil {
 			return err
 		}
-		sig, err := ing.loadSig(path)
-		if err != nil {
-			return err
-		}
-		if sig == nil {
-			ing.log.Warn("missing signature file, deferring record ingestion", "path", path)
-			return fmt.Errorf("missing signature file for %s: deferring until sig arrives", path)
-		}
 		start, err := hashFromPB(f.StartRunningHash)
 		if err != nil {
 			return fmt.Errorf("record %s start hash: %w", path, err)
@@ -308,21 +404,41 @@ func (ing *Ingester) ingestRecord(path string) error {
 		}
 		ing.mu.Lock()
 		var expected [32]byte
-		if ing.lastRecordEnd == nil {
+		hasAnchor := ing.lastRecordEnd != nil
+		if !hasAnchor {
 			expected = stream.ChainSeed
 		} else {
 			expected = *ing.lastRecordEnd
 		}
 		ing.mu.Unlock()
 		if start != expected {
+			if !hasAnchor {
+				return fmt.Errorf("no record chain anchor for %s: start %x has no anchor; start from genesis or restore a store with accepted records", path, start)
+			}
 			ing.log.Warn("record chain continuity violation", "path", path, "expected", fmt.Sprintf("%x", expected), "got", fmt.Sprintf("%x", start))
 			return fmt.Errorf("record chain continuity violation for %s: expected start %x got %x", path, expected, start)
 		}
-		if err := stream.VerifyRecordFile(raw, sig, ing.cfg.PubKey, ing.cfg.TrustedRosterHash); err != nil {
+		if err := stream.VerifyRecordFile(raw, nil, ing.cfg.PubKey, ing.cfg.TrustedRosterHash); err != nil {
 			return fmt.Errorf("verify record %s: %w", path, err)
+		}
+		if f.Checkpoint != nil {
+			if err := ing.checkPrev(f.Checkpoint, false); err != nil {
+				return fmt.Errorf("prev chain %s: %w", path, err)
+			}
+		}
+		if err := stream.ValidateStateDiffs(f.StateDiffs); err != nil {
+			return fmt.Errorf("state_diffs %s: %w", path, err)
+		}
+		if err := verifyProofSidecarLocal(filepath.Dir(path), f); err != nil {
+			return fmt.Errorf("proof sidecar %s: %w", path, err)
 		}
 		if err := ing.store.PutRecord(f); err != nil {
 			return err
+		}
+		if f.Checkpoint != nil {
+			if err := ing.checkPrev(f.Checkpoint, true); err != nil {
+				return fmt.Errorf("prev chain %s: %w", path, err)
+			}
 		}
 		ing.mu.Lock()
 		ing.lastRecordEnd = &end
@@ -336,14 +452,6 @@ func (ing *Ingester) ingestRecord(path string) error {
 	if err != nil {
 		return err
 	}
-	sig, err := ing.loadSig(path)
-	if err != nil {
-		return err
-	}
-	if sig == nil {
-		ing.log.Warn("missing signature file, deferring record ingestion", "path", path)
-		return fmt.Errorf("missing signature file for %s: deferring until sig arrives", path)
-	}
 	start, err := hashFromPB(f.StartRunningHash)
 	if err != nil {
 		return fmt.Errorf("record %s start hash: %w", path, err)
@@ -354,21 +462,41 @@ func (ing *Ingester) ingestRecord(path string) error {
 	}
 	ing.mu.Lock()
 	var expected [32]byte
-	if ing.lastRecordEnd == nil {
+	hasAnchor := ing.lastRecordEnd != nil
+	if !hasAnchor {
 		expected = stream.ChainSeed
 	} else {
 		expected = *ing.lastRecordEnd
 	}
 	ing.mu.Unlock()
 	if start != expected {
+		if !hasAnchor {
+			return fmt.Errorf("no record chain anchor for %s: start %x has no anchor; start from genesis or restore a store with accepted records", path, start)
+		}
 		ing.log.Warn("record chain continuity violation", "path", path, "expected", fmt.Sprintf("%x", expected), "got", fmt.Sprintf("%x", start))
 		return fmt.Errorf("record chain continuity violation for %s: expected start %x got %x", path, expected, start)
 	}
-	if err := stream.VerifyRecordFile(raw, sig, ing.cfg.PubKey, ing.cfg.TrustedRosterHash); err != nil {
+	if err := stream.VerifyRecordFile(raw, nil, ing.cfg.PubKey, ing.cfg.TrustedRosterHash); err != nil {
 		return fmt.Errorf("verify record %s: %w", path, err)
+	}
+	if f.Checkpoint != nil {
+		if err := ing.checkPrev(f.Checkpoint, false); err != nil {
+			return fmt.Errorf("prev chain %s: %w", path, err)
+		}
+	}
+	if err := stream.ValidateStateDiffs(f.StateDiffs); err != nil {
+		return fmt.Errorf("state_diffs %s: %w", path, err)
+	}
+	if err := verifyProofSidecarLocal(filepath.Dir(path), f); err != nil {
+		return fmt.Errorf("proof sidecar %s: %w", path, err)
 	}
 	if err := ing.store.PutRecord(f); err != nil {
 		return err
+	}
+	if f.Checkpoint != nil {
+		if err := ing.checkPrev(f.Checkpoint, true); err != nil {
+			return fmt.Errorf("prev chain %s: %w", path, err)
+		}
 	}
 	ing.mu.Lock()
 	ing.lastRecordEnd = &end
@@ -545,14 +673,6 @@ func (ing *Ingester) ingestRecordRemote(ctx context.Context, name string, listed
 		if err != nil {
 			return err
 		}
-		sig, err := ing.fetchRemoteSig(ctx, name, listed, remote)
-		if err != nil {
-			return err
-		}
-		if sig == nil {
-			ing.log.Warn("missing signature file, deferring record ingestion", "name", name)
-			return fmt.Errorf("missing signature file for %s: deferring until sig arrives", name)
-		}
 		var f pb.RecordStreamFile
 		if err := unmarshalStrictRemote(raw, &f); err != nil {
 			return fmt.Errorf("unmarshal %s: %w", name, err)
@@ -567,21 +687,41 @@ func (ing *Ingester) ingestRecordRemote(ctx context.Context, name string, listed
 		}
 		ing.mu.Lock()
 		var expected [32]byte
-		if ing.lastRecordEnd == nil {
+		hasAnchor := ing.lastRecordEnd != nil
+		if !hasAnchor {
 			expected = stream.ChainSeed
 		} else {
 			expected = *ing.lastRecordEnd
 		}
 		ing.mu.Unlock()
 		if start != expected {
+			if !hasAnchor {
+				return fmt.Errorf("no record chain anchor for %s: start %x has no anchor; start from genesis or restore a store with accepted records", name, start)
+			}
 			ing.log.Warn("record chain continuity violation", "name", name, "expected", fmt.Sprintf("%x", expected), "got", fmt.Sprintf("%x", start))
 			return fmt.Errorf("record chain continuity violation for %s: expected start %x got %x", name, expected, start)
 		}
-		if err := stream.VerifyRecordFile(raw, sig, ing.cfg.PubKey, ing.cfg.TrustedRosterHash); err != nil {
+		if err := stream.VerifyRecordFile(raw, nil, ing.cfg.PubKey, ing.cfg.TrustedRosterHash); err != nil {
 			return fmt.Errorf("verify record %s: %w", name, err)
+		}
+		if f.Checkpoint != nil {
+			if err := ing.checkPrev(f.Checkpoint, false); err != nil {
+				return fmt.Errorf("prev chain %s: %w", name, err)
+			}
+		}
+		if err := stream.ValidateStateDiffs(f.StateDiffs); err != nil {
+			return fmt.Errorf("state_diffs %s: %w", name, err)
+		}
+		if err := ing.verifyProofSidecarRemote(ctx, listed, remote, &f); err != nil {
+			return fmt.Errorf("proof sidecar %s: %w", name, err)
 		}
 		if err := ing.store.PutRecord(&f); err != nil {
 			return err
+		}
+		if f.Checkpoint != nil {
+			if err := ing.checkPrev(f.Checkpoint, true); err != nil {
+				return fmt.Errorf("prev chain %s: %w", name, err)
+			}
 		}
 		ing.mu.Lock()
 		ing.lastRecordEnd = &end
@@ -594,14 +734,6 @@ func (ing *Ingester) ingestRecordRemote(ctx context.Context, name string, listed
 	raw, err := remote.Fetch(ctx, name)
 	if err != nil {
 		return err
-	}
-	sig, err := ing.fetchRemoteSig(ctx, name, listed, remote)
-	if err != nil {
-		return err
-	}
-	if sig == nil {
-		ing.log.Warn("missing signature file, deferring record ingestion", "name", name)
-		return fmt.Errorf("missing signature file for %s: deferring until sig arrives", name)
 	}
 	var f pb.RecordStreamFile
 	if err := unmarshalStrictRemote(raw, &f); err != nil {
@@ -617,21 +749,41 @@ func (ing *Ingester) ingestRecordRemote(ctx context.Context, name string, listed
 	}
 	ing.mu.Lock()
 	var expected [32]byte
-	if ing.lastRecordEnd == nil {
+	hasAnchor := ing.lastRecordEnd != nil
+	if !hasAnchor {
 		expected = stream.ChainSeed
 	} else {
 		expected = *ing.lastRecordEnd
 	}
 	ing.mu.Unlock()
 	if start != expected {
+		if !hasAnchor {
+			return fmt.Errorf("no record chain anchor for %s: start %x has no anchor; start from genesis or restore a store with accepted records", name, start)
+		}
 		ing.log.Warn("record chain continuity violation", "name", name, "expected", fmt.Sprintf("%x", expected), "got", fmt.Sprintf("%x", start))
 		return fmt.Errorf("record chain continuity violation for %s: expected start %x got %x", name, expected, start)
 	}
-	if err := stream.VerifyRecordFile(raw, sig, ing.cfg.PubKey, ing.cfg.TrustedRosterHash); err != nil {
+	if err := stream.VerifyRecordFile(raw, nil, ing.cfg.PubKey, ing.cfg.TrustedRosterHash); err != nil {
 		return fmt.Errorf("verify record %s: %w", name, err)
+	}
+	if f.Checkpoint != nil {
+		if err := ing.checkPrev(f.Checkpoint, false); err != nil {
+			return fmt.Errorf("prev chain %s: %w", name, err)
+		}
+	}
+	if err := stream.ValidateStateDiffs(f.StateDiffs); err != nil {
+		return fmt.Errorf("state_diffs %s: %w", name, err)
+	}
+	if err := ing.verifyProofSidecarRemote(ctx, listed, remote, &f); err != nil {
+		return fmt.Errorf("proof sidecar %s: %w", name, err)
 	}
 	if err := ing.store.PutRecord(&f); err != nil {
 		return err
+	}
+	if f.Checkpoint != nil {
+		if err := ing.checkPrev(f.Checkpoint, true); err != nil {
+			return fmt.Errorf("prev chain %s: %w", name, err)
+		}
 	}
 	ing.mu.Lock()
 	ing.lastRecordEnd = &end

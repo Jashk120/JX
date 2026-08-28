@@ -3,7 +3,7 @@ package stream
 import "fmt"
 
 const (
-	Version              = 1
+	Version              = 3
 	StreamsSubdir        = "streams"
 	DefaultEventsPerFile = 10000
 
@@ -14,6 +14,11 @@ const (
 	RecordFilePrefix = "round-"
 	RecordFileSuffix = ".rsf"
 	RecordSigSuffix  = ".rsf_sig"
+
+	RecordProofSuffix = ".rsf_proofs"
+
+	CkptFilePrefix = "checkpoint-"
+	CkptFileSuffix = ".ckpt"
 
 	EventFileIndexWidth = 8
 )
@@ -40,6 +45,14 @@ func RecordFileRound(name string) (round uint64, ok bool) {
 	return streamIndex(name, RecordFilePrefix, RecordFileSuffix)
 }
 
+func CkptFileName(round uint64) string {
+	return fmt.Sprintf("%s%d%s", CkptFilePrefix, round, CkptFileSuffix)
+}
+
+func CkptFileRound(name string) (uint64, bool) {
+	return streamIndex(name, CkptFilePrefix, CkptFileSuffix)
+}
+
 // SignatureFileName returns the companion .sig name for a stream file.
 // Mirrors consensus-node/protocol/stream/src/lib.rs:signature_file_name —
 // unknown names fall back to the record signature suffix.
@@ -52,4 +65,14 @@ func SignatureFileName(streamFileName string) string {
 	default:
 		return streamFileName + RecordSigSuffix
 	}
+}
+
+// RecordProofFileName returns the sidecar name for a record round's proofs.
+func RecordProofFileName(round uint64) string {
+	return fmt.Sprintf("%s%d%s", RecordFilePrefix, round, RecordProofSuffix)
+}
+
+// RecordProofFileRound extracts the round from a proof sidecar name.
+func RecordProofFileRound(name string) (uint64, bool) {
+	return streamIndex(name, RecordFilePrefix, RecordProofSuffix)
 }

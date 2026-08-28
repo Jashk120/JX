@@ -50,15 +50,22 @@ fn key_for(id: u64) -> SigningKey {
 fn registry_for(ids: &[u64]) -> MembershipRegistry {
     let mut registry = MembershipRegistry::new();
     for &id in ids {
-        registry.register(NodeId::new(id), key_for(id).verifying_key());
+        registry.register(
+            NodeId::new(id),
+            key_for(id).verifying_key(),
+            crypto::BlsIdentity::from_ikm(&[id as u8; 32]).expect("bls").public.to_bytes(),
+        );
     }
     registry
 }
 
 fn membership_add_tx(new_node: u64) -> Transaction {
+    let bls_id = crypto::BlsIdentity::from_ikm(&[new_node as u8; 32]).expect("bls");
     let op = MembershipOp::Add {
         node: NodeId::new(new_node),
         key: Box::new(key_for(new_node).verifying_key()),
+        bls_key: bls_id.public.to_bytes(),
+        pop: crypto::sign_pop(&bls_id).to_bytes(),
         addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7000),
         reconnect_addr: Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7001)),
     };
