@@ -190,6 +190,13 @@ pub struct GossipNode {
     /// writer as `record_sink`; keeping it separate allows a dedicated proof
     /// writer if desired without blocking consensus.
     record_proof_sink: Mutex<Option<Arc<stream::RecordStreamWriter>>>,
+    /// Cumulative per-round state hashes for every finalized round.
+    /// Unlike the per-pass `state_hashes` built in `process_finalized_rounds`,
+    /// this map is never truncated on the hot path: `canonical_checkpoint_payload`
+    /// and `prev_checkpoint_hash_for` read from it, so a node always derives
+    /// the true per-round state hash regardless of which rounds finalized
+    /// together in a given pass (PLAN-2 Rule 1).
+    cumulative_state_hashes: Mutex<BTreeMap<u64, [u8; 32]>>,
 }
 
 impl GossipNode {
@@ -263,6 +270,11 @@ impl GossipNode {
             event_stream_sink: Mutex::new(None),
             record_sink: Mutex::new(None),
             record_proof_sink: Mutex::new(None),
+            cumulative_state_hashes: Mutex::new({
+                let mut m = BTreeMap::new();
+                m.insert(0, state::SparseMerkleTree::new().root());
+                m
+            }),
         }
     }
 
@@ -871,17 +883,28 @@ impl GossipNode {
             }
 
             // Phase D: produce checkpoints for every round decided since the
-            // last pass, using the per-round state hashes captured above.
-            self.produce_pending_checkpoints(&state_hashes, &snapshots, &diffs).await;
+            // last pass. State hashes are cumulative so `prev_checkpoint_hash_for`
+            // rebuilds read true per-round hashes (Rule 1), not the pass-local
+            // pre-batch sentinel.
+            let cumulative_state_hashes = {
+                let mut cumulative = self.cumulative_state_hashes.lock().await;
+                for (round, hash) in &state_hashes {
+                    if *round != 0 {
+                        cumulative.insert(*round, *hash);
+                    }
+                }
+                cumulative.clone()
+            };
+            self.produce_pending_checkpoints(&cumulative_state_hashes, &snapshots, &diffs).await;
         } else {
-            let (bytes, root) = {
+            let (bytes, _root) = {
                 let executor = self.executor.lock().await;
                 (executor.state().to_bytes(), executor.state().root())
             };
-            let state_hashes = BTreeMap::from([(0, root)]);
+            let cumulative_state_hashes = self.cumulative_state_hashes.lock().await.clone();
             let snapshots = BTreeMap::from([(0, bytes)]);
             let diffs: BTreeMap<u64, Vec<stream::pb::StateDiff>> = BTreeMap::new();
-            self.produce_pending_checkpoints(&state_hashes, &snapshots, &diffs).await;
+            self.produce_pending_checkpoints(&cumulative_state_hashes, &snapshots, &diffs).await;
         }
         self.checkpoint_notify.notify_waiters();
     }
@@ -1187,6 +1210,10 @@ impl GossipNode {
         {
             let mut snapshots = self.state_snapshots.lock().await;
             snapshots.retain(|&snap_round, _| snap_round >= prune_before_round);
+        }
+        {
+            let mut cumulative = self.cumulative_state_hashes.lock().await;
+            cumulative.retain(|&r, _| r == 0 || r >= prune_before_round);
         }
         if let Err(e) = self.state_db.prune_snapshots_before(prune_before_round) {
             tracing::warn!(prune_before_round, error = %e, "failed to prune state snapshots");
@@ -1530,6 +1557,12 @@ impl GossipNode {
             return false;
         }
         self.state_snapshots.lock().await.insert(cp_round, response.state_bytes.clone());
+        {
+            let mut cumulative = self.cumulative_state_hashes.lock().await;
+            cumulative.clear();
+            cumulative.insert(0, state::SparseMerkleTree::new().root());
+            cumulative.insert(cp_round, checkpoint.payload.state_hash);
+        }
 
         // 5. Rebuild the hashgraph scaffold and load the teacher's retained
         //    graph into it. The retained events carry their full record
@@ -2019,5 +2052,48 @@ mod rule1_chain_tests {
         let p2 = GossipNode::canonical_checkpoint_payload_chained(&hg, 2, &state_hashes, &[])
             .expect("round 2");
         assert_eq!(p2.prev_checkpoint_hash, p1.signing_bytes_hash());
+    }
+
+    #[tokio::test]
+    async fn chained_payload_deterministic_across_pass_groupings() {
+        let registry = registry_with(&[1, 2, 3, 4]);
+        let mut hg = consensus::Hashgraph::new(&registry);
+        hg.mark_decided_through(3);
+        let mut cumulative = BTreeMap::new();
+        cumulative.insert(0, [0xAA; 32]);
+        cumulative.insert(1, [0x11; 32]);
+        cumulative.insert(2, [0x22; 32]);
+        cumulative.insert(3, [0x33; 32]);
+
+        let payload3_cumulative =
+            GossipNode::canonical_checkpoint_payload_chained(&hg, 3, &cumulative, &[])
+                .expect("round 3 via cumulative");
+
+        let mut map_a = BTreeMap::new();
+        map_a.insert(0, [0x22; 32]);
+        map_a.insert(3, [0x33; 32]);
+        let payload3_a = GossipNode::canonical_checkpoint_payload_chained(&hg, 3, &map_a, &[])
+            .expect("round 3 via map_a");
+
+        let mut map_b = BTreeMap::new();
+        map_b.insert(0, [0x11; 32]);
+        map_b.insert(2, [0x22; 32]);
+        map_b.insert(3, [0x33; 32]);
+        let payload3_b = GossipNode::canonical_checkpoint_payload_chained(&hg, 3, &map_b, &[])
+            .expect("round 3 via map_b");
+
+        assert_ne!(
+            payload3_a.signing_bytes(),
+            payload3_b.signing_bytes(),
+            "per-pass maps with different floors must diverge (the bug)"
+        );
+
+        let payload2 = GossipNode::canonical_checkpoint_payload_chained(&hg, 2, &cumulative, &[])
+            .expect("round 2");
+        let payload1 = GossipNode::canonical_checkpoint_payload_chained(&hg, 1, &cumulative, &[])
+            .expect("round 1");
+        assert_eq!(payload2.prev_checkpoint_hash, payload1.signing_bytes_hash());
+        assert_eq!(payload3_cumulative.prev_checkpoint_hash, payload2.signing_bytes_hash());
+        assert_ne!(payload3_a.prev_checkpoint_hash, payload2.signing_bytes_hash());
     }
 }
