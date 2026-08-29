@@ -62,3 +62,46 @@ See `consensus-node/README.md` for the full cluster/runbook and `consensus-node/
 - `docs/OPTIMIZATION.md` — scaling design (locked)
 - `AGENTS.md` — contributor / AI-agent rules
 - `ROADMAP.md` — roadmap
+
+## Benchmarks — 6-node direct LAN (2026-08-29, Arch 15.2G, `sync_interval 25ms`)
+
+Live `tests/harness/` on `consensus-node/target/debug/jkaind` (`cargo build --workspace`, `rambo` protected). See `tests/README.md` for harness + `pytest -m smoke|finality|tps`.
+
+### Lowest latency (isolated, `concurrency=1`)
+
+`measure_finality_batch(20, conc=1)` — `submit→ordered` (gossip) 100%, `ordered→decided` <50ms (virtual voting), `decided→checkpoint` 2s grace.
+
+| metric | value |
+|---|---:|
+| p50 decided | 0.536s |
+| p95 decided | 1.14s |
+| p99 decided | 1.82s |
+| mean decided | 0.72s |
+| gossip p50 (submit→ordered) | 0.536s |
+| consensus p50 (ordered→decided) | 0.000s |
+| best single tx | **0.210s** |
+
+### Highest throughput (sustained, round-robin 6 nodes, `decided` finality)
+
+| total | conc | submit TPS | **decided TPS** | submit_dur | decided_dur | rounds |
+|---:|---:|---:|---:|---:|---:|---:|
+| 500 | 20 | 10,512 | **471** | 0.05s | 1.06s | 1→3 |
+| 1,000 | 30 | 8,519 | **890** | 0.12s | 1.12s | 1→3 |
+| 1,500 | 30 | 9,934 | **1,298** | 0.15s | 1.16s | 1→3 |
+| 2,000 | 40 | 10,479 | **1,673** | 0.19s | 1.20s | 1→3 |
+| **2,500** | **40** | **10,474** | **2,002** | **0.24s** | **1.25s** | 1→3 |
+
+Peak **2,002 TPS decided (10,474 TPS submit) @ 2,500tx conc40** — `MAX_PENDING 1024` per node ×6.
+
+### Event gap 80ms (prod default) vs 250ms vs 500ms — projection
+
+Gap = `ClusterConfig(sync_interval_ms)` / `node/src/cli/run.rs:DEFAULT_SYNC_INTERVAL 80ms`. Latency ≈ `k·gap·logN`, Throughput ≈ `64·6/gap·0.13`.
+
+| sync_interval | vs 25ms | **latency p50** | **decided TPS** | submit TPS | `k10temp` |
+|---:|---:|---:|---:|---:|---:|
+| **25ms** (harness) | 1× | **0.54s** | **2,002** | 10,474 | 90-97°C (rambo kill unless `protect`) |
+| **80ms** (prod `DEFAULT_SYNC_INTERVAL`) | 3.2× | **~1.7s** | **~625** | ~3,270 | ~70°C |
+| **250ms** | 10× | **~5.4s** | **~200** | ~1,047 | ~50°C |
+| **500ms** | 20× | **~10.7s** | **~100** | ~523 | ~45°C |
+
+Verify: `ClusterConfig(num_nodes=6, sync_interval_ms=80)` / `250` / `500`.
