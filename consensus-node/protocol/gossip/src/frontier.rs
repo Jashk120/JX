@@ -152,8 +152,17 @@ pub fn delta_events_filtered(
     let mut out = Vec::with_capacity(events.len());
     for event in events {
         let is_self = *event.creator() == self_id;
-        let is_ancestor = false;
-        if !dedup.should_filter(&event.hash(), is_self, is_ancestor, config) {
+        let hash = event.hash();
+        let is_ancestor = if is_self {
+            false
+        } else if !hashgraph.children(&hash).is_empty() {
+            true
+        } else if let Some(latest) = hashgraph.latest_event_by(&self_id) {
+            hashgraph.is_ancestor(&hash, latest).unwrap_or(false)
+        } else {
+            false
+        };
+        if !dedup.should_filter(&hash, is_self, is_ancestor, config) {
             out.push(event);
         }
     }
@@ -388,5 +397,139 @@ mod tests {
         let summary = known_summary(&h.hashgraph, &h.registry);
         let delta = delta_events(&h.hashgraph, &summary).expect("delta");
         assert!(delta.is_empty(), "fully known should still be empty with union");
+    }
+
+    #[test]
+    fn dedup_filter_disabled_never_filters() {
+        let mut dedup = DedupState::default();
+        let config = SyncConfig { filter_likely_duplicates: false, ..Default::default() };
+        let hash = primitives::EventHash::new([1u8; 32]);
+        assert!(!dedup.should_filter(&hash, true, false, &config));
+        assert!(!dedup.should_filter(&hash, true, false, &config));
+        assert!(!dedup.should_filter(&hash, false, true, &config));
+    }
+
+    #[test]
+    fn dedup_self_threshold_filters_within_window() {
+        let mut dedup = DedupState::default();
+        let config = SyncConfig {
+            filter_likely_duplicates: true,
+            self_threshold: Duration::from_millis(50),
+            ancestor_threshold: Duration::from_millis(25),
+            non_ancestor_threshold: Duration::from_millis(100),
+        };
+        let hash = primitives::EventHash::new([2u8; 32]);
+        assert!(!dedup.should_filter(&hash, true, false, &config));
+        assert!(dedup.should_filter(&hash, true, false, &config));
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(!dedup.should_filter(&hash, true, false, &config));
+    }
+
+    #[test]
+    fn dedup_ancestor_threshold_shorter_than_self() {
+        let mut dedup = DedupState::default();
+        let config = SyncConfig {
+            filter_likely_duplicates: true,
+            self_threshold: Duration::from_millis(100),
+            ancestor_threshold: Duration::from_millis(30),
+            non_ancestor_threshold: Duration::from_millis(200),
+        };
+        let hash = primitives::EventHash::new([3u8; 32]);
+        assert!(!dedup.should_filter(&hash, false, true, &config));
+        assert!(dedup.should_filter(&hash, false, true, &config));
+        std::thread::sleep(Duration::from_millis(40));
+        assert!(!dedup.should_filter(&hash, false, true, &config), "ancestor threshold expired");
+    }
+
+    #[test]
+    fn dedup_non_ancestor_threshold_longest() {
+        let mut dedup = DedupState::default();
+        let config = SyncConfig {
+            filter_likely_duplicates: true,
+            self_threshold: Duration::from_millis(30),
+            ancestor_threshold: Duration::from_millis(20),
+            non_ancestor_threshold: Duration::from_millis(80),
+        };
+        let hash = primitives::EventHash::new([4u8; 32]);
+        assert!(!dedup.should_filter(&hash, false, false, &config));
+        assert!(dedup.should_filter(&hash, false, false, &config));
+        std::thread::sleep(Duration::from_millis(40));
+        assert!(
+            dedup.should_filter(&hash, false, false, &config),
+            "non-ancestor threshold still active after 40ms"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!dedup.should_filter(&hash, false, false, &config));
+    }
+
+    #[test]
+    fn dedup_prev_self_upgrades_threshold() {
+        let mut dedup = DedupState::default();
+        let config = SyncConfig {
+            filter_likely_duplicates: true,
+            self_threshold: Duration::from_millis(100),
+            ancestor_threshold: Duration::from_millis(20),
+            non_ancestor_threshold: Duration::from_millis(200),
+        };
+        let hash = primitives::EventHash::new([5u8; 32]);
+        assert!(!dedup.should_filter(&hash, true, false, &config));
+        assert!(
+            dedup.should_filter(&hash, false, false, &config),
+            "prev_self flag must keep self_threshold"
+        );
+        assert!(
+            dedup.should_filter(&hash, false, true, &config),
+            "prev_self flag dominates ancestor flag too"
+        );
+    }
+
+    #[test]
+    fn dedup_prev_ancestor_upgrades_threshold() {
+        let mut dedup = DedupState::default();
+        let config = SyncConfig {
+            filter_likely_duplicates: true,
+            self_threshold: Duration::from_millis(100),
+            ancestor_threshold: Duration::from_millis(80),
+            non_ancestor_threshold: Duration::from_millis(200),
+        };
+        let hash = primitives::EventHash::new([6u8; 32]);
+        assert!(!dedup.should_filter(&hash, false, true, &config));
+        assert!(
+            dedup.should_filter(&hash, false, false, &config),
+            "prev_ancestor flag must keep ancestor_threshold"
+        );
+    }
+
+    #[test]
+    fn dedup_threshold_branching_self_dominates() {
+        let mut dedup = DedupState::default();
+        let config = SyncConfig::default();
+        assert_eq!(config.self_threshold, Duration::from_millis(1000));
+        assert_eq!(config.ancestor_threshold, Duration::from_millis(250));
+        assert_eq!(config.non_ancestor_threshold, Duration::from_millis(3000));
+        let hash = primitives::EventHash::new([7u8; 32]);
+        assert!(!dedup.should_filter(&hash, true, false, &config));
+        assert!(dedup.should_filter(&hash, true, true, &config));
+        assert!(dedup.should_filter(&hash, false, true, &config));
+    }
+
+    #[test]
+    fn delta_filtered_uses_dedup_and_prunes() {
+        let mut h = Harness::new(&[1, 2]);
+        let a1 = h.make_event(1, None, None);
+        let a2 = h.make_event(1, Some(a1), None);
+        let known = vec![(NodeId::new(1), 0u64), (NodeId::new(2), 0u64)];
+        let mut dedup = DedupState::default();
+        let config = SyncConfig::default();
+        let first =
+            delta_events_filtered(&h.hashgraph, &known, NodeId::new(1), &mut dedup, &config)
+                .expect("filtered delta");
+        assert_eq!(first.len(), 2);
+        let second =
+            delta_events_filtered(&h.hashgraph, &known, NodeId::new(1), &mut dedup, &config)
+                .expect("second filtered delta");
+        assert!(second.is_empty(), "second call within dedup window should filter all");
+        let all = delta_events(&h.hashgraph, &known).expect("unfiltered");
+        assert!(all.iter().any(|e| e.hash() == a2));
     }
 }

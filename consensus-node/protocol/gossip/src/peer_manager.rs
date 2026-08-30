@@ -32,8 +32,8 @@ impl FanoutMode {
         match *self {
             Self::Fixed(k) => k.clamp(1, n_peers.max(1)),
             Self::Auto => {
-                if n_peers == 0 {
-                    return 1;
+                if n_peers <= 1 {
+                    return n_peers.max(1);
                 }
                 let n = n_peers + 1;
                 let ratio = if n <= 10 {
@@ -51,7 +51,9 @@ impl FanoutMode {
                     17
                 };
                 let k = (n as f64 * ratio).ceil() as usize;
-                k.clamp(2, k_max.min(n_peers))
+                let upper = k_max.min(n_peers);
+                let lower = 2.min(upper);
+                k.clamp(lower, upper)
             }
         }
     }
@@ -60,6 +62,9 @@ impl FanoutMode {
         if s.eq_ignore_ascii_case("auto") {
             Some(Self::Auto)
         } else if let Ok(k) = s.parse::<usize>() {
+            if k == 0 {
+                return None;
+            }
             Some(Self::Fixed(k))
         } else {
             None

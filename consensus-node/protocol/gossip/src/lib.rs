@@ -60,7 +60,6 @@ pub use reconnect::{
 pub use sync::run_sync;
 pub use tls::TlsIdentity;
 pub use transport::{
-    QuicTransport,
     SyncTransport,
     TcpTransport,
 };
