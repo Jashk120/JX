@@ -1,4 +1,3 @@
-use std::collections::hash_map::Entry;
 use std::collections::{
     BTreeMap,
     HashMap,
@@ -55,7 +54,7 @@ use crate::error::{
 use crate::frontier::{
     DedupState,
     SyncConfig,
-    delta_events,
+    delta_events_filtered,
 };
 use crate::peer::PeerInfo;
 use crate::peer_manager::{
@@ -149,10 +148,8 @@ pub struct GossipNode {
     peers: Mutex<PeerManager>,
     sync_timing: SyncTiming,
     fanout: FanoutMode,
-    #[allow(dead_code)]
     sync_config: SyncConfig,
-    #[allow(dead_code)]
-    dedup_state: Mutex<DedupState>,
+    dedup_state: Mutex<HashMap<NodeId, DedupState>>,
     gossip_metrics: Arc<Mutex<GossipMetrics>>,
     executor: Mutex<state::Executor>,
     /// The durable Fjall state database backing the executor's `State` (the
@@ -290,7 +287,7 @@ impl GossipNode {
             sync_timing,
             fanout: FanoutMode::Auto,
             sync_config: SyncConfig::default(),
-            dedup_state: Mutex::new(DedupState::default()),
+            dedup_state: Mutex::new(HashMap::new()),
             gossip_metrics: Arc::new(Mutex::new(GossipMetrics::default())),
             executor: Mutex::new(state::Executor::new(state_db.state_keyspace())),
             state_db,
@@ -540,8 +537,7 @@ impl GossipNode {
     ) -> Result<()> {
         let _accept_task = tokio::spawn(self.clone().accept_loop(listener));
 
-        let mut outbound: HashMap<NodeId, TcpTransport> = HashMap::new();
-        let outbound_concurrent: Arc<Mutex<HashMap<NodeId, Arc<Mutex<TcpTransport>>>>> =
+        let outbound: Arc<Mutex<HashMap<NodeId, Arc<Mutex<TcpTransport>>>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let mut consecutive_failures: u64 = 0;
         let mut decided_watermark: u64 = 0;
@@ -605,58 +601,73 @@ impl GossipNode {
                 let peer = self.peers.lock().await.random_peer();
                 let Some(peer) = peer else { continue };
 
-                let transport = match outbound.entry(peer.node_id) {
-                    Entry::Occupied(entry) => entry.into_mut(),
-                    Entry::Vacant(entry) => {
-                        let mut transport = TcpTransport::new(self.identity.clone());
-                        if let Err(e) = transport.connect(&peer).await {
-                            consecutive_failures += 1;
-                            self.peers.lock().await.record_failure(peer.node_id);
-                            {
-                                let mut m = self.gossip_metrics.lock().await;
-                                m.sync_attempts += 1;
-                                m.sync_failures += 1;
-                            }
-                            if consecutive_failures == 1 || consecutive_failures.is_multiple_of(10)
-                            {
-                                tracing::warn!(
-                                    peer = ?peer.node_id,
-                                    consecutive_failures,
-                                    error = %e,
-                                    "sync connect failed"
-                                );
-                            }
-                            continue;
+                let transport_arc = {
+                    let mut map = outbound.lock().await;
+                    map.entry(peer.node_id)
+                        .or_insert_with(|| {
+                            Arc::new(Mutex::new(TcpTransport::new(self.identity.clone())))
+                        })
+                        .clone()
+                };
+
+                let connect_result = {
+                    let mut guard = transport_arc.lock().await;
+                    if guard.is_connected() {
+                        Ok(())
+                    } else {
+                        let res = guard.connect(&peer).await;
+                        if res.is_err() {
+                            *guard = TcpTransport::new(self.identity.clone());
                         }
-                        entry.insert(transport)
+                        res.map(|_| ())
                     }
                 };
+                if let Err(e) = connect_result {
+                    consecutive_failures += 1;
+                    self.peers.lock().await.record_failure(peer.node_id);
+                    {
+                        let mut m = self.gossip_metrics.lock().await;
+                        m.sync_attempts += 1;
+                        m.sync_failures += 1;
+                    }
+                    if consecutive_failures == 1 || consecutive_failures.is_multiple_of(10) {
+                        tracing::warn!(
+                            peer = ?peer.node_id,
+                            consecutive_failures,
+                            error = %e,
+                            "sync connect failed"
+                        );
+                    }
+                    continue;
+                }
 
                 let registry = self.registry.lock().await.clone();
                 let payload = self.drain_pending_transactions().await;
                 let timestamp = self.next_timestamp();
                 let start = std::time::Instant::now();
-                let round = tokio::time::timeout(
-                    self.sync_timing.sync_timeout,
-                    run_sync(
-                        transport,
-                        &self.hashgraph,
-                        &registry,
-                        self.node_id,
-                        &self.signing_key,
-                        peer.node_id,
-                        payload,
-                        timestamp,
-                    ),
-                )
-                .await;
-
-                let round = match round {
-                    Ok(result) => result,
-                    Err(_) => Err(GossipError::Sync(format!(
-                        "sync round with peer {peer:?} timed out after {:?}",
-                        self.sync_timing.sync_timeout
-                    ))),
+                let round = {
+                    let mut guard = transport_arc.lock().await;
+                    let res = tokio::time::timeout(
+                        self.sync_timing.sync_timeout,
+                        run_sync(
+                            &mut *guard,
+                            &self.hashgraph,
+                            &registry,
+                            self.node_id,
+                            &self.signing_key,
+                            peer.node_id,
+                            payload,
+                            timestamp,
+                        ),
+                    )
+                    .await;
+                    match res {
+                        Ok(r) => r,
+                        Err(_) => Err(GossipError::Sync(format!(
+                            "sync round with peer {peer:?} timed out after {:?}",
+                            self.sync_timing.sync_timeout
+                        ))),
+                    }
                 };
 
                 match &round {
@@ -668,7 +679,10 @@ impl GossipNode {
                             m.sync_attempts += 1;
                             m.sync_failures += 1;
                         }
-                        outbound.remove(&peer.node_id);
+                        {
+                            let mut guard = transport_arc.lock().await;
+                            *guard = TcpTransport::new(self.identity.clone());
+                        }
                         if consecutive_failures == 1 || consecutive_failures.is_multiple_of(10) {
                             tracing::warn!(
                                 peer = ?peer.node_id,
@@ -687,6 +701,11 @@ impl GossipNode {
                             m.sync_attempts += 1;
                             m.sync_success += 1;
                             m.p50_rtt_ms = m.p50_rtt_ms * 0.9 + rtt.as_millis() as f64 * 0.1;
+                            let delta_bytes = fresh.len() as f64 * 1024.0;
+                            m.delta_bytes_per_sync =
+                                m.delta_bytes_per_sync * 0.9 + delta_bytes * 0.1;
+                            let hit = if fresh.is_empty() { 1.0 } else { 0.0 };
+                            m.cache_hit_rate = m.cache_hit_rate * 0.9 + hit * 0.1;
                         }
                         tracing::debug!(
                             peer = ?peer.node_id,
@@ -694,7 +713,10 @@ impl GossipNode {
                             "sync round succeeded"
                         );
                         self.log_fresh_inserts(fresh).await;
-                        self.gossip_checkpoint_sigs(transport).await;
+                        {
+                            let mut guard = transport_arc.lock().await;
+                            self.gossip_checkpoint_sigs(&mut *guard).await;
+                        }
                     }
                 }
 
@@ -715,10 +737,41 @@ impl GossipNode {
                 if decided > decided_watermark {
                     decided_watermark = decided;
                     tracing::info!(decided_round = decided, "round decided");
+                    let m = self.gossip_metrics.lock().await.clone();
+                    tracing::info!(
+                        sync_attempts = m.sync_attempts,
+                        sync_success = m.sync_success,
+                        success_rate = m.success_rate(),
+                        p50_rtt_ms = m.p50_rtt_ms,
+                        delta_bytes_per_sync = m.delta_bytes_per_sync,
+                        cache_hit_rate = m.cache_hit_rate,
+                        "gossip metrics"
+                    );
                 }
                 continue;
             }
 
+            {
+                let peers_snapshot = self.peers.lock().await.all();
+                let hg = self.hashgraph.lock().await;
+                let my_seq = hg
+                    .latest_event_by(&self.node_id)
+                    .and_then(|h| hg.get(h))
+                    .map_or(0, |r| r.seq()) as i64;
+                let mut gaps: Vec<(NodeId, i64)> = Vec::with_capacity(peers_snapshot.len());
+                for peer in &peers_snapshot {
+                    let peer_seq = hg
+                        .latest_event_by(&peer.node_id)
+                        .and_then(|h| hg.get(h))
+                        .map_or(0, |r| r.seq()) as i64;
+                    gaps.push((peer.node_id, my_seq - peer_seq));
+                }
+                drop(hg);
+                let mut pm = self.peers.lock().await;
+                for (id, gap) in gaps {
+                    pm.set_frontier_gap(id, gap);
+                }
+            }
             let peers = self.peers.lock().await.pick_k(k);
             if peers.is_empty() {
                 self.process_finalized_rounds().await;
@@ -735,7 +788,7 @@ impl GossipNode {
                         break;
                     }
                 };
-                let outbound = outbound_concurrent.clone();
+                let outbound = outbound.clone();
                 let self_clone = self.clone();
                 let peer_clone = peer.clone();
                 let payload_clone = payload.clone();
@@ -814,13 +867,14 @@ impl GossipNode {
                                 m.sync_attempts += 1;
                                 m.sync_success += 1;
                                 m.p50_rtt_ms = m.p50_rtt_ms * 0.9 + rtt.as_millis() as f64 * 0.1;
+                                let delta_bytes = fresh.len() as f64 * 1024.0;
+                                m.delta_bytes_per_sync =
+                                    m.delta_bytes_per_sync * 0.9 + delta_bytes * 0.1;
+                                let hit = if fresh.is_empty() { 1.0 } else { 0.0 };
+                                m.cache_hit_rate = m.cache_hit_rate * 0.9 + hit * 0.1;
                             }
                             self_clone.log_fresh_inserts(&fresh).await;
                             self_clone.gossip_checkpoint_sigs(&mut *guard).await;
-                            if fresh.is_empty() {
-                                let mut m = metrics.lock().await;
-                                m.cache_hit_rate = m.cache_hit_rate * 0.9 + 0.1 * 1.0;
-                            }
                         }
                     }
                 });
@@ -1538,7 +1592,16 @@ impl GossipNode {
                 Frame::SyncRequest(request) => {
                     let delta_result = {
                         let hashgraph = self.hashgraph.lock().await;
-                        delta_events(&hashgraph, &request.known)
+                        let mut dedup_map = self.dedup_state.lock().await;
+                        let dedup = dedup_map.entry(request.from).or_default();
+                        let config = self.sync_config.clone();
+                        delta_events_filtered(
+                            &hashgraph,
+                            &request.known,
+                            self.node_id,
+                            dedup,
+                            &config,
+                        )
                     };
                     match delta_result {
                         Ok(events) => {
