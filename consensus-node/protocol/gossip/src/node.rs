@@ -44,15 +44,24 @@ use tokio::net::{
 use tokio::sync::{
     Mutex,
     Notify,
+    Semaphore,
 };
+use tokio::task::JoinSet;
 
 use crate::error::{
     GossipError,
     Result,
 };
-use crate::frontier::delta_events;
+use crate::frontier::{
+    DedupState,
+    SyncConfig,
+    delta_events,
+};
 use crate::peer::PeerInfo;
-use crate::peer_manager::PeerManager;
+use crate::peer_manager::{
+    FanoutMode,
+    PeerManager,
+};
 use crate::proto::{
     Frame,
     ReconnectResponse,
@@ -68,6 +77,26 @@ use crate::transport::{
     SyncTransport,
     TcpTransport,
 };
+
+#[derive(Clone, Debug, Default)]
+pub struct GossipMetrics {
+    pub sync_attempts: u64,
+    pub sync_success: u64,
+    pub sync_failures: u64,
+    pub p50_rtt_ms: f64,
+    pub delta_bytes_per_sync: f64,
+    pub cache_hit_rate: f64,
+}
+
+impl GossipMetrics {
+    pub fn success_rate(&self) -> f64 {
+        if self.sync_attempts == 0 {
+            0.0
+        } else {
+            self.sync_success as f64 / self.sync_attempts as f64
+        }
+    }
+}
 
 /// The sync driver's timing parameters.
 #[derive(Clone, Copy, Debug)]
@@ -119,6 +148,12 @@ pub struct GossipNode {
     identity: TlsIdentity,
     peers: Mutex<PeerManager>,
     sync_timing: SyncTiming,
+    fanout: FanoutMode,
+    #[allow(dead_code)]
+    sync_config: SyncConfig,
+    #[allow(dead_code)]
+    dedup_state: Mutex<DedupState>,
+    gossip_metrics: Arc<Mutex<GossipMetrics>>,
     executor: Mutex<state::Executor>,
     /// The durable Fjall state database backing the executor's `State` (the
     /// live LSM partition) plus the per-accepted-round snapshots a restart or
@@ -253,6 +288,10 @@ impl GossipNode {
             identity,
             peers: Mutex::new(PeerManager::new(peers)),
             sync_timing,
+            fanout: FanoutMode::Auto,
+            sync_config: SyncConfig::default(),
+            dedup_state: Mutex::new(DedupState::default()),
+            gossip_metrics: Arc::new(Mutex::new(GossipMetrics::default())),
             executor: Mutex::new(state::Executor::new(state_db.state_keyspace())),
             state_db,
             activation: Mutex::new(ActivationState::default()),
@@ -276,6 +315,18 @@ impl GossipNode {
                 m
             }),
         }
+    }
+
+    pub fn set_fanout(&mut self, fanout: FanoutMode) {
+        self.fanout = fanout;
+    }
+
+    pub fn fanout(&self) -> FanoutMode {
+        self.fanout
+    }
+
+    pub async fn gossip_metrics_snapshot(&self) -> GossipMetrics {
+        self.gossip_metrics.lock().await.clone()
     }
 
     /// Whether `node` is a registered member of this node's hashgraph.
@@ -490,6 +541,8 @@ impl GossipNode {
         let _accept_task = tokio::spawn(self.clone().accept_loop(listener));
 
         let mut outbound: HashMap<NodeId, TcpTransport> = HashMap::new();
+        let outbound_concurrent: Arc<Mutex<HashMap<NodeId, Arc<Mutex<TcpTransport>>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
         let mut consecutive_failures: u64 = 0;
         let mut decided_watermark: u64 = 0;
         loop {
@@ -501,11 +554,6 @@ impl GossipNode {
                 break;
             }
 
-            // Phase 4: a previous sync round concluded this node is too far
-            // behind for delta-sync. Attempt a reconnect from a random peer
-            // with a reconnect port before any normal sync. The flag stays
-            // set until a reconnect succeeds, so a failed attempt is retried
-            // next interval.
             if self.needs_reconnect.load(Ordering::Acquire) {
                 let mut attempted = false;
                 if let Some(peer) = self.peers.lock().await.random_peer()
@@ -521,9 +569,6 @@ impl GossipNode {
                         registry.hash()
                     };
                     tracing::info!(peer = ?peer.node_id, "reconnect attempt starting");
-                    // Bounded: `fetch_checkpoint`'s connect/recv awaits have
-                    // no internal timeouts, so an unresponsive teacher must
-                    // not wedge the driver past the stop check.
                     let attempt = tokio::time::timeout(
                         self.sync_timing.sync_timeout * 2,
                         fetch_checkpoint(
@@ -551,110 +596,243 @@ impl GossipNode {
                     }
                 }
                 if attempted {
-                    continue; // Skip normal sync this round.
+                    continue;
                 }
-                // No reconnect-capable peer: fall through to normal sync
-                // rather than spinning on the flag forever.
             }
 
-            let peer = self.peers.lock().await.random_peer();
-            let Some(peer) = peer else { continue };
+            let k = self.fanout.effective_k(self.peers.lock().await.len());
+            if k <= 1 {
+                let peer = self.peers.lock().await.random_peer();
+                let Some(peer) = peer else { continue };
 
-            let transport = match outbound.entry(peer.node_id) {
-                Entry::Occupied(entry) => entry.into_mut(),
-                Entry::Vacant(entry) => {
-                    let mut transport = TcpTransport::new(self.identity.clone());
-                    if let Err(e) = transport.connect(&peer).await {
+                let transport = match outbound.entry(peer.node_id) {
+                    Entry::Occupied(entry) => entry.into_mut(),
+                    Entry::Vacant(entry) => {
+                        let mut transport = TcpTransport::new(self.identity.clone());
+                        if let Err(e) = transport.connect(&peer).await {
+                            consecutive_failures += 1;
+                            self.peers.lock().await.record_failure(peer.node_id);
+                            {
+                                let mut m = self.gossip_metrics.lock().await;
+                                m.sync_attempts += 1;
+                                m.sync_failures += 1;
+                            }
+                            if consecutive_failures == 1 || consecutive_failures.is_multiple_of(10)
+                            {
+                                tracing::warn!(
+                                    peer = ?peer.node_id,
+                                    consecutive_failures,
+                                    error = %e,
+                                    "sync connect failed"
+                                );
+                            }
+                            continue;
+                        }
+                        entry.insert(transport)
+                    }
+                };
+
+                let registry = self.registry.lock().await.clone();
+                let payload = self.drain_pending_transactions().await;
+                let timestamp = self.next_timestamp();
+                let start = std::time::Instant::now();
+                let round = tokio::time::timeout(
+                    self.sync_timing.sync_timeout,
+                    run_sync(
+                        transport,
+                        &self.hashgraph,
+                        &registry,
+                        self.node_id,
+                        &self.signing_key,
+                        peer.node_id,
+                        payload,
+                        timestamp,
+                    ),
+                )
+                .await;
+
+                let round = match round {
+                    Ok(result) => result,
+                    Err(_) => Err(GossipError::Sync(format!(
+                        "sync round with peer {peer:?} timed out after {:?}",
+                        self.sync_timing.sync_timeout
+                    ))),
+                };
+
+                match &round {
+                    Err(e) => {
                         consecutive_failures += 1;
+                        self.peers.lock().await.record_failure(peer.node_id);
+                        {
+                            let mut m = self.gossip_metrics.lock().await;
+                            m.sync_attempts += 1;
+                            m.sync_failures += 1;
+                        }
+                        outbound.remove(&peer.node_id);
                         if consecutive_failures == 1 || consecutive_failures.is_multiple_of(10) {
                             tracing::warn!(
                                 peer = ?peer.node_id,
                                 consecutive_failures,
                                 error = %e,
-                                "sync connect failed"
+                                "sync round failed"
                             );
                         }
-                        continue;
                     }
-                    entry.insert(transport)
-                }
-            };
-
-            let registry = self.registry.lock().await.clone();
-            let payload = self.drain_pending_transactions().await;
-            let timestamp = self.next_timestamp();
-            let round = tokio::time::timeout(
-                self.sync_timing.sync_timeout,
-                run_sync(
-                    transport,
-                    &self.hashgraph,
-                    &registry,
-                    self.node_id,
-                    &self.signing_key,
-                    peer.node_id,
-                    payload,
-                    timestamp,
-                ),
-            )
-            .await;
-
-            let round = match round {
-                Ok(result) => result,
-                Err(_) => Err(GossipError::Sync(format!(
-                    "sync round with peer {peer:?} timed out after {:?}",
-                    self.sync_timing.sync_timeout
-                ))),
-            };
-
-            match &round {
-                Err(e) => {
-                    consecutive_failures += 1;
-                    if consecutive_failures == 1 || consecutive_failures.is_multiple_of(10) {
-                        tracing::warn!(
+                    Ok(fresh) => {
+                        consecutive_failures = 0;
+                        let rtt = start.elapsed();
+                        self.peers.lock().await.record_success(peer.node_id, rtt);
+                        {
+                            let mut m = self.gossip_metrics.lock().await;
+                            m.sync_attempts += 1;
+                            m.sync_success += 1;
+                            m.p50_rtt_ms = m.p50_rtt_ms * 0.9 + rtt.as_millis() as f64 * 0.1;
+                        }
+                        tracing::debug!(
                             peer = ?peer.node_id,
-                            consecutive_failures,
-                            error = %e,
-                            "sync round failed"
+                            fresh_events = fresh.len(),
+                            "sync round succeeded"
                         );
+                        self.log_fresh_inserts(fresh).await;
+                        self.gossip_checkpoint_sigs(transport).await;
                     }
-                    outbound.remove(&peer.node_id);
                 }
-                Ok(fresh) => {
-                    consecutive_failures = 0;
-                    tracing::debug!(
-                        peer = ?peer.node_id,
-                        fresh_events = fresh.len(),
-                        "sync round succeeded"
-                    );
-                    // Append every freshly inserted event to the durable log
-                    // (Phase 8), then piggyback any pending checkpoint
-                    // signatures on this sync round (Phase 3). Sigs are
-                    // re-sent on every successful sync until the round's
-                    // checkpoint is accepted — the peer that needs one the
-                    // most is exactly the one that fell behind.
-                    self.log_fresh_inserts(fresh).await;
-                    self.gossip_checkpoint_sigs(transport).await;
+
+                if matches!(
+                    &round,
+                    Err(GossipError::Consensus(consensus::ConsensusError::MissingParent(_)))
+                        | Err(GossipError::Reconnect(_))
+                ) {
+                    self.needs_reconnect.store(true, Ordering::Release);
+                }
+
+                self.process_finalized_rounds().await;
+
+                let decided = {
+                    let hg = self.hashgraph.lock().await;
+                    hg.highest_decided_round()
+                };
+                if decided > decided_watermark {
+                    decided_watermark = decided;
+                    tracing::info!(decided_round = decided, "round decided");
+                }
+                continue;
+            }
+
+            let peers = self.peers.lock().await.pick_k(k);
+            if peers.is_empty() {
+                self.process_finalized_rounds().await;
+                continue;
+            }
+            let semaphore = Arc::new(Semaphore::new(k));
+            let mut join_set: JoinSet<()> = JoinSet::new();
+            let payload = self.drain_pending_transactions().await;
+            for peer in peers {
+                let permit = match semaphore.clone().try_acquire_owned() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        tracing::debug!("fanout backpressure: skip spawn, k in-flight");
+                        break;
+                    }
+                };
+                let outbound = outbound_concurrent.clone();
+                let self_clone = self.clone();
+                let peer_clone = peer.clone();
+                let payload_clone = payload.clone();
+                let registry_clone = self_clone.registry.lock().await.clone();
+                let metrics = self_clone.gossip_metrics.clone();
+                join_set.spawn(async move {
+                    let _permit = permit;
+                    let start = std::time::Instant::now();
+                    let transport_arc = {
+                        let mut map = outbound.lock().await;
+                        map.entry(peer_clone.node_id)
+                            .or_insert_with(|| {
+                                Arc::new(Mutex::new(TcpTransport::new(self_clone.identity.clone())))
+                            })
+                            .clone()
+                    };
+                    let mut guard = transport_arc.lock().await;
+                    if !guard.is_connected()
+                        && let Err(e) = guard.connect(&peer_clone).await
+                    {
+                        self_clone.peers.lock().await.record_failure(peer_clone.node_id);
+                        {
+                            let mut m = metrics.lock().await;
+                            m.sync_attempts += 1;
+                            m.sync_failures += 1;
+                        }
+                        *guard = TcpTransport::new(self_clone.identity.clone());
+                        tracing::warn!(peer=?peer_clone.node_id, error=%e, "sync connect failed");
+                        return;
+                    }
+                    let timestamp = self_clone.next_timestamp();
+                    let result = tokio::time::timeout(
+                        self_clone.sync_timing.sync_timeout,
+                        run_sync(
+                            &mut *guard,
+                            &self_clone.hashgraph,
+                            &registry_clone,
+                            self_clone.node_id,
+                            &self_clone.signing_key,
+                            peer_clone.node_id,
+                            payload_clone,
+                            timestamp,
+                        ),
+                    )
+                    .await;
+                    let result = match result {
+                        Ok(r) => r,
+                        Err(_) => Err(GossipError::Sync(format!(
+                            "sync round with peer {:?} timed out after {:?}",
+                            peer_clone.node_id, self_clone.sync_timing.sync_timeout
+                        ))),
+                    };
+                    match result {
+                        Err(e) => {
+                            self_clone.peers.lock().await.record_failure(peer_clone.node_id);
+                            {
+                                let mut m = metrics.lock().await;
+                                m.sync_attempts += 1;
+                                m.sync_failures += 1;
+                            }
+                            *guard = TcpTransport::new(self_clone.identity.clone());
+                            if matches!(
+                                &e,
+                                GossipError::Consensus(consensus::ConsensusError::MissingParent(_))
+                                    | GossipError::Reconnect(_)
+                            ) {
+                                self_clone.needs_reconnect.store(true, Ordering::Release);
+                            }
+                            tracing::warn!(peer=?peer_clone.node_id, error=%e, "sync round failed");
+                        }
+                        Ok(fresh) => {
+                            let rtt = start.elapsed();
+                            self_clone.peers.lock().await.record_success(peer_clone.node_id, rtt);
+                            {
+                                let mut m = metrics.lock().await;
+                                m.sync_attempts += 1;
+                                m.sync_success += 1;
+                                m.p50_rtt_ms = m.p50_rtt_ms * 0.9 + rtt.as_millis() as f64 * 0.1;
+                            }
+                            self_clone.log_fresh_inserts(&fresh).await;
+                            self_clone.gossip_checkpoint_sigs(&mut *guard).await;
+                            if fresh.is_empty() {
+                                let mut m = metrics.lock().await;
+                                m.cache_hit_rate = m.cache_hit_rate * 0.9 + 0.1 * 1.0;
+                            }
+                        }
+                    }
+                });
+            }
+            while let Some(res) = join_set.join_next().await {
+                if let Err(e) = res {
+                    tracing::warn!(error=%e, "fanout task panicked");
                 }
             }
 
-            // Phase 4: a sync round concluded this node is too far behind for
-            // delta-sync — either the peer signalled `Behind` (its pruned
-            // history can no longer serve this node) or an insert hit
-            // `MissingParent`. Either way, reconnect from a checkpoint.
-            if matches!(
-                &round,
-                Err(GossipError::Consensus(consensus::ConsensusError::MissingParent(_)))
-                    | Err(GossipError::Reconnect(_))
-            ) {
-                self.needs_reconnect.store(true, Ordering::Release);
-            }
-
-            // Decode newly finalized events, drive any membership
-            // activations, and emit checkpoints for newly decided rounds.
             self.process_finalized_rounds().await;
 
-            // Periodic liveness heartbeat: consensus progress is otherwise
-            // silent, so log whenever the decided round advances.
             let decided = {
                 let hg = self.hashgraph.lock().await;
                 hg.highest_decided_round()

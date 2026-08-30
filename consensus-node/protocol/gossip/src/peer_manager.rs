@@ -1,6 +1,12 @@
+use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::time::{
+    Duration,
+    Instant,
+};
 
 use ed25519_dalek::VerifyingKey;
+use rand::prelude::SliceRandom;
 use rand::rngs::StdRng;
 use rand::{
     Rng,
@@ -13,33 +19,214 @@ use sha2::{
 
 use crate::peer::PeerInfo;
 
-/// The set of known peers plus uniform-random selection for the gossip
-/// sync target (Consensus Spec §5). Peer selection is deliberately
-/// unweighted — matching Hedera's behavior — until real multi-node data
-/// (Phase 6) justifies weighting as an optimization.
+/// Dynamic fanout mode — `Auto` computes `k` from roster size per PLAN-2.4 D2,
+/// `Fixed(k)` overrides for testing/bench.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FanoutMode {
+    Auto,
+    Fixed(usize),
+}
+
+impl FanoutMode {
+    pub fn effective_k(&self, n_peers: usize) -> usize {
+        match *self {
+            Self::Fixed(k) => k.clamp(1, n_peers.max(1)),
+            Self::Auto => {
+                if n_peers == 0 {
+                    return 1;
+                }
+                let n = n_peers + 1;
+                let ratio = if n <= 10 {
+                    0.6
+                } else if n >= 30 {
+                    0.3
+                } else {
+                    0.6 - (n as f64 - 10.0) * (0.3 / 20.0)
+                };
+                let k_max = if n <= 6 {
+                    4
+                } else if n >= 100 {
+                    12
+                } else {
+                    17
+                };
+                let k = (n as f64 * ratio).ceil() as usize;
+                k.clamp(2, k_max.min(n_peers))
+            }
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        if s.eq_ignore_ascii_case("auto") {
+            Some(Self::Auto)
+        } else if let Ok(k) = s.parse::<usize>() {
+            Some(Self::Fixed(k))
+        } else {
+            None
+        }
+    }
+}
+
+/// Per-peer score state — ephemeral, not persisted. Collects G0 signals
+/// (success EWMA, RTT, freshness, diversity, backoff).
+#[derive(Clone, Debug)]
+pub struct PeerScore {
+    /// EWMA of sync success (0.9 decay, per Hedera `permits*` analogue).
+    pub success_rate: f64,
+    /// Exponential moving average RTT in ms (lower is better).
+    pub avg_rtt_ms: f64,
+    /// Frontier gap delta (known_summary delta) — higher gap = more value.
+    pub frontier_gap: i64,
+    /// Last successful sync time.
+    pub last_success: Option<Instant>,
+    /// Consecutive failures for backoff.
+    pub consecutive_failures: u32,
+    /// Backoff until (if penalized).
+    pub backoff_until: Option<Instant>,
+}
+
+impl Default for PeerScore {
+    fn default() -> Self {
+        Self {
+            success_rate: 0.5,
+            avg_rtt_ms: 100.0,
+            frontier_gap: 0,
+            last_success: None,
+            consecutive_failures: 0,
+            backoff_until: None,
+        }
+    }
+}
+
+impl PeerScore {
+    fn score_value(&self, now: Instant, addr: &SocketAddr) -> f64 {
+        if let Some(until) = self.backoff_until
+            && now < until
+        {
+            return f64::NEG_INFINITY;
+        }
+        let rtt_penalty = self.avg_rtt_ms / 100.0;
+        let freshness_bonus = self
+            .last_success
+            .map(|t| {
+                let age = now.duration_since(t).as_secs_f64();
+                if age < 1.0 { 0.5 } else { 0.0 }
+            })
+            .unwrap_or(0.0);
+        let diversity_bonus = if addr.ip().is_loopback() { 0.0 } else { 0.2 };
+        let penalty = f64::from(self.consecutive_failures) * 0.5;
+        self.frontier_gap as f64 * 0.1 + self.success_rate * 10.0 - rtt_penalty
+            + freshness_bonus
+            + diversity_bonus
+            - penalty
+    }
+}
+
 pub struct PeerManager {
     peers: Vec<PeerInfo>,
     rng: StdRng,
+    scores: HashMap<primitives::NodeId, PeerScore>,
 }
 
 impl PeerManager {
-    /// Builds a peer manager with an OS-entropy rng.
     pub fn new(peers: Vec<PeerInfo>) -> Self {
-        Self { peers, rng: StdRng::from_entropy() }
+        Self { peers, rng: StdRng::from_entropy(), scores: HashMap::new() }
     }
 
-    /// Builds a peer manager with a fixed seed, for deterministic tests.
     pub fn with_seed(peers: Vec<PeerInfo>, seed: u64) -> Self {
-        Self { peers, rng: StdRng::seed_from_u64(seed) }
+        Self { peers, rng: StdRng::seed_from_u64(seed), scores: HashMap::new() }
     }
 
-    /// Uniform-random selection of the next sync partner, if any are known.
     pub fn random_peer(&mut self) -> Option<PeerInfo> {
         if self.peers.is_empty() {
             return None;
         }
-        let idx = self.rng.gen_range(0..self.peers.len());
+        let idx = self.rng.r#gen_range(0..self.peers.len());
         Some(self.peers[idx].clone())
+    }
+
+    pub fn pick_k(&mut self, k: usize) -> Vec<PeerInfo> {
+        if self.peers.is_empty() || k == 0 {
+            return Vec::new();
+        }
+        let now = Instant::now();
+        let mut scored: Vec<(f64, usize)> = self
+            .peers
+            .iter()
+            .enumerate()
+            .map(|(idx, peer)| {
+                let score = self
+                    .scores
+                    .get(&peer.node_id)
+                    .map(|s| s.score_value(now, &peer.addr))
+                    .unwrap_or(0.0);
+                (score, idx)
+            })
+            .collect();
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        let mut result = Vec::new();
+        for (score, idx) in scored.iter() {
+            if *score == f64::NEG_INFINITY {
+                continue;
+            }
+            if self.rng.r#gen::<f64>() < 0.1 && result.len() + 1 < k {
+                continue;
+            }
+            result.push(self.peers[*idx].clone());
+            if result.len() >= k {
+                break;
+            }
+        }
+        if result.len() < k {
+            let mut remaining: Vec<PeerInfo> = self
+                .peers
+                .iter()
+                .filter(|p| !result.iter().any(|r| r.node_id == p.node_id))
+                .filter(|p| {
+                    self.scores
+                        .get(&p.node_id)
+                        .and_then(|s| s.backoff_until)
+                        .map(|until| now >= until)
+                        .unwrap_or(true)
+                })
+                .cloned()
+                .collect();
+            remaining.shuffle(&mut self.rng);
+            for peer in remaining {
+                if result.len() >= k {
+                    break;
+                }
+                result.push(peer);
+            }
+        }
+        if result.is_empty()
+            && let Some(p) = self.random_peer()
+        {
+            result.push(p);
+        }
+        result
+    }
+
+    pub fn record_success(&mut self, peer: primitives::NodeId, rtt: Duration) {
+        let entry = self.scores.entry(peer).or_default();
+        entry.success_rate = entry.success_rate * 0.9 + 0.1;
+        let rtt_ms = rtt.as_millis() as f64;
+        entry.avg_rtt_ms = entry.avg_rtt_ms * 0.9 + rtt_ms * 0.1;
+        entry.last_success = Some(Instant::now());
+        entry.consecutive_failures = 0;
+        entry.backoff_until = None;
+    }
+
+    pub fn record_failure(&mut self, peer: primitives::NodeId) {
+        let entry = self.scores.entry(peer).or_default();
+        entry.success_rate *= 0.9;
+        entry.consecutive_failures += 1;
+        let backoff_secs = 1u64 << entry.consecutive_failures.min(6);
+        entry.backoff_until = Some(Instant::now() + Duration::from_secs(backoff_secs));
+    }
+
+    pub fn set_frontier_gap(&mut self, peer: primitives::NodeId, gap: i64) {
+        self.scores.entry(peer).or_default().frontier_gap = gap;
     }
 
     pub fn peer(&self, node_id: primitives::NodeId) -> Option<&PeerInfo> {
@@ -246,5 +433,29 @@ mod tests {
         assert!(manager.add_peer_from_key(NodeId::new(9), &key.verifying_key(), addr, None));
         assert!(!manager.add_peer_from_key(NodeId::new(9), &key.verifying_key(), addr, None));
         assert_eq!(manager.len(), 1);
+    }
+
+    #[test]
+    fn pick_k_prefers_low_rtt_high_gap_peer() {
+        let peers = vec![peer(1), peer(2), peer(3)];
+        let mut manager = PeerManager::with_seed(peers, 42);
+        manager.set_frontier_gap(NodeId::new(1), 10);
+        manager.set_frontier_gap(NodeId::new(2), 0);
+        manager.set_frontier_gap(NodeId::new(3), 0);
+        manager.record_success(NodeId::new(1), Duration::from_millis(10));
+        manager.record_success(NodeId::new(2), Duration::from_millis(200));
+        manager.record_failure(NodeId::new(3));
+        let picked = manager.pick_k(1);
+        assert_eq!(picked.len(), 1);
+        assert_eq!(picked[0].node_id, NodeId::new(1));
+    }
+
+    #[test]
+    fn fanout_auto_computes_k() {
+        assert_eq!(FanoutMode::Auto.effective_k(0), 1);
+        assert_eq!(FanoutMode::Auto.effective_k(5), 4);
+        assert_eq!(FanoutMode::Fixed(1).effective_k(5), 1);
+        assert_eq!(FanoutMode::Fixed(10).effective_k(5), 5);
+        assert_eq!(FanoutMode::Auto.effective_k(29), 9);
     }
 }
