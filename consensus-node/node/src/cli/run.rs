@@ -52,6 +52,7 @@ use crate::config::{
 
 const DEFAULT_SYNC_INTERVAL: Duration = Duration::from_millis(500);
 const DEFAULT_SYNC_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_FANOUT: &str = "auto";
 
 pub(crate) async fn run(args: &[String]) -> Result<()> {
     let mut cluster_path: Option<PathBuf> = None;
@@ -63,6 +64,7 @@ pub(crate) async fn run(args: &[String]) -> Result<()> {
     let mut control_socket: Option<PathBuf> = None;
     let mut sync_interval = DEFAULT_SYNC_INTERVAL;
     let mut sync_timeout = DEFAULT_SYNC_TIMEOUT;
+    let mut fanout_str = DEFAULT_FANOUT.to_string();
     let mut log_level = "info".to_string();
     let mut log_file: Option<String> = None;
 
@@ -112,6 +114,9 @@ pub(crate) async fn run(args: &[String]) -> Result<()> {
             "--log-file" => {
                 log_file = Some(next_value(args, &mut i, "--log-file")?);
             }
+            "--fanout" => {
+                fanout_str = next_value(args, &mut i, "--fanout")?;
+            }
             other => bail!("run: unknown argument '{other}'"),
         }
     }
@@ -119,6 +124,8 @@ pub(crate) async fn run(args: &[String]) -> Result<()> {
     let node_id = node_id.context("run: --node-id <id> is required")?;
     let secret_path = secret_path.context("run: --secret <path> is required")?;
 
+    let fanout = gossip::FanoutMode::parse(&fanout_str)
+        .with_context(|| format!("invalid --fanout '{fanout_str}' (expected auto or integer)"))?;
     let opts = RunOptions {
         cluster_path,
         node_id,
@@ -129,6 +136,7 @@ pub(crate) async fn run(args: &[String]) -> Result<()> {
         control_socket,
         sync_interval,
         sync_timeout,
+        fanout,
         log_level,
         log_file,
     };
@@ -147,6 +155,7 @@ struct RunOptions {
     control_socket: Option<PathBuf>,
     sync_interval: Duration,
     sync_timeout: Duration,
+    fanout: gossip::FanoutMode,
     log_level: String,
     log_file: Option<String>,
 }
@@ -395,6 +404,8 @@ async fn run_node(opts: &RunOptions) -> Result<()> {
             )
         }
     };
+    let mut node = node;
+    node.set_fanout(opts.fanout);
     let node = Arc::new(node);
 
     node.set_event_sink(event_log.clone()).await;

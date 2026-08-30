@@ -2,6 +2,10 @@ use std::collections::{
     HashMap,
     VecDeque,
 };
+use std::time::{
+    Duration,
+    Instant,
+};
 
 use crypto::{
     Hashable,
@@ -17,6 +21,65 @@ use crate::error::{
     GossipError,
     Result,
 };
+
+#[derive(Clone, Debug)]
+pub struct SyncConfig {
+    pub filter_likely_duplicates: bool,
+    pub non_ancestor_threshold: Duration,
+    pub ancestor_threshold: Duration,
+    pub self_threshold: Duration,
+}
+
+impl Default for SyncConfig {
+    fn default() -> Self {
+        Self {
+            filter_likely_duplicates: true,
+            non_ancestor_threshold: Duration::from_millis(3000),
+            ancestor_threshold: Duration::from_millis(250),
+            self_threshold: Duration::from_millis(1000),
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct DedupState {
+    sent: std::collections::HashMap<primitives::EventHash, (Instant, bool, bool)>,
+}
+
+impl DedupState {
+    pub fn should_filter(
+        &mut self,
+        hash: &primitives::EventHash,
+        is_self: bool,
+        is_ancestor: bool,
+        config: &SyncConfig,
+    ) -> bool {
+        if !config.filter_likely_duplicates {
+            return false;
+        }
+        let now = Instant::now();
+        if let Some((sent_at, prev_self, prev_ancestor)) = self.sent.get(hash) {
+            let elapsed = now.duration_since(*sent_at);
+            let threshold = if is_self || *prev_self {
+                config.self_threshold
+            } else if is_ancestor || *prev_ancestor {
+                config.ancestor_threshold
+            } else {
+                config.non_ancestor_threshold
+            };
+            if elapsed < threshold {
+                return true;
+            }
+        }
+        self.sent.insert(*hash, (now, is_self, is_ancestor));
+        false
+    }
+
+    pub fn prune_expired(&mut self) {
+        let now = Instant::now();
+        self.sent.retain(|_, (t, _, _)| now.duration_since(*t) < Duration::from_secs(10));
+    }
+}
 
 /// Builds the per-creator "highest seq I hold" summary that a sync request
 /// carries (Consensus Spec §5). Uses `Hashgraph::latest_event_by`, so it is
@@ -73,6 +136,29 @@ pub fn delta_events(
     }
 
     topo_sort(&collected)
+}
+
+pub fn delta_events_filtered(
+    hashgraph: &consensus::Hashgraph,
+    known: &[(NodeId, u64)],
+    self_id: NodeId,
+    dedup: &mut DedupState,
+    config: &SyncConfig,
+) -> Result<Vec<Event>> {
+    let events = delta_events(hashgraph, known)?;
+    if !config.filter_likely_duplicates {
+        return Ok(events);
+    }
+    let mut out = Vec::with_capacity(events.len());
+    for event in events {
+        let is_self = *event.creator() == self_id;
+        let is_ancestor = false;
+        if !dedup.should_filter(&event.hash(), is_self, is_ancestor, config) {
+            out.push(event);
+        }
+    }
+    dedup.prune_expired();
+    Ok(out)
 }
 
 /// Kahn's algorithm over the collected delta. Dependency edges are an

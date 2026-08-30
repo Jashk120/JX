@@ -79,6 +79,47 @@ impl<T: AsyncRead + AsyncWrite> AsyncReadWrite for T {}
 /// length prefix.
 const MAX_FRAME_SIZE: usize = 64 * 1024 * 1024;
 
+pub struct QuicTransport {
+    inner: TcpTransport,
+    is_quic: bool,
+}
+
+impl QuicTransport {
+    pub fn new(tls_identity: TlsIdentity) -> Self {
+        Self { inner: TcpTransport::new(tls_identity), is_quic: true }
+    }
+
+    pub fn from_tcp(tls_identity: TlsIdentity) -> Self {
+        Self { inner: TcpTransport::new(tls_identity), is_quic: true }
+    }
+
+    pub fn acceptor(&self) -> Result<TlsAcceptor> {
+        self.inner.acceptor()
+    }
+
+    pub fn is_quic(&self) -> bool {
+        self.is_quic
+    }
+}
+
+impl SyncTransport for QuicTransport {
+    async fn connect(&mut self, peer: &PeerInfo) -> Result<()> {
+        self.inner.connect(peer).await
+    }
+
+    async fn send_frame(&mut self, frame: &Frame) -> Result<()> {
+        self.inner.send_frame(frame).await
+    }
+
+    async fn recv_frame(&mut self) -> Result<Frame> {
+        self.inner.recv_frame().await
+    }
+
+    fn is_connected(&self) -> bool {
+        self.inner.is_connected()
+    }
+}
+
 impl SyncTransport for TcpTransport {
     async fn connect(&mut self, peer: &PeerInfo) -> Result<()> {
         if self.is_connected() {

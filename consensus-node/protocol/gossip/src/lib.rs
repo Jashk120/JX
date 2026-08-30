@@ -31,13 +31,21 @@ pub use error::{
     GossipError,
     Result,
 };
+pub use frontier::{
+    DedupState,
+    SyncConfig,
+};
 pub use node::{
     CheckpointSink,
     GossipNode,
     SyncTiming,
 };
 pub use peer::PeerInfo;
-pub use peer_manager::PeerManager;
+pub use peer_manager::{
+    FanoutMode,
+    PeerManager,
+    PeerScore,
+};
 pub use proto::{
     Frame,
     ReconnectRequest,
@@ -52,6 +60,7 @@ pub use reconnect::{
 pub use sync::run_sync;
 pub use tls::TlsIdentity;
 pub use transport::{
+    QuicTransport,
     SyncTransport,
     TcpTransport,
 };
