@@ -3,6 +3,7 @@ use std::collections::{
     HashMap,
     VecDeque,
 };
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{
     AtomicBool,
@@ -29,6 +30,7 @@ use ed25519_dalek::{
     SigningKey,
     VerifyingKey,
 };
+use lru::LruCache;
 use primitives::{
     Event,
     EventHash,
@@ -83,6 +85,7 @@ pub struct GossipMetrics {
     pub sync_success: u64,
     pub sync_failures: u64,
     pub p50_rtt_ms: f64,
+    pub p95_rtt_ms: f64,
     pub delta_bytes_per_sync: f64,
     pub cache_hit_rate: f64,
 }
@@ -131,6 +134,19 @@ struct ActivationState {
 /// own event per sync round. Bounded so a burst cannot produce unbounded
 /// events; ordering across payloads is consensus's job, not the driver's.
 const TX_PER_SYNC: usize = 64;
+
+/// Bounded LRU capacity for the outbound transport pool (PLAN-2 D4/D5).
+/// `N=6 → 10`, `N=100 → 30`, linear interpolation in between.
+pub fn outbound_capacity(n: usize) -> NonZeroUsize {
+    let cap = if n <= 6 {
+        10
+    } else if n >= 100 {
+        30
+    } else {
+        10 + (n - 6) * 20 / (100 - 6)
+    };
+    NonZeroUsize::new(cap).expect("outbound capacity must be non-zero")
+}
 
 const MAX_PENDING_SIGS_PER_ROUND: usize = 64;
 
@@ -537,8 +553,8 @@ impl GossipNode {
     ) -> Result<()> {
         let _accept_task = tokio::spawn(self.clone().accept_loop(listener));
 
-        let outbound: Arc<Mutex<HashMap<NodeId, Arc<Mutex<TcpTransport>>>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        let outbound: Arc<Mutex<LruCache<NodeId, Arc<Mutex<TcpTransport>>>>> =
+            Arc::new(Mutex::new(LruCache::new(outbound_capacity(self.peers.lock().await.len()))));
         let mut consecutive_failures: u64 = 0;
         let mut decided_watermark: u64 = 0;
         loop {
@@ -602,12 +618,18 @@ impl GossipNode {
                 let Some(peer) = peer else { continue };
 
                 let transport_arc = {
-                    let mut map = outbound.lock().await;
-                    map.entry(peer.node_id)
-                        .or_insert_with(|| {
-                            Arc::new(Mutex::new(TcpTransport::new(self.identity.clone())))
-                        })
-                        .clone()
+                    let mut cache = outbound.lock().await;
+                    let cap = outbound_capacity(self.peers.lock().await.len());
+                    if cache.cap() != cap {
+                        cache.resize(cap);
+                    }
+                    if let Some(existing) = cache.get(&peer.node_id) {
+                        existing.clone()
+                    } else {
+                        let arc = Arc::new(Mutex::new(TcpTransport::new(self.identity.clone())));
+                        cache.put(peer.node_id, arc.clone());
+                        arc
+                    }
                 };
 
                 let connect_result = {
@@ -701,11 +723,25 @@ impl GossipNode {
                             m.sync_attempts += 1;
                             m.sync_success += 1;
                             m.p50_rtt_ms = m.p50_rtt_ms * 0.9 + rtt.as_millis() as f64 * 0.1;
+                            m.p95_rtt_ms = m.p95_rtt_ms * 0.9 + rtt.as_millis() as f64 * 0.1;
                             let delta_bytes = fresh.len() as f64 * 1024.0;
                             m.delta_bytes_per_sync =
                                 m.delta_bytes_per_sync * 0.9 + delta_bytes * 0.1;
                             let hit = if fresh.is_empty() { 1.0 } else { 0.0 };
                             m.cache_hit_rate = m.cache_hit_rate * 0.9 + hit * 0.1;
+                            if m.sync_attempts.is_multiple_of(10) {
+                                tracing::info!(
+                                    sync_attempts = m.sync_attempts,
+                                    sync_success = m.sync_success,
+                                    success_rate = m.success_rate(),
+                                    p50_rtt_ms = m.p50_rtt_ms,
+                                    p95_rtt_ms = m.p95_rtt_ms,
+                                    delta_bytes_per_sync = m.delta_bytes_per_sync,
+                                    cache_hit_rate = m.cache_hit_rate,
+                                    consecutive_failures = consecutive_failures,
+                                    "gossip metrics periodic"
+                                );
+                            }
                         }
                         tracing::debug!(
                             peer = ?peer.node_id,
@@ -743,10 +779,19 @@ impl GossipNode {
                         sync_success = m.sync_success,
                         success_rate = m.success_rate(),
                         p50_rtt_ms = m.p50_rtt_ms,
+                        p95_rtt_ms = m.p95_rtt_ms,
                         delta_bytes_per_sync = m.delta_bytes_per_sync,
                         cache_hit_rate = m.cache_hit_rate,
+                        consecutive_failures = consecutive_failures,
                         "gossip metrics"
                     );
+                }
+                {
+                    let mut cache = outbound.lock().await;
+                    let cap = outbound_capacity(self.peers.lock().await.len());
+                    if cache.cap() != cap {
+                        cache.resize(cap);
+                    }
                 }
                 continue;
             }
@@ -798,12 +843,20 @@ impl GossipNode {
                     let _permit = permit;
                     let start = std::time::Instant::now();
                     let transport_arc = {
-                        let mut map = outbound.lock().await;
-                        map.entry(peer_clone.node_id)
-                            .or_insert_with(|| {
-                                Arc::new(Mutex::new(TcpTransport::new(self_clone.identity.clone())))
-                            })
-                            .clone()
+                        let mut cache = outbound.lock().await;
+                        let cap = outbound_capacity(self_clone.peers.lock().await.len());
+                        if cache.cap() != cap {
+                            cache.resize(cap);
+                        }
+                        if let Some(existing) = cache.get(&peer_clone.node_id) {
+                            existing.clone()
+                        } else {
+                            let arc = Arc::new(Mutex::new(TcpTransport::new(
+                                self_clone.identity.clone(),
+                            )));
+                            cache.put(peer_clone.node_id, arc.clone());
+                            arc
+                        }
                     };
                     let mut guard = transport_arc.lock().await;
                     if !guard.is_connected()
@@ -867,11 +920,24 @@ impl GossipNode {
                                 m.sync_attempts += 1;
                                 m.sync_success += 1;
                                 m.p50_rtt_ms = m.p50_rtt_ms * 0.9 + rtt.as_millis() as f64 * 0.1;
+                                m.p95_rtt_ms = m.p95_rtt_ms * 0.9 + rtt.as_millis() as f64 * 0.1;
                                 let delta_bytes = fresh.len() as f64 * 1024.0;
                                 m.delta_bytes_per_sync =
                                     m.delta_bytes_per_sync * 0.9 + delta_bytes * 0.1;
                                 let hit = if fresh.is_empty() { 1.0 } else { 0.0 };
                                 m.cache_hit_rate = m.cache_hit_rate * 0.9 + hit * 0.1;
+                                if m.sync_attempts.is_multiple_of(10) {
+                                    tracing::info!(
+                                        sync_attempts = m.sync_attempts,
+                                        sync_success = m.sync_success,
+                                        success_rate = m.success_rate(),
+                                        p50_rtt_ms = m.p50_rtt_ms,
+                                        p95_rtt_ms = m.p95_rtt_ms,
+                                        delta_bytes_per_sync = m.delta_bytes_per_sync,
+                                        cache_hit_rate = m.cache_hit_rate,
+                                        "gossip metrics periodic fanout"
+                                    );
+                                }
                             }
                             self_clone.log_fresh_inserts(&fresh).await;
                             self_clone.gossip_checkpoint_sigs(&mut *guard).await;
@@ -894,6 +960,24 @@ impl GossipNode {
             if decided > decided_watermark {
                 decided_watermark = decided;
                 tracing::info!(decided_round = decided, "round decided");
+                let m = self.gossip_metrics.lock().await.clone();
+                tracing::info!(
+                    sync_attempts = m.sync_attempts,
+                    sync_success = m.sync_success,
+                    success_rate = m.success_rate(),
+                    p50_rtt_ms = m.p50_rtt_ms,
+                    p95_rtt_ms = m.p95_rtt_ms,
+                    delta_bytes_per_sync = m.delta_bytes_per_sync,
+                    cache_hit_rate = m.cache_hit_rate,
+                    "gossip metrics fanout"
+                );
+            }
+            {
+                let mut cache = outbound.lock().await;
+                let cap = outbound_capacity(self.peers.lock().await.len());
+                if cache.cap() != cap {
+                    cache.resize(cap);
+                }
             }
         }
         let _ = self.flush_streams(Duration::from_secs(5)).await;
@@ -1595,10 +1679,12 @@ impl GossipNode {
                         let mut dedup_map = self.dedup_state.lock().await;
                         let dedup = dedup_map.entry(request.from).or_default();
                         let config = self.sync_config.clone();
+                        let target_peer = request.from;
                         delta_events_filtered(
                             &hashgraph,
                             &request.known,
                             self.node_id,
+                            target_peer,
                             dedup,
                             &config,
                         )

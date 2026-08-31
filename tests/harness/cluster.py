@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import json
 import logging
+import math
 import os
 import shutil
 import signal
@@ -173,6 +175,10 @@ class ClusterConfig:
     base_dir: Optional[Path] = None  # temp dir parent; None -> mkdtemp
     jkaind_bin: Optional[Path] = None
     host: str = "127.0.0.1"
+    # T10 (PLAN-2.4 Wave 6 / D1): 25ms until W1-W3 green + G6 bench pass.
+    # 5ms only via ClusterConfig(num_nodes=6, sync_interval_ms=5, fanout=4)
+    # after hot-peer QUIC proven, expect p50 ~0.12s if thermal allows.
+    # Abort 5ms runs if k10temp > 85°C. Validated in jkaind run: 5..5000ms.
     sync_interval_ms: int = 25
     sync_timeout_ms: int = 500
     log_level: str = "info"
@@ -181,6 +187,73 @@ class ClusterConfig:
     proxy_latency_ms: float = 0.0
     proxy_jitter_ms: float = 0.0
     proxy_drop_prob: float = 0.0
+    # T11 gap vs fanout sweep (PLAN-2.4): gap 25/80, k 1/2/4, dedup on/off, QUIC on/off.
+    # Latency≈k*gap*logN fit: 80ms k=4 should match 25ms k=1 at ~0.6s @70°C.
+    # Fanout maps to --fanout (auto|1|2|4) when spawning jkaind; dedup/quic are
+    # harness-level toggles for instrumentation until native flags exist.
+    fanout: str | int = "auto"
+    dedup_enabled: bool = True
+    quic_enabled: bool = False
+
+
+def _fanout_k(fanout: str | int, n_peers: int = 5) -> int:
+    if isinstance(fanout, int):
+        return max(1, min(fanout, max(1, n_peers)))
+    if isinstance(fanout, str) and fanout.isdigit():
+        return max(1, min(int(fanout), max(1, n_peers)))
+    if n_peers <= 1:
+        return 1
+    n = n_peers + 1
+    if n <= 6:
+        return 4 if n_peers >= 4 else n_peers
+    if n >= 30:
+        return 9
+    return max(2, min(4, n_peers))
+
+
+def predicted_p50_seconds(gap_ms: int, fanout: str | int, n_nodes: int = 6) -> float:
+    k = _fanout_k(fanout, n_nodes - 1)
+    log_n = math.log2(max(2, n_nodes))
+    return (gap_ms / 1000.0) * log_n * 9.3 / max(1, k)
+
+
+def predicted_p50_gap_k(gap_ms: int, fanout: str | int, n_nodes: int = 6) -> float:
+    k = _fanout_k(fanout, n_nodes - 1)
+    log_n = math.log2(max(2, n_nodes))
+    base = 0.6 / (25 * log_n)
+    return gap_ms * log_n * base / max(1, k) if k > 1 else gap_ms * log_n * base
+
+
+def parse_diagnosis_log(path: Path) -> dict:
+    if not path.is_file():
+        return {}
+    last: dict = {}
+    hit_rates: list[float] = []
+    p95s: list[float] = []
+    try:
+        for line in path.read_text(errors="replace").splitlines()[-200:]:
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            if "cache_hit_rate" in obj:
+                hit_rates.append(float(obj.get("cache_hit_rate") or 0))
+            if "p95_rtt_ms" in obj:
+                p95s.append(float(obj.get("p95_rtt_ms") or 0))
+            if "p50_rtt_ms" in obj:
+                last = obj
+        if hit_rates:
+            last["hit_rate_avg"] = sum(hit_rates) / len(hit_rates)
+            last["hit_rate_last"] = hit_rates[-1]
+        if p95s:
+            last["p95_rtt_avg"] = sum(p95s) / len(p95s)
+            last["p95_rtt_last"] = p95s[-1]
+    except Exception:
+        pass
+    return last
 
 
 # ---------------------------------------------------------------------------
@@ -357,12 +430,13 @@ class ClusterManager:
                 "--sync-timeout", str(self.config.sync_timeout_ms),
                 "--log-level", self.config.log_level,
             ]
+            if str(self.config.fanout) != "auto":
+                run_args.extend(["--fanout", str(self.config.fanout)])
             if real_reconnect is not None:
                 run_args.extend(["--reconnect-port", str(real_reconnect)])
             if self.config.log_file_mode == "-":
                 run_args.extend(["--log-file", "-"])
             else:
-                # default is data/logs/jkaind.log; be explicit
                 log_path = data_dir / "logs" / "jkaind.log"
                 run_args.extend(["--log-file", str(log_path)])
 
@@ -547,6 +621,8 @@ class ClusterManager:
             "--sync-timeout", str(self.config.sync_timeout_ms),
             "--log-level", self.config.log_level,
         ]
+        if str(self.config.fanout) != "auto":
+            run_args.extend(["--fanout", str(self.config.fanout)])
         if old.real_reconnect_port is not None:
             run_args.extend(["--reconnect-port", str(old.real_reconnect_port)])
         if self.config.log_file_mode == "-":
@@ -606,6 +682,14 @@ class ClusterManager:
                         out.append(f"=== node {h.node_id} log read error {candidate}: {e} ===")
                     break
         return "\n".join(out)
+
+    def diagnosis_metrics(self, node_id: Optional[int] = None) -> Dict[int, dict]:
+        targets = [self._nodes[node_id]] if node_id is not None else list(self._nodes.values())
+        out: Dict[int, dict] = {}
+        for h in targets:
+            p = h.data_dir / "logs" / "diagnosis.log"
+            out[h.node_id] = parse_diagnosis_log(p)
+        return out
 
     def node_handle(self, node_id: int) -> NodeHandle:
         return self._nodes[node_id]

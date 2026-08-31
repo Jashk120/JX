@@ -50,6 +50,12 @@ use crate::config::{
     encode_hex,
 };
 
+// T10 (PLAN-2.4 Wave 6): prod default stays 500ms (safe). 5ms gap is
+// allowed only via `--sync-interval 5` after W1-W3 green (hot-peer QUIC +
+// fanout proven) and G6 bench passes. Operator must abort 5ms runs if
+// `k10temp > 85°C` (thermal throttle — expect p50 ~0.12s at 5ms, fanout=4,
+// only when cool). See protocol/test-support SYNC_INTERVAL (still 25ms until
+// D1 lifted).
 const DEFAULT_SYNC_INTERVAL: Duration = Duration::from_millis(500);
 const DEFAULT_SYNC_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_FANOUT: &str = "auto";
@@ -102,7 +108,11 @@ pub(crate) async fn run(args: &[String]) -> Result<()> {
             }
             "--sync-interval" => {
                 let value = next_value(args, &mut i, "--sync-interval")?;
-                sync_interval = Duration::from_millis(parse_ms(&value, "--sync-interval")?);
+                let ms = parse_ms(&value, "--sync-interval")?;
+                if !(5..=5000).contains(&ms) {
+                    bail!("run: invalid --sync-interval '{value}' (expected 5..5000)");
+                }
+                sync_interval = Duration::from_millis(ms);
             }
             "--sync-timeout" => {
                 let value = next_value(args, &mut i, "--sync-timeout")?;
@@ -470,6 +480,7 @@ async fn run_node(opts: &RunOptions) -> Result<()> {
         reconnect_listener,
         control_listener,
         control_socket_path,
+        opts.data_dir.clone(),
     )
     .await
 }
@@ -480,6 +491,7 @@ async fn run_until_shutdown(
     reconnect_listener: Option<TcpListener>,
     control_listener: UnixListener,
     control_socket_path: PathBuf,
+    data_dir: PathBuf,
 ) -> Result<()> {
     let stop = Arc::new(AtomicBool::new(false));
     let signal_stop = stop.clone();
@@ -492,6 +504,13 @@ async fn run_until_shutdown(
     let control_node = node.clone();
     let control_task = tokio::spawn(async move {
         crate::control::serve(control_listener, control_node, control_stop).await;
+    });
+
+    let diagnosis_stop = stop.clone();
+    let diagnosis_node = node.clone();
+    let diagnosis_path = data_dir.join("logs").join("diagnosis.log");
+    let diagnosis_task = tokio::spawn(async move {
+        spawn_diagnosis_logger(diagnosis_node, diagnosis_path, diagnosis_stop).await;
     });
 
     let result = match reconnect_listener {
@@ -508,6 +527,7 @@ async fn run_until_shutdown(
     }
     signal_task.abort();
     control_task.abort();
+    diagnosis_task.abort();
     let _ = std::fs::remove_file(&control_socket_path);
     match result {
         Ok(()) => {
@@ -515,6 +535,54 @@ async fn run_until_shutdown(
             Ok(())
         }
         Err(e) => Err(e).with_context(|| "node run failed"),
+    }
+}
+
+async fn spawn_diagnosis_logger(node: Arc<GossipNode>, path: PathBuf, stop: Arc<AtomicBool>) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let mut interval = tokio::time::interval(Duration::from_secs(1));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        interval.tick().await;
+        if stop.load(Ordering::Acquire) {
+            break;
+        }
+        let m = node.gossip_metrics_snapshot().await;
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis().to_string())
+            .unwrap_or_else(|_| "0".to_string());
+        let line = serde_json::json!({
+            "ts": ts,
+            "sync_attempts": m.sync_attempts,
+            "sync_success": m.sync_success,
+            "sync_failures": m.sync_failures,
+            "success_rate": m.success_rate(),
+            "p50_rtt_ms": m.p50_rtt_ms,
+            "p95_rtt_ms": m.p95_rtt_ms,
+            "delta_bytes_per_sync": m.delta_bytes_per_sync,
+            "cache_hit_rate": m.cache_hit_rate,
+            "backoff_peers": 0,
+        });
+        let text = format!("{}\n", line);
+        if let Ok(mut file) =
+            tokio::fs::OpenOptions::new().create(true).append(true).open(&path).await
+        {
+            use tokio::io::AsyncWriteExt;
+            let _ = file.write_all(text.as_bytes()).await;
+        }
+        tracing::info!(
+            sync_attempts = m.sync_attempts,
+            sync_success = m.sync_success,
+            success_rate = m.success_rate(),
+            p50_rtt_ms = m.p50_rtt_ms,
+            p95_rtt_ms = m.p95_rtt_ms,
+            delta_bytes_per_sync = m.delta_bytes_per_sync,
+            cache_hit_rate = m.cache_hit_rate,
+            "diagnosis gossip metrics"
+        );
     }
 }
 

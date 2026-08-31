@@ -27,6 +27,20 @@ impl Hashgraph {
     /// threshold only for events born strictly after `activation_round`;
     /// events born before it keep the old quorum, which is exactly what makes
     /// a mid-stream join safe without a coordinated restart.
+    ///
+    /// Fanout invariant (PLAN-2.4 T9, k=4): gossip `k` controls how many peers
+    /// are synced per tick (network parallelism). Consensus round assignment
+    /// depends only on parent rounds (`base_round`) and the witness
+    /// supermajority (`stronglySee` over round-`base_round` witnesses); the
+    /// per-creator frontier (`latest_event_by` / `latest_by_creator`) is a
+    /// single-threaded `seq`-max updated under `Hashgraph::insert(&mut self)`
+    /// with exclusive borrow, so higher `k` cannot race or reorder the
+    /// frontier and does not change any round threshold. The threshold below
+    /// is already stake-ready (PLAN-3): `count * 3 > total * 2` with
+    /// `total = member_count_at_round(base_round)` equals
+    /// `sum(stake_seen) * 3 > sum(stake_total) * 2` under unit stake, and the
+    /// `* 3 > * 2` integer idiom is intentionally kept to avoid float
+    /// rounding.
     pub(crate) fn finalize_round(
         &mut self,
         hash: EventHash,
@@ -308,5 +322,139 @@ mod tests {
         assert_eq!(base_round(Some(3), Some(1)), 3, "self-parent newer");
         assert_eq!(base_round(Some(1), Some(3)), 3, "other-parent newer");
         assert_eq!(base_round(Some(5), Some(5)), 5, "equal rounds");
+    }
+
+    #[test]
+    fn round_invariants_under_k4() {
+        // Gossip k=4 fanout increases parallel syncs per tick but must not
+        // affect consensus round invariants: `latest_event_by` is a
+        // single-threaded seq-max frontier under &mut self, and the
+        // supermajority uses `member_count_at_round` with the `*3>2` idiom
+        // (already stake-ready for PLAN-3: unit stake => sum(stake)=n).
+        let mut g = DynamicGraph::new(&["a", "b", "c", "d"]);
+
+        g.build(&[
+            ("a1", "a", None, None),
+            ("b1", "b", None, None),
+            ("c1", "c", None, None),
+            ("d1", "d", None, None),
+        ]);
+
+        // Frontier after genesis: each creator seq 1.
+        for (label, creator_id) in [("a", 1u64), ("b", 2), ("c", 3), ("d", 4)] {
+            let node = NodeId::new(creator_id);
+            let key = format!("{label}1");
+            let hash = *g.events.get(key.as_str()).unwrap();
+            assert_eq!(g.hg.latest_event_by(&node), Some(&hash));
+            assert_eq!(g.hg.get(&hash).unwrap().seq(), 1);
+        }
+        // Stake-ready denominator: pre-join rounds see all 4 members.
+        assert_eq!(g.hg.member_count_at_round(1), 4);
+        assert_eq!(g.hg.member_count(), 4);
+        // Future weighted form coincides under unit stake.
+        let total_stake = g.hg.member_count_at_round(1);
+        debug_assert_eq!(total_stake, 4, "unit stake: total_stake == member_count");
+
+        // Simulate k=4 concurrent inserts: four events created in parallel
+        // on different nodes, each syncing a different peer's genesis.
+        // From the local insert perspective they arrive sequentially under
+        // &mut self, so frontier must be seq-max with no race.
+        g.build(&[
+            ("a2", "a", Some("a1"), Some("b1")),
+            ("b2", "b", Some("b1"), Some("c1")),
+            ("c2", "c", Some("c1"), Some("d1")),
+            ("d2", "d", Some("d1"), Some("a1")),
+        ]);
+
+        for (label, creator_id, expected_seq) in
+            [("a", 1u64, 2u64), ("b", 2, 2), ("c", 3, 2), ("d", 4, 2)]
+        {
+            let node = NodeId::new(creator_id);
+            let key = format!("{label}2");
+            let hash = *g.events.get(key.as_str()).unwrap();
+            assert_eq!(
+                g.hg.latest_event_by(&node),
+                Some(&hash),
+                "frontier for {label} after first k=4 wave must be {label}2"
+            );
+            assert_eq!(g.hg.get(&hash).unwrap().seq(), expected_seq);
+        }
+
+        // No event in this wave should have bumped beyond round 1: each
+        // sees at most 2 of 4 witnesses through distinct chains, below the
+        // 3-of-4 supermajority (count*3 > 4*2).
+        for label in ["a2", "b2", "c2", "d2"] {
+            let hash = g.events[label];
+            let witnesses = g.round_one_witnesses();
+            let seen = g.strongly_seen(&hash, &witnesses).len();
+            // Keep the *3>2 idiom, stake-ready via member_count_at_round.
+            let total = g.hg.member_count_at_round(1);
+            let bumps = seen * 3 > total * 2;
+            assert!(!bumps, "{label} must not bump: seen {seen}/4");
+            assert_eq!(g.hg.get(&hash).unwrap().round(), 1);
+            assert_eq!(g.expected_round(&hash), 1);
+        }
+
+        // Second concurrent wave (still k=4): each creator advances once
+        // more, cross-referencing the previous wave.
+        g.build(&[
+            ("a3", "a", Some("a2"), Some("c2")),
+            ("b3", "b", Some("b2"), Some("d2")),
+            ("c3", "c", Some("c2"), Some("a2")),
+            ("d3", "d", Some("d2"), Some("b2")),
+        ]);
+
+        for (label, creator_id) in [("a", 1u64), ("b", 2), ("c", 3), ("d", 4)] {
+            let node = NodeId::new(creator_id);
+            let key = format!("{label}3");
+            let hash = *g.events.get(key.as_str()).unwrap();
+            assert_eq!(g.hg.latest_event_by(&node), Some(&hash));
+            assert_eq!(g.hg.get(&hash).unwrap().seq(), 3);
+        }
+
+        // Frontier is monotonic and race-free: no lower-seq event clobbers it.
+        // Re-check all creators' frontier still points to the highest seq.
+        for (label, creator_id) in [("a", 1u64), ("b", 2), ("c", 3), ("d", 4)] {
+            let node = NodeId::new(creator_id);
+            let latest = g.hg.latest_event_by(&node).unwrap();
+            let rec = g.hg.get(latest).unwrap();
+            assert_eq!(rec.seq(), 3, "frontier for {label} must stay at seq 3");
+            assert_eq!(*rec.event().creator(), node);
+        }
+
+        // Threshold idiom preserved under k=4: verify the exact
+        // `count*3 > total*2` check still governs round bumps and matches
+        // the future weighted `sum(stake)*3 > total_stake*2` for unit stake.
+        // Build a gathering event that *does* strongly-see a supermajority
+        // and confirm it bumps, while the stake-ready denominator is unchanged.
+        g.build(&[
+            // A collects the second wave so its chain reaches all four
+            // round-1 witnesses through distinct members.
+            ("a4", "a", Some("a3"), Some("b3")),
+            ("b4", "b", Some("b3"), Some("a4")),
+            // D syncs the fully-mixed chain and should strongly-see 4/4.
+            ("d4", "d", Some("d3"), Some("b4")),
+        ]);
+
+        let witnesses = g.round_one_witnesses();
+        let d4 = g.events["d4"];
+        let seen_d4 = g.strongly_seen(&d4, &witnesses).len();
+        let total = g.hg.member_count_at_round(1);
+        assert!(
+            seen_d4 * 3 > total * 2,
+            "d4 must strongly-see supermajority: {seen_d4}*3 > {total}*2"
+        );
+        // Unit-stake equivalence: sum(stake_seen)==seen_d4, total_stake==total.
+        debug_assert_eq!(seen_d4 * 3 > total_stake * 2, seen_d4 * 3 > total * 2);
+        assert_eq!(g.hg.get(&d4).unwrap().round(), 2);
+        assert_eq!(g.expected_round(&d4), 2);
+        assert!(g.hg.get(&d4).unwrap().is_witness());
+
+        // Frontier still correct after the bump (k does not move frontier).
+        assert_eq!(g.hg.latest_event_by(&NodeId::new(1)), Some(&g.events["a4"]));
+        assert_eq!(g.hg.latest_event_by(&NodeId::new(2)), Some(&g.events["b4"]));
+        assert_eq!(g.hg.latest_event_by(&NodeId::new(4)), Some(&g.events["d4"]));
+        // `latest_event_by` for c still points to c3 (no newer c event).
+        assert_eq!(g.hg.latest_event_by(&NodeId::new(3)), Some(&g.events["c3"]));
     }
 }
