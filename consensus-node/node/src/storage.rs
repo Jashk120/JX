@@ -78,7 +78,8 @@ impl Storage {
     pub fn persist(&self, checkpoint: &SignedCheckpoint) -> Result<()> {
         let round = checkpoint.payload.round;
         let checkpoint_path = self.checkpoint_path(round);
-        atomic_write(&checkpoint_path, &encode_signed_checkpoint(checkpoint))
+        let bytes = encode_signed_checkpoint(checkpoint).expect("checkpoint encode bounded");
+        atomic_write(&checkpoint_path, &bytes)
             .with_context(|| format!("writing checkpoint {round}"))?;
         Ok(())
     }

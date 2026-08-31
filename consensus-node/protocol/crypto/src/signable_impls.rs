@@ -23,10 +23,10 @@ use crate::signable::{
 impl Signable for UnsignedEvent {
     type Signed = Event;
 
-    fn sign(self, key: &ed25519_dalek::SigningKey) -> Event {
-        let bytes = self.canonical_bytes();
+    fn sign(self, key: &ed25519_dalek::SigningKey) -> Result<Event> {
+        let bytes = self.canonical_bytes().map_err(CryptoError::Base)?;
         let signature = key.sign(&bytes);
-        self.finalize(Signature::new(signature.to_bytes()))
+        Ok(self.finalize(Signature::new(signature.to_bytes())))
     }
 }
 
@@ -35,7 +35,7 @@ impl Verifiable for Event {
         let verifying_key = registry.key_for(self.creator())?;
 
         let signature = DalekSignature::from_bytes(self.signature().as_bytes());
-        let bytes = self.unsigned().canonical_bytes();
+        let bytes = self.unsigned().canonical_bytes().map_err(CryptoError::Base)?;
 
         verifying_key
             .verify_strict(&bytes, &signature)
@@ -73,7 +73,8 @@ mod tests {
         let registry = registry_with(node, &signing_key);
 
         let event = UnsignedEvent::new(node, None, None, Timestamp::new(100), Vec::new())
-            .sign(&signing_key);
+            .sign(&signing_key)
+            .unwrap();
         let expected = event.clone();
 
         let verified = event.verify(&registry).expect("signature should verify");
@@ -89,7 +90,8 @@ mod tests {
         let registry = registry_with(node, &signing_key);
 
         let event = UnsignedEvent::new(node, None, None, Timestamp::new(100), Vec::new())
-            .sign(&signing_key);
+            .sign(&signing_key)
+            .unwrap();
 
         // Re-sign correctly, then re-derive an event with a different timestamp
         // but the *original* signature, simulating tampering after signing.
@@ -106,7 +108,8 @@ mod tests {
         let empty_registry = MembershipRegistry::new();
 
         let event = UnsignedEvent::new(node, None, None, Timestamp::new(100), Vec::new())
-            .sign(&signing_key);
+            .sign(&signing_key)
+            .unwrap();
 
         assert_eq!(
             event.verify(&empty_registry),
@@ -122,7 +125,8 @@ mod tests {
         let registry = registry_with(node, &wrong_key);
 
         let event = UnsignedEvent::new(node, None, None, Timestamp::new(100), Vec::new())
-            .sign(&signing_key);
+            .sign(&signing_key)
+            .unwrap();
 
         assert_eq!(event.verify(&registry), Err(CryptoError::SignatureVerificationFailed));
     }

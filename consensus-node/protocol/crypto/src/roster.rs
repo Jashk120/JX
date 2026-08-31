@@ -363,7 +363,9 @@ fn reject_trailing(cursor: &[u8]) -> Result<()> {
 }
 
 fn write_bytes(buf: &mut Vec<u8>, bytes: &[u8]) {
-    buf.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+    let len =
+        u32::try_from(bytes.len()).expect("bytes length must fit u32 - bounded by roster size");
+    buf.extend_from_slice(&len.to_be_bytes());
     buf.extend_from_slice(bytes);
 }
 

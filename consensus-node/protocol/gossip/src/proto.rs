@@ -130,16 +130,27 @@ impl Frame {
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
         let mut payload = Vec::new();
         match self {
-            Self::SyncRequest(req) => req.encode_canonical(&mut payload),
-            Self::SyncResponse(resp) => resp.encode_canonical(&mut payload),
-            Self::Event(event) => event.encode_canonical(&mut payload),
-            Self::CheckpointSig(sig) => sig.encode_canonical(&mut payload),
+            Self::SyncRequest(req) => req
+                .encode_canonical(&mut payload)
+                .map_err(|e| GossipError::framing(e.to_string()))?,
+            Self::SyncResponse(resp) => resp
+                .encode_canonical(&mut payload)
+                .map_err(|e| GossipError::framing(e.to_string()))?,
+            Self::Event(event) => event
+                .encode_canonical(&mut payload)
+                .map_err(|e| GossipError::framing(e.to_string()))?,
+            Self::CheckpointSig(sig) => sig
+                .encode_canonical(&mut payload)
+                .map_err(|e| GossipError::framing(e.to_string()))?,
             Self::Reconnect(req) => {
-                req.from.encode_canonical(&mut payload);
+                req.from
+                    .encode_canonical(&mut payload)
+                    .map_err(|e| GossipError::framing(e.to_string()))?;
             }
             Self::ReconnectResponse(resp) => {
                 let cp_bytes =
-                    consensus::reconnect::encode_signed_checkpoint(&resp.signed_checkpoint);
+                    consensus::reconnect::encode_signed_checkpoint(&resp.signed_checkpoint)
+                        .map_err(|e| GossipError::framing(e.to_string()))?;
                 let cp_len = u32::try_from(cp_bytes.len())
                     .map_err(|_| GossipError::framing("length overflow"))?;
                 payload.extend_from_slice(&cp_len.to_be_bytes());
@@ -173,7 +184,10 @@ impl Frame {
                     for seq in &retained.ancestor_seqs {
                         payload.extend_from_slice(&seq.to_be_bytes());
                     }
-                    let event_bytes = retained.event.canonical_bytes();
+                    let event_bytes = retained
+                        .event
+                        .canonical_bytes()
+                        .map_err(|e| GossipError::framing(e.to_string()))?;
                     let event_len = u32::try_from(event_bytes.len())
                         .map_err(|_| GossipError::framing("length overflow"))?;
                     payload.extend_from_slice(&event_len.to_be_bytes());
@@ -464,18 +478,18 @@ impl Frame {
 }
 
 impl CanonicalEncode for SyncRequest {
-    fn encode_canonical(&self, buf: &mut Vec<u8>) {
-        self.from.encode_canonical(buf);
-        // `known.len()` is bounded by the number of creators (≤ N) and
-        // `MAX_FRAME_SIZE` (64 MiB); > u32::MAX would require >4B entries and
-        // OOM long before truncation, so overflow is impossible in practice.
-        let len = u32::try_from(self.known.len())
-            .expect("SyncRequest known length must fit u32 - caller must enforce limit; payload capped by MAX_FRAME_SIZE");
+    fn encode_canonical(&self, buf: &mut Vec<u8>) -> std::result::Result<(), primitives::Error> {
+        self.from.encode_canonical(buf)?;
+        let len = u32::try_from(self.known.len()).map_err(|_| primitives::Error::OutOfRange {
+            field: "SyncRequest known length",
+            got: self.known.len().to_string(),
+        })?;
         buf.extend_from_slice(&len.to_be_bytes());
         for &(node, seq) in &self.known {
-            node.encode_canonical(buf);
+            node.encode_canonical(buf)?;
             buf.extend_from_slice(&seq.to_be_bytes());
         }
+        Ok(())
     }
 }
 
@@ -500,13 +514,16 @@ impl SyncRequest {
 }
 
 impl CanonicalEncode for SyncResponse {
-    fn encode_canonical(&self, buf: &mut Vec<u8>) {
-        let len = u32::try_from(self.events.len())
-            .expect("SyncResponse events length must fit u32 - caller must enforce limit; payload capped by MAX_FRAME_SIZE");
+    fn encode_canonical(&self, buf: &mut Vec<u8>) -> std::result::Result<(), primitives::Error> {
+        let len = u32::try_from(self.events.len()).map_err(|_| primitives::Error::OutOfRange {
+            field: "SyncResponse events length",
+            got: self.events.len().to_string(),
+        })?;
         buf.extend_from_slice(&len.to_be_bytes());
         for event in &self.events {
-            event.encode_canonical(buf);
+            event.encode_canonical(buf)?;
         }
+        Ok(())
     }
 }
 
@@ -849,7 +866,8 @@ mod tests {
                 signers: vec![NodeId::new(1)],
             },
             state_bytes: vec![0xDE, 0xAD, 0xBE, 0xEF],
-            roster_history_bytes: consensus::reconnect::encode_roster_history(&roster_history),
+            roster_history_bytes: consensus::reconnect::encode_roster_history(&roster_history)
+                .expect("roster_history bounded"),
             decided_round: 6,
             retained: vec![consensus::RetainedEvent {
                 event: sample_event(3),
@@ -903,9 +921,7 @@ mod tests {
         // count = u32::MAX — only 4 bytes of payload remain after the NodeId.
         payload.extend_from_slice(&u32::MAX.to_be_bytes());
         let mut frame = vec![MessageType::SyncRequest as u8];
-        frame.extend_from_slice(
-            &u32::try_from(payload.len()).expect("payload length must fit u32").to_be_bytes(),
-        );
+        frame.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_be_bytes());
         frame.extend_from_slice(&payload);
         assert!(
             matches!(Frame::from_bytes(&frame), Err(GossipError::Framing(msg)) if msg == "declared count exceeds remaining buffer"),
@@ -935,23 +951,17 @@ mod tests {
         let response = sample_reconnect_response();
         let mut payload = Vec::new();
         // Checkpoint encoded bytes.
-        let cp_bytes = consensus::reconnect::encode_signed_checkpoint(&response.signed_checkpoint);
-        payload.extend_from_slice(
-            &u32::try_from(cp_bytes.len()).expect("cp_bytes length must fit u32").to_be_bytes(),
-        );
+        let cp_bytes = consensus::reconnect::encode_signed_checkpoint(&response.signed_checkpoint)
+            .expect("signed checkpoint bounded");
+        payload.extend_from_slice(&u32::try_from(cp_bytes.len()).unwrap().to_be_bytes());
         payload.extend_from_slice(&cp_bytes);
         // State bytes.
-        payload.extend_from_slice(
-            &u32::try_from(response.state_bytes.len())
-                .expect("state_bytes length must fit u32")
-                .to_be_bytes(),
-        );
+        payload
+            .extend_from_slice(&u32::try_from(response.state_bytes.len()).unwrap().to_be_bytes());
         payload.extend_from_slice(&response.state_bytes);
         // Roster history bytes.
         payload.extend_from_slice(
-            &u32::try_from(response.roster_history_bytes.len())
-                .expect("roster_history_bytes length must fit u32")
-                .to_be_bytes(),
+            &u32::try_from(response.roster_history_bytes.len()).unwrap().to_be_bytes(),
         );
         payload.extend_from_slice(&response.roster_history_bytes);
         // Decided round.
@@ -962,9 +972,7 @@ mod tests {
         payload.extend_from_slice(&u32::MAX.to_be_bytes());
 
         let mut frame = vec![MessageType::ReconnectResponse as u8];
-        frame.extend_from_slice(
-            &u32::try_from(payload.len()).expect("payload length must fit u32").to_be_bytes(),
-        );
+        frame.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_be_bytes());
         frame.extend_from_slice(&payload);
         assert!(
             matches!(Frame::from_bytes(&frame), Err(GossipError::Framing(msg)) if msg == "declared count exceeds remaining buffer"),
@@ -979,21 +987,15 @@ mod tests {
         // The inner capacity guard (commit b6a53a5) must catch this.
         let response = sample_reconnect_response();
         let mut payload = Vec::new();
-        let cp_bytes = consensus::reconnect::encode_signed_checkpoint(&response.signed_checkpoint);
-        payload.extend_from_slice(
-            &u32::try_from(cp_bytes.len()).expect("cp_bytes length must fit u32").to_be_bytes(),
-        );
+        let cp_bytes = consensus::reconnect::encode_signed_checkpoint(&response.signed_checkpoint)
+            .expect("signed checkpoint bounded");
+        payload.extend_from_slice(&u32::try_from(cp_bytes.len()).unwrap().to_be_bytes());
         payload.extend_from_slice(&cp_bytes);
-        payload.extend_from_slice(
-            &u32::try_from(response.state_bytes.len())
-                .expect("state_bytes length must fit u32")
-                .to_be_bytes(),
-        );
+        payload
+            .extend_from_slice(&u32::try_from(response.state_bytes.len()).unwrap().to_be_bytes());
         payload.extend_from_slice(&response.state_bytes);
         payload.extend_from_slice(
-            &u32::try_from(response.roster_history_bytes.len())
-                .expect("roster_history_bytes length must fit u32")
-                .to_be_bytes(),
+            &u32::try_from(response.roster_history_bytes.len()).unwrap().to_be_bytes(),
         );
         payload.extend_from_slice(&response.roster_history_bytes);
         payload.extend_from_slice(&response.decided_round.to_be_bytes());
@@ -1010,9 +1012,7 @@ mod tests {
         payload.extend_from_slice(&u32::MAX.to_be_bytes());
 
         let mut frame = vec![MessageType::ReconnectResponse as u8];
-        frame.extend_from_slice(
-            &u32::try_from(payload.len()).expect("payload length must fit u32").to_be_bytes(),
-        );
+        frame.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_be_bytes());
         frame.extend_from_slice(&payload);
         assert!(
             matches!(Frame::from_bytes(&frame), Err(GossipError::Framing(msg)) if msg == "declared count exceeds remaining buffer"),
@@ -1037,11 +1037,7 @@ mod tests {
         event_payload.extend_from_slice(&u32::MAX.to_be_bytes());
 
         let mut frame = vec![MessageType::Event as u8];
-        frame.extend_from_slice(
-            &u32::try_from(event_payload.len())
-                .expect("event_payload length must fit u32")
-                .to_be_bytes(),
-        );
+        frame.extend_from_slice(&u32::try_from(event_payload.len()).unwrap().to_be_bytes());
         frame.extend_from_slice(&event_payload);
         assert!(
             matches!(Frame::from_bytes(&frame), Err(GossipError::Framing(msg)) if msg == "declared count exceeds remaining buffer"),
@@ -1062,11 +1058,7 @@ mod tests {
         event_payload.extend_from_slice(&[0u8; 64]); // signature
 
         let mut frame = vec![MessageType::Event as u8];
-        frame.extend_from_slice(
-            &u32::try_from(event_payload.len())
-                .expect("event_payload length must fit u32")
-                .to_be_bytes(),
-        );
+        frame.extend_from_slice(&u32::try_from(event_payload.len()).unwrap().to_be_bytes());
         frame.extend_from_slice(&event_payload);
         assert!(
             matches!(Frame::from_bytes(&frame), Err(GossipError::Framing(msg)) if msg.contains("invalid optional-hash tag")),
@@ -1080,21 +1072,15 @@ mod tests {
         // tag is neither 0x00 nor 0x01.
         let response = sample_reconnect_response();
         let mut payload = Vec::new();
-        let cp_bytes = consensus::reconnect::encode_signed_checkpoint(&response.signed_checkpoint);
-        payload.extend_from_slice(
-            &u32::try_from(cp_bytes.len()).expect("cp_bytes length must fit u32").to_be_bytes(),
-        );
+        let cp_bytes = consensus::reconnect::encode_signed_checkpoint(&response.signed_checkpoint)
+            .expect("signed checkpoint bounded");
+        payload.extend_from_slice(&u32::try_from(cp_bytes.len()).unwrap().to_be_bytes());
         payload.extend_from_slice(&cp_bytes);
-        payload.extend_from_slice(
-            &u32::try_from(response.state_bytes.len())
-                .expect("state_bytes length must fit u32")
-                .to_be_bytes(),
-        );
+        payload
+            .extend_from_slice(&u32::try_from(response.state_bytes.len()).unwrap().to_be_bytes());
         payload.extend_from_slice(&response.state_bytes);
         payload.extend_from_slice(
-            &u32::try_from(response.roster_history_bytes.len())
-                .expect("roster_history_bytes length must fit u32")
-                .to_be_bytes(),
+            &u32::try_from(response.roster_history_bytes.len()).unwrap().to_be_bytes(),
         );
         payload.extend_from_slice(&response.roster_history_bytes);
         payload.extend_from_slice(&response.decided_round.to_be_bytes());
@@ -1111,9 +1097,7 @@ mod tests {
         payload.extend_from_slice(&[0u8; 200]);
 
         let mut frame = vec![MessageType::ReconnectResponse as u8];
-        frame.extend_from_slice(
-            &u32::try_from(payload.len()).expect("payload length must fit u32").to_be_bytes(),
-        );
+        frame.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_be_bytes());
         frame.extend_from_slice(&payload);
         let result = Frame::from_bytes(&frame);
         assert!(result.is_err(), "must reject invalid round_received tag");
@@ -1134,16 +1118,14 @@ mod tests {
         // payload" error from Cursor::read must surface.
         let event = sample_event(32);
         let mut event_bytes = Vec::new();
-        event.encode_canonical(&mut event_bytes);
+        event.encode_canonical(&mut event_bytes).unwrap();
         // SyncResponse: count=1, then only the first 10 bytes of the event.
         let mut payload = Vec::new();
         payload.extend_from_slice(&1u32.to_be_bytes());
         payload.extend_from_slice(&event_bytes[..10]);
 
         let mut frame = vec![MessageType::SyncResponse as u8];
-        frame.extend_from_slice(
-            &u32::try_from(payload.len()).expect("payload length must fit u32").to_be_bytes(),
-        );
+        frame.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_be_bytes());
         frame.extend_from_slice(&payload);
         let result = Frame::from_bytes(&frame);
         assert!(result.is_err(), "SyncResponse truncated mid-event must be rejected");

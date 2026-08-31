@@ -613,7 +613,7 @@ impl GossipNode {
                             tracing::error!("reconnect refused: no trusted roster hash available");
                             continue;
                         }
-                        registry.hash()
+                        registry.hash().expect("hash bounded")
                     };
                     tracing::info!(peer = ?peer.node_id, "reconnect attempt starting");
                     let attempt = tokio::time::timeout(
@@ -1022,7 +1022,7 @@ impl GossipNode {
             state::finalized_events(&hg)
                 .into_iter()
                 .filter_map(|event| {
-                    let hash = event.hash();
+                    let hash = event.hash().expect("hash bounded");
                     hg.round_received(&hash).map(|rr| (event, rr))
                 })
                 .collect()
@@ -1036,7 +1036,7 @@ impl GossipNode {
         let sink = self.event_sink.lock().await.clone();
         if let Some(sink) = &sink {
             for (event, rr) in &finalized {
-                sink.set_round_received(&event.hash(), *rr);
+                sink.set_round_received(&event.hash().expect("hash bounded"), *rr);
             }
         }
 
@@ -1188,6 +1188,7 @@ impl GossipNode {
                         let roster_bytes = {
                             let hg = self.hashgraph.lock().await;
                             consensus::encode_roster_history(hg.roster_history())
+                                .expect("roster_history bounded")
                         };
                         let sink = self.event_sink.lock().await.clone();
                         if let Some(sink) = &sink {
@@ -1357,9 +1358,11 @@ impl GossipNode {
         for hash in &order {
             if let Some(record) = hg.get(hash) {
                 for (idx, tx) in record.event().payload().iter().enumerate() {
+                    let tx_index = u32::try_from(idx)
+                        .expect("tx_index must fit u32 - payload length bounded by u32::MAX");
                     items.push(RecordsRootItem {
                         event_hash: *hash.as_bytes(),
-                        tx_index: idx as u32,
+                        tx_index,
                         tx_payload: tx.payload().to_vec(),
                     });
                 }
@@ -1854,7 +1857,7 @@ impl GossipNode {
         // 3. The roster active at the checkpoint round must match the
         //    committed roster_hash.
         let roster_at_cp = roster_history.roster_for_round(cp_round);
-        if roster_at_cp.hash() != checkpoint.payload.roster_hash {
+        if roster_at_cp.hash().expect("hash bounded") != checkpoint.payload.roster_hash {
             tracing::error!("reconnect: roster hash mismatch; rejecting checkpoint");
             return false;
         }
@@ -2067,7 +2070,8 @@ impl GossipNode {
 
         let (roster_history_bytes, decided_round, retained) = {
             let hg = self.hashgraph.lock().await;
-            let roster_history_bytes = consensus::encode_roster_history(hg.roster_history());
+            let roster_history_bytes = consensus::encode_roster_history(hg.roster_history())
+                .expect("roster_history bounded");
             let decided_round = hg.highest_decided_round();
             let retained = hg.retained_events();
             (roster_history_bytes, decided_round, retained)

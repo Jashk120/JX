@@ -49,7 +49,8 @@ fn verified_event(
 ) -> crypto::VerifiedEvent {
     let event =
         UnsignedEvent::new(creator, self_parent, other_parent, Timestamp::new(ts), Vec::new())
-            .sign(key);
+            .sign(key)
+            .unwrap();
     event.verify(registry).expect("test event should verify")
 }
 

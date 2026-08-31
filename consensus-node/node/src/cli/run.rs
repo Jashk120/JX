@@ -441,7 +441,7 @@ async fn run_node(opts: &RunOptions) -> Result<()> {
     // node's own activation path.
     let roster_bytes = {
         let hg = node.hashgraph.lock().await;
-        consensus::encode_roster_history(hg.roster_history())
+        consensus::encode_roster_history(hg.roster_history()).expect("roster history bounded")
     };
     event_log.set_roster_history(&roster_bytes)?;
 

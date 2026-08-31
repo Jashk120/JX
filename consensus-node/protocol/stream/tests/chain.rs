@@ -137,7 +137,7 @@ async fn record_verifier_rejects_tampering_and_reordering() {
         writer.submit_items(cp, items);
     }
     writer.barrier().await;
-    let trusted_hash = registry_of(&[1, 2, 3, 4]).hash();
+    let trusted_hash = registry_of(&[1, 2, 3, 4]).hash().expect("hash bounded");
     assert!(
         stream::verify::verify_record_stream_dir(
             dir.path(),

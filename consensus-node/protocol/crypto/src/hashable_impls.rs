@@ -16,33 +16,28 @@ use crate::membership::MembershipRegistry;
 impl Hashable for Event {
     type Hash = EventHash;
 
-    fn hash(&self) -> Self::Hash {
-        let bytes = self.canonical_bytes();
+    fn hash(&self) -> crate::error::Result<Self::Hash> {
+        let bytes = self.canonical_bytes().map_err(crate::error::CryptoError::Base)?;
         let digest = Sha256::digest(&bytes);
-        EventHash::new(digest.into())
+        Ok(EventHash::new(digest.into()))
     }
 }
 
-// Transaction hashing isn't in the spec's Event.hash definition, but you'll
-// want it eventually (replay checks, references) — same pattern:
 impl Hashable for Transaction {
     type Hash = TransactionHash;
 
-    fn hash(&self) -> Self::Hash {
-        let bytes = self.canonical_bytes();
+    fn hash(&self) -> crate::error::Result<Self::Hash> {
+        let bytes = self.canonical_bytes().map_err(crate::error::CryptoError::Base)?;
         let digest = Sha256::digest(&bytes);
-        TransactionHash::new(digest.into())
+        Ok(TransactionHash::new(digest.into()))
     }
 }
 
-/// SHA-256 of [`MembershipRegistry::to_bytes`] — the canonical roster hash
-/// a checkpoint payload commits to (Phase 3). Deterministic across nodes for
-/// the same roster, so every node derives the identical `roster_hash`.
 impl Hashable for MembershipRegistry {
     type Hash = [u8; 32];
 
-    fn hash(&self) -> [u8; 32] {
-        Sha256::digest(self.to_bytes()).into()
+    fn hash(&self) -> crate::error::Result<[u8; 32]> {
+        Ok(Sha256::digest(self.to_bytes()).into())
     }
 }
 
@@ -68,8 +63,8 @@ mod tests {
     #[test]
     fn event_hash_is_deterministic() {
         let event = make_event(Vec::new());
-        let h1 = event.hash();
-        let h2 = event.hash();
+        let h1 = event.hash().unwrap();
+        let h2 = event.hash().unwrap();
         assert_eq!(h1, h2);
     }
 
@@ -77,16 +72,16 @@ mod tests {
     fn event_hash_changes_with_payload() {
         let e1 = make_event(Vec::new());
         let e2 = make_event(vec![Transaction::default()]);
-        assert_ne!(e1.hash(), e2.hash());
+        assert_ne!(e1.hash().unwrap(), e2.hash().unwrap());
     }
 
     #[test]
     fn single_bit_mutation_in_payload_changes_event_hash() {
         let original = make_event(vec![Transaction::from_bytes(vec![0x00])]);
-        let original_hash = original.hash();
+        let original_hash = original.hash().unwrap();
 
         let mutated = make_event(vec![Transaction::from_bytes(vec![0x01])]);
-        let mutated_hash = mutated.hash();
+        let mutated_hash = mutated.hash().unwrap();
 
         assert_ne!(original_hash, mutated_hash);
     }
@@ -99,7 +94,7 @@ mod tests {
         let sig2 = Signature::new([0x01; 64]);
         let event1 = unsigned.clone().finalize(sig1);
         let event2 = unsigned.finalize(sig2);
-        assert_ne!(event1.hash(), event2.hash());
+        assert_ne!(event1.hash().unwrap(), event2.hash().unwrap());
     }
 
     #[test]
@@ -108,7 +103,7 @@ mod tests {
             .finalize(Signature::default());
         let e2 = UnsignedEvent::new(NodeId::new(2), None, None, Timestamp::new(100), Vec::new())
             .finalize(Signature::default());
-        assert_ne!(e1.hash(), e2.hash());
+        assert_ne!(e1.hash().unwrap(), e2.hash().unwrap());
     }
 
     #[test]
@@ -117,7 +112,7 @@ mod tests {
             .finalize(Signature::default());
         let e2 = UnsignedEvent::new(NodeId::new(1), None, None, Timestamp::new(101), Vec::new())
             .finalize(Signature::default());
-        assert_ne!(e1.hash(), e2.hash());
+        assert_ne!(e1.hash().unwrap(), e2.hash().unwrap());
     }
 
     #[test]
@@ -136,14 +131,14 @@ mod tests {
             Vec::new(),
         )
         .finalize(Signature::default());
-        assert_ne!(e1.hash(), e2.hash());
+        assert_ne!(e1.hash().unwrap(), e2.hash().unwrap());
     }
 
     #[test]
     fn transaction_hash_is_deterministic() {
         let tx = Transaction::from_bytes(vec![1, 2, 3]);
-        let h1 = tx.hash();
-        let h2 = tx.hash();
+        let h1 = tx.hash().unwrap();
+        let h2 = tx.hash().unwrap();
         assert_eq!(h1, h2);
     }
 
@@ -151,14 +146,14 @@ mod tests {
     fn transaction_hash_changes_with_payload() {
         let tx1 = Transaction::from_bytes(vec![1]);
         let tx2 = Transaction::from_bytes(vec![2]);
-        assert_ne!(tx1.hash(), tx2.hash());
+        assert_ne!(tx1.hash().unwrap(), tx2.hash().unwrap());
     }
 
     #[test]
     fn empty_transaction_hash_differs_from_nonempty() {
         let tx_empty = Transaction::default();
         let tx_nonempty = Transaction::from_bytes(vec![0xFF]);
-        assert_ne!(tx_empty.hash(), tx_nonempty.hash());
+        assert_ne!(tx_empty.hash().unwrap(), tx_nonempty.hash().unwrap());
     }
 
     #[test]
@@ -169,8 +164,8 @@ mod tests {
             SigningKey::generate(&mut OsRng).verifying_key(),
             crate::BlsIdentity::from_ikm(&[0u8; 32]).expect("bls").public.to_bytes(),
         );
-        let h1 = reg.hash();
-        let h2 = reg.hash();
+        let h1 = reg.hash().unwrap();
+        let h2 = reg.hash().unwrap();
         assert_eq!(h1, h2);
     }
 
@@ -190,7 +185,7 @@ mod tests {
             crate::BlsIdentity::from_ikm(&[0u8; 32]).expect("bls").public.to_bytes(),
         );
 
-        assert_ne!(reg1.hash(), reg2.hash());
+        assert_ne!(reg1.hash().unwrap(), reg2.hash().unwrap());
     }
 
     #[test]
@@ -221,20 +216,20 @@ mod tests {
             crate::BlsIdentity::from_ikm(&[0u8; 32]).expect("bls").public.to_bytes(),
         );
 
-        assert_eq!(reg1.hash(), reg2.hash());
+        assert_eq!(reg1.hash().unwrap(), reg2.hash().unwrap());
     }
 
     #[test]
     fn event_hash_is_32_bytes() {
         let event = make_event(Vec::new());
-        let hash = event.hash();
+        let hash = event.hash().unwrap();
         assert_eq!(hash.as_bytes().len(), 32);
     }
 
     #[test]
     fn transaction_hash_is_32_bytes() {
         let tx = Transaction::from_bytes(vec![42]);
-        let hash = tx.hash();
+        let hash = tx.hash().unwrap();
         assert_eq!(hash.as_bytes().len(), 32);
     }
 }

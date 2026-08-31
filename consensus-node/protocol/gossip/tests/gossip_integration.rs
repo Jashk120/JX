@@ -103,11 +103,11 @@ async fn diverged_node_rejoins_and_reconciles() {
     // Shared history: both nodes hold both genesis events (created once, so
     // the hashes match across nodes).
     let a1_event = make_event_with_payload(&a.key, 1, None, None, Vec::new());
-    let a1 = a1_event.hash();
+    let a1 = a1_event.hash().expect("hash bounded");
     insert_event(&a, &registry, a1_event.clone()).await;
     insert_event(&b, &registry, a1_event).await;
     let b1_event = make_event_with_payload(&b.key, 2, None, None, Vec::new());
-    let b1 = b1_event.hash();
+    let b1 = b1_event.hash().expect("hash bounded");
     insert_event(&a, &registry, b1_event.clone()).await;
     insert_event(&b, &registry, b1_event).await;
 

@@ -128,7 +128,8 @@ impl GraphBuilder {
             Timestamp::new(self.timestamp),
             Vec::new(),
         )
-        .sign(&self.keys[creator_index]);
+        .sign(&self.keys[creator_index])
+        .unwrap();
         let verified = event.verify(&self.registry).expect("generated event must verify");
         let hash = self.hashgraph.insert(verified).expect("generated graph must insert");
         self.events.push((hash, creator, self_parent, other_parent));

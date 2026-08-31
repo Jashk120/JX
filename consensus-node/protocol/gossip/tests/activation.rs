@@ -100,9 +100,10 @@ impl CliqueBuilder {
             Timestamp::new(self.ts),
             payload,
         )
-        .sign(&key_for(author));
+        .sign(&key_for(author))
+        .expect("sign bounded");
         self.ts += 1;
-        self.events.insert(label, event.hash());
+        self.events.insert(label, event.hash().expect("hash bounded"));
         event
     }
 }

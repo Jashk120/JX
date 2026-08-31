@@ -404,7 +404,8 @@ mod tests {
     ) -> crypto::VerifiedEvent {
         let event =
             UnsignedEvent::new(creator, self_parent, other_parent, Timestamp::new(ts), Vec::new())
-                .sign(key);
+                .sign(key)
+                .unwrap();
         event.verify(registry).expect("test event should verify")
     }
 
@@ -1219,7 +1220,8 @@ mod tests {
             let other_parent = op.map(|l| events[l]);
             let event =
                 UnsignedEvent::new(node, self_parent, other_parent, Timestamp::new(ts), Vec::new())
-                    .sign(key);
+                    .sign(key)
+                    .unwrap();
             let ve = event.verify(&registry).expect("verify");
             ts += 1;
             let h = hg.insert(ve).expect("insert");
