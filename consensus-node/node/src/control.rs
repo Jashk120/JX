@@ -79,6 +79,8 @@ pub struct GossipMetricsReport {
     pub delta_bytes_per_sync: f64,
     pub cache_hit_rate: f64,
     pub backoff_peers: usize,
+    #[serde(default)]
+    pub pending_dropped: u64,
 }
 
 /// The `status` report: node identity, current roster, known peers, and the
@@ -337,6 +339,7 @@ async fn status_response(node: &GossipNode) -> ControlResponse {
         delta_bytes_per_sync: metrics.delta_bytes_per_sync,
         cache_hit_rate: metrics.cache_hit_rate,
         backoff_peers,
+        pending_dropped: metrics.pending_dropped,
     };
     ok_response(json!(StatusReport {
         node_id,
@@ -387,7 +390,9 @@ async fn submit_tx(node: &GossipNode, payload_hex: &str) -> ControlResponse {
             payload.len()
         ));
     }
-    node.submit_transaction(payload).await;
+    if !node.submit_transaction(payload).await {
+        return error_response("pending queue full".to_string());
+    }
     ok_response(json!({ "queued": true }))
 }
 
@@ -475,7 +480,7 @@ mod tests {
         let listener = UnixListener::bind(path).expect("bind control socket");
         let stop = Arc::new(AtomicBool::new(false));
         let serve_stop = stop.clone();
-        let serve_node = node.clone();
+        let serve_node = node;
         tokio::spawn(async move {
             serve(listener, serve_node, serve_stop).await;
         });

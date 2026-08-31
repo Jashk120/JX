@@ -1,3 +1,4 @@
+/// Raw Ed25519 signature bytes carried by an event.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Signature([u8; 64]);
 
@@ -7,10 +8,12 @@ impl Default for Signature {
     }
 }
 impl Signature {
+    /// Creates a signature from raw bytes.
     pub fn new(bytes: [u8; 64]) -> Self {
         Self(bytes)
     }
 
+    /// Returns the underlying bytes.
     pub fn as_bytes(&self) -> &[u8; 64] {
         &self.0
     }

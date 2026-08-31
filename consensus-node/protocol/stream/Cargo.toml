@@ -16,6 +16,9 @@ ed25519-dalek  = { workspace = true }
 blst           = { workspace = true }
 thiserror      = { workspace = true }
 
+[lints]
+workspace = true
+
 [build-dependencies]
 prost-build    = { workspace = true }
 

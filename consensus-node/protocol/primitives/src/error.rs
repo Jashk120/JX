@@ -1,13 +1,33 @@
 use std::fmt;
 
+/// Errors for primitive type validation and serialization.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Error {
-    Validation { reason: String },
-    OutOfRange { field: &'static str, got: String },
-    SerializationFailed { reason: String },
-    InvalidState { reason: String },
+    /// Input failed validation.
+    Validation {
+        /// Reason for failure.
+        reason: String,
+    },
+    /// Value is out of allowed range.
+    OutOfRange {
+        /// Field name.
+        field: &'static str,
+        /// Got value.
+        got: String,
+    },
+    /// Serialization failed.
+    SerializationFailed {
+        /// Reason for failure.
+        reason: String,
+    },
+    /// Operation in invalid state.
+    InvalidState {
+        /// Reason for failure.
+        reason: String,
+    },
 }
 
+/// Result type for primitive operations.
 pub type Result<T> = std::result::Result<T, Error>;
 
 impl fmt::Display for Error {
@@ -139,10 +159,10 @@ mod tests {
         let serialization = Error::SerializationFailed { reason: "b".into() };
         let invalid_state = Error::InvalidState { reason: "c".into() };
 
-        let _ = validation.clone();
-        let _ = out_of_range.clone();
-        let _ = serialization.clone();
-        let _ = invalid_state.clone();
+        let _ = validation;
+        let _ = out_of_range;
+        let _ = serialization;
+        let _ = invalid_state;
     }
 
     #[test]

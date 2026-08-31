@@ -1,11 +1,14 @@
+/// 32-byte hash of a transaction payload.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TransactionHash([u8; 32]);
 
 impl TransactionHash {
+    /// Creates a `TransactionHash` from raw bytes.
     pub fn new(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }
 
+    /// Returns the underlying bytes.
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }

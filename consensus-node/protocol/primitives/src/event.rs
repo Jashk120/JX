@@ -4,6 +4,7 @@ use crate::signature::Signature;
 use crate::timestamp::Timestamp;
 use crate::transaction::Transaction;
 
+/// Hashgraph event before signing, with two parents and a payload.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UnsignedEvent {
     creator: NodeId,
@@ -14,6 +15,7 @@ pub struct UnsignedEvent {
 }
 
 impl UnsignedEvent {
+    /// Creates an unsigned event from its parents, timestamp, and payload.
     pub fn new(
         creator: NodeId,
         self_parent: Option<EventHash>,
@@ -24,31 +26,38 @@ impl UnsignedEvent {
         Self { creator, self_parent, other_parent, timestamp, payload }
     }
 
+    /// Returns the creator of this event.
     pub fn creator(&self) -> &NodeId {
         &self.creator
     }
 
+    /// Returns the self-parent hash, if any.
     pub fn self_parent(&self) -> Option<&EventHash> {
         self.self_parent.as_ref()
     }
 
+    /// Returns the other-parent hash, if any.
     pub fn other_parent(&self) -> Option<&EventHash> {
         self.other_parent.as_ref()
     }
 
+    /// Returns the creation timestamp.
     pub fn timestamp(&self) -> Timestamp {
         self.timestamp
     }
 
+    /// Returns the payload transactions.
     pub fn payload(&self) -> &[Transaction] {
         &self.payload
     }
 
+    /// Attaches a signature and returns the signed event.
     pub fn finalize(self, signature: Signature) -> Event {
         Event { unsigned: self, signature }
     }
 }
 
+/// Signed hashgraph event carrying an `UnsignedEvent` plus its signature.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Event {
     unsigned: UnsignedEvent,
@@ -56,30 +65,37 @@ pub struct Event {
 }
 
 impl Event {
+    /// Returns the unsigned payload of this event.
     pub fn unsigned(&self) -> &UnsignedEvent {
         &self.unsigned
     }
 
+    /// Returns the creator of this event.
     pub fn creator(&self) -> &NodeId {
         self.unsigned.creator()
     }
 
+    /// Returns the self-parent hash, if any.
     pub fn self_parent(&self) -> Option<&EventHash> {
         self.unsigned.self_parent()
     }
 
+    /// Returns the other-parent hash, if any.
     pub fn other_parent(&self) -> Option<&EventHash> {
         self.unsigned.other_parent()
     }
 
+    /// Returns the creation timestamp.
     pub fn timestamp(&self) -> Timestamp {
         self.unsigned.timestamp()
     }
 
+    /// Returns the payload transactions.
     pub fn payload(&self) -> &[Transaction] {
         self.unsigned.payload()
     }
 
+    /// Returns the attached signature.
     pub fn signature(&self) -> &Signature {
         &self.signature
     }

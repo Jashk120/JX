@@ -1,11 +1,14 @@
+/// Nanosecond timestamp of event creation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Timestamp(u64);
 
 impl Timestamp {
+    /// Creates a `Timestamp` from a raw value.
     pub fn new(value: u64) -> Self {
         Self(value)
     }
 
+    /// Returns the underlying value.
     pub fn get(self) -> u64 {
         self.0
     }
@@ -59,7 +62,7 @@ mod tests {
 
     #[test]
     fn ordering_equal() {
-        assert!(Timestamp::new(7) == Timestamp::new(7));
+        assert_eq!(Timestamp::new(7), Timestamp::new(7));
     }
 
     #[test]

@@ -1,11 +1,14 @@
+/// 32-byte content hash identifying a hashgraph event.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Ord, PartialOrd)]
 pub struct EventHash([u8; 32]);
 
 impl EventHash {
+    /// Creates an `EventHash` from raw bytes.
     pub fn new(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }
 
+    /// Returns the underlying bytes.
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }

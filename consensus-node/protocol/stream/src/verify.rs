@@ -281,7 +281,7 @@ mod tests {
     fn quorum_requires_two_thirds_plus_one() {
         let roster = crate::convert::test_helpers::registry_of(&[1, 2, 3, 4]);
         let rr = consensus::compute_records_root(&[]);
-        let payload = consensus::CheckpointPayload::new(1, rr, [0u8; 32], roster.clone());
+        let payload = consensus::CheckpointPayload::new(1, rr, [0u8; 32], roster);
         // Build BLS aggregate for 3 signers
         let mut sigs = Vec::new();
         for signer in [1, 2, 3] {

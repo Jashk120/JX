@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::net::SocketAddr;
 
 use crypto::MembershipRegistry;
@@ -39,8 +40,35 @@ pub struct MemberEntry {
 
 impl ClusterConfig {
     /// Builds a config from the complete member list.
+    ///
+    /// Panics if any `node_id`, `addr`, or `spki_fingerprint` is duplicated.
+    /// For fallible construction use [`Self::try_new`].
     pub fn new(members: Vec<MemberEntry>) -> Self {
-        Self { members }
+        Self::try_new(members).unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// Fallible constructor that rejects duplicate `node_id`, `addr`, or
+    /// `spki_fingerprint`. Returns an error string describing the first
+    /// duplicate encountered.
+    pub fn try_new(members: Vec<MemberEntry>) -> Result<Self, String> {
+        let mut seen_ids = HashSet::new();
+        let mut seen_addrs = HashSet::new();
+        let mut seen_spki = HashSet::new();
+        for member in &members {
+            if !seen_ids.insert(member.node_id) {
+                return Err(format!("duplicate node_id {}", member.node_id.get()));
+            }
+            if !seen_addrs.insert(member.addr) {
+                return Err(format!("duplicate addr {addr}", addr = member.addr));
+            }
+            if !seen_spki.insert(member.spki_fingerprint) {
+                return Err(format!(
+                    "duplicate spki_fingerprint for node_id {}",
+                    member.node_id.get()
+                ));
+            }
+        }
+        Ok(Self { members })
     }
 
     /// Builds the `MembershipRegistry` used to verify events, from every
@@ -83,7 +111,7 @@ mod tests {
     fn entry(node_id: u64, key: &SigningKey, spki_fingerprint: u8) -> MemberEntry {
         MemberEntry {
             node_id: NodeId::new(node_id),
-            addr: "10.0.0.1:7000".parse().expect("valid addr"),
+            addr: format!("10.0.0.{}:7000", node_id).parse().expect("valid addr"),
             reconnect_addr: None,
             verifying_key: key.verifying_key(),
             spki_fingerprint: [spki_fingerprint; 32],
@@ -152,5 +180,45 @@ mod tests {
                 .is_none(),
             "peer without a reconnect port keeps None"
         );
+    }
+
+    #[test]
+    fn duplicate_config_rejected() {
+        let k1 = key_for(1);
+        let k2 = key_for(2);
+        let dup_id = vec![entry(1, &k1, 1), entry(1, &k2, 2)];
+        let err = ClusterConfig::try_new(dup_id).expect_err("duplicate node_id must be rejected");
+        assert!(err.contains("duplicate node_id"), "err: {err}");
+
+        let dup_addr = vec![
+            MemberEntry {
+                node_id: NodeId::new(1),
+                addr: "10.0.0.1:7000".parse().expect("valid addr"),
+                reconnect_addr: None,
+                verifying_key: k1.verifying_key(),
+                spki_fingerprint: [1u8; 32],
+                bls_verifying_key: crypto::BlsIdentity::from_ikm(&[1u8; 32])
+                    .expect("bls")
+                    .public
+                    .to_bytes(),
+            },
+            MemberEntry {
+                node_id: NodeId::new(2),
+                addr: "10.0.0.1:7000".parse().expect("valid addr"),
+                reconnect_addr: None,
+                verifying_key: k2.verifying_key(),
+                spki_fingerprint: [2u8; 32],
+                bls_verifying_key: crypto::BlsIdentity::from_ikm(&[2u8; 32])
+                    .expect("bls")
+                    .public
+                    .to_bytes(),
+            },
+        ];
+        let err = ClusterConfig::try_new(dup_addr).expect_err("duplicate addr must be rejected");
+        assert!(err.contains("duplicate addr"), "err: {err}");
+
+        let dup_spki = vec![entry(1, &k1, 9), entry(2, &k2, 9)];
+        let err = ClusterConfig::try_new(dup_spki).expect_err("duplicate spki must be rejected");
+        assert!(err.contains("duplicate spki"), "err: {err}");
     }
 }

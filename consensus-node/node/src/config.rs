@@ -6,6 +6,7 @@
 //! (hex, 32 bytes). It contains no secrets — the per-node `secret-<id>.bin`
 //! files (64 bytes: consensus signing seed ‖ TLS seed) stay on their node.
 
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::Path;
 
@@ -68,15 +69,28 @@ impl ClusterConfigFile {
     /// source of truth used to build registries and peer lists.
     pub fn to_cluster_config(&self) -> Result<gossip::ClusterConfig> {
         let mut members = Vec::with_capacity(self.members.len());
+        let mut seen_ids = HashSet::new();
+        let mut seen_addrs = HashSet::new();
+        let mut seen_spki = HashSet::new();
         for member in &self.members {
+            if !seen_ids.insert(member.node_id) {
+                bail!("duplicate node_id {}", member.node_id);
+            }
+            if !seen_addrs.insert(member.gossip_addr) {
+                bail!("duplicate addr {}", member.gossip_addr);
+            }
+            // Decode early so SPKI duplicate check uses canonical bytes.
+            let spki_fingerprint = decode_hex(&member.spki_fingerprint).ok_or_else(|| {
+                anyhow::anyhow!("member {}: invalid spki_fingerprint hex", member.node_id)
+            })?;
+            if !seen_spki.insert(spki_fingerprint) {
+                bail!("duplicate spki_fingerprint for node_id {}", member.node_id);
+            }
             let verifying_key_bytes = decode_hex(&member.verifying_key).ok_or_else(|| {
                 anyhow::anyhow!("member {}: invalid verifying_key hex", member.node_id)
             })?;
             let verifying_key = VerifyingKey::from_bytes(&verifying_key_bytes)
                 .map_err(|_| anyhow::anyhow!("member {}: invalid verifying key", member.node_id))?;
-            let spki_fingerprint = decode_hex(&member.spki_fingerprint).ok_or_else(|| {
-                anyhow::anyhow!("member {}: invalid spki_fingerprint hex", member.node_id)
-            })?;
             // Validate BLS public key encoding (96 hex chars -> 48 bytes).
             let bls_bytes = decode_bls_hex(&member.bls_verifying_key).ok_or_else(|| {
                 anyhow::anyhow!("member {}: invalid bls_verifying_key hex", member.node_id)
@@ -93,7 +107,9 @@ impl ClusterConfigFile {
         if members.is_empty() {
             bail!("cluster config declares no members");
         }
-        Ok(gossip::ClusterConfig::new(members))
+        gossip::ClusterConfig::try_new(members)
+            .map_err(|e| anyhow::anyhow!(e))
+            .context("duplicate cluster member")
     }
 
     /// The peer list for `node_id`, excluding the node itself.

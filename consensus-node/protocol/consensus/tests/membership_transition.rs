@@ -81,7 +81,7 @@ fn single_hashgraph_crosses_membership_transition() {
     // Node 4 joins, activating the expanded roster at round 2.
     let key_d = SigningKey::generate(&mut OsRng);
     let node_d = NodeId::new(4);
-    let mut expanded = initial.clone();
+    let mut expanded = initial;
     expanded.register(
         node_d,
         key_d.verifying_key(),

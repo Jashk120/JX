@@ -1822,8 +1822,8 @@ mod tests {
         let payload = vec![Transaction::from_bytes(b"same-key".to_vec())];
         let event_a = UnsignedEvent::new(node_a, None, None, Timestamp::new(10), payload.clone())
             .sign(&key_a);
-        let event_b = UnsignedEvent::new(node_b, None, None, Timestamp::new(20), payload.clone())
-            .sign(&key_b);
+        let event_b =
+            UnsignedEvent::new(node_b, None, None, Timestamp::new(20), payload).sign(&key_b);
         let verified_a = event_a.verify(&registry).expect("verify a");
         let verified_b = event_b.verify(&registry).expect("verify b");
         let hash_a = teacher.insert(verified_a).expect("insert a");
@@ -1924,7 +1924,7 @@ mod tests {
         // Legacy fallback: insert_accepted with round_received Some but timestamp None
         // must fabricate Timestamp(0) (backward compat for old persisted logs)
         let mut hg_legacy =
-            Hashgraph::from_checkpoint(&checkpoint, crypto::RosterHistory::new(registry.clone()));
+            Hashgraph::from_checkpoint(&checkpoint, crypto::RosterHistory::new(registry));
         let event_legacy =
             UnsignedEvent::new(node_a, None, None, Timestamp::new(999), Vec::new()).sign(&key_a);
         let hash_legacy = hg_legacy

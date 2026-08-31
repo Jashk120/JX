@@ -79,31 +79,17 @@ pub fn encode_retained_event(record: &RetainedEvent) -> Vec<u8> {
         }
         None => buf.push(0x00),
     }
-    let ancestor_len = match u32::try_from(record.ancestor_seqs.len()) {
-        Ok(v) => v,
-        Err(_) => panic!(
-            "{}",
-            primitives::Error::OutOfRange {
-                field: "RetainedEvent ancestor_seqs length",
-                got: record.ancestor_seqs.len().to_string()
-            }
-        ),
-    };
+    let ancestor_len = u32::try_from(record.ancestor_seqs.len()).expect(
+        "RetainedEvent ancestor_seqs length must fit u32 - payload capped by MAX_FRAME_SIZE 64MiB < u32::MAX",
+    );
     buf.extend_from_slice(&ancestor_len.to_be_bytes());
     for seq in &record.ancestor_seqs {
         buf.extend_from_slice(&seq.to_be_bytes());
     }
     let event_bytes = record.event.canonical_bytes();
-    let event_len = match u32::try_from(event_bytes.len()) {
-        Ok(v) => v,
-        Err(_) => panic!(
-            "{}",
-            primitives::Error::OutOfRange {
-                field: "RetainedEvent event length",
-                got: event_bytes.len().to_string()
-            }
-        ),
-    };
+    let event_len = u32::try_from(event_bytes.len()).expect(
+        "RetainedEvent event length must fit u32 - payload capped by MAX_FRAME_SIZE 64MiB < u32::MAX",
+    );
     buf.extend_from_slice(&event_len.to_be_bytes());
     buf.extend_from_slice(&event_bytes);
     match record.consensus_timestamp {
@@ -213,28 +199,14 @@ pub fn encode_signed_checkpoint(sc: &SignedCheckpoint) -> Vec<u8> {
     buf.extend_from_slice(&sc.payload.roster_hash);
     buf.extend_from_slice(&sc.payload.prev_checkpoint_hash);
     let roster_bytes = sc.payload.roster_snapshot.to_bytes();
-    let roster_len = match u32::try_from(roster_bytes.len()) {
-        Ok(v) => v,
-        Err(_) => panic!(
-            "{}",
-            primitives::Error::OutOfRange {
-                field: "SignedCheckpoint roster_snapshot length",
-                got: roster_bytes.len().to_string()
-            }
-        ),
-    };
+    let roster_len = u32::try_from(roster_bytes.len()).expect(
+        "SignedCheckpoint roster_snapshot length must fit u32 - payload capped by MAX_FRAME_SIZE 64MiB < u32::MAX",
+    );
     buf.extend_from_slice(&roster_len.to_be_bytes());
     buf.extend_from_slice(&roster_bytes);
-    let signer_count = match u32::try_from(sc.signers.len()) {
-        Ok(v) => v,
-        Err(_) => panic!(
-            "{}",
-            primitives::Error::OutOfRange {
-                field: "SignedCheckpoint signers length",
-                got: sc.signers.len().to_string()
-            }
-        ),
-    };
+    let signer_count = u32::try_from(sc.signers.len()).expect(
+        "SignedCheckpoint signers length must fit u32 - payload capped by MAX_FRAME_SIZE 64MiB < u32::MAX",
+    );
     buf.extend_from_slice(&signer_count.to_be_bytes());
     for signer in &sc.signers {
         buf.extend_from_slice(&signer.get().to_be_bytes());
@@ -300,30 +272,16 @@ pub fn decode_signed_checkpoint(bytes: &[u8]) -> Option<SignedCheckpoint> {
 pub fn encode_roster_history(rh: &RosterHistory) -> Vec<u8> {
     let entries: Vec<(&u64, &MembershipRegistry)> = rh.snapshots().collect();
     let mut buf = Vec::new();
-    let entry_count = match u32::try_from(entries.len()) {
-        Ok(v) => v,
-        Err(_) => panic!(
-            "{}",
-            primitives::Error::OutOfRange {
-                field: "RosterHistory entry count",
-                got: entries.len().to_string()
-            }
-        ),
-    };
+    let entry_count = u32::try_from(entries.len()).expect(
+        "RosterHistory entry count must fit u32 - payload capped by MAX_FRAME_SIZE 64MiB < u32::MAX",
+    );
     buf.extend_from_slice(&entry_count.to_be_bytes());
     for (round, registry) in entries {
         buf.extend_from_slice(&round.to_be_bytes());
         let registry_bytes = registry.to_bytes();
-        let registry_len = match u32::try_from(registry_bytes.len()) {
-            Ok(v) => v,
-            Err(_) => panic!(
-                "{}",
-                primitives::Error::OutOfRange {
-                    field: "RosterHistory registry length",
-                    got: registry_bytes.len().to_string()
-                }
-            ),
-        };
+        let registry_len = u32::try_from(registry_bytes.len()).expect(
+            "RosterHistory registry length must fit u32 - payload capped by MAX_FRAME_SIZE 64MiB < u32::MAX",
+        );
         buf.extend_from_slice(&registry_len.to_be_bytes());
         buf.extend_from_slice(&registry_bytes);
     }
@@ -396,7 +354,7 @@ mod tests {
             round,
             crate::checkpoint::compute_records_root(&[]),
             [7u8; 32],
-            roster_snapshot.clone(),
+            roster_snapshot,
         );
         let mut sigs = Vec::new();
         for &signer in signers {

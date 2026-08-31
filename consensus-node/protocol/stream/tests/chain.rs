@@ -117,7 +117,7 @@ async fn record_reader_rejects_truncation_and_trailing_bytes() {
             "truncation at {cut} must be rejected"
         );
     }
-    let mut trailing = bytes.clone();
+    let mut trailing = bytes;
     trailing.push(0);
     assert!(read_record_stream_file(&trailing).is_err(), "trailing bytes must be rejected");
 }

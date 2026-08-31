@@ -10,6 +10,9 @@ thiserror     = { workspace = true }
 sha2          = { workspace = true }
 blst          = { workspace = true }
 
+[lints]
+workspace = true
+
 [dev-dependencies]
 ed25519-dalek = { workspace = true, features = ["rand_core"] }
 rand          = "0.8"

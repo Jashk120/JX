@@ -88,6 +88,7 @@ pub struct GossipMetrics {
     pub p95_rtt_ms: f64,
     pub delta_bytes_per_sync: f64,
     pub cache_hit_rate: f64,
+    pub pending_dropped: u64,
 }
 
 impl GossipMetrics {
@@ -413,12 +414,22 @@ impl GossipNode {
     /// [`TX_PER_SYNC`] per round, and passed into the initiator's own event.
     /// If that sync round fails the drained payloads are dropped — ordering
     /// is consensus's job, so a dropped payload is simply not included.
-    pub async fn submit_transaction(&self, payload: Vec<u8>) {
+    /// Returns `true` if the payload was queued, `false` if the pending queue
+    /// is full.
+    pub async fn submit_transaction(&self, payload: Vec<u8>) -> bool {
         let mut pending = self.pending_transactions.lock().await;
         if pending.len() >= MAX_PENDING_TRANSACTIONS {
-            return;
+            tracing::warn!(
+                pending = pending.len(),
+                limit = MAX_PENDING_TRANSACTIONS,
+                "pending queue full, dropping transaction"
+            );
+            drop(pending);
+            self.gossip_metrics.lock().await.pending_dropped += 1;
+            return false;
         }
         pending.push_back(payload);
+        true
     }
 
     /// Requests a reconnect from a live peer on the next sync interval, even
