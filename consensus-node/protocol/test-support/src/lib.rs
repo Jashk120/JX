@@ -29,12 +29,17 @@ pub const DEADLINE: Duration = Duration::from_secs(30);
 /// can poll slightly faster than the driver if desired.
 pub const POLL_INTERVAL: Duration = Duration::from_millis(10);
 
-/// Test helper: wall-clock millis since UNIX_EPOCH, with the same semantics
+/// Test helper: wall-clock millis since `UNIX_EPOCH`, with the same semantics
 /// as the production `now_timestamp` pre-clamp path. Relocated here from
 /// `gossip/tests/common/mod.rs` (audit 8.2) to avoid duplication.
+#[must_use]
 pub fn now_millis() -> u64 {
-    std::time::SystemTime::now()
+    // `as_millis` is `u128`; truncation to `u64` is intentional for test timing
+    // (values far exceed `u64::MAX` only after ~584M years).
+    #[allow(clippy::cast_possible_truncation)]
+    let millis = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_millis() as u64
+        .as_millis() as u64;
+    millis
 }

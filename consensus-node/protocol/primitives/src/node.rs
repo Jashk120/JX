@@ -1,11 +1,14 @@
+/// Plain numeric member index for a consensus participant.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Ord, PartialOrd, Default)]
 pub struct NodeId(u64);
 
 impl NodeId {
+    /// Creates a `NodeId` from a raw integer.
     pub fn new(id: u64) -> Self {
         Self(id)
     }
 
+    /// Returns the underlying integer.
     pub fn get(self) -> u64 {
         self.0
     }

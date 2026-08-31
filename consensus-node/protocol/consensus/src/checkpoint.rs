@@ -155,7 +155,10 @@ pub fn build_records_proofs(items: &[RecordsRootItem]) -> Vec<RecordsProof> {
             }
             cur_idx /= 2;
         }
-        proofs.push(RecordsProof { item_index: idx as u32, steps });
+        let item_index = u32::try_from(idx).expect(
+            "item_index must fit u32 - caller must enforce limit; payload capped by MAX_FRAME_SIZE",
+        );
+        proofs.push(RecordsProof { item_index, steps });
     }
     proofs
 }
@@ -196,7 +199,9 @@ fn leaf_hash(item: &RecordsRootItem) -> [u8; 32] {
     h.update([0x00u8]);
     h.update(item.event_hash);
     h.update(item.tx_index.to_be_bytes());
-    h.update((item.tx_payload.len() as u32).to_be_bytes());
+    let len = u32::try_from(item.tx_payload.len())
+        .expect("tx_payload length must fit u32 - caller must enforce limit; payload capped by MAX_FRAME_SIZE");
+    h.update(len.to_be_bytes());
     h.update(&item.tx_payload);
     h.finalize().into()
 }
@@ -553,7 +558,7 @@ mod tests {
         }]);
         assert_ne!(
             a.signing_bytes(),
-            CheckpointPayload::new(3, rr2, [7u8; 32], a.roster_snapshot.clone()).signing_bytes()
+            CheckpointPayload::new(3, rr2, [7u8; 32], a.roster_snapshot).signing_bytes()
         );
     }
 
@@ -566,7 +571,7 @@ mod tests {
     #[test]
     fn prev_checkpoint_hash_defaults_to_genesis_and_binds_signing() {
         let roster = registry_of(&[1]);
-        let genesis = CheckpointPayload::new(1, [0u8; 32], [0u8; 32], roster.clone());
+        let genesis = CheckpointPayload::new(1, [0u8; 32], [0u8; 32], roster);
         // `new` leaves the chain anchor at the genesis sentinel.
         assert_eq!(genesis.prev_checkpoint_hash, [0u8; 32]);
 
@@ -631,7 +636,8 @@ mod tests {
         h.update([0x00u8]);
         h.update(item.event_hash);
         h.update(item.tx_index.to_be_bytes());
-        h.update((item.tx_payload.len() as u32).to_be_bytes());
+        let len = u32::try_from(item.tx_payload.len()).expect("tx_payload length must fit u32");
+        h.update(len.to_be_bytes());
         h.update(&item.tx_payload);
         let expected: [u8; 32] = h.finalize().into();
         assert_eq!(root, expected);
@@ -647,7 +653,8 @@ mod tests {
             h.update([0x00u8]);
             h.update(item.event_hash);
             h.update(item.tx_index.to_be_bytes());
-            h.update((item.tx_payload.len() as u32).to_be_bytes());
+            let len = u32::try_from(item.tx_payload.len()).expect("tx_payload length must fit u32");
+            h.update(len.to_be_bytes());
             h.update(&item.tx_payload);
             let out: [u8; 32] = h.finalize().into();
             out
@@ -785,7 +792,7 @@ mod tests {
         let registry = registry_of(&[1, 2, 3, 4]);
         let rr = empty_records_root();
         let payload = CheckpointPayload::new(1, rr, [0u8; 32], registry.clone());
-        let mut accumulator = CheckpointAccumulator::new(payload.clone(), Vec::new());
+        let mut accumulator = CheckpointAccumulator::new(payload, Vec::new());
         let bad = sig_for(2, 1, &CheckpointPayload::new(2, rr, [0u8; 32], registry.clone()));
         assert!(accumulator.add_sig(bad, &registry).is_none());
     }
@@ -895,7 +902,7 @@ mod tests {
         // Truncate by one
         assert_eq!(CheckpointSig::decode(&bytes[..111]), None);
         // Extra byte
-        let mut extra = bytes.clone();
+        let mut extra = bytes;
         extra.push(0);
         assert_eq!(CheckpointSig::decode(&extra), None);
     }

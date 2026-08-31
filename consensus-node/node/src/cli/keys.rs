@@ -54,7 +54,9 @@ pub(crate) fn write_secret_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
     }
     #[cfg(not(unix))]
     {
-        std::fs::write(path, bytes).with_context(|| format!("writing {}", path.display()))?;
+        compile_error!(
+            "secret file creation is only supported on Unix (requires 0600 permissions)"
+        );
     }
     Ok(())
 }

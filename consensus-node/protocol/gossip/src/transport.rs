@@ -10,11 +10,13 @@ use rustls::pki_types::{
     IpAddr as PkiIpAddr,
     ServerName,
 };
-#[allow(unused_imports)]
 use tokio::io::{
     AsyncRead,
-    AsyncReadExt,
     AsyncWrite,
+};
+#[cfg(any(test, feature = "tcp-fallback", debug_assertions))]
+use tokio::io::{
+    AsyncReadExt,
     AsyncWriteExt,
 };
 use tokio::net::TcpStream;
@@ -62,6 +64,13 @@ impl TcpTransport {
 pub trait AsyncReadWrite: AsyncRead + AsyncWrite {}
 impl<T: AsyncRead + AsyncWrite> AsyncReadWrite for T {}
 
+/// Maximum wire frame size (64 MiB). The length prefix is validated
+/// before any allocation in `recv_frame` (`len > MAX_FRAME_SIZE` rejects
+/// with a framing error), so a peer cannot force unbounded allocation.
+/// Kept at 64 MiB to accommodate `ReconnectResponse` which carries the full
+/// signed checkpoint plus retained graph; reducing to 4 MiB would break
+/// reconnect of large retained windows. Per-sync byte budgets are enforced
+/// at the application layer via `MAX_PENDING_TRANSACTIONS`.
 const MAX_FRAME_SIZE: usize = 64 * 1024 * 1024;
 
 pub struct QuicTransport {
@@ -129,7 +138,7 @@ impl SyncTransport for TcpTransport {
     }
     async fn send_frame(&mut self, frame: &Frame) -> Result<()> {
         let stream = self.stream.as_mut().ok_or(GossipError::Closed)?;
-        let bytes = frame.to_bytes();
+        let bytes = frame.to_bytes()?;
         stream.write_all(&bytes).await?;
         stream.flush().await?;
         Ok(())
@@ -177,7 +186,7 @@ impl SyncTransport for QuicTransport {
             .open_bi()
             .await
             .map_err(|e| GossipError::Io(std::io::Error::other(e.to_string())))?;
-        let bytes = frame.to_bytes();
+        let bytes = frame.to_bytes()?;
         send.write_all(&bytes)
             .await
             .map_err(|e| GossipError::Io(std::io::Error::other(e.to_string())))?;
@@ -270,7 +279,7 @@ mod tests {
         let (mut client, server) = tokio::io::duplex(4096);
         let mut transport =
             TcpTransport { tls_identity: test_identity(), stream: Some(Box::new(server)) };
-        let frame_bytes = Frame::Behind.to_bytes();
+        let frame_bytes = Frame::Behind.to_bytes().expect("Behind frame must encode");
         let len = frame_bytes.len() - 5;
         assert!(len <= MAX_FRAME_SIZE);
         client.write_all(&frame_bytes).await.expect("write");

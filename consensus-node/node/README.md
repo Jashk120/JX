@@ -85,6 +85,8 @@ key/config copy steps, and the add-a-third-member flow.
 
 - `MembershipOp::Remove` is not implemented; membership only grows.
 - The control socket trusts Unix file permissions (`0600`), not a shared
-  secret or client certificate.
+  secret or client certificate. It is `0600` Unix-only local IPC and uses
+  JSON not protobuf, an intentional local exception per `AGENTS.md` Wire
+  Formats, not network external.
 - `state::StateDb::snapshot_for` is the source of truth for a checkpoint
   round's state; the live `state` partition is not trusted on restart.

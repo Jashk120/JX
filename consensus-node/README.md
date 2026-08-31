@@ -23,6 +23,11 @@ executor/     deterministic execution layer
 node/         the jkaind daemon: config, persistence, restart recovery (FORMAT_VERSION 5, STREAM_VERSION 3)
 ```
 
+Shared protobuf schema lives at the repo root `proto/jkain_stream.proto` and is
+compiled by `protocol/stream/build.rs` (prost) for both Rust and Go mirrors.
+External-facing wire formats use protobuf per `AGENTS.md`; internal
+consensus and gossip encodings keep the canonical binary form.
+
 Data dir layout: `<data>/checkpoints/` (`.cp`), `<data>/statedb/`, `<data>/eventlog/`, `<data>/streams/` (`.esf` + `.esf_sig` + `.rsf` + `.rsf_proofs` + `.ckpt`).
 
 ## Documents

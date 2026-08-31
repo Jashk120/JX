@@ -10,6 +10,9 @@ consensus   = { workspace = true }
 fjall       = { workspace = true }
 thiserror   = { workspace = true }
 
+[lints]
+workspace = true
+
 [dev-dependencies]
 ed25519-dalek = { workspace = true, features = ["rand_core"] }
 rand          = { workspace = true }

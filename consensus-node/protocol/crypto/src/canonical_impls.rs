@@ -9,7 +9,6 @@ use primitives::{
 };
 
 use crate::canonical::CanonicalEncode;
-use crate::error::CryptoError;
 
 impl CanonicalEncode for NodeId {
     fn encode_canonical(&self, buf: &mut Vec<u8>) {
@@ -50,16 +49,9 @@ impl CanonicalEncode for Option<EventHash> {
 impl CanonicalEncode for Transaction {
     fn encode_canonical(&self, buf: &mut Vec<u8>) {
         let payload = self.payload();
-        let len = match u32::try_from(payload.len()) {
-            Ok(v) => v,
-            Err(_) => panic!(
-                "{}",
-                CryptoError::Base(primitives::Error::OutOfRange {
-                    field: "Transaction payload length",
-                    got: payload.len().to_string()
-                })
-            ),
-        };
+        let len = u32::try_from(payload.len()).expect(
+            "Transaction payload length must fit u32 - caller must enforce limit; payload capped by MAX_FRAME_SIZE 64MiB < u32::MAX",
+        );
         buf.extend_from_slice(&len.to_be_bytes());
         buf.extend_from_slice(payload);
     }
@@ -67,16 +59,9 @@ impl CanonicalEncode for Transaction {
 
 impl CanonicalEncode for Vec<Transaction> {
     fn encode_canonical(&self, buf: &mut Vec<u8>) {
-        let count = match u32::try_from(self.len()) {
-            Ok(v) => v,
-            Err(_) => panic!(
-                "{}",
-                CryptoError::Base(primitives::Error::OutOfRange {
-                    field: "Vec<Transaction> length",
-                    got: self.len().to_string()
-                })
-            ),
-        };
+        let count = u32::try_from(self.len()).expect(
+            "Vec<Transaction> length must fit u32 - caller must enforce limit; payload capped by MAX_FRAME_SIZE 64MiB < u32::MAX",
+        );
         buf.extend_from_slice(&count.to_be_bytes());
         for tx in self {
             tx.encode_canonical(buf);
@@ -87,8 +72,8 @@ impl CanonicalEncode for Vec<Transaction> {
 impl CanonicalEncode for UnsignedEvent {
     fn encode_canonical(&self, buf: &mut Vec<u8>) {
         self.creator().encode_canonical(buf);
-        self.self_parent().cloned().encode_canonical(buf);
-        self.other_parent().cloned().encode_canonical(buf);
+        self.self_parent().copied().encode_canonical(buf);
+        self.other_parent().copied().encode_canonical(buf);
         self.timestamp().encode_canonical(buf);
         self.payload().to_vec().encode_canonical(buf);
     }

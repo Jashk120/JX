@@ -284,7 +284,7 @@ mod tests {
                 Vec::new(),
             );
             let event = unsigned.sign(&key);
-            let verified = event.clone().verify(&self.registry).expect("signs correctly");
+            let verified = event.verify(&self.registry).expect("signs correctly");
             self.hashgraph.insert(verified).expect("inserts")
         }
     }

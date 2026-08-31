@@ -1,13 +1,16 @@
+/// Payload transaction carried inside an event.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct Transaction {
     payload: Vec<u8>,
 }
 
 impl Transaction {
+    /// Creates a transaction from raw bytes.
     pub fn from_bytes(payload: Vec<u8>) -> Self {
         Self { payload }
     }
 
+    /// Returns the raw payload bytes.
     pub fn payload(&self) -> &[u8] {
         &self.payload
     }
@@ -83,7 +86,7 @@ mod tests {
     #[test]
     fn large_payload() {
         let data = vec![0x42; 1024 * 1024];
-        let tx = Transaction::from_bytes(data.clone());
+        let tx = Transaction::from_bytes(data);
         assert_eq!(tx.payload().len(), 1024 * 1024);
         assert_eq!(tx.payload()[0], 0x42);
         assert_eq!(tx.payload()[1024 * 1024 - 1], 0x42);
