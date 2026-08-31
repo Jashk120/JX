@@ -155,7 +155,7 @@ impl Executor {
         let new_max = finalized.iter().map(|(_, round)| *round).max().unwrap_or(0);
         let mut any_new = false;
         for (event, round_received) in finalized {
-            let hash = event.hash();
+            let hash = event.hash().expect("hash bounded");
             if self.executed.contains(&hash) {
                 continue;
             }
@@ -185,7 +185,7 @@ impl Executor {
         let new_max = finalized.iter().map(|(_, round)| *round).max().unwrap_or(0);
         let mut any_new = false;
         for (event, round_received) in finalized {
-            let hash = event.hash();
+            let hash = event.hash().expect("hash bounded");
             if self.executed.contains(&hash) {
                 continue;
             }

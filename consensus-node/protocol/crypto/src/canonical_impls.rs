@@ -11,78 +11,89 @@ use primitives::{
 use crate::canonical::CanonicalEncode;
 
 impl CanonicalEncode for NodeId {
-    fn encode_canonical(&self, buf: &mut Vec<u8>) {
+    fn encode_canonical(&self, buf: &mut Vec<u8>) -> Result<(), primitives::Error> {
         buf.extend_from_slice(&self.get().to_be_bytes());
+        Ok(())
     }
 }
 
 impl CanonicalEncode for Timestamp {
-    fn encode_canonical(&self, buf: &mut Vec<u8>) {
+    fn encode_canonical(&self, buf: &mut Vec<u8>) -> Result<(), primitives::Error> {
         buf.extend_from_slice(&self.get().to_be_bytes());
+        Ok(())
     }
 }
 
 impl CanonicalEncode for Signature {
-    fn encode_canonical(&self, buf: &mut Vec<u8>) {
+    fn encode_canonical(&self, buf: &mut Vec<u8>) -> Result<(), primitives::Error> {
         buf.extend_from_slice(self.as_bytes());
+        Ok(())
     }
 }
 
 impl CanonicalEncode for EventHash {
-    fn encode_canonical(&self, buf: &mut Vec<u8>) {
+    fn encode_canonical(&self, buf: &mut Vec<u8>) -> Result<(), primitives::Error> {
         buf.extend_from_slice(self.as_bytes());
+        Ok(())
     }
 }
 
 impl CanonicalEncode for Option<EventHash> {
-    fn encode_canonical(&self, buf: &mut Vec<u8>) {
+    fn encode_canonical(&self, buf: &mut Vec<u8>) -> Result<(), primitives::Error> {
         match self {
             None => buf.push(0x00),
             Some(hash) => {
                 buf.push(0x01);
-                hash.encode_canonical(buf);
+                hash.encode_canonical(buf)?;
             }
         }
+        Ok(())
     }
 }
 
 impl CanonicalEncode for Transaction {
-    fn encode_canonical(&self, buf: &mut Vec<u8>) {
+    fn encode_canonical(&self, buf: &mut Vec<u8>) -> Result<(), primitives::Error> {
         let payload = self.payload();
-        let len = u32::try_from(payload.len()).expect(
-            "Transaction payload length must fit u32 - caller must enforce limit; payload capped by MAX_FRAME_SIZE 64MiB < u32::MAX",
-        );
+        let len = u32::try_from(payload.len()).map_err(|_| primitives::Error::OutOfRange {
+            field: "Transaction payload length",
+            got: payload.len().to_string(),
+        })?;
         buf.extend_from_slice(&len.to_be_bytes());
         buf.extend_from_slice(payload);
+        Ok(())
     }
 }
 
 impl CanonicalEncode for Vec<Transaction> {
-    fn encode_canonical(&self, buf: &mut Vec<u8>) {
-        let count = u32::try_from(self.len()).expect(
-            "Vec<Transaction> length must fit u32 - caller must enforce limit; payload capped by MAX_FRAME_SIZE 64MiB < u32::MAX",
-        );
+    fn encode_canonical(&self, buf: &mut Vec<u8>) -> Result<(), primitives::Error> {
+        let count = u32::try_from(self.len()).map_err(|_| primitives::Error::OutOfRange {
+            field: "Vec<Transaction> length",
+            got: self.len().to_string(),
+        })?;
         buf.extend_from_slice(&count.to_be_bytes());
         for tx in self {
-            tx.encode_canonical(buf);
+            tx.encode_canonical(buf)?;
         }
+        Ok(())
     }
 }
 
 impl CanonicalEncode for UnsignedEvent {
-    fn encode_canonical(&self, buf: &mut Vec<u8>) {
-        self.creator().encode_canonical(buf);
-        self.self_parent().copied().encode_canonical(buf);
-        self.other_parent().copied().encode_canonical(buf);
-        self.timestamp().encode_canonical(buf);
-        self.payload().to_vec().encode_canonical(buf);
+    fn encode_canonical(&self, buf: &mut Vec<u8>) -> Result<(), primitives::Error> {
+        self.creator().encode_canonical(buf)?;
+        self.self_parent().copied().encode_canonical(buf)?;
+        self.other_parent().copied().encode_canonical(buf)?;
+        self.timestamp().encode_canonical(buf)?;
+        self.payload().to_vec().encode_canonical(buf)?;
+        Ok(())
     }
 }
 
 impl CanonicalEncode for Event {
-    fn encode_canonical(&self, buf: &mut Vec<u8>) {
-        self.unsigned().encode_canonical(buf);
-        self.signature().encode_canonical(buf);
+    fn encode_canonical(&self, buf: &mut Vec<u8>) -> Result<(), primitives::Error> {
+        self.unsigned().encode_canonical(buf)?;
+        self.signature().encode_canonical(buf)?;
+        Ok(())
     }
 }
 
@@ -97,9 +108,9 @@ mod tests {
         let signature = Signature::default();
         let event = unsigned.clone().finalize(signature.clone());
 
-        let unsigned_bytes = unsigned.canonical_bytes();
-        let signature_bytes = signature.canonical_bytes();
-        let event_bytes = event.canonical_bytes();
+        let unsigned_bytes = unsigned.canonical_bytes().unwrap();
+        let signature_bytes = signature.canonical_bytes().unwrap();
+        let event_bytes = event.canonical_bytes().unwrap();
 
         let mut expected = Vec::new();
         expected.extend_from_slice(&unsigned_bytes);
@@ -111,7 +122,7 @@ mod tests {
     #[test]
     fn empty_transaction_vec_encodes_zero_count() {
         let txs: Vec<Transaction> = Vec::new();
-        let bytes = txs.canonical_bytes();
+        let bytes = txs.canonical_bytes().unwrap();
         assert_eq!(bytes.len(), 4);
         assert_eq!(u32::from_be_bytes(bytes[..4].try_into().unwrap()), 0);
     }
@@ -119,7 +130,7 @@ mod tests {
     #[test]
     fn single_transaction_encoding() {
         let tx = Transaction::from_bytes(vec![0xAA, 0xBB, 0xCC]);
-        let bytes = tx.canonical_bytes();
+        let bytes = tx.canonical_bytes().unwrap();
         assert_eq!(bytes.len(), 7);
         assert_eq!(u32::from_be_bytes(bytes[..4].try_into().unwrap()), 3);
         assert_eq!(&bytes[4..], &[0xAA, 0xBB, 0xCC]);
@@ -131,8 +142,8 @@ mod tests {
         let tx_b = Transaction::from_bytes(vec![2]);
         let txs1 = vec![tx_a.clone(), tx_b.clone()];
         let txs2 = vec![tx_b, tx_a];
-        let bytes1 = txs1.canonical_bytes();
-        let bytes2 = txs2.canonical_bytes();
+        let bytes1 = txs1.canonical_bytes().unwrap();
+        let bytes2 = txs2.canonical_bytes().unwrap();
         assert_ne!(bytes1, bytes2, "different tx orderings should produce different bytes");
     }
 
@@ -140,16 +151,16 @@ mod tests {
     fn option_event_hash_none_vs_some_produce_different_bytes() {
         let none: Option<EventHash> = None;
         let some = Some(EventHash::new([0u8; 32]));
-        assert_ne!(none.canonical_bytes(), some.canonical_bytes());
-        assert_eq!(none.canonical_bytes(), vec![0x00]);
-        assert_eq!(some.canonical_bytes()[0], 0x01);
+        assert_ne!(none.canonical_bytes().unwrap(), some.canonical_bytes().unwrap());
+        assert_eq!(none.canonical_bytes().unwrap(), vec![0x00]);
+        assert_eq!(some.canonical_bytes().unwrap()[0], 0x01);
     }
 
     #[test]
     fn option_event_hash_some_preserves_hash_bytes() {
         let hash = EventHash::new([0xAB; 32]);
         let some = Some(hash);
-        let bytes = some.canonical_bytes();
+        let bytes = some.canonical_bytes().unwrap();
         assert_eq!(bytes.len(), 33);
         assert_eq!(&bytes[1..], hash.as_bytes());
     }
@@ -157,7 +168,7 @@ mod tests {
     #[test]
     fn node_id_max_value_encodes_correctly() {
         let node = NodeId::new(u64::MAX);
-        let bytes = node.canonical_bytes();
+        let bytes = node.canonical_bytes().unwrap();
         assert_eq!(bytes.len(), 8);
         assert_eq!(u64::from_be_bytes(bytes.try_into().unwrap()), u64::MAX);
     }
@@ -165,7 +176,7 @@ mod tests {
     #[test]
     fn timestamp_max_value_encodes_correctly() {
         let ts = Timestamp::new(u64::MAX);
-        let bytes = ts.canonical_bytes();
+        let bytes = ts.canonical_bytes().unwrap();
         assert_eq!(bytes.len(), 8);
         assert_eq!(u64::from_be_bytes(bytes.try_into().unwrap()), u64::MAX);
     }
@@ -178,7 +189,7 @@ mod tests {
         let sig2 = Signature::new([0xFF; 64]);
         let event1 = unsigned.clone().finalize(sig1);
         let event2 = unsigned.finalize(sig2);
-        assert_ne!(event1.canonical_bytes(), event2.canonical_bytes());
+        assert_ne!(event1.canonical_bytes().unwrap(), event2.canonical_bytes().unwrap());
     }
 
     #[test]
@@ -199,16 +210,16 @@ mod tests {
             Timestamp::new(100),
             Vec::new(),
         );
-        assert_ne!(e1.canonical_bytes(), e2.canonical_bytes());
+        assert_ne!(e1.canonical_bytes().unwrap(), e2.canonical_bytes().unwrap());
     }
 
     #[test]
     fn empty_payload_is_empty_transaction_vec() {
         let event = UnsignedEvent::new(NodeId::new(1), None, None, Timestamp::new(0), Vec::new())
             .finalize(Signature::default());
-        let bytes = event.canonical_bytes();
-        let unsigned_bytes = event.unsigned().canonical_bytes();
-        let sig_bytes = event.signature().canonical_bytes();
+        let bytes = event.canonical_bytes().unwrap();
+        let unsigned_bytes = event.unsigned().canonical_bytes().unwrap();
+        let sig_bytes = event.signature().canonical_bytes().unwrap();
         assert_eq!(bytes.len(), unsigned_bytes.len() + sig_bytes.len());
     }
 }

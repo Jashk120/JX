@@ -84,9 +84,10 @@ fn build_deep_clique() -> Vec<Event> {
             Timestamp::new(ts),
             Vec::new(),
         )
-        .sign(&SigningKey::from_bytes(&consensus_seed(author)));
+        .sign(&SigningKey::from_bytes(&consensus_seed(author)))
+        .expect("sign bounded");
         ts += 1;
-        events.insert(label, event.hash());
+        events.insert(label, event.hash().expect("hash bounded"));
         out.push(event);
     };
     step("a1", 1, None, None);
@@ -244,7 +245,7 @@ async fn from_checkpoint_rejects_roster_key_mismatched_to_the_learner() {
     let response = ReconnectResponse {
         signed_checkpoint: accepted,
         state_bytes,
-        roster_history_bytes: encode_roster_history(&RosterHistory::new(roster)),
+        roster_history_bytes: encode_roster_history(&RosterHistory::new(roster)).expect("bounded"),
         decided_round: 1,
         retained: Vec::new(),
         last_timestamp: 0,

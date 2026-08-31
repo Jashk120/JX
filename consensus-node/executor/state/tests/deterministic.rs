@@ -114,7 +114,8 @@ impl Clique {
         );
         self.ts += 1;
         let key = &self.keys[author as usize - 1];
-        let verified = unsigned.sign(key).verify(&self.registry).expect("test event verifies");
+        let verified =
+            unsigned.sign(key).unwrap().verify(&self.registry).expect("test event verifies");
         let hash = self.hg.insert(verified).expect("test insert succeeds");
         self.events.insert(label, hash);
     }
@@ -221,7 +222,7 @@ fn finalized_events_follow_consensus_order() {
 
     let mut prev_round = 0u64;
     for event in &events {
-        let hash = event.hash();
+        let hash = event.hash().unwrap();
         let round = clique.hg.round_received(&hash).expect("finalized events are ordered");
         assert!(round >= prev_round, "roundReceived must be non-decreasing along the order");
         prev_round = round;

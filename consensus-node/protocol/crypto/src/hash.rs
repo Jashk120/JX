@@ -1,5 +1,5 @@
 pub trait Hashable {
     type Hash;
 
-    fn hash(&self) -> Self::Hash;
+    fn hash(&self) -> Result<Self::Hash, crate::error::CryptoError>;
 }

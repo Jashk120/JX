@@ -65,9 +65,10 @@ fn build_deep_clique() -> Vec<Event> {
             Timestamp::new(ts),
             Vec::new(),
         )
-        .sign(&SigningKey::from_bytes(&consensus_seed(author)));
+        .sign(&SigningKey::from_bytes(&consensus_seed(author)))
+        .expect("sign bounded");
         ts += 1;
-        events.insert(label, event.hash());
+        events.insert(label, event.hash().expect("hash bounded"));
         out.push(event);
     };
     step("a1", 1, None, None);
@@ -144,7 +145,7 @@ async fn record_stream_emitted_on_checkpoint_accept() {
     assert_eq!(round, 1);
 
     // A mirror verifies the emitted stream from the files alone.
-    let trusted_hash = registry.hash();
+    let trusted_hash = registry.hash().expect("hash bounded");
     verify::verify_record_stream_dir(streams_dir.path(), NodeId::new(1), trusted_hash)
         .expect("record stream verifies end-to-end");
 }

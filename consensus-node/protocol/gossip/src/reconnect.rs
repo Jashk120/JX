@@ -301,7 +301,7 @@ mod tests {
     #[test]
     fn fabricated_roster_with_attacker_quorum_rejected_by_trusted_hash() {
         let legitimate = Cluster::of(&[1, 2, 3, 4]);
-        let trusted_hash = legitimate.registry.hash();
+        let trusted_hash = legitimate.registry.hash().expect("hash bounded");
         let attacker = Cluster::of(&[99, 98, 97]);
         let checkpoint = attacker.checkpoint(5, &[99, 98, 97]);
         assert!(

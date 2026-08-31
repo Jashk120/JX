@@ -158,7 +158,7 @@ pub fn delta_events_filtered(
     let mut out = Vec::with_capacity(events.len());
     for event in events {
         let is_self = *event.creator() == self_id;
-        let hash = event.hash();
+        let hash = event.hash().expect("hash bounded");
         let is_ancestor = if is_self {
             false
         } else {
@@ -187,7 +187,7 @@ fn topo_sort(events: &HashMap<EventHash, Event>) -> Result<Vec<Event>> {
         children.entry(*hash).or_default();
     }
     for event in events.values() {
-        let hash = event.hash();
+        let hash = event.hash().expect("hash bounded");
         for parent in [event.self_parent(), event.other_parent()].into_iter().flatten() {
             if events.contains_key(parent) {
                 children.entry(*parent).or_default().push(hash);
@@ -283,7 +283,7 @@ mod tests {
                 Timestamp::new(1),
                 Vec::new(),
             );
-            let event = unsigned.sign(&key);
+            let event = unsigned.sign(&key).expect("sign bounded");
             let verified = event.verify(&self.registry).expect("signs correctly");
             self.hashgraph.insert(verified).expect("inserts")
         }
@@ -324,7 +324,7 @@ mod tests {
 
         let known = vec![(NodeId::new(1), 1u64), (NodeId::new(2), 0u64)];
         let delta = delta_events(&h.hashgraph, &known).expect("delta computes");
-        let hashes: Vec<_> = delta.iter().map(|e| e.hash()).collect();
+        let hashes: Vec<_> = delta.iter().map(|e| e.hash().expect("hash bounded")).collect();
         assert_eq!(hashes, vec![g2, g3]);
     }
 
@@ -339,7 +339,7 @@ mod tests {
 
         let known = vec![(NodeId::new(1), 0u64), (NodeId::new(2), 0u64)];
         let delta = delta_events(&h.hashgraph, &known).expect("delta computes");
-        let hashes: Vec<_> = delta.iter().map(|e| e.hash()).collect();
+        let hashes: Vec<_> = delta.iter().map(|e| e.hash().expect("hash bounded")).collect();
 
         let pos_a1 = hashes.iter().position(|&h| h == a1).unwrap();
         let pos_a2 = hashes.iter().position(|&h| h == a2).unwrap();
@@ -372,9 +372,13 @@ mod tests {
         let h = Harness::new(&[1]);
         let key = key_for(&h, 1);
         let event = UnsignedEvent::new(NodeId::new(1), None, None, Timestamp::new(1), Vec::new())
-            .sign(&key);
-        let expected_hash = event.hash();
-        assert_eq!(event.verify(&h.registry).map(|v| v.event().hash()), Ok(expected_hash));
+            .sign(&key)
+            .expect("sign bounded");
+        let expected_hash = event.hash().expect("hash bounded");
+        assert_eq!(
+            event.verify(&h.registry).map(|v| v.event().hash().expect("hash bounded")),
+            Ok(expected_hash)
+        );
     }
 
     #[test]
@@ -386,7 +390,7 @@ mod tests {
         let c2 = h.make_event(3, Some(c1), Some(a1));
         let known = vec![(NodeId::new(1), 1u64), (NodeId::new(2), 1u64)];
         let delta = delta_events(&h.hashgraph, &known).expect("delta computes");
-        let hashes: Vec<_> = delta.iter().map(|e| e.hash()).collect();
+        let hashes: Vec<_> = delta.iter().map(|e| e.hash().expect("hash bounded")).collect();
         assert!(hashes.contains(&c1), "union must include unknown creator 3 events");
         assert!(
             hashes.contains(&c2),
@@ -546,7 +550,7 @@ mod tests {
                 .expect("second filtered delta");
         assert!(second.is_empty(), "second call within dedup window should filter all");
         let all = delta_events(&h.hashgraph, &known).expect("unfiltered");
-        assert!(all.iter().any(|e| e.hash() == a2));
+        assert!(all.iter().any(|e| e.hash().expect("hash bounded") == a2));
     }
 
     #[test]

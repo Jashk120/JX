@@ -543,7 +543,7 @@ async fn tampered_signature_event_rejected_over_wire() {
         vec![Transaction::from_bytes(b"forged".to_vec())],
     );
     let forged = unsigned.finalize(Signature::new([0x42; 64]));
-    let forged_hash = forged.hash();
+    let forged_hash = forged.hash().expect("hash bounded");
 
     let mut attacker = TcpTransport::new(TlsIdentity::from_seed(tls_seed(1), 1).expect("identity"));
     let peer = PeerInfo::new(NodeId::new(2), addr, identity2.spki_fingerprint());
@@ -593,7 +593,8 @@ async fn unknown_creator_event_rejected() {
     let rogue = SigningKey::from_bytes(&[0x99; 32]);
     let event =
         UnsignedEvent::new(NodeId::new(99), None, None, Timestamp::new(now_millis()), Vec::new())
-            .sign(&rogue);
+            .sign(&rogue)
+            .expect("sign bounded");
     assert!(event.verify(&registry).is_err(), "unregistered creator must not verify");
 }
 
@@ -611,7 +612,8 @@ async fn missing_parent_event_rejected() {
         Timestamp::new(now_millis()),
         Vec::new(),
     )
-    .sign(&key1);
+    .sign(&key1)
+    .expect("sign bounded");
     let verified = event.verify(&registry).expect("signature is valid");
     let mut hashgraph = consensus::Hashgraph::new(&registry);
     assert_eq!(hashgraph.insert(verified), Err(consensus::ConsensusError::MissingParent(missing)));
@@ -626,8 +628,9 @@ async fn duplicate_event_insert_is_noop() {
     let key1 = SigningKey::from_bytes(&consensus_seed(1));
     let event =
         UnsignedEvent::new(NodeId::new(1), None, None, Timestamp::new(now_millis()), Vec::new())
-            .sign(&key1);
-    let hash = event.hash();
+            .sign(&key1)
+            .expect("sign bounded");
+    let hash = event.hash().expect("hash bounded");
     let verified = event.verify(&registry).expect("signature is valid");
     let mut hashgraph = consensus::Hashgraph::new(&registry);
     hashgraph.insert(verified.clone()).expect("first insert");
@@ -644,7 +647,8 @@ async fn unexpected_frame_type_fails_run_sync() {
     let hashgraph = Arc::new(Mutex::new(consensus::Hashgraph::new(&registry)));
     let rogue = Frame::Event(
         UnsignedEvent::new(NodeId::new(2), None, None, Timestamp::new(now_millis()), Vec::new())
-            .sign(&SigningKey::from_bytes(&consensus_seed(2))),
+            .sign(&SigningKey::from_bytes(&consensus_seed(2)))
+            .expect("sign bounded"),
     );
 
     let mut transport = ResponseForbidden { frames: VecDeque::from([rogue]) };
@@ -892,7 +896,7 @@ async fn membership_added_node_joins_live_cluster() {
     assert!(first.other_parent().is_some(), "first event references the sync partner");
 
     // Every teacher verifies and inserts node 4's events.
-    let first_hash = first.hash();
+    let first_hash = first.hash().expect("hash bounded");
     for node in &refs {
         wait_for_event(&node.node, first_hash, DEADLINE).await;
     }
@@ -1143,9 +1147,10 @@ fn build_stateful_clique() -> Vec<Event> {
             Timestamp::new(ts),
             payload,
         )
-        .sign(&SigningKey::from_bytes(&consensus_seed(author)));
+        .sign(&SigningKey::from_bytes(&consensus_seed(author)))
+        .expect("sign bounded");
         ts += 1;
-        events.insert(label, event.hash());
+        events.insert(label, event.hash().expect("hash bounded"));
         out.push(event);
     };
     let put = |key: &[u8], value: &[u8]| {
@@ -1247,7 +1252,7 @@ async fn reconnect_serves_state_at_checkpoint_round() {
     let identity4 = TlsIdentity::from_seed(tls_seed(4), 4).expect("identity");
     let peer1 = PeerInfo::new(NodeId::new(1), gossip_addr, identity1.spki_fingerprint())
         .with_reconnect(reconnect_addr);
-    let trusted_hash = registry.hash();
+    let trusted_hash = registry.hash().expect("hash bounded");
     let response = fetch_checkpoint(&identity4, &peer1, reconnect_addr, node4_id, trusted_hash)
         .await
         .expect("fetch checkpoint from node 1");
@@ -1358,7 +1363,7 @@ async fn fetch_checkpoint_rejects_untrusted_roster_over_network() {
 
     // Client: trusts a DIFFERENT roster (registry_B = {97, 98, 99}).
     let client_trusted_registry = registry_for_ids(&[97, 98, 99]);
-    let client_trusted_hash = client_trusted_registry.hash();
+    let client_trusted_hash = client_trusted_registry.hash().expect("hash bounded");
 
     let client_identity = TlsIdentity::from_seed(tls_seed(4), 4).expect("identity");
     let peer1 = PeerInfo::new(NodeId::new(1), gossip_addr, identity1.spki_fingerprint())

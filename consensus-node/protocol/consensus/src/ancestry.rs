@@ -306,7 +306,7 @@ mod tests {
                 Timestamp::new(ts),
                 Vec::new(),
             );
-            let signed = unsigned.sign(key);
+            let signed = unsigned.sign(key).unwrap();
             let verified = signed.verify(&registry).expect("test event should verify");
             hg.insert(verified).expect("test event insertion should succeed")
         };
@@ -388,7 +388,7 @@ mod tests {
                 Timestamp::new(ts),
                 Vec::new(),
             );
-            let signed = unsigned.sign(key);
+            let signed = unsigned.sign(key).unwrap();
             let verified = signed.verify(&registry).expect("test event should verify");
             hg.insert(verified).expect("test event insertion should succeed")
         };
@@ -550,7 +550,7 @@ mod tests {
                     Timestamp::new(ts),
                     Vec::new(),
                 );
-                let signed = unsigned.sign(key);
+                let signed = unsigned.sign(key).unwrap();
                 let verified = signed.verify(&registry).expect("test event should verify");
                 hg.insert(verified).expect("test event insertion should succeed")
             };

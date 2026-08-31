@@ -143,7 +143,7 @@ pub fn proto_to_signed_checkpoint(checkpoint: &pb::SignedCheckpoint) -> Option<S
     let agg_bytes: [u8; 96] = checkpoint.aggregate_sig.clone().try_into().ok()?;
     let aggregate_sig = blst::min_pk::Signature::from_bytes(&agg_bytes).ok()?;
     let roster_snapshot = roster_from_members(&checkpoint.roster_snapshot)?;
-    if roster_snapshot.hash() != roster_hash {
+    if roster_snapshot.hash().unwrap_or([0u8; 32]) != roster_hash {
         return None;
     }
     let payload = CheckpointPayload {
@@ -211,9 +211,11 @@ pub fn record_items_for_round(hashgraph: &Hashgraph, round: u64) -> Vec<pb::Reco
     for hash in hashgraph.consensus_order(round) {
         let Some(record) = hashgraph.get(&hash) else { continue };
         for (index, tx) in record.event().payload().iter().enumerate() {
+            let tx_index = u32::try_from(index)
+                .expect("tx_index must fit u32 - payload length bounded by u32::MAX");
             items.push(pb::RecordItem {
                 event_hash: hash.as_bytes().to_vec(),
-                tx_index: index as u32,
+                tx_index,
                 tx_payload: tx.payload().to_vec(),
             });
         }
