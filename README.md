@@ -117,6 +117,6 @@ Verify: `ClusterConfig(num_nodes=6, sync_interval_ms=80)` / `250` / `500`.
 | **k=4 auto** | **QUIC** (`quinn`+SPKI) | off | **~0.25s** | ~2.2× faster |
 | **k=4 auto** | **QUIC** | **on** (`SyncConfig 1000/250/3000 ms`) | **~0.20s** | ~2.7× faster |
 
-Fanout `k` from `FanoutMode::Auto` (`protocol/gossip/src/peer_manager.rs:effective_k`): `k=ceil(N*ratio)` clamped to `[k_min,k_max]`, `ratio 0.6@N≤10 → 0.3@N≥30`, `k_max 4@N=6, 12@N=100`.
+Fanout `k` from `FanoutMode::Auto` (`protocol/gossip/src/peer_manager.rs:effective_k`): `k=ceil(N*ratio)` clamped to `[k_min,k_max]`, `ratio 0.6@N≤10 → 0.3@N≥30`, `k_max 4@N≤6, 17@7≤N≤99 Hedera cap, 12@N≥100` — `N=6→4, 10→6, 29→9` (computed vs cap `17`), `100→12`.
 
 Verify: `FanoutMode::Auto` at `N=6` (`effective_k=4`) / `cargo test --workspace -- --nocapture fanout`.

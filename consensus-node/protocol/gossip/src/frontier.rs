@@ -161,12 +161,11 @@ pub fn delta_events_filtered(
         let hash = event.hash();
         let is_ancestor = if is_self {
             false
-        } else if !hashgraph.children(&hash).is_empty() {
-            true
-        } else if let Some(latest) = hashgraph.latest_event_by(&self_id) {
-            hashgraph.is_ancestor(&hash, latest).unwrap_or(false)
         } else {
-            false
+            hashgraph
+                .latest_event_by(&self_id)
+                .and_then(|latest| hashgraph.is_ancestor(&hash, latest).ok())
+                .unwrap_or(false)
         };
         if !dedup.should_filter(&hash, target_peer, is_self, is_ancestor, config) {
             out.push(event);

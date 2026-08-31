@@ -326,6 +326,7 @@ async fn status_response(node: &GossipNode) -> ControlResponse {
         None => Vec::new(),
     };
     let metrics = node.gossip_metrics_snapshot().await;
+    let backoff_peers = node.backoff_peer_count().await;
     let gossip_metrics = GossipMetricsReport {
         sync_attempts: metrics.sync_attempts,
         sync_success: metrics.sync_success,
@@ -335,7 +336,7 @@ async fn status_response(node: &GossipNode) -> ControlResponse {
         p95_rtt_ms: metrics.p95_rtt_ms,
         delta_bytes_per_sync: metrics.delta_bytes_per_sync,
         cache_hit_rate: metrics.cache_hit_rate,
-        backoff_peers: 0,
+        backoff_peers,
     };
     ok_response(json!(StatusReport {
         node_id,

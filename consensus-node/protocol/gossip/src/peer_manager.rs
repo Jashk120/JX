@@ -6,7 +6,6 @@ use std::time::{
 };
 
 use ed25519_dalek::VerifyingKey;
-use rand::prelude::SliceRandom;
 use rand::rngs::StdRng;
 use rand::{
     Rng,
@@ -28,6 +27,30 @@ pub enum FanoutMode {
 }
 
 impl FanoutMode {
+    /// Effective fanout `k` (PLAN-2.4 D2: ratio vs cap divergence).
+    ///
+    /// For `Auto`, `k = ceil(n * ratio)` clamped to `[k_min, k_max]` where
+    /// `n = n_peers + 1` is the total roster size:
+    /// - `ratio` interpolates linearly `0.6 @ n≤10 → 0.3 @ n≥30`
+    ///   (`0.6 - (n as f64 - 10.0) * (0.3/20.0)` for `10 < n < 30`).
+    /// - `k_max` tiers: `4 @ n≤6`, `17 @ 7≤n≤99` (Hedera cap), `12 @ n≥100`.
+    /// - `k_min = 2` (or `1` when `n≤2`); upper bound is `min(k_max, n_peers)`.
+    ///
+    /// `Fixed(k)` just clamps to `[1, n_peers]`.
+    ///
+    /// Example table (input is `n_peers`; `N = n_peers + 1` is total):
+    ///
+    /// | N (total) | n_peers | ratio | ceil(N*ratio) | k_max | effective_k |
+    /// |---:|---:|---:|---:|---:|---:|
+    /// | 6 | 5 | 0.60 | 4 | 4 | **4** |
+    /// | 10 | 9 | 0.60 | 6 | 17 | **6** |
+    /// | 30 | 29 | 0.30 | 9 | 17 | **9** (Hedera 17 is cap, not computed) |
+    /// | 100 | 99 | 0.30 | 30 | 12 | **12** |
+    ///
+    /// Shorthand as often cited: `N=6→4, 10→6, 29→9, 100→12` — where `N=29`
+    /// means `n_peers=29` (`N=30` total) computed `ceil(30*0.3)=9` well below
+    /// the Hedera `17` cap; the cap only bounds mid-size clusters and is
+    /// replaced by `12` at `N≥100`.
     pub fn effective_k(&self, n_peers: usize) -> usize {
         match *self {
             Self::Fixed(k) => k.clamp(1, n_peers.max(1)),
@@ -169,39 +192,20 @@ impl PeerManager {
             })
             .collect();
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        // Filter backoff (NEG_INFINITY) — never pick a peer in backoff.
+        let mut eligible: Vec<(f64, usize)> =
+            scored.into_iter().filter(|(score, _)| *score != f64::NEG_INFINITY).collect();
         let mut result = Vec::new();
-        for (score, idx) in scored.iter() {
-            if *score == f64::NEG_INFINITY {
-                continue;
-            }
-            if self.rng.r#gen::<f64>() < 0.1 && result.len() + 1 < k {
-                continue;
-            }
-            result.push(self.peers[*idx].clone());
-            if result.len() >= k {
-                break;
-            }
-        }
-        if result.len() < k {
-            let mut remaining: Vec<PeerInfo> = self
-                .peers
-                .iter()
-                .filter(|p| !result.iter().any(|r| r.node_id == p.node_id))
-                .filter(|p| {
-                    self.scores
-                        .get(&p.node_id)
-                        .and_then(|s| s.backoff_until)
-                        .map(|until| now >= until)
-                        .unwrap_or(true)
-                })
-                .cloned()
-                .collect();
-            remaining.shuffle(&mut self.rng);
-            for peer in remaining {
-                if result.len() >= k {
-                    break;
-                }
-                result.push(peer);
+        while result.len() < k && !eligible.is_empty() {
+            if self.rng.r#gen::<f64>() < 0.1 {
+                // explore: uniform random among remaining eligible
+                let idx = self.rng.r#gen_range(0..eligible.len());
+                let (_, peer_idx) = eligible.remove(idx);
+                result.push(self.peers[peer_idx].clone());
+            } else {
+                // exploit: best remaining by score
+                let (_, peer_idx) = eligible.remove(0);
+                result.push(self.peers[peer_idx].clone());
             }
         }
         if result.is_empty()
@@ -298,6 +302,11 @@ impl PeerManager {
 
     pub fn is_empty(&self) -> bool {
         self.peers.is_empty()
+    }
+
+    pub fn backoff_count(&self) -> usize {
+        let now = Instant::now();
+        self.scores.values().filter(|s| s.backoff_until.is_some_and(|until| now < until)).count()
     }
 }
 
