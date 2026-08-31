@@ -67,6 +67,20 @@ pub struct ControlResponse {
     pub error: Option<String>,
 }
 
+/// Snapshot of gossip-layer bench metrics (G0 instrumentation).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct GossipMetricsReport {
+    pub sync_attempts: u64,
+    pub sync_success: u64,
+    pub sync_failures: u64,
+    pub success_rate: f64,
+    pub p50_rtt_ms: f64,
+    pub p95_rtt_ms: f64,
+    pub delta_bytes_per_sync: f64,
+    pub cache_hit_rate: f64,
+    pub backoff_peers: usize,
+}
+
 /// The `status` report: node identity, current roster, known peers, and the
 /// ordering/checkpoint watermarks.
 #[derive(Debug, Serialize, Deserialize)]
@@ -81,6 +95,8 @@ pub struct StatusReport {
     /// `members` when a node restored a checkpoint written under keys that no
     /// longer match the live registry — the silent-stall signal.
     pub checkpoint_roster: Vec<MemberReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gossip_metrics: Option<GossipMetricsReport>,
 }
 
 /// One consensus member in the `status` report.
@@ -309,6 +325,18 @@ async fn status_response(node: &GossipNode) -> ControlResponse {
             .collect(),
         None => Vec::new(),
     };
+    let metrics = node.gossip_metrics_snapshot().await;
+    let gossip_metrics = GossipMetricsReport {
+        sync_attempts: metrics.sync_attempts,
+        sync_success: metrics.sync_success,
+        sync_failures: metrics.sync_failures,
+        success_rate: metrics.success_rate(),
+        p50_rtt_ms: metrics.p50_rtt_ms,
+        p95_rtt_ms: metrics.p95_rtt_ms,
+        delta_bytes_per_sync: metrics.delta_bytes_per_sync,
+        cache_hit_rate: metrics.cache_hit_rate,
+        backoff_peers: 0,
+    };
     ok_response(json!(StatusReport {
         node_id,
         members,
@@ -317,6 +345,7 @@ async fn status_response(node: &GossipNode) -> ControlResponse {
         decided_round,
         latest_checkpoint_round,
         checkpoint_roster,
+        gossip_metrics: Some(gossip_metrics),
     }))
 }
 

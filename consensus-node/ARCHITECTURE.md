@@ -134,60 +134,58 @@ Every frame on the wire is `[tag: u8][payload_len: u32 BE][payload]`. The
 payload for request/response frames is the canonical encoding, so both sides
 serialize byte-for-byte identically.
 
-## 3. Sequence diagram — one gossip sync round
+## 3. Sequence diagram — one gossip sync round (T12 concurrent fanout)
+
+Each `sync_interval` the driver fans out to `k = FanoutMode::effective_k(N)` peers concurrently via `tokio::JoinSet` + `Semaphore(k)` (backpressure: skip spawn if `k` in-flight). Peers come from `PeerManager::pick_k` (scored selection with ε-greedy exploration), transports are `Arc<Mutex<TcpTransport|QuicTransport>>` in an `LruCache` hot-pool (`outbound_capacity` 10 for `N=6`, 30 for `N=100`, interpolated, LRU eviction over usefulness), deltas are filtered per-peer by `DedupState`/`SyncConfig` (`self 1000 ms / ancestor 250 ms / non-ancestor 3000 ms`), and `GossipMetrics` (`sync_attempts/success`, `p50/p95_rtt_ms`, `cache_hit_rate`) is updated per sync. QUIC (`QuicTransport` via `quinn`+`rustls` SPKI verifier) reuses the same `gossip_addr` as UDP endpoint with `TcpTransport` fallback; `Frame` `[tag:u8][len:u32BE][payload]` is unchanged.
 
 ### 3.1 ASCII
 
 ```
-┌──────────┐                      TLS (SPKI-pinned, TCP)                ┌──────────┐
-│ INITIATOR│                                                             │ RESPONDER│
-│ (node A) │                                                             │ (node B) │
-└──────────┘                                                             └──────────┘
-     │                                                                        │
-     │ peers.lock() → PeerManager.random_peer() → PeerInfo                    │
-     │ outbound.entry(node_id) → TcpTransport (reuse or connect)              │
-     │   connect → TcpStream::connect(peer.addr)                              │
-     │          → TlsConnector (FingerprintVerifier vs spki_fingerprint)      │
-     │                                                                        │
-     │  hashgraph.lock()                                                      │
-     │  known_summary(&hg, &registry)                                         │
-     │    → per member: latest_event_by → get → record.seq                    │
-     │    → Vec<(NodeId, u64)>                                                │
-     │                                                                        │
-     │── SyncRequest{ from:A, known } ────────────────────────────────────────▶│
-     │                                                                        │
-     │                                                                        │  hashgraph.lock()
-     │                                                                        │  delta_events(&hg, &known)
-     │                                                                        │    → walk self_parent chains above frontier
-     │                                                                        │    → topo_sort (Kahn) parents-first
-     │                                                                        │    → Vec<Event>
-     │                                                                        │
-     │◀──────────────────────────── SyncResponse{ events } ───────────────────┤
-     │                                                                        │
-     │  for event in events:                                                  │
-     │    insert_verified(&hg, &registry, event)                              │
-     │      → event.verify(&registry)   (Ed25519)                             │
-     │      → hashgraph.insert(VerifiedEvent)                                 │
-     │          AlreadyPresent? → no-op (benign, redundant syncs)             │
-     │          MissingParent?  → Err → needs_reconnect = true                │
-     │          else → EventRecord built, stored, round/fame machinery runs   │
-     │                                                                        │
-     │  self_parent  = latest_event_by(&A)                                    │
-     │  other_parent = latest_event_by(&B)                                    │
-     │  event = UnsignedEvent::new(A, self_parent, other_parent, ts, payload) │
-     │          .sign(&signing_key)                                           │
-     │  insert_verified(&hg, &registry, event)   ← my own event is stored     │
-     │                                                                        │
-     │── Frame::Event(my_event) ─────────────────────────────────────────────▶│
-     │                                                                        │  insert_verified(&hg, &registry, event)
-     │                                                                        │  → same verify + insert path
-     │                                                                        │  → now BOTH hold an event referencing
-     │                                                                        │    each other → gossip has spread
-     │                                                                        │
-     │  process_finalized_rounds()  (after each round, both sides)            │
-     │    → finalized events executed → per-round state hash captured         │
-     │    → membership ops (MembershipOp::Add) activated                      │
-     │    → produce_checkpoint + gossip_checkpoint_sigs (Frame::CheckpointSig)│
+┌──────────┐        JoinSet(k) + Semaphore(k)  LruCache hot-pool (10@N=6, 30@N=100)   ┌──────────┐
+│ INITIATOR│  k=FanoutMode::Auto::effective_k(N)  pick_k (scored + dedup per-peer)    │RESPONDERs│
+│ (node A) │  ratio 0.6@N≤10 → 0.3@N≥30, k_max 4@N=6, 12@N=100                         │(nodes B₁..Bₖ)│
+└──────────┘                               │                                          └──────────┘
+      │ peers.lock() → PeerManager.pick_k(k) → Vec<PeerInfo> (scored, at-most-once)   │
+      │ for each peer in parallel (JoinSet, Semaphore):                               │
+      │   outbound LruCache entry → Arc<Mutex<TcpTransport|QuicTransport>> (reuse or connect)│
+      │     connect → TcpStream::connect(peer.addr) or QUIC Endpoint (quinn)          │
+      │            → TlsConnector/QuicClientConfig (FingerprintVerifier vs spki_fingerprint)│
+      │   dedup_state[peer].prune_expired()                                            │
+      │   hashgraph.lock() → known_summary(&hg, &registry) → Vec<(NodeId,u64)>         │
+      │                                                                        │        │
+      │── SyncRequest{ from:A, known } ───────────────────────────────────────▶│        │
+      │                                                                        │        │  hashgraph.lock()
+      │                                                                        │        │  delta_events_filtered(&hg,&known,peer,dedup,SyncConfig)
+      │                                                                        │        │    → walk self_parent chains above frontier
+      │                                                                        │        │    → topo_sort (Kahn) parents-first
+      │                                                                        │        │    → dedup filter (self/ancestor/non-ancestor thresholds)
+      │                                                                        │        │
+      │◀────────────────────────── SyncResponse{ events } ─────────────────────┤        │
+      │  for event in events:                                                  │        │
+      │    insert_verified(&hg, &registry, event)                              │        │
+      │      → event.verify(&registry)   (Ed25519)                             │        │
+      │      → hashgraph.insert(VerifiedEvent)                                 │        │
+      │          AlreadyPresent? → no-op (benign, redundant syncs)             │        │
+      │          MissingParent?  → Err → needs_reconnect = true                │        │
+      │          else → EventRecord built, stored, round/fame machinery runs   │        │
+      │   GossipMetrics { sync_attempts++, p50/p95_rtt, delta_bytes, cache_hit }│        │
+      │                                                                        │        │
+      │  self_parent  = latest_event_by(&A)                                    │        │
+      │  other_parent = latest_event_by(&Bᵢ) (per-peer parent)                 │        │
+      │  event = UnsignedEvent::new(A, self_parent, other_parent, ts, payload) │        │
+      │          .sign(&signing_key)                                           │        │
+      │  insert_verified(&hg, &registry, event)   ← my own event is stored     │        │
+      │                                                                        │        │
+      │── Frame::Event(my_event) ─────────────────────────────────────────────▶│        │
+      │                                                                        │        │  insert_verified(&hg, &registry, event)
+      │                                                                        │        │  → same verify + insert path
+      │                                                                        │        │  → now BOTH hold an event referencing
+      │                                                                        │        │    each other → gossip has spread
+      │                                                                        │        │
+      │  process_finalized_rounds()  (after each round, both sides)            │        │
+      │    → finalized events executed → per-round state hash captured         │        │
+      │    → membership ops (MembershipOp::Add) activated                      │        │
+      │    → produce_checkpoint + gossip_checkpoint_sigs (Frame::CheckpointSig)│        │
 ```
 
 ### 3.2 Mermaid (renders on GitHub)
@@ -196,27 +194,36 @@ serialize byte-for-byte identically.
 sequenceDiagram
     autonumber
     participant A as Initiator (node A)
-    participant T as TcpTransport (TLS 1.3, SPKI-pinned)
-    participant B as Responder (node B)
+    participant PM as PeerManager::pick_k(k)
+    participant Pool as LruCache hot-pool (10@N=6, 30@N=100)
+    participant T as TcpTransport|QuicTransport (TLS 1.3/SPKI, QUIC quinn)
+    participant B as Responder (node Bᵢ, one of k)
     participant H as Hashgraph (Arc<Mutex<Hashgraph>>)
+    participant D as DedupState per peer
 
-    A->>A: PeerManager.random_peer() → PeerInfo
-    A->>T: TcpTransport::connect(peer) — TLS handshake + SPKI pin
-    A->>H: lock() → known_summary() → Vec<(NodeId,u64)>
-    A->>B: Frame::SyncRequest{from, known}
-    activate B
-    B->>H: lock() → delta_events() → topo_sort() → Vec<Event>
-    B-->>A: Frame::SyncResponse{events}
-    deactivate B
-    A->>H: insert_verified(each) — verify signature, insert, AlreadyPresent=noop
-    A->>H: self_parent=latest_event_by(A), other_parent=latest_event_by(B)
-    A->>A: UnsignedEvent::new(...).sign(key) → Event
-    A->>H: insert_verified(my event)
-    A->>B: Frame::Event(my_event)
-    activate B
-    B->>H: insert_verified(my_event)
-    deactivate B
-    Note over A,B: Both nodes now hold an event referencing each other's latest.
+    A->>PM: effective_k(N) — ratio 0.6→0.3, k_max 4@6/12@100, pick_k(k)
+    PM-->>A: Vec<PeerInfo> k peers (scored, ε-greedy, at-most-once)
+    par k concurrent syncs — JoinSet + Semaphore(k), backpressure skip if k in-flight
+        A->>Pool: LruCache entry → Arc<Mutex<Transport>> (reuse or connect, LRU evict)
+        A->>T: connect(peer) — TLS 1.3 SPKI pin or QUIC (quinn) + SPKI verifier
+        A->>D: prune_expired() + should_filter thresholds (1000/250/3000 ms)
+        A->>H: lock() → known_summary() → Vec<(NodeId,u64)>
+        A->>B: Frame::SyncRequest{from, known}
+        activate B
+        B->>H: lock() → delta_events_filtered() → topo_sort() → Dedup filter → Vec<Event>
+        B-->>A: Frame::SyncResponse{events}
+        deactivate B
+        A->>H: insert_verified(each) — verify signature, insert, AlreadyPresent=noop
+        A->>H: self_parent=latest_event_by(A), other_parent=latest_event_by(Bᵢ)
+        A->>A: UnsignedEvent::new(...).sign(key) → Event
+        A->>H: insert_verified(my event)
+        A->>B: Frame::Event(my_event)
+        activate B
+        B->>H: insert_verified(my_event)
+        deactivate B
+        A->>A: GossipMetrics update (sync_attempts/success, p50/p95_rtt, cache_hit)
+    end
+    Note over A,B: k parallel gossip spreads per interval; dedup + LRU hot-pool + metrics drive adaptive fanout.
 ```
 
 ## 4. What happens after gossip — finalization (both sides)

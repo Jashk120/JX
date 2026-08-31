@@ -172,13 +172,35 @@ First implementation target: **100 nodes**, interfaces sized for **1,000**.
 ### 3.4 Bounded Concurrent Fanout
 
 * Replace single `run_sync` in `node.rs:416` with `k` concurrent syncs per
-  interval, `k` bounded by semaphore / `tokio::JoinSet`. Suggested initial
-  bounds: `k_min=2`, `k_max=8` for 100 nodes, `k_max=12` for 1,000 —
-  tuned from G0 benches, not hardcoded.
-* Per-peer `Mutex<Transport>` in `outbound` pool so concurrent tasks do not
-  race on same peer. Peer selected at most once per interval.
-* Backpressure: if `k` tasks still in-flight at next interval, skip new
+  interval, bounded by `tokio::JoinSet` + `Semaphore(k)` (GossipNode sync
+  driver at `protocol/gossip/src/node.rs:825`). `k` is derived from
+  `FanoutMode::Auto` (`protocol/gossip/src/peer_manager.rs:effective_k`):
+  `k = ceil(N * ratio)` clamped to `[k_min, k_max]` where `ratio`
+  interpolates `0.6` at `N ≤ 10` → `0.3` at `N ≥ 30` (linear), and
+  `k_max=4` for `N=6`, `12` for `N=100` (and `1,000`), `k_min=2` (or `1`
+  when `N ≤ 2`). `FanoutMode::Fixed(k)` overrides for tests/bench. Tuned
+  from G0 benches, not hardcoded.
+* Per-peer `Arc<Mutex<Transport>>` in an `LruCache` outbound pool
+  (`protocol/gossip/src/node.rs:outbound_capacity` — `10` for `N=6`, `30`
+  for `N=100`, interpolated, LRU eviction over usefulness) and per-peer
+  `DedupState` (`protocol/gossip/src/frontier.rs:SyncConfig/DedupState`);
+  peer selected at most once per interval via scored `pick_k`.
+  Backpressure: if `k` tasks still in-flight at next interval, skip new
   spawns — never queue unbounded syncs.
+* Dedup filtering in `frontier::delta_events_filtered` suppresses re-sending
+  an event hash to the same peer within
+  `self_threshold=1000 ms` (own events), `ancestor_threshold=250 ms`
+  (ancestor events), `non_ancestor_threshold=3000 ms` (other events), with
+  `filter_likely_duplicates` flag; `prev_self`/`prev_ancestor` upgrade the
+  window and per-peer isolation is enforced (`dedup_state:
+  Mutex<HashMap<NodeId, DedupState>>`).
+* QUIC path: `QuicTransport: SyncTransport` (`protocol/gossip/src/transport.rs:QuicTransport` via `quinn` + `rustls` SPKI verifier reusing
+  `TlsIdentity::spki_fingerprint` — same pin as `TcpTransport`, single
+  `gossip_addr` as QUIC endpoint per PLAN-2.4 D4, `TcpTransport` as fallback;
+  `Frame` `[tag:u8][len:u32BE][payload]` unchanged over QUIC bidi streams.
+  `GossipMetrics` (`sync_attempts/success/failures`, `p50/p95_rtt_ms`,
+  `delta_bytes_per_sync`, `cache_hit_rate`, `success_rate`) drives adaptive
+  fanout/interval signals.
 
 ### 3.5 Dynamic Smart Peer Selection
 

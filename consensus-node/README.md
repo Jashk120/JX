@@ -1,9 +1,11 @@
 # JKaIN
 
 A consensus-critical blockchain node implementing the virtual-voting
-Hashgraph algorithm. Events gossip over pinned-TLS TCP, order through
-round-based virtual voting, and execute deterministically into a shared
-key-value state.
+Hashgraph algorithm. Events gossip over pinned-TLS TCP/QUIC with bounded
+concurrent fanout (`k=4@N=6, 12@N=100` via `JoinSet`+`Semaphore`, `LruCache`
+hot-pool `10@N=6, 30@N=100`, per-peer dedup `1000/250/3000 ms`, `GossipMetrics`),
+order through round-based virtual voting, and execute deterministically into a
+shared key-value state.
 
 ## Workspace layout
 

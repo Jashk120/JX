@@ -43,13 +43,17 @@ impl Default for SyncConfig {
 
 #[derive(Default)]
 pub struct DedupState {
-    sent: std::collections::HashMap<primitives::EventHash, (Instant, bool, bool)>,
+    sent: std::collections::HashMap<
+        (primitives::EventHash, primitives::NodeId),
+        (Instant, bool, bool),
+    >,
 }
 
 impl DedupState {
     pub fn should_filter(
         &mut self,
         hash: &primitives::EventHash,
+        target_peer: primitives::NodeId,
         is_self: bool,
         is_ancestor: bool,
         config: &SyncConfig,
@@ -58,7 +62,8 @@ impl DedupState {
             return false;
         }
         let now = Instant::now();
-        if let Some((sent_at, prev_self, prev_ancestor)) = self.sent.get(hash) {
+        let key = (*hash, target_peer);
+        if let Some((sent_at, prev_self, prev_ancestor)) = self.sent.get(&key) {
             let elapsed = now.duration_since(*sent_at);
             let threshold = if is_self || *prev_self {
                 config.self_threshold
@@ -71,7 +76,7 @@ impl DedupState {
                 return true;
             }
         }
-        self.sent.insert(*hash, (now, is_self, is_ancestor));
+        self.sent.insert(key, (now, is_self, is_ancestor));
         false
     }
 
@@ -142,6 +147,7 @@ pub fn delta_events_filtered(
     hashgraph: &consensus::Hashgraph,
     known: &[(NodeId, u64)],
     self_id: NodeId,
+    target_peer: NodeId,
     dedup: &mut DedupState,
     config: &SyncConfig,
 ) -> Result<Vec<Event>> {
@@ -162,7 +168,7 @@ pub fn delta_events_filtered(
         } else {
             false
         };
-        if !dedup.should_filter(&hash, is_self, is_ancestor, config) {
+        if !dedup.should_filter(&hash, target_peer, is_self, is_ancestor, config) {
             out.push(event);
         }
     }
@@ -404,9 +410,10 @@ mod tests {
         let mut dedup = DedupState::default();
         let config = SyncConfig { filter_likely_duplicates: false, ..Default::default() };
         let hash = primitives::EventHash::new([1u8; 32]);
-        assert!(!dedup.should_filter(&hash, true, false, &config));
-        assert!(!dedup.should_filter(&hash, true, false, &config));
-        assert!(!dedup.should_filter(&hash, false, true, &config));
+        let peer = NodeId::new(10);
+        assert!(!dedup.should_filter(&hash, peer, true, false, &config));
+        assert!(!dedup.should_filter(&hash, peer, true, false, &config));
+        assert!(!dedup.should_filter(&hash, peer, false, true, &config));
     }
 
     #[test]
@@ -419,10 +426,11 @@ mod tests {
             non_ancestor_threshold: Duration::from_millis(100),
         };
         let hash = primitives::EventHash::new([2u8; 32]);
-        assert!(!dedup.should_filter(&hash, true, false, &config));
-        assert!(dedup.should_filter(&hash, true, false, &config));
+        let peer = NodeId::new(10);
+        assert!(!dedup.should_filter(&hash, peer, true, false, &config));
+        assert!(dedup.should_filter(&hash, peer, true, false, &config));
         std::thread::sleep(Duration::from_millis(60));
-        assert!(!dedup.should_filter(&hash, true, false, &config));
+        assert!(!dedup.should_filter(&hash, peer, true, false, &config));
     }
 
     #[test]
@@ -435,10 +443,14 @@ mod tests {
             non_ancestor_threshold: Duration::from_millis(200),
         };
         let hash = primitives::EventHash::new([3u8; 32]);
-        assert!(!dedup.should_filter(&hash, false, true, &config));
-        assert!(dedup.should_filter(&hash, false, true, &config));
+        let peer = NodeId::new(10);
+        assert!(!dedup.should_filter(&hash, peer, false, true, &config));
+        assert!(dedup.should_filter(&hash, peer, false, true, &config));
         std::thread::sleep(Duration::from_millis(40));
-        assert!(!dedup.should_filter(&hash, false, true, &config), "ancestor threshold expired");
+        assert!(
+            !dedup.should_filter(&hash, peer, false, true, &config),
+            "ancestor threshold expired"
+        );
     }
 
     #[test]
@@ -451,15 +463,16 @@ mod tests {
             non_ancestor_threshold: Duration::from_millis(80),
         };
         let hash = primitives::EventHash::new([4u8; 32]);
-        assert!(!dedup.should_filter(&hash, false, false, &config));
-        assert!(dedup.should_filter(&hash, false, false, &config));
+        let peer = NodeId::new(10);
+        assert!(!dedup.should_filter(&hash, peer, false, false, &config));
+        assert!(dedup.should_filter(&hash, peer, false, false, &config));
         std::thread::sleep(Duration::from_millis(40));
         assert!(
-            dedup.should_filter(&hash, false, false, &config),
+            dedup.should_filter(&hash, peer, false, false, &config),
             "non-ancestor threshold still active after 40ms"
         );
         std::thread::sleep(Duration::from_millis(50));
-        assert!(!dedup.should_filter(&hash, false, false, &config));
+        assert!(!dedup.should_filter(&hash, peer, false, false, &config));
     }
 
     #[test]
@@ -472,13 +485,14 @@ mod tests {
             non_ancestor_threshold: Duration::from_millis(200),
         };
         let hash = primitives::EventHash::new([5u8; 32]);
-        assert!(!dedup.should_filter(&hash, true, false, &config));
+        let peer = NodeId::new(10);
+        assert!(!dedup.should_filter(&hash, peer, true, false, &config));
         assert!(
-            dedup.should_filter(&hash, false, false, &config),
+            dedup.should_filter(&hash, peer, false, false, &config),
             "prev_self flag must keep self_threshold"
         );
         assert!(
-            dedup.should_filter(&hash, false, true, &config),
+            dedup.should_filter(&hash, peer, false, true, &config),
             "prev_self flag dominates ancestor flag too"
         );
     }
@@ -493,9 +507,10 @@ mod tests {
             non_ancestor_threshold: Duration::from_millis(200),
         };
         let hash = primitives::EventHash::new([6u8; 32]);
-        assert!(!dedup.should_filter(&hash, false, true, &config));
+        let peer = NodeId::new(10);
+        assert!(!dedup.should_filter(&hash, peer, false, true, &config));
         assert!(
-            dedup.should_filter(&hash, false, false, &config),
+            dedup.should_filter(&hash, peer, false, false, &config),
             "prev_ancestor flag must keep ancestor_threshold"
         );
     }
@@ -508,9 +523,10 @@ mod tests {
         assert_eq!(config.ancestor_threshold, Duration::from_millis(250));
         assert_eq!(config.non_ancestor_threshold, Duration::from_millis(3000));
         let hash = primitives::EventHash::new([7u8; 32]);
-        assert!(!dedup.should_filter(&hash, true, false, &config));
-        assert!(dedup.should_filter(&hash, true, true, &config));
-        assert!(dedup.should_filter(&hash, false, true, &config));
+        let peer = NodeId::new(10);
+        assert!(!dedup.should_filter(&hash, peer, true, false, &config));
+        assert!(dedup.should_filter(&hash, peer, true, true, &config));
+        assert!(dedup.should_filter(&hash, peer, false, true, &config));
     }
 
     #[test]
@@ -521,15 +537,75 @@ mod tests {
         let known = vec![(NodeId::new(1), 0u64), (NodeId::new(2), 0u64)];
         let mut dedup = DedupState::default();
         let config = SyncConfig::default();
+        let peer = NodeId::new(10);
         let first =
-            delta_events_filtered(&h.hashgraph, &known, NodeId::new(1), &mut dedup, &config)
+            delta_events_filtered(&h.hashgraph, &known, NodeId::new(1), peer, &mut dedup, &config)
                 .expect("filtered delta");
         assert_eq!(first.len(), 2);
         let second =
-            delta_events_filtered(&h.hashgraph, &known, NodeId::new(1), &mut dedup, &config)
+            delta_events_filtered(&h.hashgraph, &known, NodeId::new(1), peer, &mut dedup, &config)
                 .expect("second filtered delta");
         assert!(second.is_empty(), "second call within dedup window should filter all");
         let all = delta_events(&h.hashgraph, &known).expect("unfiltered");
         assert!(all.iter().any(|e| e.hash() == a2));
+    }
+
+    #[test]
+    fn dedup_per_peer_isolation() {
+        let mut dedup = DedupState::default();
+        let config = SyncConfig::default();
+        let hash = primitives::EventHash::new([8u8; 32]);
+        let peer_a = NodeId::new(10);
+        let peer_b = NodeId::new(11);
+        assert!(!dedup.should_filter(&hash, peer_a, false, false, &config));
+        assert!(dedup.should_filter(&hash, peer_a, false, false, &config));
+        assert!(
+            !dedup.should_filter(&hash, peer_b, false, false, &config),
+            "different peer must not be filtered"
+        );
+        assert!(dedup.should_filter(&hash, peer_b, false, false, &config));
+        assert!(dedup.should_filter(&hash, peer_a, false, false, &config));
+    }
+
+    #[test]
+    fn delta_filtered_per_peer_isolation() {
+        let mut h = Harness::new(&[1, 2]);
+        let a1 = h.make_event(1, None, None);
+        let _a2 = h.make_event(1, Some(a1), None);
+        let known = vec![(NodeId::new(1), 0u64), (NodeId::new(2), 0u64)];
+        let mut dedup = DedupState::default();
+        let config = SyncConfig::default();
+        let peer_a = NodeId::new(10);
+        let peer_b = NodeId::new(11);
+        let first_a = delta_events_filtered(
+            &h.hashgraph,
+            &known,
+            NodeId::new(1),
+            peer_a,
+            &mut dedup,
+            &config,
+        )
+        .expect("first peer_a");
+        assert_eq!(first_a.len(), 2);
+        let first_b = delta_events_filtered(
+            &h.hashgraph,
+            &known,
+            NodeId::new(1),
+            peer_b,
+            &mut dedup,
+            &config,
+        )
+        .expect("first peer_b should not be filtered");
+        assert_eq!(first_b.len(), 2, "different peer must receive same delta");
+        let second_a = delta_events_filtered(
+            &h.hashgraph,
+            &known,
+            NodeId::new(1),
+            peer_a,
+            &mut dedup,
+            &config,
+        )
+        .expect("second peer_a");
+        assert!(second_a.is_empty(), "peer_a second call filtered");
     }
 }
