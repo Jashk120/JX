@@ -4,7 +4,8 @@ Gossip-about-gossip network layer for JKain.
 
 Implements Consensus Spec §5: nodes periodically fan out to `k =
 FanoutMode::effective_k(N)` peers concurrently (`JoinSet`+`Semaphore(k)`,
-`ratio 0.6@N≤10 → 0.3@N≥30`, `k_max 4@N=6, 12@N=100`), exchange event deltas over
+`ratio 0.6@N≤10 → 0.3@N≥30`, `k_max 4@N≤6, 17@7≤N≤99 (Hedera cap), 12@N≥100` —
+`N=6→4, 10→6, 29→9, 100→12`; Hedera `17` is cap not computed), exchange event deltas over
 pinned TLS (TCP/QUIC) connections, and fold the newly received events into a
 locally-created event of their own. Depends on `primitives` for the value
 types, `crypto` for hashing, signing, and membership, and `consensus` for the
@@ -24,8 +25,9 @@ per `docs/OPTIMIZATION.md:3.4` (G-track G1–G6).
 
 - `peer` / `peer_manager` — known peers (NodeId, address, reconnect address,
   expected TLS fingerprint) and `FanoutMode::Auto` scored selection
-  (`effective_k(N)=ceil(N*ratio)` clamped to `k_max 4@N=6, 12@N=100`, ratio
-  `0.6→0.3`, `pick_k` with ε-greedy exploration + backoff, matching Hedera's
+  (`effective_k(N)=ceil(N*ratio)` clamped to `k_max 4@N≤6, 17@7≤N≤99 Hedera cap, 12@N≥100`,
+  ratio `0.6→0.3` — `N=6→4, 10→6, 29→9` (computed `9` vs cap `17`), `100→12`,
+  `pick_k` with ε-greedy exploration + backoff, matching Hedera's
   unweighted behavior for k=1). `add_peer_from_key` admits a runtime-added
   member by deriving its TLS pin from its Ed25519 consensus key (the
   single-seed convention) and carrying its reconnect port.
@@ -88,8 +90,8 @@ per `docs/OPTIMIZATION.md:3.4` (G-track G1–G6).
 ## Design
 
 - Each interval fans out to `k` peers concurrently (`JoinSet`+`Semaphore(k)`,
-  `FanoutMode::Auto` `k_max 4@N=6, 12@N=100`, ratio `0.6→0.3`, LRU hot-pool
-  `10@N=6, 30@N=100`): one initiator creates one event per peer sync, each
+  `FanoutMode::Auto` `k_max 4@N≤6, 17@7≤N≤99 Hedera cap, 12@N≥100` (`N=6→4, 10→6, 29→9 vs cap 17, 100→12`),
+  ratio `0.6→0.3`, LRU hot-pool `10@N=6, 30@N=100`): one initiator creates one event per peer sync, each
   responder folds it into its own next event. Over repeated scored `pick_k`
   syncs both sides create events, preserving exponential gossip spread at
   `O(log N)` rounds with `k`-way parallelism.

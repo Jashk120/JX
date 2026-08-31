@@ -550,6 +550,7 @@ async fn spawn_diagnosis_logger(node: Arc<GossipNode>, path: PathBuf, stop: Arc<
             break;
         }
         let m = node.gossip_metrics_snapshot().await;
+        let backoff_peers = node.backoff_peer_count().await;
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis().to_string())
@@ -564,7 +565,7 @@ async fn spawn_diagnosis_logger(node: Arc<GossipNode>, path: PathBuf, stop: Arc<
             "p95_rtt_ms": m.p95_rtt_ms,
             "delta_bytes_per_sync": m.delta_bytes_per_sync,
             "cache_hit_rate": m.cache_hit_rate,
-            "backoff_peers": 0,
+            "backoff_peers": backoff_peers,
         });
         let text = format!("{}\n", line);
         if let Ok(mut file) =
@@ -581,6 +582,7 @@ async fn spawn_diagnosis_logger(node: Arc<GossipNode>, path: PathBuf, stop: Arc<
             p95_rtt_ms = m.p95_rtt_ms,
             delta_bytes_per_sync = m.delta_bytes_per_sync,
             cache_hit_rate = m.cache_hit_rate,
+            backoff_peers = backoff_peers,
             "diagnosis gossip metrics"
         );
     }

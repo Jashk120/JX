@@ -177,8 +177,9 @@ First implementation target: **100 nodes**, interfaces sized for **1,000**.
   `FanoutMode::Auto` (`protocol/gossip/src/peer_manager.rs:effective_k`):
   `k = ceil(N * ratio)` clamped to `[k_min, k_max]` where `ratio`
   interpolates `0.6` at `N ≤ 10` → `0.3` at `N ≥ 30` (linear), and
-  `k_max=4` for `N=6`, `12` for `N=100` (and `1,000`), `k_min=2` (or `1`
-  when `N ≤ 2`). `FanoutMode::Fixed(k)` overrides for tests/bench. Tuned
+  `k_max=4` for `N≤6`, `17` for `7≤N≤99` (Hedera cap), `12` for `N≥100`
+  (and `1,000`), `k_min=2` (or `1` when `N ≤ 2`) — e.g. `N=6→4, 10→6, 29→9`
+  (computed `9` vs cap `17`), `100→12`. `FanoutMode::Fixed(k)` overrides for tests/bench. Tuned
   from G0 benches, not hardcoded.
 * Per-peer `Arc<Mutex<Transport>>` in an `LruCache` outbound pool
   (`protocol/gossip/src/node.rs:outbound_capacity` — `10` for `N=6`, `30`

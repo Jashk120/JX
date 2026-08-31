@@ -98,6 +98,26 @@ impl GossipMetrics {
             self.sync_success as f64 / self.sync_attempts as f64
         }
     }
+
+    /// Record a successful sync's latency and payload size into the EWMA
+    /// metrics. `p50` uses a fast alpha (0.1) for a responsive median while
+    /// `p95` uses a slower alpha (0.05) so tail spikes are retained longer
+    /// and the two series diverge. `fresh_len` drives two additional EWMAs:
+    /// `delta_bytes_per_sync` is a rough estimate (1 KiB per event) and
+    /// `cache_hit_rate` tracks the empty-delta ratio.
+    pub fn record_sync_success(&mut self, rtt: Duration, fresh_len: usize) {
+        self.sync_attempts += 1;
+        self.sync_success += 1;
+        let rtt_ms = rtt.as_millis() as f64;
+        // p50: alpha 0.1 (decay 0.9) — responsive; p95: alpha 0.05 (decay 0.95) — retains tails.
+        self.p50_rtt_ms = self.p50_rtt_ms * 0.9 + rtt_ms * 0.1;
+        self.p95_rtt_ms = self.p95_rtt_ms * 0.95 + rtt_ms * 0.05;
+        // Rough estimate: ~1 KiB per event; keep EWMA for observability.
+        let delta_bytes = fresh_len as f64 * 1024.0;
+        self.delta_bytes_per_sync = self.delta_bytes_per_sync * 0.9 + delta_bytes * 0.1;
+        let hit = if fresh_len == 0 { 1.0 } else { 0.0 };
+        self.cache_hit_rate = self.cache_hit_rate * 0.9 + hit * 0.1;
+    }
 }
 
 /// The sync driver's timing parameters.
@@ -340,6 +360,10 @@ impl GossipNode {
 
     pub async fn gossip_metrics_snapshot(&self) -> GossipMetrics {
         self.gossip_metrics.lock().await.clone()
+    }
+
+    pub async fn backoff_peer_count(&self) -> usize {
+        self.peers.lock().await.backoff_count()
     }
 
     /// Whether `node` is a registered member of this node's hashgraph.
@@ -612,6 +636,14 @@ impl GossipNode {
                 }
             }
 
+            {
+                let mut cache = outbound.lock().await;
+                let cap = outbound_capacity(self.peers.lock().await.len());
+                if cache.cap() != cap {
+                    cache.resize(cap);
+                }
+            }
+
             let k = self.fanout.effective_k(self.peers.lock().await.len());
             if k <= 1 {
                 let peer = self.peers.lock().await.random_peer();
@@ -619,10 +651,6 @@ impl GossipNode {
 
                 let transport_arc = {
                     let mut cache = outbound.lock().await;
-                    let cap = outbound_capacity(self.peers.lock().await.len());
-                    if cache.cap() != cap {
-                        cache.resize(cap);
-                    }
                     if let Some(existing) = cache.get(&peer.node_id) {
                         existing.clone()
                     } else {
@@ -720,15 +748,7 @@ impl GossipNode {
                         self.peers.lock().await.record_success(peer.node_id, rtt);
                         {
                             let mut m = self.gossip_metrics.lock().await;
-                            m.sync_attempts += 1;
-                            m.sync_success += 1;
-                            m.p50_rtt_ms = m.p50_rtt_ms * 0.9 + rtt.as_millis() as f64 * 0.1;
-                            m.p95_rtt_ms = m.p95_rtt_ms * 0.9 + rtt.as_millis() as f64 * 0.1;
-                            let delta_bytes = fresh.len() as f64 * 1024.0;
-                            m.delta_bytes_per_sync =
-                                m.delta_bytes_per_sync * 0.9 + delta_bytes * 0.1;
-                            let hit = if fresh.is_empty() { 1.0 } else { 0.0 };
-                            m.cache_hit_rate = m.cache_hit_rate * 0.9 + hit * 0.1;
+                            m.record_sync_success(rtt, fresh.len());
                             if m.sync_attempts.is_multiple_of(10) {
                                 tracing::info!(
                                     sync_attempts = m.sync_attempts,
@@ -785,8 +805,6 @@ impl GossipNode {
                         consecutive_failures = consecutive_failures,
                         "gossip metrics"
                     );
-                }
-                {
                     let mut cache = outbound.lock().await;
                     let cap = outbound_capacity(self.peers.lock().await.len());
                     if cache.cap() != cap {
@@ -844,10 +862,6 @@ impl GossipNode {
                     let start = std::time::Instant::now();
                     let transport_arc = {
                         let mut cache = outbound.lock().await;
-                        let cap = outbound_capacity(self_clone.peers.lock().await.len());
-                        if cache.cap() != cap {
-                            cache.resize(cap);
-                        }
                         if let Some(existing) = cache.get(&peer_clone.node_id) {
                             existing.clone()
                         } else {
@@ -917,15 +931,7 @@ impl GossipNode {
                             self_clone.peers.lock().await.record_success(peer_clone.node_id, rtt);
                             {
                                 let mut m = metrics.lock().await;
-                                m.sync_attempts += 1;
-                                m.sync_success += 1;
-                                m.p50_rtt_ms = m.p50_rtt_ms * 0.9 + rtt.as_millis() as f64 * 0.1;
-                                m.p95_rtt_ms = m.p95_rtt_ms * 0.9 + rtt.as_millis() as f64 * 0.1;
-                                let delta_bytes = fresh.len() as f64 * 1024.0;
-                                m.delta_bytes_per_sync =
-                                    m.delta_bytes_per_sync * 0.9 + delta_bytes * 0.1;
-                                let hit = if fresh.is_empty() { 1.0 } else { 0.0 };
-                                m.cache_hit_rate = m.cache_hit_rate * 0.9 + hit * 0.1;
+                                m.record_sync_success(rtt, fresh.len());
                                 if m.sync_attempts.is_multiple_of(10) {
                                     tracing::info!(
                                         sync_attempts = m.sync_attempts,
@@ -971,8 +977,6 @@ impl GossipNode {
                     cache_hit_rate = m.cache_hit_rate,
                     "gossip metrics fanout"
                 );
-            }
-            {
                 let mut cache = outbound.lock().await;
                 let cap = outbound_capacity(self.peers.lock().await.len());
                 if cache.cap() != cap {
