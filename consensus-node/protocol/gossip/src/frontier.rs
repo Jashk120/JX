@@ -308,7 +308,7 @@ mod tests {
     fn delta_empty_when_peer_knows_everything() {
         let mut h = Harness::new(&[1, 2]);
         let g1 = h.make_event(1, None, None);
-        h.make_event(2, Some(g1), None);
+        h.make_event(2, None, Some(g1));
 
         let summary = known_summary(&h.hashgraph, &h.registry);
         let delta = delta_events(&h.hashgraph, &summary).expect("no delta");
