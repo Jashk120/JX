@@ -169,7 +169,23 @@ impl PeerManager {
         if self.peers.is_empty() {
             return None;
         }
-        let idx = self.rng.r#gen_range(0..self.peers.len());
+        let now = Instant::now();
+        let eligible: Vec<usize> = self
+            .peers
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| {
+                self.scores
+                    .get(&p.node_id)
+                    .and_then(|s| s.backoff_until)
+                    .is_none_or(|until| now >= until)
+            })
+            .map(|(idx, _)| idx)
+            .collect();
+        if eligible.is_empty() {
+            return None;
+        }
+        let idx = eligible[self.rng.r#gen_range(0..eligible.len())];
         Some(self.peers[idx].clone())
     }
 
