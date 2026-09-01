@@ -293,6 +293,12 @@ impl Hashgraph {
             None => None,
         };
 
+        if let Some(record) = self_parent_record
+            && *record.event().creator() != creator
+        {
+            return Err(InsertError::InvalidSelfParent);
+        }
+
         let seq = self_parent_record.map_or(1, |r| r.seq + 1);
 
         // Incremental ancestor_seqs: elementwise max of both parents',
