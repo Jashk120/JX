@@ -49,9 +49,9 @@ pub fn path_of(key: &[u8]) -> Hash {
 fn leaf_hash(key: &[u8], value: &[u8]) -> Hash {
     let mut hasher = Sha256::new();
     hasher.update([0x00u8]);
-    hasher.update((key.len() as u32).to_be_bytes());
+    hasher.update(u32::try_from(key.len()).expect("key length exceeds u32::MAX").to_be_bytes());
     hasher.update(key);
-    hasher.update((value.len() as u32).to_be_bytes());
+    hasher.update(u32::try_from(value.len()).expect("value length exceeds u32::MAX").to_be_bytes());
     hasher.update(value);
     hasher.finalize().into()
 }
@@ -244,7 +244,11 @@ impl MerkleProof {
             Vec::with_capacity(8 + self.key.len() + self.value.len() + self.siblings.len() * 32);
         write_bytes(&mut buf, &self.key);
         write_bytes(&mut buf, &self.value);
-        buf.extend_from_slice(&(self.siblings.len() as u32).to_be_bytes());
+        buf.extend_from_slice(
+            &u32::try_from(self.siblings.len())
+                .expect("siblings length exceeds u32::MAX")
+                .to_be_bytes(),
+        );
         for sibling in &self.siblings {
             buf.extend_from_slice(sibling);
         }
@@ -274,7 +278,9 @@ impl MerkleProof {
 }
 
 fn write_bytes(buf: &mut Vec<u8>, bytes: &[u8]) {
-    buf.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+    buf.extend_from_slice(
+        &u32::try_from(bytes.len()).expect("bytes length exceeds u32::MAX").to_be_bytes(),
+    );
     buf.extend_from_slice(bytes);
 }
 

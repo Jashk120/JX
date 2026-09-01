@@ -300,7 +300,9 @@ fn reject_trailing(cursor: &[u8]) -> Result<()> {
 }
 
 fn write_bytes(buf: &mut Vec<u8>, bytes: &[u8]) {
-    buf.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+    buf.extend_from_slice(
+        &u32::try_from(bytes.len()).expect("bytes length exceeds u32::MAX").to_be_bytes(),
+    );
     buf.extend_from_slice(bytes);
 }
 
