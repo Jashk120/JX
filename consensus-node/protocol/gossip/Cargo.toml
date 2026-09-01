@@ -28,6 +28,7 @@ tracing        = { workspace = true }
 workspace = true
 
 [features]
+default = ["tcp-fallback"]
 tcp-fallback = []
 
 [dev-dependencies]
