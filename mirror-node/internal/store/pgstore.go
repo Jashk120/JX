@@ -58,22 +58,24 @@ func (s *PGStore) PutRecord(f *pb.RecordStreamFile) error {
 	var rosterHash any
 	var recordsRoot any
 	var aggregateSig any
+	var prevHash any
 	if cp := f.GetCheckpoint(); cp != nil {
 		cpRound = int64(cp.Round)
 		stateHash = cp.StateHash
 		rosterHash = cp.RosterHash
 		recordsRoot = cp.RecordsRoot
 		aggregateSig = cp.AggregateSig
+		prevHash = cp.PrevCheckpointHash
 	}
 	tag, err := tx.Exec(ctx,
 		`INSERT INTO record_files
 			(round, version, start_running_hash, end_running_hash,
-			 checkpoint_round, state_hash, roster_hash, records_root, aggregate_sig)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+			 checkpoint_round, state_hash, roster_hash, records_root, aggregate_sig, prev_checkpoint_hash)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 		 ON CONFLICT (round) DO NOTHING`,
 		int64(f.Round), int32(f.Version),
 		f.GetStartRunningHash().GetHash(), f.GetEndRunningHash().GetHash(),
-		cpRound, stateHash, rosterHash, recordsRoot, aggregateSig,
+		cpRound, stateHash, rosterHash, recordsRoot, aggregateSig, prevHash,
 	)
 	if err != nil {
 		return fmt.Errorf("insert record_files round %d: %w", f.Round, err)
@@ -199,7 +201,7 @@ func (s *PGStore) ListRecords() []*pb.RecordStreamFile {
 func (s *PGStore) listRecordFiles(ctx context.Context) ([]*pb.RecordStreamFile, error) {
 	rows, err := s.pool.Query(ctx,
 		`SELECT round, version, start_running_hash, end_running_hash,
-		        checkpoint_round, state_hash, roster_hash, records_root, aggregate_sig
+		        checkpoint_round, state_hash, roster_hash, records_root, aggregate_sig, prev_checkpoint_hash
 		 FROM record_files ORDER BY round`)
 	if err != nil {
 		return nil, err
@@ -208,13 +210,13 @@ func (s *PGStore) listRecordFiles(ctx context.Context) ([]*pb.RecordStreamFile, 
 	var files []*pb.RecordStreamFile
 	for rows.Next() {
 		var (
-			round                   int64
-			version                 int32
-			start, end              []byte
-			cpRound                 *int64
-			state, ros, rec, aggSig []byte
+			round                        int64
+			version                      int32
+			start, end                   []byte
+			cpRound                      *int64
+			state, ros, rec, aggSig, prev []byte
 		)
-		if err := rows.Scan(&round, &version, &start, &end, &cpRound, &state, &ros, &rec, &aggSig); err != nil {
+		if err := rows.Scan(&round, &version, &start, &end, &cpRound, &state, &ros, &rec, &aggSig, &prev); err != nil {
 			return nil, err
 		}
 		f := &pb.RecordStreamFile{
@@ -225,11 +227,12 @@ func (s *PGStore) listRecordFiles(ctx context.Context) ([]*pb.RecordStreamFile, 
 		}
 		if cpRound != nil {
 			f.Checkpoint = &pb.SignedCheckpoint{
-				Round:        uint64(*cpRound),
-				StateHash:    state,
-				RosterHash:   ros,
-				RecordsRoot:  rec,
-				AggregateSig: aggSig,
+				Round:              uint64(*cpRound),
+				StateHash:          state,
+				RosterHash:         ros,
+				RecordsRoot:        rec,
+				AggregateSig:       aggSig,
+				PrevCheckpointHash: prev,
 			}
 		}
 		files = append(files, f)

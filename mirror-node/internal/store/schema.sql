@@ -27,6 +27,7 @@ CREATE TABLE IF NOT EXISTS record_files (
 
 ALTER TABLE record_files ADD COLUMN IF NOT EXISTS records_root BYTEA;
 ALTER TABLE record_files ADD COLUMN IF NOT EXISTS aggregate_sig BYTEA CHECK (aggregate_sig IS NULL OR octet_length(aggregate_sig) = 96);
+ALTER TABLE record_files ADD COLUMN IF NOT EXISTS prev_checkpoint_hash BYTEA CHECK (prev_checkpoint_hash IS NULL OR octet_length(prev_checkpoint_hash) = 32);
 
 -- repeated RecordItem items — order inside the file matters, hence item_index in the key
 CREATE TABLE IF NOT EXISTS record_items (
