@@ -10,6 +10,7 @@ pub mod cli;
 pub mod config;
 pub mod control;
 pub mod format;
+pub mod lock;
 pub mod restart;
 pub mod storage;
 

@@ -340,6 +340,8 @@ async fn run_node(opts: &RunOptions) -> Result<()> {
     crate::format::check_or_init_data_dir(&opts.data_dir)
         .with_context(|| format!("checking data dir {}", opts.data_dir.display()))?;
 
+    let _dir_lock = crate::lock::acquire_data_dir_lock(&opts.data_dir)?;
+
     let storage = crate::storage::Storage::new(&opts.data_dir)?;
     let event_log = Arc::new(EventLog::open(&opts.data_dir)?);
     let state_db = Arc::new(StateDb::open(&opts.data_dir)?);
