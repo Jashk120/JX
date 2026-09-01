@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -223,7 +224,10 @@ func emptyHash() [32]byte {
 	return sha256.Sum256([]byte{0x00})
 }
 
-func leafHash(item *pb.RecordItem) [32]byte {
+func leafHash(item *pb.RecordItem) ([32]byte, error) {
+	if len(item.TxPayload) > math.MaxUint32 {
+		return [32]byte{}, fmt.Errorf("TxPayload length %d exceeds u32::MAX", len(item.TxPayload))
+	}
 	h := sha256.New()
 	h.Write([]byte{0x00})
 	eh := item.EventHash
@@ -241,7 +245,7 @@ func leafHash(item *pb.RecordItem) [32]byte {
 	h.Write(item.TxPayload)
 	var out [32]byte
 	copy(out[:], h.Sum(nil))
-	return out
+	return out, nil
 }
 
 func internalHash(left, right [32]byte) [32]byte {
@@ -285,7 +289,11 @@ func ComputeRecordsRoot(items []*pb.RecordItem) [32]byte {
 	}
 	leaves := make([][32]byte, len(items))
 	for i, it := range items {
-		leaves[i] = leafHash(it)
+		h, err := leafHash(it)
+		if err != nil {
+			h = emptyHash()
+		}
+		leaves[i] = h
 	}
 	paddedLen := 1
 	for paddedLen < len(leaves) {
@@ -309,7 +317,10 @@ func VerifyRecordsProof(root [32]byte, item *pb.RecordItem, proof *pb.ProofEntry
 	if proof == nil {
 		return false
 	}
-	cur := leafHash(item)
+	cur, err := leafHash(item)
+	if err != nil {
+		return false
+	}
 	for _, step := range proof.ProofSteps {
 		if len(step.SiblingHash) != 32 {
 			return false
