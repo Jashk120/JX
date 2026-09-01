@@ -169,7 +169,11 @@ impl Hashgraph {
         if voters.is_empty() {
             return None;
         }
-        let total = self.member_count_at_round(w_round + 1);
+        // AC-1: unify denominator to the voter's round (y_round = w_round+2)
+        // so eager and normal vote use the same threshold when roster grows.
+        // `vote_of` checks `has_supermajority` at `y_round`; the earliest y
+        // that could aggregate this r+1 tally is at r+2, hence total(r+2).
+        let total = self.member_count_at_round(w_round + 2);
         if voters.len() * 3 <= total * 2 {
             return None;
         }
