@@ -548,23 +548,37 @@ impl GossipNode {
     async fn log_fresh_inserts(&self, fresh: &[EventHash]) {
         let sink = self.event_sink.lock().await.clone();
         let stream_sink = self.event_stream_sink.lock().await.clone();
-        let hg = self.hashgraph.lock().await;
-        for hash in fresh {
-            if let Some(record) = hg.get(hash) {
-                let retained = consensus::RetainedEvent {
-                    event: record.event().clone(),
-                    seq: record.seq(),
-                    round: record.round(),
-                    ancestor_seqs: record.ancestor_seqs().to_vec(),
-                    round_received: None,
-                    consensus_timestamp: None,
-                };
-                if let Some(sink) = &sink {
-                    sink.append(&retained);
-                }
-                if let Some(stream_sink) = &stream_sink {
-                    storage::EventSink::append(&**stream_sink, &retained);
-                }
+        const MAX_SYNC_EVENT_COUNT: usize = 4096;
+        if fresh.len() > MAX_SYNC_EVENT_COUNT {
+            tracing::warn!(
+                fresh_len = fresh.len(),
+                limit = MAX_SYNC_EVENT_COUNT,
+                "fresh delta exceeds per-sync event cap, truncating"
+            );
+        }
+        let retained_vec: Vec<consensus::RetainedEvent> = {
+            let hg = self.hashgraph.lock().await;
+            fresh
+                .iter()
+                .take(MAX_SYNC_EVENT_COUNT)
+                .filter_map(|hash| {
+                    hg.get(hash).map(|record| consensus::RetainedEvent {
+                        event: record.event().clone(),
+                        seq: record.seq(),
+                        round: record.round(),
+                        ancestor_seqs: record.ancestor_seqs().to_vec(),
+                        round_received: None,
+                        consensus_timestamp: None,
+                    })
+                })
+                .collect()
+        };
+        for retained in &retained_vec {
+            if let Some(sink) = &sink {
+                sink.append(retained);
+            }
+            if let Some(stream_sink) = &stream_sink {
+                storage::EventSink::append(&**stream_sink, retained);
             }
         }
     }
