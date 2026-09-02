@@ -541,8 +541,10 @@ async fn run_until_shutdown(
 }
 
 async fn spawn_diagnosis_logger(node: Arc<GossipNode>, path: PathBuf, stop: Arc<AtomicBool>) {
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+    if let Some(parent) = path.parent()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        tracing::warn!(path = %parent.display(), error = %e, "diagnosis: create_dir_all failed");
     }
     let mut interval = tokio::time::interval(Duration::from_secs(1));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -570,11 +572,16 @@ async fn spawn_diagnosis_logger(node: Arc<GossipNode>, path: PathBuf, stop: Arc<
             "backoff_peers": backoff_peers,
         });
         let text = format!("{}\n", line);
-        if let Ok(mut file) =
-            tokio::fs::OpenOptions::new().create(true).append(true).open(&path).await
-        {
-            use tokio::io::AsyncWriteExt;
-            let _ = file.write_all(text.as_bytes()).await;
+        match tokio::fs::OpenOptions::new().create(true).append(true).open(&path).await {
+            Ok(mut file) => {
+                use tokio::io::AsyncWriteExt;
+                if let Err(e) = file.write_all(text.as_bytes()).await {
+                    tracing::warn!(path = %path.display(), error = %e, "diagnosis: write_all failed");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "diagnosis: open failed");
+            }
         }
         tracing::info!(
             sync_attempts = m.sync_attempts,
