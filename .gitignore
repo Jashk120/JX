@@ -49,6 +49,20 @@ Thumbs.db
 *~
 
 # ==========================================
+# Python (tests/ harness)
+# ==========================================
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+.coverage
+htmlcov/
+
+# ==========================================
 # Node daemon (consensus-node)
 # ==========================================
 
