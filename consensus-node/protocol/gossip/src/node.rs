@@ -995,7 +995,10 @@ impl GossipNode {
                 }
             }
         }
-        let _ = self.flush_streams(Duration::from_secs(5)).await;
+        if !self.flush_streams(Duration::from_secs(5)).await {
+            tracing::warn!("stream flush barrier timed out or failed");
+            self.gossip_metrics.lock().await.sync_failures += 1;
+        }
         Ok(())
     }
 
@@ -1483,6 +1486,7 @@ impl GossipNode {
                 round,
                 "refusing to accept checkpoint: snapshot does not rebuild to the committed state_hash"
             );
+            self.gossip_metrics.lock().await.sync_failures += 1;
             return;
         }
         // Durable copy: the `.snap` file is gone; a restart restores the
@@ -1657,7 +1661,9 @@ impl GossipNode {
     async fn gossip_checkpoint_sigs(&self, transport: &mut (impl SyncTransport + Send)) {
         let sigs = self.outbound_checkpoint_sigs.lock().await.clone();
         for sig in sigs {
-            if transport.send_frame(&Frame::CheckpointSig(sig)).await.is_err() {
+            if let Err(e) = transport.send_frame(&Frame::CheckpointSig(sig)).await {
+                tracing::warn!(error = %e, "failed to send CheckpointSig");
+                self.gossip_metrics.lock().await.sync_failures += 1;
                 return;
             }
         }
@@ -1667,7 +1673,11 @@ impl GossipNode {
         loop {
             let (stream, _) = match listener.accept().await {
                 Ok(accepted) => accepted,
-                Err(_) => continue,
+                Err(e) => {
+                    tracing::warn!(error = %e, "gossip accept failed");
+                    self.gossip_metrics.lock().await.sync_failures += 1;
+                    continue;
+                }
             };
             tokio::spawn(self.clone().handle_inbound(stream));
         }
@@ -1677,18 +1687,30 @@ impl GossipNode {
         let transport = TcpTransport::new(self.identity.clone());
         let acceptor = match transport.acceptor() {
             Ok(acceptor) => acceptor,
-            Err(_) => return,
+            Err(e) => {
+                tracing::warn!(error = %e, "inbound: failed to build TLS acceptor");
+                self.gossip_metrics.lock().await.sync_failures += 1;
+                return;
+            }
         };
         let tls = match acceptor.accept(stream).await {
             Ok(tls) => tls,
-            Err(_) => return,
+            Err(e) => {
+                tracing::warn!(error = %e, "inbound: TLS accept failed");
+                self.gossip_metrics.lock().await.sync_failures += 1;
+                return;
+            }
         };
         let mut transport = TcpTransport::from_tls_stream(self.identity.clone(), tls);
 
         loop {
             let frame = match transport.recv_frame().await {
                 Ok(frame) => frame,
-                Err(_) => return,
+                Err(e) => {
+                    tracing::warn!(error = %e, "inbound: recv_frame failed");
+                    self.gossip_metrics.lock().await.sync_failures += 1;
+                    return;
+                }
             };
             match frame {
                 Frame::SyncRequest(request) => {
@@ -2091,7 +2113,10 @@ impl GossipNode {
             retained,
             last_timestamp,
         };
-        let _ = transport.send_frame(&Frame::ReconnectResponse(response)).await;
+        if let Err(e) = transport.send_frame(&Frame::ReconnectResponse(response)).await {
+            tracing::warn!(error = %e, "failed to send ReconnectResponse");
+            self.gossip_metrics.lock().await.sync_failures += 1;
+        }
     }
 
     /// Phase 4 — the checkpoint a reconnect learner should be served.
