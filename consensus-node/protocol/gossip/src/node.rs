@@ -1863,8 +1863,17 @@ impl GossipNode {
         //    root. The teacher serves the state exactly as it stood at the
         //    checkpoint round, so this holds; the learner replays only the
         //    retained events newer than the checkpoint (step 7's watermark).
-        //    The live partition is reset first so the rebuilt state is exactly
-        //    the served bytes, not a merge with any prior contents.
+        //    Validate before touching the live partition so invalid bytes
+        //    never wipe the current state — mirrors the
+        //    `root_of_bytes == state_hash` guard in `accept_checkpoint`.
+        let Some(verified_root) = state::State::root_of_bytes(&response.state_bytes) else {
+            tracing::error!("reconnect: invalid state bytes from peer");
+            return false;
+        };
+        if verified_root != checkpoint.payload.state_hash {
+            tracing::error!("reconnect: state hash mismatch; rejecting checkpoint");
+            return false;
+        }
         let state = {
             if let Err(e) = self.state_db.clear_state() {
                 tracing::error!(error = %e, "reconnect: failed to reset state partition");
@@ -1878,10 +1887,7 @@ impl GossipNode {
             };
             state
         };
-        if state.root() != checkpoint.payload.state_hash {
-            tracing::error!("reconnect: state hash mismatch; rejecting checkpoint");
-            return false;
-        }
+        debug_assert_eq!(state.root(), checkpoint.payload.state_hash);
 
         // 2. Decode the roster history.
         let Some(roster_history) = consensus::decode_roster_history(&response.roster_history_bytes)
