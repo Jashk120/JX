@@ -194,7 +194,7 @@ mod tests {
             );
             let witnesses = self.hg.witnesses_of_round(base).to_vec();
             let count = self.strongly_seen(x, &witnesses).len();
-            if count * 3 > self.hg.member_count() * 2 { base + 1 } else { base }
+            if count * 3 > self.hg.member_count_at_round(base) * 2 { base + 1 } else { base }
         }
     }
 
@@ -457,5 +457,57 @@ mod tests {
         assert_eq!(g.hg.latest_event_by(&NodeId::new(4)), Some(&g.events["d4"]));
         // `latest_event_by` for c still points to c3 (no newer c event).
         assert_eq!(g.hg.latest_event_by(&NodeId::new(3)), Some(&g.events["c3"]));
+    }
+
+    #[test]
+    fn expected_round_matches_production_across_membership_transition() {
+        let mut g = DynamicGraph::new(&["a", "b", "c"]);
+        g.build(&[
+            ("a1", "a", None, None),
+            ("b1", "b", None, None),
+            ("c1", "c", None, None),
+            ("a2", "a", Some("a1"), Some("b1")),
+            ("b2", "b", Some("b1"), Some("c1")),
+            ("c2", "c", Some("c1"), Some("a2")),
+        ]);
+        for &label in &["a1", "b1", "c1", "a2", "b2", "c2"] {
+            let h = g.events[label];
+            assert_eq!(
+                g.hg.get(&h).unwrap().round(),
+                g.expected_round(&h),
+                "pre-join {label} round must match roster-aware oracle"
+            );
+        }
+        let key_d = SigningKey::generate(&mut OsRng);
+        let node_d = NodeId::new(4);
+        let mut expanded = g.registry.clone();
+        expanded.register(
+            node_d,
+            key_d.verifying_key(),
+            crypto::BlsIdentity::from_ikm(&[0u8; 32]).expect("bls").public.to_bytes(),
+        );
+        g.hg.add_member(node_d, 1, expanded.clone());
+        assert_eq!(g.hg.member_count_at_round(1), 3);
+        assert_eq!(g.hg.member_count_at_round(2), 4);
+        g.nodes.insert("d", (node_d, key_d));
+        g.registry = expanded;
+        g.build(&[
+            ("a3", "a", Some("a2"), Some("c2")),
+            ("b3", "b", Some("b2"), Some("a3")),
+            ("c3", "c", Some("c2"), Some("b3")),
+            ("d1", "d", None, Some("c3")),
+            ("a4", "a", Some("a3"), Some("d1")),
+            ("b4", "b", Some("b3"), Some("a4")),
+            ("c4", "c", Some("c3"), Some("b4")),
+            ("d2", "d", Some("d1"), Some("c4")),
+        ]);
+        for &label in &["a3", "b3", "c3", "d1", "a4", "b4", "c4", "d2"] {
+            let h = g.events[label];
+            assert_eq!(
+                g.hg.get(&h).unwrap().round(),
+                g.expected_round(&h),
+                "post-join {label} round must match roster-aware oracle"
+            );
+        }
     }
 }
