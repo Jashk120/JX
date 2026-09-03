@@ -432,6 +432,14 @@ impl GossipNode {
         self.fanout
     }
 
+    pub fn set_dedup_enabled(&mut self, enabled: bool) {
+        self.sync_config.filter_likely_duplicates = enabled;
+    }
+
+    pub fn dedup_enabled(&self) -> bool {
+        self.sync_config.filter_likely_duplicates
+    }
+
     pub async fn gossip_metrics_snapshot(&self) -> GossipMetrics {
         self.gossip_metrics.lock().await.clone()
     }
