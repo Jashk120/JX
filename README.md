@@ -93,18 +93,18 @@ Live `tests/harness/` on `consensus-node/target/debug/jkaind` (`cargo build --wo
 
 Peak **2,002 TPS decided (10,474 TPS submit) @ 2,500tx conc40** — `MAX_PENDING 1024` per node ×6.
 
-### Event gap 80ms (prod default) vs 250ms vs 500ms — projection
+### Event gap 500ms (prod default) vs 80ms vs 250ms — projection
 
-Gap = `ClusterConfig(sync_interval_ms)` / `node/src/cli/run.rs:DEFAULT_SYNC_INTERVAL 80ms`. Latency ≈ `k·gap·logN`, Throughput ≈ `64·6/gap·0.13`.
+Gap = `ClusterConfig(sync_interval_ms)` / `node/src/cli/run.rs:DEFAULT_SYNC_INTERVAL 500ms`. Latency ≈ `k·gap·logN`, Throughput ≈ `64·6/gap·0.13`.
 
 | sync_interval | vs 25ms | **latency p50** | **decided TPS** | submit TPS | `k10temp` |
 |---:|---:|---:|---:|---:|---:|
 | **25ms** (harness) | 1× | **0.54s** | **2,002** | 10,474 | 90-97°C (rambo kill unless `protect`) |
-| **80ms** (prod `DEFAULT_SYNC_INTERVAL`) | 3.2× | **~1.7s** | **~625** | ~3,270 | ~70°C |
+| **80ms** | 3.2× | **~1.7s** | **~625** | ~3,270 | ~70°C |
 | **250ms** | 10× | **~5.4s** | **~200** | ~1,047 | ~50°C |
-| **500ms** | 20× | **~10.7s** | **~100** | ~523 | ~45°C |
+| **500ms** (prod `DEFAULT_SYNC_INTERVAL`) | 20× | **~10.7s** | **~100** | ~523 | ~45°C |
 
-Verify: `ClusterConfig(num_nodes=6, sync_interval_ms=80)` / `250` / `500`.
+Verify: `ClusterConfig(num_nodes=6, sync_interval_ms=500)` (prod) / `80` / `250`.
 
 ### Concurrent fanout k=4 (T12, N=6, `sync_interval 25ms`, `FanoutMode::Auto`)
 

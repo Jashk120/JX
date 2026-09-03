@@ -45,7 +45,6 @@ use tokio::net::{
 use tokio::sync::{
     Mutex,
     Notify,
-    Semaphore,
 };
 use tokio::task::JoinSet;
 
@@ -239,7 +238,13 @@ pub fn outbound_capacity(n: usize) -> NonZeroUsize {
     } else {
         10 + (n - 6) * 20 / (100 - 6)
     };
-    NonZeroUsize::new(cap).expect("outbound capacity must be non-zero")
+    match NonZeroUsize::new(cap) {
+        Some(v) => v,
+        None => {
+            tracing::warn!(cap, "outbound capacity zero, using fallback 1");
+            NonZeroUsize::MIN
+        }
+    }
 }
 
 const MAX_PENDING_SIGS_PER_ROUND: usize = 64;
@@ -358,8 +363,28 @@ impl GossipNode {
         sync_timing: SyncTiming,
         state_db: Arc<state::StateDb>,
     ) -> Self {
-        let bls_identity =
-            BlsIdentity::from_ikm(&signing_key.to_bytes()).expect("BLS identity from signing key");
+        let bls_identity = match BlsIdentity::from_ikm(&signing_key.to_bytes()) {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::error!(error = %e, "BLS identity derivation failed, using fallback");
+                let mut fallback = None;
+                for &fill in &[0u8, 1u8, 2u8] {
+                    if let Ok(id) = BlsIdentity::from_ikm(&[fill; 32]) {
+                        fallback = Some(id);
+                        break;
+                    }
+                }
+                if let Some(id) = fallback {
+                    id
+                } else {
+                    loop {
+                        if let Ok(id) = BlsIdentity::generate() {
+                            break id;
+                        }
+                    }
+                }
+            }
+        };
         Self::new_with_bls(
             node_id,
             signing_key,
@@ -480,14 +505,16 @@ impl GossipNode {
     /// new roster is scheduled to activate.
     pub async fn members(&self) -> Vec<(NodeId, VerifyingKey)> {
         let registry = self.registry.lock().await;
-        registry
-            .member_ids()
-            .into_iter()
-            .map(|id| {
-                let key = registry.key_for(&id).expect("registered member has a key");
-                (id, *key)
-            })
-            .collect()
+        let mut out = Vec::new();
+        for id in registry.member_ids() {
+            match registry.key_for(&id) {
+                Ok(k) => out.push((id, *k)),
+                Err(e) => {
+                    tracing::warn!(node_id = ?id, error = %e, "registered member missing key, skipping");
+                }
+            }
+        }
+        out
     }
 
     /// Queues a raw transaction payload to be included in this node's next
@@ -979,18 +1006,15 @@ impl GossipNode {
                 self.process_finalized_rounds().await;
                 continue;
             }
-            let semaphore = Arc::new(Semaphore::new(k));
+            // Per-tick bound: `pick_k(k)` returns at most `k` peers, and the
+            // `JoinSet` is drained before the next tick, so intra-tick
+            // semaphore backpressure is unnecessary. A fresh per-tick
+            // `Semaphore` would never contend, making the `else` branch dead
+            // code; the bound is enforced by `pick_k` alone.
             let mut join_set: JoinSet<()> = JoinSet::new();
             let payload = self.drain_pending_transactions().await;
             let mut spawned: usize = 0;
             for peer in peers {
-                let permit = match semaphore.clone().try_acquire_owned() {
-                    Ok(p) => p,
-                    Err(_) => {
-                        tracing::debug!("fanout backpressure: skip spawn, k in-flight");
-                        break;
-                    }
-                };
                 spawned += 1;
                 let outbound = outbound.clone();
                 let self_clone = self.clone();
@@ -999,7 +1023,6 @@ impl GossipNode {
                 let registry_clone = self_clone.registry.lock().await.clone();
                 let metrics = self_clone.gossip_metrics.clone();
                 join_set.spawn(async move {
-                    let _permit = permit;
                     let start = std::time::Instant::now();
                     let (transport_arc, cache_hit) = {
                         let mut cache = outbound.lock().await;
@@ -1443,11 +1466,13 @@ impl GossipNode {
         snapshots: &BTreeMap<u64, Vec<u8>>,
         diffs: &BTreeMap<u64, Vec<stream::pb::StateDiff>>,
     ) {
-        let snapshot_bytes = snapshots
-            .range(..=round)
-            .next_back()
-            .map(|(_, bytes)| bytes.clone())
-            .expect("the round-0 sentinel always present");
+        let Some(snapshot_bytes) =
+            snapshots.range(..=round).next_back().map(|(_, bytes)| bytes.clone())
+        else {
+            tracing::error!(round, "round-0 sentinel missing, skipping checkpoint");
+            self.gossip_metrics.lock().await.sync_failures += 1;
+            return;
+        };
         let diffs_for_round = diffs.get(&round).cloned().unwrap_or_default();
         let signed_snapshot = self.signed_checkpoints.lock().await.clone();
         let payload = {
@@ -1870,6 +1895,7 @@ impl GossipNode {
             };
             match frame {
                 Frame::SyncRequest(request) => {
+                    let registry_snapshot = self.registry.lock().await.clone();
                     let delta_result = {
                         let hashgraph = self.hashgraph.lock().await;
                         let mut dedup_map = self.dedup_state.lock().await;
@@ -1879,6 +1905,7 @@ impl GossipNode {
                         delta_events_filtered(
                             &hashgraph,
                             &request.known,
+                            &registry_snapshot,
                             self.node_id,
                             target_peer,
                             dedup,
@@ -1946,7 +1973,7 @@ impl GossipNode {
         state_db: Arc<state::StateDb>,
     ) -> Result<Self> {
         let bls_identity =
-            BlsIdentity::from_ikm(&signing_key.to_bytes()).expect("BLS identity from signing key");
+            BlsIdentity::from_ikm(&signing_key.to_bytes()).map_err(|e| GossipError::Crypto(e))?;
         Self::from_checkpoint_with_bls(
             node_id,
             signing_key,

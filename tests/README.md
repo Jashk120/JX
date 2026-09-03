@@ -242,9 +242,9 @@ Live run on `consensus-node/target/debug/jkaind` (ELF, `cargo build --workspace`
 
 Earlier single-node `benchmark_tps(300, conc10)`: `submit 338 → decided 268 TPS` avg.
 
-### Event gap 80ms (prod default) vs 250ms vs 500ms — projection
+### Event gap 500ms (prod default) vs 80ms vs 250ms — projection
 
-Current harness uses `ClusterConfig(sync_interval_ms=25, sync_timeout_ms=500)` (`consensus-node/node/src/cli/run.rs` default is `80ms`). Event gap = gossip sync period = how often a node picks a random peer and creates `Event(self_parent, other_parent)` via `GossipNode::run_until_stopped`.
+Current harness uses `ClusterConfig(sync_interval_ms=25, sync_timeout_ms=500)` (`consensus-node/node/src/cli/run.rs` default is `500ms`). Event gap = gossip sync period = how often a node picks a random peer and creates `Event(self_parent, other_parent)` via `GossipNode::run_until_stopped`.
 
 Model (empirical from 25ms run):
 
@@ -254,15 +254,15 @@ Model (empirical from 25ms run):
 | sync_interval | vs 25ms | **latency p50** (proj.) | **decided TPS** (proj.) | submit TPS | CPU `k10temp` (peak 90°C kill) |
 |---:|---:|---:|---:|---:|---:|
 | **25ms** (harness) | 1× | **0.54s** (measured) | **2,002** (measured) | 10,474 | 90-97°C (rambo kills `bash` unless protected) |
-| **80ms** (prod `DEFAULT_SYNC_INTERVAL`) | 3.2× | **~1.7s** (0.54×3.2) `p95 ~3.6s` | **~625 TPS** (2002×25/80) | ~3,270 | ~70°C (3× less wakeups) |
+| **80ms** | 3.2× | **~1.7s** (0.54×3.2) `p95 ~3.6s` | **~625 TPS** (2002×25/80) | ~3,270 | ~70°C (3× less wakeups) |
 | **250ms** | 10× | **~5.4s** (0.54×10) `p95 ~11s` | **~200 TPS** (2002×25/250) | ~1,047 | ~50°C |
-| **500ms** | 20× | **~10.7s** (0.54×20) `p95 ~22s` | **~100 TPS** (2002×25/500) | ~523 | ~45°C |
+| **500ms** (prod `DEFAULT_SYNC_INTERVAL`) | 20× | **~10.7s** (0.54×20) `p95 ~22s` | **~100 TPS** (2002×25/500) | ~523 | ~45°C |
 
 Notes:
 
 - Latency scales almost linearly because gossip is the dominant phase (`100%` @25ms). At 500ms, `gossip 10.7s` + `consensus 0.05s` + `checkpoint ~0.1s` → ~10.8s total. Real `p95` higher due to jitter.
 - Throughput scales `1/interval` but consensus batching (more tx per round) partially compensates: at 500ms each event carries `64` tx max, but rounds are larger, so `100 TPS` is ~15× less than submit theoretical `64*6/0.5=768` → `efficiency 0.13` holds.
-- Production default `80ms` was chosen (`node/src/cli/run.rs:DEFAULT_SYNC_INTERVAL 80ms`) as sweet spot: **~1.7s finality, ~625 TPS, ~70°C** vs 25ms `0.5s/2k TPS` (hot) vs 500ms `10s/100 TPS` (cold). If you run heavy TPS on 80ms, use `rambo protect` (already done: `jkaind,bash,python*`) or raise `temperature.critical 90→95` (`rambo threshold set --temp-critical 95`).
+- Production default `500ms` was chosen (`node/src/cli/run.rs:DEFAULT_SYNC_INTERVAL 500ms`) as thermal-conservative: **~10.7s finality, ~100 TPS, ~45°C** vs 80ms `~1.7s/625 TPS` vs 25ms `0.5s/2k TPS` (hot). If you run heavy TPS on 500ms, tune `sync_interval` lower via `--sync-interval` or raise `temperature.critical` (`rambo threshold set --temp-critical 95`).
 
 To verify projection live:
 
