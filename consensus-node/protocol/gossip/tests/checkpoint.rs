@@ -231,7 +231,7 @@ async fn pruning_old_events_does_not_break_ordering_after_checkpoint() {
 async fn from_checkpoint_rejects_roster_key_mismatched_to_the_learner() {
     let roster = registry_for_ids(&[1, 4]);
     let state = state::State::new(temp_state_db().state_keyspace());
-    let state_bytes = state.to_bytes();
+    let state_bytes = state.to_bytes().expect("to_bytes succeeds");
     let state_hash = state.root();
     let payload =
         CheckpointPayload::new(1, consensus::compute_records_root(&[]), state_hash, roster.clone());
