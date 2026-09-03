@@ -1272,7 +1272,16 @@ impl GossipNode {
             let (state_hashes, snapshots, diffs) = {
                 let (pre_batch_hash, pre_batch_bytes) = {
                     let executor = self.executor.lock().await;
-                    (executor.state().root(), executor.state().to_bytes())
+                    let root = executor.state().root();
+                    let bytes = match executor.state().to_bytes() {
+                        Ok(b) => b,
+                        Err(e) => {
+                            tracing::error!(error = %e, "to_bytes failed for pre-batch snapshot, aborting checkpoint production");
+                            self.gossip_metrics.lock().await.sync_failures += 1;
+                            return;
+                        }
+                    };
+                    (root, bytes)
                 };
                 let mut activation = self.activation.lock().await;
                 let mut executor = self.executor.lock().await;
@@ -1312,14 +1321,22 @@ impl GossipNode {
                         })
                         .unwrap_or_default();
                     let after_root = executor.state().root();
+                    let snapshot = match executor.state().to_bytes() {
+                        Ok(b) => b,
+                        Err(e) => {
+                            tracing::error!(round, error = %e, "to_bytes failed, aborting checkpoint production for round");
+                            self.gossip_metrics.lock().await.sync_failures += 1;
+                            return;
+                        }
+                    };
                     if round > original_watermark {
                         hashes.insert(round, after_root);
-                        snapshots.insert(round, executor.state().to_bytes());
+                        snapshots.insert(round, snapshot);
                         diffs.insert(round, pb_diffs);
                     } else {
                         if after_root != before_root {
                             hashes.insert(*processed_through_round, after_root);
-                            snapshots.insert(*processed_through_round, executor.state().to_bytes());
+                            snapshots.insert(*processed_through_round, snapshot);
                         }
                         if !pb_diffs.is_empty() {
                             let target = *processed_through_round;
@@ -1445,9 +1462,17 @@ impl GossipNode {
             };
             self.produce_pending_checkpoints(&cumulative_state_hashes, &snapshots, &diffs).await;
         } else {
-            let (bytes, _root) = {
+            let bytes = {
                 let executor = self.executor.lock().await;
-                (executor.state().to_bytes(), executor.state().root())
+                match executor.state().to_bytes() {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::error!(error = %e, "to_bytes failed in empty-finalized path, aborting checkpoint production");
+                        self.gossip_metrics.lock().await.sync_failures += 1;
+                        self.checkpoint_notify.notify_waiters();
+                        return;
+                    }
+                }
             };
             let cumulative_state_hashes = self.cumulative_state_hashes.lock().await.clone();
             let snapshots = BTreeMap::from([(0, bytes)]);
@@ -2589,7 +2614,7 @@ mod pending_sig_tests {
         node.pending_checkpoint_sigs.lock().await.insert(3, vec![sig(3, 2)]);
         node.pending_checkpoint_sigs.lock().await.insert(5, vec![sig(5, 2)]);
         node.hashgraph.lock().await.mark_decided_through(5);
-        let snapshot = node.executor.lock().await.state().to_bytes();
+        let snapshot = node.executor.lock().await.state().to_bytes().expect("to_bytes succeeds");
         let state_hash = state::State::root_of_bytes(&snapshot).expect("empty state hashes");
         let payload = consensus::CheckpointPayload::new(
             5,

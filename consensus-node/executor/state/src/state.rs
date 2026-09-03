@@ -92,16 +92,19 @@ impl State {
     /// (key, value) pair per entry, in ascending key order. Two states that
     /// are `==` serialize to identical bytes, so this is the check to use for
     /// "bit-identical state across nodes".
-    pub fn to_bytes(&self) -> Vec<u8> {
+    ///
+    /// Returns `Err` on any transient Fjall read error instead of silently
+    /// truncating (AH-7): callers must abort checkpoint production and keep the
+    /// round un-decided until serialization succeeds, so a transient I/O error
+    /// never produces a divergent truncated root.
+    pub fn to_bytes(&self) -> StateDbResult<Vec<u8>> {
         let mut buf = Vec::new();
         for guard in self.kv.iter() {
-            let Ok((key, value)) = guard.into_inner() else {
-                break;
-            };
+            let (key, value) = guard.into_inner()?;
             write_bytes(&mut buf, key.as_slice());
             write_bytes(&mut buf, value.as_slice());
         }
-        buf
+        Ok(buf)
     }
 
     /// The inverse of [`State::to_bytes`]: parses the length-prefixed
@@ -170,7 +173,10 @@ impl std::fmt::Debug for State {
 
 impl PartialEq for State {
     fn eq(&self, other: &Self) -> bool {
-        self.to_bytes() == other.to_bytes()
+        match (self.to_bytes(), other.to_bytes()) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => false,
+        }
     }
 }
 
@@ -257,7 +263,7 @@ mod tests {
         expected.extend_from_slice(&1u32.to_be_bytes());
         expected.extend_from_slice(b"2");
 
-        assert_eq!(state.to_bytes(), expected);
+        assert_eq!(state.to_bytes().expect("to_bytes succeeds"), expected);
     }
 
     #[test]
@@ -269,7 +275,9 @@ mod tests {
 
         let dir = tempdir().expect("temp dir");
         let db = StateDb::open(dir.path()).expect("opens");
-        let rebuilt = State::from_bytes(db.state_keyspace(), &state.to_bytes()).expect("rebuilds");
+        let rebuilt =
+            State::from_bytes(db.state_keyspace(), &state.to_bytes().expect("to_bytes succeeds"))
+                .expect("rebuilds");
         assert_eq!(rebuilt, state);
     }
 
@@ -277,7 +285,7 @@ mod tests {
     fn from_bytes_rejects_truncated_input() {
         let mut state = new_state();
         assert!(state.apply(&Op::Put { key: b"k".to_vec(), value: b"value".to_vec() }).is_ok());
-        let bytes = state.to_bytes();
+        let bytes = state.to_bytes().expect("to_bytes succeeds");
 
         // Truncate inside the length prefix, inside the key, and inside the value.
         assert_eq!(State::from_bytes(new_state().kv, &bytes[..1]), None);
@@ -289,7 +297,7 @@ mod tests {
     fn from_bytes_rejects_overflowing_length() {
         let mut state = new_state();
         assert!(state.apply(&Op::Put { key: b"k".to_vec(), value: b"v".to_vec() }).is_ok());
-        let bytes = state.to_bytes();
+        let bytes = state.to_bytes().expect("to_bytes succeeds");
         // A length prefix claiming more bytes than the buffer holds.
         let mut bad = bytes[..4].to_vec();
         bad.extend_from_slice(&u32::MAX.to_be_bytes());
@@ -331,7 +339,9 @@ mod tests {
     fn from_bytes_rebuilds_the_tree() {
         let mut state = new_state();
         assert!(state.apply(&Op::Put { key: b"k".to_vec(), value: b"v".to_vec() }).is_ok());
-        let rebuilt = State::from_bytes(new_state().kv, &state.to_bytes()).expect("decodes");
+        let rebuilt =
+            State::from_bytes(new_state().kv, &state.to_bytes().expect("to_bytes succeeds"))
+                .expect("decodes");
         assert_eq!(rebuilt.root(), state.root());
         let proof = rebuilt.proof(b"k").expect("present");
         assert!(proof.verify(&state.root()));
@@ -376,7 +386,7 @@ mod tests {
         assert!(state.apply(&Op::Put { key: b"b".to_vec(), value: b"2".to_vec() }).is_ok());
         assert!(state.apply(&Op::Put { key: b"c".to_vec(), value: b"3".to_vec() }).is_ok());
         assert!(state.apply(&Op::Delete { key: b"b".to_vec() }).is_ok());
-        let bytes = state.to_bytes();
+        let bytes = state.to_bytes().expect("to_bytes succeeds");
         assert_eq!(State::root_of_bytes(&bytes), Some(state.root()));
     }
 
@@ -392,7 +402,7 @@ mod tests {
         let mut state = State::new(db.state_keyspace());
         assert!(state.apply(&Op::Put { key: b"k".to_vec(), value: b"value".to_vec() }).is_ok());
         assert!(state.apply(&Op::Put { key: b"a".to_vec(), value: b"1".to_vec() }).is_ok());
-        let bytes = state.to_bytes();
+        let bytes = state.to_bytes().expect("to_bytes succeeds");
         assert!(!bytes.is_empty());
         let truncated = &bytes[..bytes.len() - 1];
         assert_eq!(State::root_of_bytes(truncated), None);

@@ -865,7 +865,10 @@ mod tests {
         assert_eq!(exec_b.state().get(b"late"), Some(b"1".to_vec()));
 
         assert_eq!(exec_a.state().root(), exec_b.state().root());
-        assert_eq!(exec_a.state().to_bytes(), exec_b.state().to_bytes());
+        assert_eq!(
+            exec_a.state().to_bytes().expect("to_bytes succeeds"),
+            exec_b.state().to_bytes().expect("to_bytes succeeds")
+        );
     }
 
     #[test]

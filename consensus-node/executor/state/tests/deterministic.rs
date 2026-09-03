@@ -177,7 +177,10 @@ fn same_transaction_order_yields_bit_identical_state() {
     }
 
     assert_eq!(left.state(), right.state());
-    assert_eq!(left.state().to_bytes(), right.state().to_bytes());
+    assert_eq!(
+        left.state().to_bytes().expect("to_bytes succeeds"),
+        right.state().to_bytes().expect("to_bytes succeeds")
+    );
 
     assert_eq!(left.state().get(b"alice"), Some(b"300".to_vec()));
     assert_eq!(left.state().get(b"bob"), Some(b"200".to_vec()));
@@ -208,7 +211,10 @@ fn same_finalized_order_yields_bit_identical_state() {
     }
 
     assert_eq!(left.state(), right.state());
-    assert_eq!(left.state().to_bytes(), right.state().to_bytes());
+    assert_eq!(
+        left.state().to_bytes().expect("to_bytes succeeds"),
+        right.state().to_bytes().expect("to_bytes succeeds")
+    );
     assert!(!left.state().is_empty(), "payload transactions must reach the state");
 }
 

@@ -316,7 +316,7 @@ mod tests {
     fn empty_state_bytes_and_root() -> (Vec<u8>, [u8; 32]) {
         let db = TestDb::new();
         let state = state::State::new(db.db.state_keyspace());
-        (state.to_bytes(), state.root())
+        (state.to_bytes().expect("to_bytes succeeds"), state.root())
     }
 
     #[test]
@@ -339,7 +339,7 @@ mod tests {
         other
             .apply(&state::Op::Put { key: b"k".to_vec(), value: b"v".to_vec() })
             .expect("apply to fresh state succeeds");
-        db.db.snapshot(3, &other.to_bytes()).expect("snapshot");
+        db.db.snapshot(3, &other.to_bytes().expect("to_bytes succeeds")).expect("snapshot");
         let state = PersistedCheckpoint { checkpoint };
         assert!(!verify_persisted(&state, &db.db), "mismatched state bytes must fail");
     }
