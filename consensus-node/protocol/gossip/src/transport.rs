@@ -3,6 +3,7 @@
 use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use quinn::crypto::rustls::QuicClientConfig;
 #[cfg(any(test, feature = "tcp-fallback", debug_assertions))]
@@ -99,7 +100,11 @@ impl QuicTransport {
             .map_err(|e| GossipError::Identity(format!("quinn client_config: {e}")))?;
         let quinn_crypto = QuicClientConfig::try_from(rustls_config)
             .map_err(|e| GossipError::Identity(format!("quinn QuicClientConfig: {e}")))?;
-        let quinn_config = quinn::ClientConfig::new(Arc::new(quinn_crypto));
+        let mut quinn_config = quinn::ClientConfig::new(Arc::new(quinn_crypto));
+        let mut transport = quinn::TransportConfig::default();
+        transport.max_concurrent_bidi_streams(quinn::VarInt::from_u32(128));
+        transport.keep_alive_interval(Some(Duration::from_secs(10)));
+        quinn_config.transport_config(Arc::new(transport));
         let mut endpoint =
             quinn::Endpoint::client("0.0.0.0:0".parse::<SocketAddr>().expect("valid bind addr"))
                 .map_err(|e| GossipError::Io(std::io::Error::other(e.to_string())))?;
@@ -111,7 +116,12 @@ impl QuicTransport {
         let rustls_server = self.tls_identity.server_config()?;
         let quinn_server = quinn::crypto::rustls::QuicServerConfig::try_from(rustls_server)
             .map_err(|e| GossipError::Identity(format!("quinn QuicServerConfig: {e}")))?;
-        Ok(quinn::ServerConfig::with_crypto(Arc::new(quinn_server)))
+        let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quinn_server));
+        let mut transport = quinn::TransportConfig::default();
+        transport.max_concurrent_bidi_streams(quinn::VarInt::from_u32(128));
+        transport.keep_alive_interval(Some(Duration::from_secs(10)));
+        server_config.transport = Arc::new(transport);
+        Ok(server_config)
     }
     pub fn acceptor(&self) -> Result<TlsAcceptor> {
         let config = self.tls_identity.server_config()?;
@@ -181,6 +191,9 @@ impl SyncTransport for QuicTransport {
         Ok(())
     }
     async fn send_frame(&mut self, frame: &Frame) -> Result<()> {
+        // M-2: one bidi stream per frame is kept for now for wire-format
+        // compatibility with the TCP fallback. Stream reuse per peer would
+        // avoid churn; budget is set via TransportConfig::max_concurrent_bidi_streams.
         let conn = self.connection.as_ref().ok_or(GossipError::Closed)?.clone();
         let (mut send, _recv) = conn
             .open_bi()
