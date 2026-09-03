@@ -113,9 +113,16 @@ impl State {
     pub fn from_bytes(kv: Arc<Keyspace>, bytes: &[u8]) -> Option<Self> {
         let mut state = Self::new(kv);
         let mut cursor = bytes;
+        let mut prev_key: Option<Vec<u8>> = None;
         while !cursor.is_empty() {
             let key = read_bytes(&mut cursor)?;
             let value = read_bytes(&mut cursor)?;
+            if let Some(prev) = &prev_key
+                && key <= *prev
+            {
+                return None;
+            }
+            prev_key = Some(key.clone());
             state.kv.insert(key.as_slice(), value.as_slice()).ok()?;
             state.tree.insert(&key, &value);
         }
@@ -131,9 +138,16 @@ impl State {
     pub fn root_of_bytes(bytes: &[u8]) -> Option<[u8; 32]> {
         let mut tree = SparseMerkleTree::new();
         let mut cursor = bytes;
+        let mut prev_key: Option<Vec<u8>> = None;
         while !cursor.is_empty() {
             let key = read_bytes(&mut cursor)?;
             let value = read_bytes(&mut cursor)?;
+            if let Some(prev) = &prev_key
+                && key <= *prev
+            {
+                return None;
+            }
+            prev_key = Some(key.clone());
             tree.insert(&key, &value);
         }
         Some(tree.root())
@@ -383,5 +397,46 @@ mod tests {
         let truncated = &bytes[..bytes.len() - 1];
         assert_eq!(State::root_of_bytes(truncated), None);
         assert_eq!(State::root_of_bytes(&[0u8, 0, 0, 9, b'a']), None);
+    }
+
+    fn encode_entry(key: &[u8], value: &[u8], out: &mut Vec<u8>) {
+        out.extend_from_slice(&(key.len() as u32).to_be_bytes());
+        out.extend_from_slice(key);
+        out.extend_from_slice(&(value.len() as u32).to_be_bytes());
+        out.extend_from_slice(value);
+    }
+
+    #[test]
+    fn from_bytes_rejects_unsorted() {
+        let mut unsorted = Vec::new();
+        encode_entry(b"b", b"2", &mut unsorted);
+        encode_entry(b"a", b"1", &mut unsorted);
+        assert_eq!(State::from_bytes(new_state().kv, &unsorted), None);
+        assert_eq!(State::root_of_bytes(&unsorted), None);
+    }
+
+    #[test]
+    fn from_bytes_rejects_duplicate() {
+        let mut dup = Vec::new();
+        encode_entry(b"a", b"1", &mut dup);
+        encode_entry(b"a", b"2", &mut dup);
+        assert_eq!(State::from_bytes(new_state().kv, &dup), None);
+        assert_eq!(State::root_of_bytes(&dup), None);
+    }
+
+    #[test]
+    fn root_of_bytes_rejects_unsorted() {
+        let mut unsorted = Vec::new();
+        encode_entry(b"z", b"1", &mut unsorted);
+        encode_entry(b"m", b"2", &mut unsorted);
+        assert_eq!(State::root_of_bytes(&unsorted), None);
+    }
+
+    #[test]
+    fn root_of_bytes_rejects_duplicate() {
+        let mut dup = Vec::new();
+        encode_entry(b"dup", b"1", &mut dup);
+        encode_entry(b"dup", b"1", &mut dup);
+        assert_eq!(State::root_of_bytes(&dup), None);
     }
 }
