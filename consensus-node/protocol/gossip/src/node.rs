@@ -2162,6 +2162,11 @@ impl GossipNode {
         //    malicious teacher must not be able to poison the learner's
         //    graph with forged events.
         let stream_sink = self.event_stream_sink.lock().await.clone();
+        // 5. Rebuild the hashgraph scaffold and load the teacher's retained
+        //    graph into it. Verification and insertion happen under the
+        //    hashgraph lock; durable appends are deferred until the lock is
+        //    released so blocking Fjall I/O never runs while a tokio Mutex is
+        //    held (AH-4: executor starvation / deadlock).
         {
             let mut hg = self.hashgraph.lock().await;
             *hg = consensus::Hashgraph::from_checkpoint(&checkpoint.payload, roster_history);
@@ -2188,17 +2193,22 @@ impl GossipNode {
                     tracing::error!(error = %e, "reconnect: retained event rejected");
                     return false;
                 }
-                if let Some(sink) = &sink {
-                    sink.append(retained);
-                }
-                if let Some(stream_sink) = &stream_sink {
-                    stream_sink.append(retained);
-                }
             }
             // Rounds the teacher already finalized stay finalized here, so
             // this node keeps producing matching checkpoints instead of
             // re-deciding history it holds.
             hg.mark_decided_through(response.decided_round);
+        }
+        // Blocking Fjall appends outside the hashgraph lock (AH-4).
+        if sink.is_some() || stream_sink.is_some() {
+            for retained in &response.retained {
+                if let Some(s) = &sink {
+                    s.append(retained);
+                }
+                if let Some(ss) = &stream_sink {
+                    ss.append(retained);
+                }
+            }
         }
 
         // Persist the roster history (Phase 8) so a future restart can
