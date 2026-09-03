@@ -84,11 +84,35 @@ pub struct GossipMetrics {
     pub sync_attempts: u64,
     pub sync_success: u64,
     pub sync_failures: u64,
+    /// EWMA (alpha 0.1, fast) — **NOT a true p50 percentile**.
+    /// Kept as `p50_rtt_ms` for wire/JSON compat; canonical alias is
+    /// `ewma_rtt_fast_ms`. Gates must not treat this as a percentile.
+    /// TODO(histogram): replace with HDR histogram for true p50/p95.
     pub p50_rtt_ms: f64,
+    /// EWMA (alpha 0.05, slow) — **NOT a true p95 percentile**.
+    /// Kept as `p95_rtt_ms` for wire/JSON compat; canonical alias is
+    /// `ewma_rtt_slow_ms`. Gates must not treat this as a percentile.
+    /// TODO(histogram): replace with HDR histogram for true p50/p95.
     pub p95_rtt_ms: f64,
+    /// EWMA of per-sync delta bytes. When `wire_bytes` is known the real
+    /// frame byte length should be recorded via
+    /// [`Self::record_sync_success_with_bytes`]; the `fresh_len * 1024`
+    /// heuristic is retained as fallback and documented as rough (~1 KiB per
+    /// event, no header/framing overhead).
     pub delta_bytes_per_sync: f64,
+    /// Legacy EWMA of the empty-delta ratio (1.0 when `fresh_len==0`). This
+    /// is **not** the `LruCache` hit rate; see `cache_hits`/`cache_misses`
+    /// and [`Self::true_cache_hit_rate`] for the real transport-pool hit rate.
     pub cache_hit_rate: f64,
     pub pending_dropped: u64,
+    /// Real `LruCache` hit/miss counters (transport pool). Incremented at
+    /// every `cache.get` / `cache.put` branch.
+    pub cache_hits: u64,
+    pub cache_misses: u64,
+    /// Last computed `FanoutMode::effective_k(N)` (fairMaxConcurrentSyncs).
+    pub effective_k: usize,
+    /// Actual concurrent syncs observed on the last tick (0..effective_k).
+    pub concurrent_syncs: usize,
 }
 
 impl GossipMetrics {
@@ -100,24 +124,73 @@ impl GossipMetrics {
         }
     }
 
-    /// Record a successful sync's latency and payload size into the EWMA
-    /// metrics. `p50` uses a fast alpha (0.1) for a responsive median while
-    /// `p95` uses a slower alpha (0.05) so tail spikes are retained longer
-    /// and the two series diverge. `fresh_len` drives two additional EWMAs:
-    /// `delta_bytes_per_sync` is a rough estimate (1 KiB per event) and
-    /// `cache_hit_rate` tracks the empty-delta ratio.
-    pub fn record_sync_success(&mut self, rtt: Duration, fresh_len: usize) {
+    /// Canonical EWMA fast alias for `p50_rtt_ms` (alpha 0.1).
+    pub fn ewma_rtt_fast_ms(&self) -> f64 {
+        self.p50_rtt_ms
+    }
+
+    /// Canonical EWMA slow alias for `p95_rtt_ms` (alpha 0.05).
+    pub fn ewma_rtt_slow_ms(&self) -> f64 {
+        self.p95_rtt_ms
+    }
+
+    /// True `LruCache` hit rate from hit/miss counters.
+    pub fn true_cache_hit_rate(&self) -> f64 {
+        let total = self.cache_hits + self.cache_misses;
+        if total == 0 { 0.0 } else { self.cache_hits as f64 / total as f64 }
+    }
+
+    /// Record a cache hit (transport pool `get` succeeded).
+    pub fn record_cache_hit(&mut self) {
+        self.cache_hits += 1;
+    }
+
+    /// Record a cache miss (transport pool `get` failed, new entry inserted).
+    pub fn record_cache_miss(&mut self) {
+        self.cache_misses += 1;
+    }
+
+    /// Record the computed `effective_k` for this tick.
+    pub fn set_effective_k(&mut self, k: usize) {
+        self.effective_k = k;
+    }
+
+    /// Record the actual number of concurrent syncs launched this tick.
+    pub fn set_concurrent_syncs(&mut self, n: usize) {
+        self.concurrent_syncs = n;
+    }
+
+    /// Record a successful sync with a known wire byte length.
+    /// When `wire_bytes` is `None`, falls back to the `fresh_len * 1024`
+    /// heuristic (documented as rough).
+    pub fn record_sync_success_with_bytes(
+        &mut self,
+        rtt: Duration,
+        fresh_len: usize,
+        wire_bytes: Option<usize>,
+    ) {
         self.sync_attempts += 1;
         self.sync_success += 1;
         let rtt_ms = rtt.as_millis() as f64;
-        // p50: alpha 0.1 (decay 0.9) — responsive; p95: alpha 0.05 (decay 0.95) — retains tails.
+        // EWMA fast (alpha 0.1) / slow (alpha 0.05) — not percentiles.
         self.p50_rtt_ms = self.p50_rtt_ms * 0.9 + rtt_ms * 0.1;
         self.p95_rtt_ms = self.p95_rtt_ms * 0.95 + rtt_ms * 0.05;
-        // Rough estimate: ~1 KiB per event; keep EWMA for observability.
-        let delta_bytes = fresh_len as f64 * 1024.0;
+        let delta_bytes = wire_bytes.map_or(fresh_len as f64 * 1024.0, |b| b as f64);
         self.delta_bytes_per_sync = self.delta_bytes_per_sync * 0.9 + delta_bytes * 0.1;
         let hit = if fresh_len == 0 { 1.0 } else { 0.0 };
         self.cache_hit_rate = self.cache_hit_rate * 0.9 + hit * 0.1;
+    }
+
+    /// Record a successful sync's latency and payload size into the EWMA
+    /// metrics. `p50` uses a fast alpha (0.1) for a responsive EWMA while
+    /// `p95` uses a slower alpha (0.05) so tail spikes are retained longer
+    /// and the two series diverge. `fresh_len` drives two additional EWMAs:
+    /// `delta_bytes_per_sync` is a rough estimate (1 KiB per event, see
+    /// [`Self::record_sync_success_with_bytes`] for real wire bytes) and
+    /// `cache_hit_rate` tracks the empty-delta ratio (legacy; see
+    /// `cache_hits`/`cache_misses` for the real LruCache hit rate).
+    pub fn record_sync_success(&mut self, rtt: Duration, fresh_len: usize) {
+        self.record_sync_success_with_bytes(rtt, fresh_len, None);
     }
 }
 
@@ -670,20 +743,37 @@ impl GossipNode {
             }
 
             let k = self.fanout.effective_k(self.peers.lock().await.len());
+            {
+                let mut m = self.gossip_metrics.lock().await;
+                m.set_effective_k(k);
+            }
             if k <= 1 {
                 let peer = self.peers.lock().await.random_peer();
-                let Some(peer) = peer else { continue };
+                let Some(peer) = peer else {
+                    let mut m = self.gossip_metrics.lock().await;
+                    m.set_concurrent_syncs(0);
+                    continue;
+                };
 
-                let transport_arc = {
+                let (transport_arc, cache_hit) = {
                     let mut cache = outbound.lock().await;
                     if let Some(existing) = cache.get(&peer.node_id) {
-                        existing.clone()
+                        (existing.clone(), true)
                     } else {
                         let arc = Arc::new(Mutex::new(TcpTransport::new(self.identity.clone())));
                         cache.put(peer.node_id, arc.clone());
-                        arc
+                        (arc.clone(), false)
                     }
                 };
+                {
+                    let mut m = self.gossip_metrics.lock().await;
+                    if cache_hit {
+                        m.record_cache_hit();
+                    } else {
+                        m.record_cache_miss();
+                    }
+                    m.set_concurrent_syncs(1);
+                }
 
                 let connect_result = {
                     let mut guard = transport_arc.lock().await;
@@ -781,8 +871,15 @@ impl GossipNode {
                                     success_rate = m.success_rate(),
                                     p50_rtt_ms = m.p50_rtt_ms,
                                     p95_rtt_ms = m.p95_rtt_ms,
+                                    ewma_rtt_fast_ms = m.ewma_rtt_fast_ms(),
+                                    ewma_rtt_slow_ms = m.ewma_rtt_slow_ms(),
                                     delta_bytes_per_sync = m.delta_bytes_per_sync,
                                     cache_hit_rate = m.cache_hit_rate,
+                                    cache_hits = m.cache_hits,
+                                    cache_misses = m.cache_misses,
+                                    true_cache_hit_rate = m.true_cache_hit_rate(),
+                                    effective_k = m.effective_k,
+                                    concurrent_syncs = m.concurrent_syncs,
                                     consecutive_failures = consecutive_failures,
                                     "gossip metrics periodic"
                                 );
@@ -825,8 +922,15 @@ impl GossipNode {
                         success_rate = m.success_rate(),
                         p50_rtt_ms = m.p50_rtt_ms,
                         p95_rtt_ms = m.p95_rtt_ms,
+                        ewma_rtt_fast_ms = m.ewma_rtt_fast_ms(),
+                        ewma_rtt_slow_ms = m.ewma_rtt_slow_ms(),
                         delta_bytes_per_sync = m.delta_bytes_per_sync,
                         cache_hit_rate = m.cache_hit_rate,
+                        cache_hits = m.cache_hits,
+                        cache_misses = m.cache_misses,
+                        true_cache_hit_rate = m.true_cache_hit_rate(),
+                        effective_k = m.effective_k,
+                        concurrent_syncs = m.concurrent_syncs,
                         consecutive_failures = consecutive_failures,
                         "gossip metrics"
                     );
@@ -862,12 +966,15 @@ impl GossipNode {
             }
             let peers = self.peers.lock().await.pick_k(k);
             if peers.is_empty() {
+                let mut m = self.gossip_metrics.lock().await;
+                m.set_concurrent_syncs(0);
                 self.process_finalized_rounds().await;
                 continue;
             }
             let semaphore = Arc::new(Semaphore::new(k));
             let mut join_set: JoinSet<()> = JoinSet::new();
             let payload = self.drain_pending_transactions().await;
+            let mut spawned: usize = 0;
             for peer in peers {
                 let permit = match semaphore.clone().try_acquire_owned() {
                     Ok(p) => p,
@@ -876,6 +983,7 @@ impl GossipNode {
                         break;
                     }
                 };
+                spawned += 1;
                 let outbound = outbound.clone();
                 let self_clone = self.clone();
                 let peer_clone = peer.clone();
@@ -885,18 +993,26 @@ impl GossipNode {
                 join_set.spawn(async move {
                     let _permit = permit;
                     let start = std::time::Instant::now();
-                    let transport_arc = {
+                    let (transport_arc, cache_hit) = {
                         let mut cache = outbound.lock().await;
                         if let Some(existing) = cache.get(&peer_clone.node_id) {
-                            existing.clone()
+                            (existing.clone(), true)
                         } else {
                             let arc = Arc::new(Mutex::new(TcpTransport::new(
                                 self_clone.identity.clone(),
                             )));
                             cache.put(peer_clone.node_id, arc.clone());
-                            arc
+                            (arc.clone(), false)
                         }
                     };
+                    {
+                        let mut m = metrics.lock().await;
+                        if cache_hit {
+                            m.record_cache_hit();
+                        } else {
+                            m.record_cache_miss();
+                        }
+                    }
                     let mut guard = transport_arc.lock().await;
                     if !guard.is_connected()
                         && let Err(e) = guard.connect(&peer_clone).await
@@ -964,8 +1080,15 @@ impl GossipNode {
                                         success_rate = m.success_rate(),
                                         p50_rtt_ms = m.p50_rtt_ms,
                                         p95_rtt_ms = m.p95_rtt_ms,
+                                        ewma_rtt_fast_ms = m.ewma_rtt_fast_ms(),
+                                        ewma_rtt_slow_ms = m.ewma_rtt_slow_ms(),
                                         delta_bytes_per_sync = m.delta_bytes_per_sync,
                                         cache_hit_rate = m.cache_hit_rate,
+                                        cache_hits = m.cache_hits,
+                                        cache_misses = m.cache_misses,
+                                        true_cache_hit_rate = m.true_cache_hit_rate(),
+                                        effective_k = m.effective_k,
+                                        concurrent_syncs = m.concurrent_syncs,
                                         "gossip metrics periodic fanout"
                                     );
                                 }
@@ -975,6 +1098,10 @@ impl GossipNode {
                         }
                     }
                 });
+            }
+            {
+                let mut m = self.gossip_metrics.lock().await;
+                m.set_concurrent_syncs(spawned);
             }
             while let Some(res) = join_set.join_next().await {
                 if let Err(e) = res {
@@ -998,8 +1125,15 @@ impl GossipNode {
                     success_rate = m.success_rate(),
                     p50_rtt_ms = m.p50_rtt_ms,
                     p95_rtt_ms = m.p95_rtt_ms,
+                    ewma_rtt_fast_ms = m.ewma_rtt_fast_ms(),
+                    ewma_rtt_slow_ms = m.ewma_rtt_slow_ms(),
                     delta_bytes_per_sync = m.delta_bytes_per_sync,
                     cache_hit_rate = m.cache_hit_rate,
+                    cache_hits = m.cache_hits,
+                    cache_misses = m.cache_misses,
+                    true_cache_hit_rate = m.true_cache_hit_rate(),
+                    effective_k = m.effective_k,
+                    concurrent_syncs = m.concurrent_syncs,
                     "gossip metrics fanout"
                 );
                 let mut cache = outbound.lock().await;

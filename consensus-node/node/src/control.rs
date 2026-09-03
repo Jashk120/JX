@@ -81,6 +81,20 @@ pub struct GossipMetricsReport {
     pub backoff_peers: usize,
     #[serde(default)]
     pub pending_dropped: u64,
+    #[serde(default)]
+    pub ewma_rtt_fast_ms: f64,
+    #[serde(default)]
+    pub ewma_rtt_slow_ms: f64,
+    #[serde(default)]
+    pub cache_hits: u64,
+    #[serde(default)]
+    pub cache_misses: u64,
+    #[serde(default)]
+    pub true_cache_hit_rate: f64,
+    #[serde(default)]
+    pub effective_k: usize,
+    #[serde(default)]
+    pub concurrent_syncs: usize,
 }
 
 /// The `status` report: node identity, current roster, known peers, and the
@@ -340,6 +354,13 @@ async fn status_response(node: &GossipNode) -> ControlResponse {
         cache_hit_rate: metrics.cache_hit_rate,
         backoff_peers,
         pending_dropped: metrics.pending_dropped,
+        ewma_rtt_fast_ms: metrics.ewma_rtt_fast_ms(),
+        ewma_rtt_slow_ms: metrics.ewma_rtt_slow_ms(),
+        cache_hits: metrics.cache_hits,
+        cache_misses: metrics.cache_misses,
+        true_cache_hit_rate: metrics.true_cache_hit_rate(),
+        effective_k: metrics.effective_k,
+        concurrent_syncs: metrics.concurrent_syncs,
     };
     ok_response(json!(StatusReport {
         node_id,

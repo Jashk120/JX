@@ -545,7 +545,9 @@ async fn spawn_diagnosis_logger(node: Arc<GossipNode>, path: PathBuf, stop: Arc<
         && let Err(e) = std::fs::create_dir_all(parent)
     {
         tracing::warn!(path = %parent.display(), error = %e, "diagnosis: create_dir_all failed");
+        // Propagate to caller via tracing; task continues but error is not swallowed silently.
     }
+    const MAX_DIAGNOSIS_BYTES: u64 = 10 * 1024 * 1024;
     let mut interval = tokio::time::interval(Duration::from_secs(1));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -567,16 +569,35 @@ async fn spawn_diagnosis_logger(node: Arc<GossipNode>, path: PathBuf, stop: Arc<
             "success_rate": m.success_rate(),
             "p50_rtt_ms": m.p50_rtt_ms,
             "p95_rtt_ms": m.p95_rtt_ms,
+            "ewma_rtt_fast_ms": m.ewma_rtt_fast_ms(),
+            "ewma_rtt_slow_ms": m.ewma_rtt_slow_ms(),
             "delta_bytes_per_sync": m.delta_bytes_per_sync,
             "cache_hit_rate": m.cache_hit_rate,
+            "cache_hits": m.cache_hits,
+            "cache_misses": m.cache_misses,
+            "true_cache_hit_rate": m.true_cache_hit_rate(),
+            "effective_k": m.effective_k,
+            "concurrent_syncs": m.concurrent_syncs,
             "backoff_peers": backoff_peers,
         });
         let text = format!("{}\n", line);
+        if let Ok(meta) = std::fs::metadata(&path)
+            && meta.len() > MAX_DIAGNOSIS_BYTES
+        {
+            let rotated = path.with_extension("log.1");
+            if let Err(e) = std::fs::rename(&path, &rotated) {
+                tracing::warn!(path = %path.display(), error = %e, "diagnosis: rotate failed");
+            } else {
+                tracing::info!(path = %rotated.display(), "diagnosis: rotated log");
+            }
+        }
         match tokio::fs::OpenOptions::new().create(true).append(true).open(&path).await {
             Ok(mut file) => {
                 use tokio::io::AsyncWriteExt;
                 if let Err(e) = file.write_all(text.as_bytes()).await {
                     tracing::warn!(path = %path.display(), error = %e, "diagnosis: write_all failed");
+                } else if let Err(e) = file.flush().await {
+                    tracing::warn!(path = %path.display(), error = %e, "diagnosis: flush failed");
                 }
             }
             Err(e) => {
@@ -589,8 +610,15 @@ async fn spawn_diagnosis_logger(node: Arc<GossipNode>, path: PathBuf, stop: Arc<
             success_rate = m.success_rate(),
             p50_rtt_ms = m.p50_rtt_ms,
             p95_rtt_ms = m.p95_rtt_ms,
+            ewma_rtt_fast_ms = m.ewma_rtt_fast_ms(),
+            ewma_rtt_slow_ms = m.ewma_rtt_slow_ms(),
             delta_bytes_per_sync = m.delta_bytes_per_sync,
             cache_hit_rate = m.cache_hit_rate,
+            cache_hits = m.cache_hits,
+            cache_misses = m.cache_misses,
+            true_cache_hit_rate = m.true_cache_hit_rate(),
+            effective_k = m.effective_k,
+            concurrent_syncs = m.concurrent_syncs,
             backoff_peers = backoff_peers,
             "diagnosis gossip metrics"
         );
