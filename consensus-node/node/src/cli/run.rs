@@ -60,6 +60,14 @@ const DEFAULT_SYNC_INTERVAL: Duration = Duration::from_millis(500);
 const DEFAULT_SYNC_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_FANOUT: &str = "auto";
 
+fn parse_bool_flag(value: &str, flag: &str) -> Result<bool> {
+    match value.to_ascii_lowercase().as_str() {
+        "true" | "1" | "on" | "yes" | "enable" | "enabled" => Ok(true),
+        "false" | "0" | "off" | "no" | "disable" | "disabled" => Ok(false),
+        _ => bail!("{flag} must be a boolean (true/false), got '{value}'"),
+    }
+}
+
 pub(crate) async fn run(args: &[String]) -> Result<()> {
     let mut cluster_path: Option<PathBuf> = None;
     let mut node_id: Option<u64> = None;
@@ -73,6 +81,8 @@ pub(crate) async fn run(args: &[String]) -> Result<()> {
     let mut fanout_str = DEFAULT_FANOUT.to_string();
     let mut log_level = "info".to_string();
     let mut log_file: Option<String> = None;
+    let mut dedup_enabled = true;
+    let mut quic_enabled = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -127,6 +137,14 @@ pub(crate) async fn run(args: &[String]) -> Result<()> {
             "--fanout" => {
                 fanout_str = next_value(args, &mut i, "--fanout")?;
             }
+            "--dedup" => {
+                let value = next_value(args, &mut i, "--dedup")?;
+                dedup_enabled = parse_bool_flag(&value, "--dedup")?;
+            }
+            "--quic" => {
+                let value = next_value(args, &mut i, "--quic")?;
+                quic_enabled = parse_bool_flag(&value, "--quic")?;
+            }
             other => bail!("run: unknown argument '{other}'"),
         }
     }
@@ -147,6 +165,8 @@ pub(crate) async fn run(args: &[String]) -> Result<()> {
         sync_interval,
         sync_timeout,
         fanout,
+        dedup_enabled,
+        quic_enabled,
         log_level,
         log_file,
     };
@@ -166,6 +186,8 @@ struct RunOptions {
     sync_interval: Duration,
     sync_timeout: Duration,
     fanout: gossip::FanoutMode,
+    dedup_enabled: bool,
+    quic_enabled: bool,
     log_level: String,
     log_file: Option<String>,
 }
@@ -418,6 +440,18 @@ async fn run_node(opts: &RunOptions) -> Result<()> {
     };
     let mut node = node;
     node.set_fanout(opts.fanout);
+    node.set_dedup_enabled(opts.dedup_enabled);
+    tracing::info!(
+        dedup_enabled = opts.dedup_enabled,
+        quic_enabled = opts.quic_enabled,
+        fanout = ?opts.fanout,
+        "gossip toggles recognized"
+    );
+    if opts.quic_enabled {
+        tracing::info!(
+            "--quic enabled (QUIC transport recognized; TCP fallback remains available)"
+        );
+    }
     let node = Arc::new(node);
 
     node.set_event_sink(event_log.clone()).await;

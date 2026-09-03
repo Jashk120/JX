@@ -10,7 +10,7 @@ import pytest
 from harness.cluster import ClusterConfig, ClusterManager, _fanout_k, parse_diagnosis_log, predicted_p50_seconds
 from harness.metrics import FinalityStats, collect_statuses, measure_finality_batch, wait_for_decided_round
 
-pytestmark = [pytest.mark.asyncio, pytest.mark.bench]
+pytestmark = [pytest.mark.asyncio]
 
 
 def _log_predicted_table(gaps, fans):
@@ -23,18 +23,15 @@ def _log_predicted_table(gaps, fans):
             print(f"| {g} | {k} | {pred:.3f}s |")
 
 
-async def _measure_or_predict(mgr: ClusterManager, gap: int, fanout, dedup: bool, quic: bool) -> tuple[float, FinalityStats | None, dict]:
+async def _measure_strict(mgr: ClusterManager, gap: int, fanout, dedup: bool, quic: bool) -> tuple[float, FinalityStats, dict]:
     nodes = mgr.nodes()
-    try:
-        stats = await measure_finality_batch(nodes, mgr, count=3, concurrency=1, key_prefix=f"gap{gap}k{fanout}-", timeout=15.0)
-        p50 = stats.decided_p50
-        print(f"[sweep] gap={gap} k={fanout} dedup={dedup} quic={quic} -> p50={p50:.3f}s p95={stats.decided_p95:.3f}s")
-        for s in stats.samples:
-            print(f"[sweep]   sample {s.tx_id} decided={s.decided_latency}")
-    except Exception as e:
-        print(f"[sweep] measure failed gap={gap} k={fanout} err={e} using predicted")
-        stats = None
-        p50 = predicted_p50_seconds(gap, fanout)
+    stats = await measure_finality_batch(nodes, mgr, count=3, concurrency=1, key_prefix=f"gap{gap}k{fanout}-", timeout=15.0)
+    p50 = stats.decided_p50
+    print(f"[sweep] gap={gap} k={fanout} dedup={dedup} quic={quic} -> p50={p50:.3f}s p95={stats.decided_p95:.3f}s")
+    for s in stats.samples:
+        print(f"[sweep]   sample {s.tx_id} decided={s.decided_latency}")
+    if p50 <= 0:
+        raise AssertionError(f"p50 should be >0 gap={gap} k={fanout} got {p50}")
     diag = mgr.diagnosis_metrics()
     agg_hit = 0.0
     agg_p95 = 0.0
@@ -48,17 +45,20 @@ async def _measure_or_predict(mgr: ClusterManager, gap: int, fanout, dedup: bool
         if pr is not None:
             agg_p95 += float(pr)
         print(f"[sweep] diagnosis node {nid} hit_rate={m.get('hit_rate_avg')} p95_rtt={m.get('p95_rtt_avg') or m.get('p95_rtt_ms')} attempts={m.get('sync_attempts')}")
+    # Require diagnosis.log to exist and contain real metrics — no synthesized fallback.
+    if cnt == 0:
+        raise AssertionError(
+            f"diagnosis.log missing or empty for gap={gap} k={fanout} dedup={dedup} quic={quic}; "
+            f"diag={diag!r} — hit_rate/p95 must be measured, not synthesized"
+        )
+    for nid, m in diag.items():
+        if not m:
+            raise AssertionError(f"diagnosis.log empty for node {nid} gap={gap} k={fanout}")
     hit_rate = agg_hit / cnt if cnt else 0.0
     p95_rtt = agg_p95 / max(1, len(diag)) if diag else 0.0
-    if cnt == 0:
-        hit_rate = 0.85 if dedup else 0.55
-        p95_rtt = 1.5 * gap + (2 if quic else 5)
-        print(f"[sweep] no diagnosis.log yet, synthesized hit_rate={hit_rate:.2f} p95_rtt={p95_rtt:.1f}ms (dedup={dedup} quic={quic})")
     return p50, stats, {"hit_rate": hit_rate, "p95_rtt": p95_rtt, "diag": diag}
 
 
-@pytest.mark.bench
-@pytest.mark.slow
 async def test_gap_vs_fanout_sweep() -> None:
     gaps = [25, 80]
     fans = [1, 2, 4]
@@ -89,14 +89,17 @@ async def test_gap_vs_fanout_sweep() -> None:
         p50_25_k1 = next((p for g, k, _, _, p, _ in results_dry if g == 25 and k == 1), None)
         p50_80_k4 = next((p for g, k, _, _, p, _ in results_dry if g == 80 and k == 4), None)
         assert p50_25_k1 is not None and p50_80_k4 is not None
-        assert 0.05 < p50_25_k1 < 8.0 and 0.05 < p50_80_k4 < 8.0
+        # F2 tolerance: p50 ~0.20-0.25s for quic+dedup k=4; baseline ~0.60s.
+        # Narrowed from legacy 0.05-8.0 band to 0.15-1.2s to verify F2/F3 scaling.
+        assert 0.15 < p50_25_k1 < 1.2 and 0.15 < p50_80_k4 < 1.2
         ratio = p50_80_k4 / p50_25_k1 if p50_25_k1 else 1.0
         print(f"[sweep:dry] 80k4 / 25k1 ratio={ratio:.2f} expect ~1.0")
-        assert 0.3 < ratio < 3.0
+        assert 0.5 < ratio < 2.0
         print("[test_gap_vs_fanout_sweep] PASS (dry)")
         return
 
     results: list[tuple[int, int | str, bool, bool, float, float]] = []
+    failures = 0
 
     for gap in gaps:
         for k in fans:
@@ -123,22 +126,18 @@ async def test_gap_vs_fanout_sweep() -> None:
                             await wait_for_decided_round(mgr.nodes(), min_round=1, timeout=20.0)
                         except Exception as e:
                             print(f"[sweep] warmup decided wait failed gap={gap} k={k} {e}")
-                        p50, stats, diag = await _measure_or_predict(mgr, gap, k, dedup, quic)
+                        p50, stats, diag = await _measure_strict(mgr, gap, k, dedup, quic)
                         ratio = p50 / pred if pred > 0 else 1.0
                         print(f"[sweep] result gap={gap} k={k} dedup={dedup} quic={quic} p50={p50:.3f} pred={pred:.3f} ratio={ratio:.2f} hit_rate={diag['hit_rate']:.2f} p95_rtt={diag['p95_rtt']:.1f}ms")
                         results.append((gap, k, dedup, quic, p50, pred))
-                        if stats is not None:
-                            assert p50 > 0, f"p50 should be >0 gap={gap} k={k}"
-                            if p50 > 8.0:
-                                print(f"[sweep] warn high latency gap={gap} k={k} p50={p50:.3f} >8s may be thermal")
+                        assert p50 > 0, f"p50 should be >0 gap={gap} k={k}"
+                        if p50 > 8.0:
+                            print(f"[sweep] warn high latency gap={gap} k={k} p50={p50:.3f} >8s may be thermal")
                         if dedup:
                             assert diag["hit_rate"] >= 0.0
-                        if not dedup:
-                            pass
                     except Exception as e:
-                        print(f"[sweep] cluster gap={gap} k={k} failed {e}, using predicted")
-                        pred_only = predicted_p50_seconds(gap, k)
-                        results.append((gap, k, dedup, quic, pred_only, pred_only))
+                        failures += 1
+                        print(f"[sweep] cluster gap={gap} k={k} dedup={dedup} quic={quic} failed {e} — no prediction substitution")
                     finally:
                         try:
                             mgr.stop_all()
@@ -151,10 +150,6 @@ async def test_gap_vs_fanout_sweep() -> None:
                                 pass
                         mgr.cleanup()
                         await asyncio.sleep(0.2)
-                    if len(results) >= 8:
-                        pass
-                    if len(results) >= 12 and gap == 25 and k == 1:
-                        pass
 
     print("[sweep] bench gap vs fanout summary")
     print("| gap | k | dedup | quic | p50(s) | pred(s) | hit_rate | p95_rtt(ms) |")
@@ -162,16 +157,25 @@ async def test_gap_vs_fanout_sweep() -> None:
     for gap, k, dedup, quic, p50, pred in results:
         print(f"| {gap} | {k} | {dedup} | {quic} | {p50:.3f} | {pred:.3f} | - | - |")
 
+    total_combos = len(gaps) * len(fans) * len(dedups) * len(quics)
+    # Verifiability: at least half of combos must have real measurements.
+    assert len(results) >= (total_combos + 1) // 2, (
+        f"sweep verifiability failed: only {len(results)}/{total_combos} combos produced real measurements "
+        f"({failures} failures); need >=50% real — prediction substitution is disabled"
+    )
+
     if len(results) >= 2:
         p50_25_k1 = next((p for g, k, _, _, p, _ in results if g == 25 and k == 1), None)
         p50_80_k4 = next((p for g, k, _, _, p, _ in results if g == 80 and k == 4), None)
         if p50_25_k1 is not None and p50_80_k4 is not None:
             print(f"[sweep] fit check 25ms k=1 p50={p50_25_k1:.3f}s vs 80ms k=4 p50={p50_80_k4:.3f}s target ~0.6s @70C (gap/k*logN)")
+            # F2: p50 ~0.20-0.25s for optimized (dedup+quic k=4), baseline ~0.60s.
+            # Tightened from legacy 0.05-8.0 band to 0.15-1.2s per k·logN model.
             for p in [p50_25_k1, p50_80_k4]:
-                assert 0.05 < p < 8.0, f"p50 {p:.3f}s out of expected 0.05-8.0 band"
+                assert 0.15 < p < 1.2, f"p50 {p:.3f}s out of expected 0.15-1.2 band (F2 tightened from 0.05-8.0)"
             ratio = p50_80_k4 / p50_25_k1 if p50_25_k1 > 0 else 1.0
             print(f"[sweep] 80k4 / 25k1 ratio={ratio:.2f} (expect ~0.7-1.4 with dedup+quic model gap/k*logN)")
-            assert 0.3 < ratio < 3.0, f"fanout scaling broken: ratio {ratio:.2f} expect ~1.0 (gap/k*logN)"
+            assert 0.5 < ratio < 2.0, f"fanout scaling broken: ratio {ratio:.2f} expect ~1.0 (gap/k*logN) F2 tightened"
 
     assert len(results) >= 4, f"sweep should cover at least 4 combos, got {len(results)}"
     print("[test_gap_vs_fanout_sweep] PASS")

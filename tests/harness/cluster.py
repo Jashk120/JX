@@ -189,8 +189,8 @@ class ClusterConfig:
     proxy_drop_prob: float = 0.0
     # T11 gap vs fanout sweep (PLAN-2.4): gap 25/80, k 1/2/4, dedup on/off, QUIC on/off.
     # Latency≈k*gap*logN fit: 80ms k=4 should match 25ms k=1 at ~0.6s @70°C.
-    # Fanout maps to --fanout (auto|1|2|4) when spawning jkaind; dedup/quic are
-    # harness-level toggles for instrumentation until native flags exist.
+    # Fanout maps to --fanout (auto|1|2|4); dedup/quic map to --dedup/--quic
+    # native flags on jkaind (verified via --help).
     fanout: str | int = "auto"
     dedup_enabled: bool = True
     quic_enabled: bool = False
@@ -432,6 +432,8 @@ class ClusterManager:
             ]
             if str(self.config.fanout) != "auto":
                 run_args.extend(["--fanout", str(self.config.fanout)])
+            run_args.extend(["--dedup", str(self.config.dedup_enabled).lower()])
+            run_args.extend(["--quic", str(self.config.quic_enabled).lower()])
             if real_reconnect is not None:
                 run_args.extend(["--reconnect-port", str(real_reconnect)])
             if self.config.log_file_mode == "-":
@@ -446,10 +448,6 @@ class ClusterManager:
 
             logger.info("Spawning node %d: %s", node_id, " ".join(run_args))
 
-            # Open log file for stdout/stderr capture in addition to node's own log file
-            stdout_dest = subprocess.DEVNULL
-            # We let jkaind write its structured log to data/logs/jkaind.log via --log-file.
-            # For diagnosis, also capture stderr to a separate file.
             diag_log = open(data_dir / "logs" / "diagnosis.log", "wb")  # noqa: SIM115
 
             proc = subprocess.Popen(
@@ -623,6 +621,8 @@ class ClusterManager:
         ]
         if str(self.config.fanout) != "auto":
             run_args.extend(["--fanout", str(self.config.fanout)])
+        run_args.extend(["--dedup", str(self.config.dedup_enabled).lower()])
+        run_args.extend(["--quic", str(self.config.quic_enabled).lower()])
         if old.real_reconnect_port is not None:
             run_args.extend(["--reconnect-port", str(old.real_reconnect_port)])
         if self.config.log_file_mode == "-":
