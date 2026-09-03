@@ -551,7 +551,7 @@ mod tests {
         // Rust 1.87+, above this crate's declared MSRV of 1.85).
         #[allow(clippy::manual_is_multiple_of)]
         let is_coin_round = (r_prime - r) % coin_round_frequency() == 0;
-        let has_supermajority = stake * 3 > hashgraph.member_count() * 2;
+        let has_supermajority = stake * 3 > hashgraph.member_count_at_round(r_prime) * 2;
 
         if is_coin_round && !has_supermajority {
             return RefOutcome::Vote(coin_round_vote(hashgraph, y));
@@ -1251,5 +1251,96 @@ mod tests {
                 assert_eq!(actual, expected, "golden fame mismatch");
             }
         }
+    }
+
+    /// AH-2 regression: the reference oracle must use `member_count_at_round`
+    /// (not the scalar `member_count`) so it agrees with production quorum
+    /// logic across an `add_member` transition. Before the fix the scalar
+    /// oracle used `n=4` for every round, while production used `n=3` for
+    /// pre-join rounds — producing a false-pass divergence once the roster grew.
+    #[test]
+    fn reference_oracle_matches_production_across_membership_transition() {
+        let _guard = test_serial_guard();
+        let key_a = SigningKey::generate(&mut OsRng);
+        let key_b = SigningKey::generate(&mut OsRng);
+        let key_c = SigningKey::generate(&mut OsRng);
+        let key_d = SigningKey::generate(&mut OsRng);
+        let node_a = NodeId::new(1);
+        let node_b = NodeId::new(2);
+        let node_c = NodeId::new(3);
+        let node_d = NodeId::new(4);
+        let initial =
+            registry_of(&[(node_a, &key_a), (node_b, &key_b), (node_c, &key_c), (node_d, &key_d)]);
+        let mut hg = Hashgraph::new(&initial);
+        let mut ts = 100u64;
+        let mut hashes: Vec<EventHash> = Vec::new();
+        let insert = |hg: &mut Hashgraph,
+                      key: &SigningKey,
+                      creator: NodeId,
+                      self_parent: Option<EventHash>,
+                      other_parent: Option<EventHash>,
+                      ts: u64,
+                      reg: &MembershipRegistry|
+         -> EventHash {
+            let ve = verified_event(reg, key, creator, self_parent, other_parent, ts);
+            hg.insert(ve).expect("insert must succeed")
+        };
+        // Genesis + gossip to reach round 2 before the join.
+        let a1 = insert(&mut hg, &key_a, node_a, None, None, ts, &initial);
+        ts += 1;
+        let b1 = insert(&mut hg, &key_b, node_b, None, None, ts, &initial);
+        ts += 1;
+        let c1 = insert(&mut hg, &key_c, node_c, None, None, ts, &initial);
+        ts += 1;
+        let d1 = insert(&mut hg, &key_d, node_d, None, None, ts, &initial);
+        ts += 1;
+        hashes.extend([a1, b1, c1, d1]);
+        let a2 = insert(&mut hg, &key_a, node_a, Some(a1), Some(d1), ts, &initial);
+        ts += 1;
+        let b2 = insert(&mut hg, &key_b, node_b, Some(b1), Some(a2), ts, &initial);
+        ts += 1;
+        let a3 = insert(&mut hg, &key_a, node_a, Some(a2), Some(b2), ts, &initial);
+        ts += 1;
+        let b3 = insert(&mut hg, &key_b, node_b, Some(b2), Some(c1), ts, &initial);
+        ts += 1;
+        let a4 = insert(&mut hg, &key_a, node_a, Some(a3), Some(b3), ts, &initial);
+        ts += 1;
+        let d2 = insert(&mut hg, &key_d, node_d, Some(d1), Some(a4), ts, &initial);
+        ts += 1;
+        hashes.extend([a2, b2, a3, b3, a4, d2]);
+        // Node e joins with activation round 1 — round 1 keeps n=4, round 2+ uses n=5.
+        let key_e = SigningKey::generate(&mut OsRng);
+        let node_e = NodeId::new(5);
+        let mut expanded = initial.clone();
+        expanded.register(
+            node_e,
+            key_e.verifying_key(),
+            crypto::BlsIdentity::from_ikm(&[0u8; 32]).expect("bls").public.to_bytes(),
+        );
+        hg.add_member(node_e, 1, expanded.clone());
+        assert_eq!(hg.member_count_at_round(1), 4);
+        assert_eq!(hg.member_count_at_round(2), 5);
+        // Continue gossip with the expanded roster so elections span the transition.
+        let e1 = insert(&mut hg, &key_e, node_e, None, Some(d2), ts, &expanded);
+        ts += 1;
+        let c2 = insert(&mut hg, &key_c, node_c, Some(c1), Some(e1), ts, &expanded);
+        ts += 1;
+        let a5 = insert(&mut hg, &key_a, node_a, Some(a4), Some(c2), ts, &expanded);
+        ts += 1;
+        let b4 = insert(&mut hg, &key_b, node_b, Some(b3), Some(a5), ts, &expanded);
+        ts += 1;
+        let c3 = insert(&mut hg, &key_c, node_c, Some(c2), Some(b4), ts, &expanded);
+        ts += 1;
+        let d3 = insert(&mut hg, &key_d, node_d, Some(d2), Some(c3), ts, &expanded);
+        ts += 1;
+        let e2 = insert(&mut hg, &key_e, node_e, Some(e1), Some(d3), ts, &expanded);
+        hashes.extend([e1, c2, a5, b4, c3, d3, e2]);
+        let _ = ts;
+        // Differential check: every witness must agree between production and reference.
+        assert_incremental_matches_reference(&hg, &hashes);
+        // Explicit divergence guard: a threshold that would pass with n=4 must fail with n=5.
+        let three = 3usize;
+        assert!(three * 3 > hg.member_count_at_round(1) * 2);
+        assert!(three * 3 <= hg.member_count_at_round(2) * 2);
     }
 }
