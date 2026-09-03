@@ -80,9 +80,13 @@ impl DedupState {
         false
     }
 
-    pub fn prune_expired(&mut self) {
+    pub fn prune_expired(&mut self, config: &SyncConfig) {
         let now = Instant::now();
-        self.sent.retain(|_, (t, _, _)| now.duration_since(*t) < Duration::from_secs(10));
+        let max =
+            config.non_ancestor_threshold.max(config.ancestor_threshold).max(config.self_threshold);
+        // Prune at max_threshold + slack (1000ms) — 4000ms with defaults.
+        let prune_after = max + Duration::from_millis(1000);
+        self.sent.retain(|_, (t, _, _)| now.duration_since(*t) < prune_after);
     }
 }
 
@@ -115,13 +119,13 @@ pub fn known_summary(
 pub fn delta_events(
     hashgraph: &consensus::Hashgraph,
     known: &[(NodeId, u64)],
+    registry: &MembershipRegistry,
 ) -> Result<Vec<Event>> {
     let known_seq: HashMap<NodeId, u64> = known.iter().copied().collect();
-    let mut creators: std::collections::HashSet<NodeId> = known_seq.keys().copied().collect();
-    for hash in hashgraph.all_event_hashes() {
-        if let Some(record) = hashgraph.get(&hash) {
-            creators.insert(*record.event().creator());
-        }
+    let mut creators: std::collections::HashSet<NodeId> =
+        registry.member_ids().into_iter().collect();
+    for k in known_seq.keys() {
+        creators.insert(*k);
     }
 
     let mut collected: HashMap<EventHash, Event> = HashMap::new();
@@ -146,12 +150,13 @@ pub fn delta_events(
 pub fn delta_events_filtered(
     hashgraph: &consensus::Hashgraph,
     known: &[(NodeId, u64)],
+    registry: &MembershipRegistry,
     self_id: NodeId,
     target_peer: NodeId,
     dedup: &mut DedupState,
     config: &SyncConfig,
 ) -> Result<Vec<Event>> {
-    let events = delta_events(hashgraph, known)?;
+    let events = delta_events(hashgraph, known, registry)?;
     if !config.filter_likely_duplicates {
         return Ok(events);
     }
@@ -171,7 +176,7 @@ pub fn delta_events_filtered(
             out.push(event);
         }
     }
-    dedup.prune_expired();
+    dedup.prune_expired(config);
     Ok(out)
 }
 
@@ -311,7 +316,7 @@ mod tests {
         h.make_event(2, None, Some(g1));
 
         let summary = known_summary(&h.hashgraph, &h.registry);
-        let delta = delta_events(&h.hashgraph, &summary).expect("no delta");
+        let delta = delta_events(&h.hashgraph, &summary, &h.registry).expect("no delta");
         assert!(delta.is_empty());
     }
 
@@ -323,7 +328,7 @@ mod tests {
         let g3 = h.make_event(1, Some(g2), None);
 
         let known = vec![(NodeId::new(1), 1u64), (NodeId::new(2), 0u64)];
-        let delta = delta_events(&h.hashgraph, &known).expect("delta computes");
+        let delta = delta_events(&h.hashgraph, &known, &h.registry).expect("delta computes");
         let hashes: Vec<_> = delta.iter().map(|e| e.hash().expect("hash bounded")).collect();
         assert_eq!(hashes, vec![g2, g3]);
     }
@@ -338,7 +343,7 @@ mod tests {
         let b1 = h.make_event(2, None, Some(a2));
 
         let known = vec![(NodeId::new(1), 0u64), (NodeId::new(2), 0u64)];
-        let delta = delta_events(&h.hashgraph, &known).expect("delta computes");
+        let delta = delta_events(&h.hashgraph, &known, &h.registry).expect("delta computes");
         let hashes: Vec<_> = delta.iter().map(|e| e.hash().expect("hash bounded")).collect();
 
         let pos_a1 = hashes.iter().position(|&h| h == a1).unwrap();
@@ -356,7 +361,7 @@ mod tests {
         h.make_event(2, None, Some(a2));
 
         let known = vec![(NodeId::new(1), 0u64), (NodeId::new(2), 0u64)];
-        let delta = delta_events(&h.hashgraph, &known).expect("delta computes");
+        let delta = delta_events(&h.hashgraph, &known, &h.registry).expect("delta computes");
 
         // Insert the delta into a fresh hashgraph; every insert must succeed
         // (parents present) because the delta is topologically ordered.
@@ -389,7 +394,7 @@ mod tests {
         let c1 = h.make_event(3, None, Some(b1));
         let c2 = h.make_event(3, Some(c1), Some(a1));
         let known = vec![(NodeId::new(1), 1u64), (NodeId::new(2), 1u64)];
-        let delta = delta_events(&h.hashgraph, &known).expect("delta computes");
+        let delta = delta_events(&h.hashgraph, &known, &h.registry).expect("delta computes");
         let hashes: Vec<_> = delta.iter().map(|e| e.hash().expect("hash bounded")).collect();
         assert!(hashes.contains(&c1), "union must include unknown creator 3 events");
         assert!(
@@ -404,7 +409,7 @@ mod tests {
         let a1 = h.make_event(1, None, None);
         h.make_event(2, None, Some(a1));
         let summary = known_summary(&h.hashgraph, &h.registry);
-        let delta = delta_events(&h.hashgraph, &summary).expect("delta");
+        let delta = delta_events(&h.hashgraph, &summary, &h.registry).expect("delta");
         assert!(delta.is_empty(), "fully known should still be empty with union");
     }
 
@@ -541,15 +546,29 @@ mod tests {
         let mut dedup = DedupState::default();
         let config = SyncConfig::default();
         let peer = NodeId::new(10);
-        let first =
-            delta_events_filtered(&h.hashgraph, &known, NodeId::new(1), peer, &mut dedup, &config)
-                .expect("filtered delta");
+        let first = delta_events_filtered(
+            &h.hashgraph,
+            &known,
+            &h.registry,
+            NodeId::new(1),
+            peer,
+            &mut dedup,
+            &config,
+        )
+        .expect("filtered delta");
         assert_eq!(first.len(), 2);
-        let second =
-            delta_events_filtered(&h.hashgraph, &known, NodeId::new(1), peer, &mut dedup, &config)
-                .expect("second filtered delta");
+        let second = delta_events_filtered(
+            &h.hashgraph,
+            &known,
+            &h.registry,
+            NodeId::new(1),
+            peer,
+            &mut dedup,
+            &config,
+        )
+        .expect("second filtered delta");
         assert!(second.is_empty(), "second call within dedup window should filter all");
-        let all = delta_events(&h.hashgraph, &known).expect("unfiltered");
+        let all = delta_events(&h.hashgraph, &known, &h.registry).expect("unfiltered");
         assert!(all.iter().any(|e| e.hash().expect("hash bounded") == a2));
     }
 
@@ -583,6 +602,7 @@ mod tests {
         let first_a = delta_events_filtered(
             &h.hashgraph,
             &known,
+            &h.registry,
             NodeId::new(1),
             peer_a,
             &mut dedup,
@@ -593,6 +613,7 @@ mod tests {
         let first_b = delta_events_filtered(
             &h.hashgraph,
             &known,
+            &h.registry,
             NodeId::new(1),
             peer_b,
             &mut dedup,
@@ -603,6 +624,7 @@ mod tests {
         let second_a = delta_events_filtered(
             &h.hashgraph,
             &known,
+            &h.registry,
             NodeId::new(1),
             peer_a,
             &mut dedup,
