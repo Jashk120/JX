@@ -815,11 +815,22 @@ impl GossipNode {
                     if guard.is_connected() {
                         Ok(())
                     } else {
-                        let res = guard.connect(&peer).await;
-                        if res.is_err() {
-                            *guard = TcpTransport::new(self.identity.clone());
+                        let timeout_dur = self.sync_timing.sync_timeout;
+                        let res = tokio::time::timeout(timeout_dur, guard.connect(&peer)).await;
+                        match res {
+                            Ok(Ok(())) => Ok(()),
+                            Ok(Err(e)) => {
+                                *guard = TcpTransport::new(self.identity.clone());
+                                Err(e)
+                            }
+                            Err(_) => {
+                                *guard = TcpTransport::new(self.identity.clone());
+                                Err(GossipError::Sync(format!(
+                                    "sync connect to peer {:?} timed out after {:?}",
+                                    peer.node_id, timeout_dur
+                                )))
+                            }
                         }
-                        res.map(|_| ())
                     }
                 };
                 if let Err(e) = connect_result {
@@ -1045,18 +1056,39 @@ impl GossipNode {
                         }
                     }
                     let mut guard = transport_arc.lock().await;
-                    if !guard.is_connected()
-                        && let Err(e) = guard.connect(&peer_clone).await
-                    {
-                        self_clone.peers.lock().await.record_failure(peer_clone.node_id);
-                        {
-                            let mut m = metrics.lock().await;
-                            m.sync_attempts += 1;
-                            m.sync_failures += 1;
+                    if !guard.is_connected() {
+                        let timeout_dur = self_clone.sync_timing.sync_timeout;
+                        let res =
+                            tokio::time::timeout(timeout_dur, guard.connect(&peer_clone)).await;
+                        match res {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => {
+                                self_clone.peers.lock().await.record_failure(peer_clone.node_id);
+                                {
+                                    let mut m = metrics.lock().await;
+                                    m.sync_attempts += 1;
+                                    m.sync_failures += 1;
+                                }
+                                *guard = TcpTransport::new(self_clone.identity.clone());
+                                tracing::warn!(peer=?peer_clone.node_id, error=%e, "sync connect failed");
+                                return;
+                            }
+                            Err(_) => {
+                                self_clone.peers.lock().await.record_failure(peer_clone.node_id);
+                                {
+                                    let mut m = metrics.lock().await;
+                                    m.sync_attempts += 1;
+                                    m.sync_failures += 1;
+                                }
+                                *guard = TcpTransport::new(self_clone.identity.clone());
+                                tracing::warn!(
+                                    peer=?peer_clone.node_id,
+                                    timeout=?timeout_dur,
+                                    "sync connect timed out"
+                                );
+                                return;
+                            }
                         }
-                        *guard = TcpTransport::new(self_clone.identity.clone());
-                        tracing::warn!(peer=?peer_clone.node_id, error=%e, "sync connect failed");
-                        return;
                     }
                     let timestamp = self_clone.next_timestamp();
                     let result = tokio::time::timeout(
