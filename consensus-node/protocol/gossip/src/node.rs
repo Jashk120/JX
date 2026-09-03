@@ -708,7 +708,7 @@ impl GossipNode {
         listener: TcpListener,
         stop: Arc<AtomicBool>,
     ) -> Result<()> {
-        let _accept_task = tokio::spawn(self.clone().accept_loop(listener));
+        let accept_task = tokio::spawn(self.clone().accept_loop(listener, stop.clone()));
 
         let outbound: Arc<Mutex<LruCache<NodeId, Arc<Mutex<TcpTransport>>>>> =
             Arc::new(Mutex::new(LruCache::new(outbound_capacity(self.peers.lock().await.len()))));
@@ -1206,6 +1206,8 @@ impl GossipNode {
                 }
             }
         }
+        accept_task.abort();
+        let _ = accept_task.await;
         if !self.flush_streams(Duration::from_secs(5)).await {
             tracing::warn!("stream flush barrier timed out or failed");
             self.gossip_metrics.lock().await.sync_failures += 1;
@@ -1882,17 +1884,40 @@ impl GossipNode {
         }
     }
 
-    async fn accept_loop(self: Arc<Self>, listener: TcpListener) {
+    async fn accept_loop(self: Arc<Self>, listener: TcpListener, stop: Arc<AtomicBool>) {
         loop {
-            let (stream, _) = match listener.accept().await {
-                Ok(accepted) => accepted,
-                Err(e) => {
-                    tracing::warn!(error = %e, "gossip accept failed");
-                    self.gossip_metrics.lock().await.sync_failures += 1;
-                    continue;
+            if stop.load(Ordering::Acquire) {
+                break;
+            }
+            tokio::select! {
+                res = listener.accept() => {
+                    let (stream, _) = match res {
+                        Ok(accepted) => accepted,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "gossip accept failed");
+                            self.gossip_metrics.lock().await.sync_failures += 1;
+                            continue;
+                        }
+                    };
+                    if stop.load(Ordering::Acquire) {
+                        break;
+                    }
+                    tokio::spawn(self.clone().handle_inbound(stream));
                 }
-            };
-            tokio::spawn(self.clone().handle_inbound(stream));
+                _ = async {
+                    loop {
+                        if stop.load(Ordering::Acquire) {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                } => {
+                    break;
+                }
+            }
+            if stop.load(Ordering::Acquire) {
+                break;
+            }
         }
     }
 
@@ -2265,13 +2290,36 @@ impl GossipNode {
     }
 
     /// Phase 4 — accepts inbound connections on the dedicated reconnect port.
-    async fn accept_reconnect_loop(self: Arc<Self>, listener: TcpListener) {
+    async fn accept_reconnect_loop(self: Arc<Self>, listener: TcpListener, stop: Arc<AtomicBool>) {
         loop {
-            let (stream, _) = match listener.accept().await {
-                Ok(accepted) => accepted,
-                Err(_) => continue,
-            };
-            tokio::spawn(self.clone().handle_reconnect_inbound(stream));
+            if stop.load(Ordering::Acquire) {
+                break;
+            }
+            tokio::select! {
+                res = listener.accept() => {
+                    let (stream, _) = match res {
+                        Ok(accepted) => accepted,
+                        Err(_) => continue,
+                    };
+                    if stop.load(Ordering::Acquire) {
+                        break;
+                    }
+                    tokio::spawn(self.clone().handle_reconnect_inbound(stream));
+                }
+                _ = async {
+                    loop {
+                        if stop.load(Ordering::Acquire) {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                } => {
+                    break;
+                }
+            }
+            if stop.load(Ordering::Acquire) {
+                break;
+            }
         }
     }
 
@@ -2371,8 +2419,9 @@ impl GossipNode {
         gossip_listener: TcpListener,
         reconnect_listener: TcpListener,
     ) -> Result<()> {
+        let never_stop = Arc::new(AtomicBool::new(false));
         let _reconnect_accept =
-            tokio::spawn(self.clone().accept_reconnect_loop(reconnect_listener));
+            tokio::spawn(self.clone().accept_reconnect_loop(reconnect_listener, never_stop));
         self.run(gossip_listener).await
     }
 
@@ -2383,9 +2432,12 @@ impl GossipNode {
         reconnect_listener: TcpListener,
         stop: Arc<AtomicBool>,
     ) -> Result<()> {
-        let _reconnect_accept =
-            tokio::spawn(self.clone().accept_reconnect_loop(reconnect_listener));
-        self.run_until_stopped(gossip_listener, stop).await
+        let reconnect_task =
+            tokio::spawn(self.clone().accept_reconnect_loop(reconnect_listener, stop.clone()));
+        let res = self.run_until_stopped(gossip_listener, stop).await;
+        reconnect_task.abort();
+        let _ = reconnect_task.await;
+        res
     }
 }
 
