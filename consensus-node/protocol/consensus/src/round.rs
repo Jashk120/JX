@@ -51,7 +51,7 @@ impl Hashgraph {
 
         let mut strongly_seen_count = 0usize;
         for witness in &witnesses_of_base_round {
-            if self.strongly_see(&hash, witness)? {
+            if self.strongly_see_at(&hash, witness, base_round)? {
                 strongly_seen_count += 1;
             }
         }
