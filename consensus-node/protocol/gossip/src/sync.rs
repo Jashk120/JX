@@ -93,7 +93,7 @@ pub async fn run_sync(
     };
 
     let unsigned = UnsignedEvent::new(node_id, self_parent, other_parent, timestamp, payload);
-    let event = unsigned.sign(signing_key);
+    let event = unsigned.sign(signing_key)?;
     if let Some(hash) = insert_verified(hashgraph, registry, event.clone()).await? {
         fresh.push(hash);
     }

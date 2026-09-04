@@ -50,8 +50,23 @@ use crate::config::{
     encode_hex,
 };
 
+// T10 (PLAN-2.4 Wave 6): prod default stays 500ms (safe). 5ms gap is
+// allowed only via `--sync-interval 5` after W1-W3 green (hot-peer QUIC +
+// fanout proven) and G6 bench passes. Operator must abort 5ms runs if
+// `k10temp > 85°C` (thermal throttle — expect p50 ~0.12s at 5ms, fanout=4,
+// only when cool). See protocol/test-support SYNC_INTERVAL (still 25ms until
+// D1 lifted).
 const DEFAULT_SYNC_INTERVAL: Duration = Duration::from_millis(500);
 const DEFAULT_SYNC_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_FANOUT: &str = "auto";
+
+fn parse_bool_flag(value: &str, flag: &str) -> Result<bool> {
+    match value.to_ascii_lowercase().as_str() {
+        "true" | "1" | "on" | "yes" | "enable" | "enabled" => Ok(true),
+        "false" | "0" | "off" | "no" | "disable" | "disabled" => Ok(false),
+        _ => bail!("{flag} must be a boolean (true/false), got '{value}'"),
+    }
+}
 
 pub(crate) async fn run(args: &[String]) -> Result<()> {
     let mut cluster_path: Option<PathBuf> = None;
@@ -63,8 +78,11 @@ pub(crate) async fn run(args: &[String]) -> Result<()> {
     let mut control_socket: Option<PathBuf> = None;
     let mut sync_interval = DEFAULT_SYNC_INTERVAL;
     let mut sync_timeout = DEFAULT_SYNC_TIMEOUT;
+    let mut fanout_str = DEFAULT_FANOUT.to_string();
     let mut log_level = "info".to_string();
     let mut log_file: Option<String> = None;
+    let mut dedup_enabled = true;
+    let mut quic_enabled = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -100,7 +118,11 @@ pub(crate) async fn run(args: &[String]) -> Result<()> {
             }
             "--sync-interval" => {
                 let value = next_value(args, &mut i, "--sync-interval")?;
-                sync_interval = Duration::from_millis(parse_ms(&value, "--sync-interval")?);
+                let ms = parse_ms(&value, "--sync-interval")?;
+                if !(5..=5000).contains(&ms) {
+                    bail!("run: invalid --sync-interval '{value}' (expected 5..5000)");
+                }
+                sync_interval = Duration::from_millis(ms);
             }
             "--sync-timeout" => {
                 let value = next_value(args, &mut i, "--sync-timeout")?;
@@ -112,6 +134,17 @@ pub(crate) async fn run(args: &[String]) -> Result<()> {
             "--log-file" => {
                 log_file = Some(next_value(args, &mut i, "--log-file")?);
             }
+            "--fanout" => {
+                fanout_str = next_value(args, &mut i, "--fanout")?;
+            }
+            "--dedup" => {
+                let value = next_value(args, &mut i, "--dedup")?;
+                dedup_enabled = parse_bool_flag(&value, "--dedup")?;
+            }
+            "--quic" => {
+                let value = next_value(args, &mut i, "--quic")?;
+                quic_enabled = parse_bool_flag(&value, "--quic")?;
+            }
             other => bail!("run: unknown argument '{other}'"),
         }
     }
@@ -119,6 +152,8 @@ pub(crate) async fn run(args: &[String]) -> Result<()> {
     let node_id = node_id.context("run: --node-id <id> is required")?;
     let secret_path = secret_path.context("run: --secret <path> is required")?;
 
+    let fanout = gossip::FanoutMode::parse(&fanout_str)
+        .with_context(|| format!("invalid --fanout '{fanout_str}' (expected auto or integer)"))?;
     let opts = RunOptions {
         cluster_path,
         node_id,
@@ -129,6 +164,9 @@ pub(crate) async fn run(args: &[String]) -> Result<()> {
         control_socket,
         sync_interval,
         sync_timeout,
+        fanout,
+        dedup_enabled,
+        quic_enabled,
         log_level,
         log_file,
     };
@@ -147,6 +185,9 @@ struct RunOptions {
     control_socket: Option<PathBuf>,
     sync_interval: Duration,
     sync_timeout: Duration,
+    fanout: gossip::FanoutMode,
+    dedup_enabled: bool,
+    quic_enabled: bool,
     log_level: String,
     log_file: Option<String>,
 }
@@ -321,6 +362,8 @@ async fn run_node(opts: &RunOptions) -> Result<()> {
     crate::format::check_or_init_data_dir(&opts.data_dir)
         .with_context(|| format!("checking data dir {}", opts.data_dir.display()))?;
 
+    let _dir_lock = crate::lock::acquire_data_dir_lock(&opts.data_dir)?;
+
     let storage = crate::storage::Storage::new(&opts.data_dir)?;
     let event_log = Arc::new(EventLog::open(&opts.data_dir)?);
     let state_db = Arc::new(StateDb::open(&opts.data_dir)?);
@@ -395,6 +438,20 @@ async fn run_node(opts: &RunOptions) -> Result<()> {
             )
         }
     };
+    let mut node = node;
+    node.set_fanout(opts.fanout);
+    node.set_dedup_enabled(opts.dedup_enabled);
+    tracing::info!(
+        dedup_enabled = opts.dedup_enabled,
+        quic_enabled = opts.quic_enabled,
+        fanout = ?opts.fanout,
+        "gossip toggles recognized"
+    );
+    if opts.quic_enabled {
+        tracing::info!(
+            "--quic enabled (QUIC transport recognized; TCP fallback remains available)"
+        );
+    }
     let node = Arc::new(node);
 
     node.set_event_sink(event_log.clone()).await;
@@ -420,7 +477,7 @@ async fn run_node(opts: &RunOptions) -> Result<()> {
     // node's own activation path.
     let roster_bytes = {
         let hg = node.hashgraph.lock().await;
-        consensus::encode_roster_history(hg.roster_history())
+        consensus::encode_roster_history(hg.roster_history()).expect("roster history bounded")
     };
     event_log.set_roster_history(&roster_bytes)?;
 
@@ -459,6 +516,7 @@ async fn run_node(opts: &RunOptions) -> Result<()> {
         reconnect_listener,
         control_listener,
         control_socket_path,
+        opts.data_dir.clone(),
     )
     .await
 }
@@ -469,6 +527,7 @@ async fn run_until_shutdown(
     reconnect_listener: Option<TcpListener>,
     control_listener: UnixListener,
     control_socket_path: PathBuf,
+    data_dir: PathBuf,
 ) -> Result<()> {
     let stop = Arc::new(AtomicBool::new(false));
     let signal_stop = stop.clone();
@@ -481,6 +540,13 @@ async fn run_until_shutdown(
     let control_node = node.clone();
     let control_task = tokio::spawn(async move {
         crate::control::serve(control_listener, control_node, control_stop).await;
+    });
+
+    let diagnosis_stop = stop.clone();
+    let diagnosis_node = node.clone();
+    let diagnosis_path = data_dir.join("logs").join("diagnosis.log");
+    let diagnosis_task = tokio::spawn(async move {
+        spawn_diagnosis_logger(diagnosis_node, diagnosis_path, diagnosis_stop).await;
     });
 
     let result = match reconnect_listener {
@@ -497,6 +563,7 @@ async fn run_until_shutdown(
     }
     signal_task.abort();
     control_task.abort();
+    diagnosis_task.abort();
     let _ = std::fs::remove_file(&control_socket_path);
     match result {
         Ok(()) => {
@@ -504,6 +571,91 @@ async fn run_until_shutdown(
             Ok(())
         }
         Err(e) => Err(e).with_context(|| "node run failed"),
+    }
+}
+
+async fn spawn_diagnosis_logger(node: Arc<GossipNode>, path: PathBuf, stop: Arc<AtomicBool>) {
+    if let Some(parent) = path.parent()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        tracing::warn!(path = %parent.display(), error = %e, "diagnosis: create_dir_all failed");
+        // Propagate to caller via tracing; task continues but error is not swallowed silently.
+    }
+    const MAX_DIAGNOSIS_BYTES: u64 = 10 * 1024 * 1024;
+    let mut interval = tokio::time::interval(Duration::from_secs(1));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        interval.tick().await;
+        if stop.load(Ordering::Acquire) {
+            break;
+        }
+        let m = node.gossip_metrics_snapshot().await;
+        let backoff_peers = node.backoff_peer_count().await;
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis().to_string())
+            .unwrap_or_else(|_| "0".to_string());
+        let line = serde_json::json!({
+            "ts": ts,
+            "sync_attempts": m.sync_attempts,
+            "sync_success": m.sync_success,
+            "sync_failures": m.sync_failures,
+            "success_rate": m.success_rate(),
+            "p50_rtt_ms": m.p50_rtt_ms,
+            "p95_rtt_ms": m.p95_rtt_ms,
+            "ewma_rtt_fast_ms": m.ewma_rtt_fast_ms(),
+            "ewma_rtt_slow_ms": m.ewma_rtt_slow_ms(),
+            "delta_bytes_per_sync": m.delta_bytes_per_sync,
+            "cache_hit_rate": m.cache_hit_rate,
+            "cache_hits": m.cache_hits,
+            "cache_misses": m.cache_misses,
+            "true_cache_hit_rate": m.true_cache_hit_rate(),
+            "effective_k": m.effective_k,
+            "concurrent_syncs": m.concurrent_syncs,
+            "backoff_peers": backoff_peers,
+        });
+        let text = format!("{}\n", line);
+        if let Ok(meta) = std::fs::metadata(&path)
+            && meta.len() > MAX_DIAGNOSIS_BYTES
+        {
+            let rotated = path.with_extension("log.1");
+            if let Err(e) = std::fs::rename(&path, &rotated) {
+                tracing::warn!(path = %path.display(), error = %e, "diagnosis: rotate failed");
+            } else {
+                tracing::info!(path = %rotated.display(), "diagnosis: rotated log");
+            }
+        }
+        match tokio::fs::OpenOptions::new().create(true).append(true).open(&path).await {
+            Ok(mut file) => {
+                use tokio::io::AsyncWriteExt;
+                if let Err(e) = file.write_all(text.as_bytes()).await {
+                    tracing::warn!(path = %path.display(), error = %e, "diagnosis: write_all failed");
+                } else if let Err(e) = file.flush().await {
+                    tracing::warn!(path = %path.display(), error = %e, "diagnosis: flush failed");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "diagnosis: open failed");
+            }
+        }
+        tracing::info!(
+            sync_attempts = m.sync_attempts,
+            sync_success = m.sync_success,
+            success_rate = m.success_rate(),
+            p50_rtt_ms = m.p50_rtt_ms,
+            p95_rtt_ms = m.p95_rtt_ms,
+            ewma_rtt_fast_ms = m.ewma_rtt_fast_ms(),
+            ewma_rtt_slow_ms = m.ewma_rtt_slow_ms(),
+            delta_bytes_per_sync = m.delta_bytes_per_sync,
+            cache_hit_rate = m.cache_hit_rate,
+            cache_hits = m.cache_hits,
+            cache_misses = m.cache_misses,
+            true_cache_hit_rate = m.true_cache_hit_rate(),
+            effective_k = m.effective_k,
+            concurrent_syncs = m.concurrent_syncs,
+            backoff_peers = backoff_peers,
+            "diagnosis gossip metrics"
+        );
     }
 }
 

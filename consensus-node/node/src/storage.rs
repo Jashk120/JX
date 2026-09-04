@@ -78,7 +78,8 @@ impl Storage {
     pub fn persist(&self, checkpoint: &SignedCheckpoint) -> Result<()> {
         let round = checkpoint.payload.round;
         let checkpoint_path = self.checkpoint_path(round);
-        atomic_write(&checkpoint_path, &encode_signed_checkpoint(checkpoint))
+        let bytes = encode_signed_checkpoint(checkpoint).expect("checkpoint encode bounded");
+        atomic_write(&checkpoint_path, &bytes)
             .with_context(|| format!("writing checkpoint {round}"))?;
         Ok(())
     }
@@ -328,7 +329,7 @@ mod tests {
         let storage = Storage::new(tmp.path()).expect("storage opens");
         let checkpoint = signed_checkpoint(2, &[1, 2]);
         storage.persist(&checkpoint).expect("persist");
-        let entries: Vec<String> = fs::read_dir(storage.dir.clone())
+        let entries: Vec<String> = fs::read_dir(storage.dir)
             .expect("read dir")
             .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
             .collect();
@@ -391,7 +392,7 @@ mod tests {
         let bytes = fs::read(&path).expect("read ckpt");
         assert!(!bytes.is_empty());
         let original_len = bytes.len();
-        let mut corrupted = bytes.clone();
+        let mut corrupted = bytes;
         corrupted[0] ^= 0xFF;
         let decoded = stream::pb::SignedCheckpoint::decode(corrupted.as_slice());
         let rejected = decoded.is_err()

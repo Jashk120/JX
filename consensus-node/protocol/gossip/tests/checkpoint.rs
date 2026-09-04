@@ -84,9 +84,10 @@ fn build_deep_clique() -> Vec<Event> {
             Timestamp::new(ts),
             Vec::new(),
         )
-        .sign(&SigningKey::from_bytes(&consensus_seed(author)));
+        .sign(&SigningKey::from_bytes(&consensus_seed(author)))
+        .expect("sign bounded");
         ts += 1;
-        events.insert(label, event.hash());
+        events.insert(label, event.hash().expect("hash bounded"));
         out.push(event);
     };
     step("a1", 1, None, None);
@@ -230,7 +231,7 @@ async fn pruning_old_events_does_not_break_ordering_after_checkpoint() {
 async fn from_checkpoint_rejects_roster_key_mismatched_to_the_learner() {
     let roster = registry_for_ids(&[1, 4]);
     let state = state::State::new(temp_state_db().state_keyspace());
-    let state_bytes = state.to_bytes();
+    let state_bytes = state.to_bytes().expect("to_bytes succeeds");
     let state_hash = state.root();
     let payload =
         CheckpointPayload::new(1, consensus::compute_records_root(&[]), state_hash, roster.clone());
@@ -244,7 +245,7 @@ async fn from_checkpoint_rejects_roster_key_mismatched_to_the_learner() {
     let response = ReconnectResponse {
         signed_checkpoint: accepted,
         state_bytes,
-        roster_history_bytes: encode_roster_history(&RosterHistory::new(roster)),
+        roster_history_bytes: encode_roster_history(&RosterHistory::new(roster)).expect("bounded"),
         decided_round: 1,
         retained: Vec::new(),
         last_timestamp: 0,

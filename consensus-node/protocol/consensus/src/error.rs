@@ -9,6 +9,8 @@ pub enum ConsensusError {
     UnknownCreator,
     UnknownEvent(EventHash),
     AncestorSeqsMismatch { expected: usize, got: usize },
+    EncodingFailed(String),
+    InvalidSelfParent,
 }
 
 pub type Result<T> = std::result::Result<T, ConsensusError>;
@@ -26,6 +28,10 @@ impl fmt::Display for ConsensusError {
             Self::UnknownEvent(hash) => write!(f, "event {hash:?} is not present in the hashgraph"),
             Self::AncestorSeqsMismatch { expected, got } => {
                 write!(f, "ancestor_seqs length {got} does not match member count {expected}")
+            }
+            Self::EncodingFailed(reason) => write!(f, "encoding failed: {reason}"),
+            Self::InvalidSelfParent => {
+                write!(f, "self_parent creator does not match event creator")
             }
         }
     }

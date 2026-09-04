@@ -7,6 +7,7 @@
 //! jkaind run --cluster <cluster.toml> --node-id <id> --secret <secret-<id>.bin> \
 //!            [--gossip-port <port>] [--reconnect-port <port>] [--data <dir>]
 //!            [--control-socket <path>] [--sync-interval <ms>] [--sync-timeout <ms>]
+//!            [--fanout <auto|1..N>] [--dedup <true|false>] [--quic <true|false>]
 //!
 //! jkaind status  [--socket <path>]
 //! jkaind tx put    --key <k> --value <v>  [--socket <path>]
@@ -87,6 +88,7 @@ fn print_usage() {
          \x20 jkaind run  --cluster <cluster.toml> --node-id <id> --secret <secret-<id>.bin> \\\n\
          \x20            [--gossip-port <port>] [--reconnect-port <port>] [--data <dir>] \\\n\
          \x20            [--control-socket <path>] [--sync-interval <ms>] [--sync-timeout <ms>] \\\n\
+         \x20            [--fanout <auto|1..N>] [--dedup <true|false>] [--quic <true|false>] \\\n\
          \x20            [--log-level <trace|debug|info|warn|error>] [--log-file <path>| -]\n\
          \n\
          Control (talk to a running node over its Unix socket):\n\

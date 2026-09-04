@@ -19,8 +19,17 @@ rcgen          = "0.14"
 rustls         = { version = "0.23", default-features = false, features = ["ring", "logging", "tls12"] }
 tokio-rustls   = "0.26"
 x509-parser    = "0.18.1"
+quinn          = { version = "0.11", features = ["runtime-tokio", "rustls-ring"] }
 rand           = "0.8"
+lru            = "0.12"
 tracing        = { workspace = true }
+
+[lints]
+workspace = true
+
+[features]
+default = ["tcp-fallback"]
+tcp-fallback = []
 
 [dev-dependencies]
 tempfile = "3"

@@ -14,7 +14,7 @@ use crate::membership::MembershipRegistry;
 pub trait Signable: CanonicalEncode {
     type Signed;
 
-    fn sign(self, key: &SigningKey) -> Self::Signed;
+    fn sign(self, key: &SigningKey) -> Result<Self::Signed>;
 }
 
 /// A value that carries its own signature and can check it against a

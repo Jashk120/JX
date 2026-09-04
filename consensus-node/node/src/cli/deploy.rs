@@ -517,6 +517,15 @@ fn install_service(plan: &GenesisPlan, member: &MemberTarget) -> Result<()> {
                 ssh_capture(&member.ssh_target, &["sudo", "-n", &rule], None)
                     .map(drop)
                     .with_context(|| format!("node {}: applying ufw rule", member.id))?;
+                // QUIC gossip runs over UDP; open it alongside TCP so a future
+                // QUIC listener is not firewalled off (M-1). Reconnect stays TCP.
+                if port == plan.gossip_port {
+                    let udp_rule =
+                        format!("ufw allow from {} to any port {} proto udp", peer.advertise, port);
+                    ssh_capture(&member.ssh_target, &["sudo", "-n", &udp_rule], None)
+                        .map(drop)
+                        .with_context(|| format!("node {}: applying ufw rule", member.id))?;
+                }
             }
         }
     }

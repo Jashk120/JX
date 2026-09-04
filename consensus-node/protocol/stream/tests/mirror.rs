@@ -109,7 +109,7 @@ async fn mirror_decodes_and_verifies_record_stream() {
 
     // The mirror's verification: chain + BLS aggregate + records_root binding,
     // anchored by the trusted roster hash.
-    let trusted_hash = registry_of(&[1, 2, 3, 4]).hash();
+    let trusted_hash = registry_of(&[1, 2, 3, 4]).hash().expect("hash bounded");
     verify::verify_record_stream_dir(record_dir.path(), primitives::NodeId::new(1), trusted_hash)
         .expect("record stream verifies end-to-end");
 
@@ -120,7 +120,7 @@ async fn mirror_decodes_and_verifies_record_stream() {
         .expect("record stream verifies for any node_id when roster hash is trusted");
 
     // Wrong trusted hash must fail even for the correct signer set.
-    let wrong_hash = registry_of(&[1, 2, 3]).hash();
+    let wrong_hash = registry_of(&[1, 2, 3]).hash().expect("hash bounded");
     assert!(
         verify::verify_record_stream_dir(record_dir.path(), primitives::NodeId::new(1), wrong_hash)
             .is_err(),
@@ -182,7 +182,7 @@ async fn mirror_readers_reject_corruption() {
     let mid = corrupted.len() / 2;
     corrupted[mid] ^= 0xff;
     fs::write(path, corrupted).expect("corrupt");
-    let trusted_hash = registry_of(&[1, 2, 3, 4]).hash();
+    let trusted_hash = registry_of(&[1, 2, 3, 4]).hash().expect("hash bounded");
     assert!(
         verify::verify_record_stream_dir(
             record_dir.path(),
@@ -209,7 +209,7 @@ async fn forged_roster_rejected_with_trusted_hash() {
 
     // The correct roster hash: the real network's {1, 2, 3, 4} roster.
     let correct_roster = registry_of(&[1, 2, 3, 4]);
-    let correct_roster_hash = correct_roster.hash();
+    let correct_roster_hash = correct_roster.hash().expect("hash bounded");
 
     // Tamper every record file: replace its checkpoint with a forged one whose
     // records_root correctly matches the file's actual items (so the binding
@@ -262,7 +262,7 @@ async fn forged_roster_rejected_with_trusted_hash() {
     // attacker can self-validate), but with the correct trusted hash the
     // forged roster is rejected.
     let forged_roster = registry_of(&[1, 10, 11, 12]);
-    let forged_hash = forged_roster.hash();
+    let forged_hash = forged_roster.hash().expect("hash bounded");
     assert!(
         verify::verify_record_stream_dir(
             record_dir.path(),
@@ -295,7 +295,7 @@ async fn forged_roster_rejected_with_trusted_hash() {
     file.items[0].tx_payload.push(0xff);
     let tampered_bytes = file.encode_to_vec();
     fs::write(target, tampered_bytes).expect("write tampered items");
-    let trusted = registry_of(&[1, 2, 3, 4]).hash();
+    let trusted = registry_of(&[1, 2, 3, 4]).hash().expect("hash bounded");
     assert!(
         verify::verify_record_stream_dir(record_dir2.path(), primitives::NodeId::new(1), trusted)
             .is_err(),
@@ -345,7 +345,7 @@ async fn genuine_checkpoint_with_fabricated_items_fails_records_root() {
     }
     file.end_running_hash = Some(stream::convert::digest_hash_object(cur));
     fs::write(path, file.encode_to_vec()).expect("write fabricated");
-    let trusted = registry_of(&[1, 2, 3, 4]).hash();
+    let trusted = registry_of(&[1, 2, 3, 4]).hash().expect("hash bounded");
     assert!(
         verify::verify_record_stream_dir(dir.path(), primitives::NodeId::new(1), trusted).is_err(),
         "fabricated items with genuine checkpoint must fail via records_root"
@@ -384,7 +384,7 @@ async fn wrong_dst_or_other_keys_aggregate_fails() {
     .expect("writer");
     writer.submit_items(forged_cp, items);
     writer.barrier().await;
-    let trusted = registry_of(&[1, 2, 3, 4]).hash();
+    let trusted = registry_of(&[1, 2, 3, 4]).hash().expect("hash bounded");
     assert!(
         verify::verify_record_stream_dir(dir.path(), primitives::NodeId::new(1), trusted).is_err(),
         "aggregate by other keys must fail"

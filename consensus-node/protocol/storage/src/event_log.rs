@@ -108,7 +108,8 @@ impl EventLog {
     /// reconnect teacher's retained event was ordered after the learner's own
     /// append). Returns `true` when a new record was appended.
     pub fn append(&self, record: &RetainedEvent) -> Result<bool> {
-        let hash = record.event.hash();
+        let hash =
+            record.event.hash().map_err(|e| EventLogError::Corrupt(format!("hash failed: {e}")))?;
         let _guard = self.write_lock.lock().map_err(|_| EventLogError::Poisoned)?;
         if let Some(existing) = self.by_hash.get(hash.as_bytes().as_slice())? {
             let (log_seq, mut stored) = decode_value(&existing)
@@ -279,7 +280,8 @@ impl EventSink for EventLog {
 fn encode_value(log_seq: u64, record: &RetainedEvent) -> Vec<u8> {
     let mut buf = Vec::with_capacity(8 + 64);
     buf.extend_from_slice(&log_seq.to_be_bytes());
-    buf.extend_from_slice(&encode_retained_event(record));
+    let encoded = encode_retained_event(record).expect("retained event encode bounded");
+    buf.extend_from_slice(&encoded);
     buf
 }
 
@@ -320,7 +322,7 @@ mod tests {
     }
 
     fn record_hash(record: &RetainedEvent) -> EventHash {
-        record.event.hash()
+        record.event.hash().expect("record hash bounded")
     }
 
     #[test]

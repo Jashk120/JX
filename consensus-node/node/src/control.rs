@@ -67,6 +67,36 @@ pub struct ControlResponse {
     pub error: Option<String>,
 }
 
+/// Snapshot of gossip-layer bench metrics (G0 instrumentation).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct GossipMetricsReport {
+    pub sync_attempts: u64,
+    pub sync_success: u64,
+    pub sync_failures: u64,
+    pub success_rate: f64,
+    pub p50_rtt_ms: f64,
+    pub p95_rtt_ms: f64,
+    pub delta_bytes_per_sync: f64,
+    pub cache_hit_rate: f64,
+    pub backoff_peers: usize,
+    #[serde(default)]
+    pub pending_dropped: u64,
+    #[serde(default)]
+    pub ewma_rtt_fast_ms: f64,
+    #[serde(default)]
+    pub ewma_rtt_slow_ms: f64,
+    #[serde(default)]
+    pub cache_hits: u64,
+    #[serde(default)]
+    pub cache_misses: u64,
+    #[serde(default)]
+    pub true_cache_hit_rate: f64,
+    #[serde(default)]
+    pub effective_k: usize,
+    #[serde(default)]
+    pub concurrent_syncs: usize,
+}
+
 /// The `status` report: node identity, current roster, known peers, and the
 /// ordering/checkpoint watermarks.
 #[derive(Debug, Serialize, Deserialize)]
@@ -81,6 +111,8 @@ pub struct StatusReport {
     /// `members` when a node restored a checkpoint written under keys that no
     /// longer match the live registry — the silent-stall signal.
     pub checkpoint_roster: Vec<MemberReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gossip_metrics: Option<GossipMetricsReport>,
 }
 
 /// One consensus member in the `status` report.
@@ -309,6 +341,27 @@ async fn status_response(node: &GossipNode) -> ControlResponse {
             .collect(),
         None => Vec::new(),
     };
+    let metrics = node.gossip_metrics_snapshot().await;
+    let backoff_peers = node.backoff_peer_count().await;
+    let gossip_metrics = GossipMetricsReport {
+        sync_attempts: metrics.sync_attempts,
+        sync_success: metrics.sync_success,
+        sync_failures: metrics.sync_failures,
+        success_rate: metrics.success_rate(),
+        p50_rtt_ms: metrics.p50_rtt_ms,
+        p95_rtt_ms: metrics.p95_rtt_ms,
+        delta_bytes_per_sync: metrics.delta_bytes_per_sync,
+        cache_hit_rate: metrics.cache_hit_rate,
+        backoff_peers,
+        pending_dropped: metrics.pending_dropped,
+        ewma_rtt_fast_ms: metrics.ewma_rtt_fast_ms(),
+        ewma_rtt_slow_ms: metrics.ewma_rtt_slow_ms(),
+        cache_hits: metrics.cache_hits,
+        cache_misses: metrics.cache_misses,
+        true_cache_hit_rate: metrics.true_cache_hit_rate(),
+        effective_k: metrics.effective_k,
+        concurrent_syncs: metrics.concurrent_syncs,
+    };
     ok_response(json!(StatusReport {
         node_id,
         members,
@@ -317,6 +370,7 @@ async fn status_response(node: &GossipNode) -> ControlResponse {
         decided_round,
         latest_checkpoint_round,
         checkpoint_roster,
+        gossip_metrics: Some(gossip_metrics),
     }))
 }
 
@@ -357,7 +411,9 @@ async fn submit_tx(node: &GossipNode, payload_hex: &str) -> ControlResponse {
             payload.len()
         ));
     }
-    node.submit_transaction(payload).await;
+    if !node.submit_transaction(payload).await {
+        return error_response("pending queue full".to_string());
+    }
     ok_response(json!({ "queued": true }))
 }
 
@@ -445,7 +501,7 @@ mod tests {
         let listener = UnixListener::bind(path).expect("bind control socket");
         let stop = Arc::new(AtomicBool::new(false));
         let serve_stop = stop.clone();
-        let serve_node = node.clone();
+        let serve_node = node;
         tokio::spawn(async move {
             serve(listener, serve_node, serve_stop).await;
         });

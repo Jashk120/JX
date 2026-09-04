@@ -2,14 +2,18 @@
 //! consumes, emitted by a consensus node into a node-scoped directory under
 //! `<data>/streams/`.
 //!
-//! Two protobuf file types, both chained by a running hash and accompanied by
-//! an Ed25519 signature file:
+//! Two protobuf file types, both chained by a running hash:
 //!
 //! - **Event stream files (`.esf`)**: every gossip event this node inserted,
-//!   in insertion (= topological) order — the offline DAG source.
+//!   in insertion (= topological) order, the offline DAG source, with an
+//!   accompanying `.esf_sig` Ed25519 signature file.
 //! - **Record stream files (`.rsf`)**: one file per decided round, carrying
 //!   the round's finalized transactions in consensus order plus the round's
-//!   threshold-signed `SignedCheckpoint` (the state-root anchor).
+//!   threshold-signed `SignedCheckpoint` (the state-root anchor). **No
+//!   `.rsf_sig`**: since `1313db5`/`PLAN-1` record files are content-bound via
+//!   Merkle `records_root` plus 136-byte BLS aggregate and
+//!   `prev_checkpoint_hash` chain, with a companion `.rsf_proofs` Merkle
+//!   sidecar.
 //!
 //! Everything a mirror consumes is protobuf (`AGENTS.md`, Wire Formats); the
 //! internal consensus/gossip encodings are unchanged. The schema lives at the

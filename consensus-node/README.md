@@ -1,9 +1,11 @@
 # JKaIN
 
 A consensus-critical blockchain node implementing the virtual-voting
-Hashgraph algorithm. Events gossip over pinned-TLS TCP, order through
-round-based virtual voting, and execute deterministically into a shared
-key-value state.
+Hashgraph algorithm. Events gossip over pinned-TLS TCP/QUIC with bounded
+concurrent fanout (`k=4@N=6, 12@N=100` via `JoinSet`+`Semaphore`, `LruCache`
+hot-pool `10@N=6, 30@N=100`, per-peer dedup `1000/250/3000 ms`, `GossipMetrics`),
+order through round-based virtual voting, and execute deterministically into a
+shared key-value state.
 
 ## Workspace layout
 
@@ -20,6 +22,11 @@ executor/     deterministic execution layer
   state/        Fjall-backed KV executor + Merkle tree + DID (did:jkain) — emits sorted after-image state_diffs
 node/         the jkaind daemon: config, persistence, restart recovery (FORMAT_VERSION 5, STREAM_VERSION 3)
 ```
+
+Shared protobuf schema lives at the repo root `proto/jkain_stream.proto` and is
+compiled by `protocol/stream/build.rs` (prost) for both Rust and Go mirrors.
+External-facing wire formats use protobuf per `AGENTS.md`; internal
+consensus and gossip encodings keep the canonical binary form.
 
 Data dir layout: `<data>/checkpoints/` (`.cp`), `<data>/statedb/`, `<data>/eventlog/`, `<data>/streams/` (`.esf` + `.esf_sig` + `.rsf` + `.rsf_proofs` + `.ckpt`).
 

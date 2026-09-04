@@ -275,7 +275,7 @@ impl Hashgraph {
 
     pub fn insert(&mut self, verified: VerifiedEvent) -> Result<EventHash> {
         let event = verified.into_inner();
-        let hash = event.hash();
+        let hash = event.hash().map_err(|e| ConsensusError::EncodingFailed(e.to_string()))?;
 
         if self.events.contains_key(&hash) {
             return Err(InsertError::AlreadyPresent(hash));
@@ -292,6 +292,12 @@ impl Hashgraph {
             Some(h) => Some(self.events.get(h).ok_or(InsertError::MissingParent(*h))?),
             None => None,
         };
+
+        if let Some(record) = self_parent_record
+            && *record.event().creator() != creator
+        {
+            return Err(InsertError::InvalidSelfParent);
+        }
 
         let seq = self_parent_record.map_or(1, |r| r.seq + 1);
 
@@ -407,7 +413,7 @@ impl Hashgraph {
         round_received: Option<u64>,
         consensus_timestamp: Option<Timestamp>,
     ) -> Result<EventHash> {
-        let hash = event.hash();
+        let hash = event.hash().map_err(|e| ConsensusError::EncodingFailed(e.to_string()))?;
         if self.events.contains_key(&hash) {
             return Err(InsertError::AlreadyPresent(hash));
         }
@@ -1020,7 +1026,8 @@ mod tests {
     ) -> VerifiedEvent {
         let event =
             UnsignedEvent::new(creator, self_parent, other_parent, Timestamp::new(ts), Vec::new())
-                .sign(key);
+                .sign(key)
+                .unwrap();
         event.verify(&registry_of(&[(creator, key)])).expect("test event should verify")
     }
 
@@ -1630,8 +1637,9 @@ mod tests {
         );
         let mut hg = Hashgraph::from_checkpoint(&checkpoint, RosterHistory::new(registry));
 
-        let event =
-            UnsignedEvent::new(node, None, None, Timestamp::new(100), Vec::new()).sign(&key);
+        let event = UnsignedEvent::new(node, None, None, Timestamp::new(100), Vec::new())
+            .sign(&key)
+            .unwrap();
         let ancestor_seqs = vec![7u64];
         let hash = hg
             .insert_accepted(
@@ -1675,8 +1683,9 @@ mod tests {
         );
         let mut hg = Hashgraph::from_checkpoint(&checkpoint, RosterHistory::new(registry));
 
-        let event =
-            UnsignedEvent::new(node, None, None, Timestamp::new(100), Vec::new()).sign(&key);
+        let event = UnsignedEvent::new(node, None, None, Timestamp::new(100), Vec::new())
+            .sign(&key)
+            .unwrap();
         // round_received None: the teacher had not ordered this event yet, so
         // the learner leaves it pending for its own ordering machinery.
         let hash =
@@ -1698,7 +1707,8 @@ mod tests {
 
         let rogue = NodeId::new(99);
         let event = UnsignedEvent::new(rogue, None, None, Timestamp::new(100), Vec::new())
-            .sign(&SigningKey::generate(&mut OsRng));
+            .sign(&SigningKey::generate(&mut OsRng))
+            .unwrap();
         assert_eq!(
             hg.insert_accepted(event, 1, 1, vec![1], Some(1), Some(Timestamp::new(0))),
             Err(InsertError::UnknownCreator)
@@ -1718,8 +1728,9 @@ mod tests {
         );
         let mut hg = Hashgraph::from_checkpoint(&checkpoint, RosterHistory::new(registry));
 
-        let event =
-            UnsignedEvent::new(node, None, None, Timestamp::new(100), Vec::new()).sign(&key);
+        let event = UnsignedEvent::new(node, None, None, Timestamp::new(100), Vec::new())
+            .sign(&key)
+            .unwrap();
         // ancestor_seqs has 2 entries but the hashgraph only has 1 member.
         assert_eq!(
             hg.insert_accepted(event, 1, 1, vec![1, 0], Some(1), Some(Timestamp::new(0))),
@@ -1754,7 +1765,7 @@ mod tests {
         assert_eq!(re_a1.round_received, Some(1));
         assert_eq!(re_a1.consensus_timestamp, Some(Timestamp::new(100)));
         assert_eq!(re_a1.ancestor_seqs.len(), 2, "ancestor_seqs covers both members");
-        assert_eq!(re_a1.event.hash(), a1);
+        assert_eq!(re_a1.event.hash().unwrap(), a1);
 
         let re_a2 = &by_seq[&(node_a, 2)];
         assert_eq!(re_a2.round, 1, "birth round tracks the parents, not the ordering");
@@ -1821,9 +1832,11 @@ mod tests {
         // matters (distinct keys would hide the divergence).
         let payload = vec![Transaction::from_bytes(b"same-key".to_vec())];
         let event_a = UnsignedEvent::new(node_a, None, None, Timestamp::new(10), payload.clone())
-            .sign(&key_a);
-        let event_b = UnsignedEvent::new(node_b, None, None, Timestamp::new(20), payload.clone())
-            .sign(&key_b);
+            .sign(&key_a)
+            .unwrap();
+        let event_b = UnsignedEvent::new(node_b, None, None, Timestamp::new(20), payload)
+            .sign(&key_b)
+            .unwrap();
         let verified_a = event_a.verify(&registry).expect("verify a");
         let verified_b = event_b.verify(&registry).expect("verify b");
         let hash_a = teacher.insert(verified_a).expect("insert a");
@@ -1843,17 +1856,17 @@ mod tests {
         let retained = teacher.retained_events();
         // Verify retained carries the timestamps
         for re in &retained {
-            if re.event.hash() == hash_a {
+            if re.event.hash().unwrap() == hash_a {
                 assert_eq!(re.consensus_timestamp, Some(ts_late));
                 assert_eq!(re.round_received, Some(5));
             }
-            if re.event.hash() == hash_b {
+            if re.event.hash().unwrap() == hash_b {
                 assert_eq!(re.consensus_timestamp, Some(ts_early));
             }
         }
         // Encode/decode round-trip via storage wire format (backward compat)
         for re in &retained {
-            let bytes = crate::reconnect::encode_retained_event(re);
+            let bytes = crate::reconnect::encode_retained_event(re).unwrap();
             let decoded = crate::reconnect::decode_retained_event(&bytes).expect("decode");
             assert_eq!(&decoded, re, "storage wire round-trip preserves timestamp");
         }
@@ -1861,7 +1874,7 @@ mod tests {
         {
             // Simulate old encoding by truncating the last byte (timestamp tag)
             let re = retained.iter().find(|r| r.round_received.is_some()).unwrap();
-            let mut old_bytes = crate::reconnect::encode_retained_event(re);
+            let mut old_bytes = crate::reconnect::encode_retained_event(re).unwrap();
             // Old format had no trailing timestamp field: remove it
             old_bytes.pop();
             if re.consensus_timestamp.is_some() {
@@ -1924,9 +1937,10 @@ mod tests {
         // Legacy fallback: insert_accepted with round_received Some but timestamp None
         // must fabricate Timestamp(0) (backward compat for old persisted logs)
         let mut hg_legacy =
-            Hashgraph::from_checkpoint(&checkpoint, crypto::RosterHistory::new(registry.clone()));
-        let event_legacy =
-            UnsignedEvent::new(node_a, None, None, Timestamp::new(999), Vec::new()).sign(&key_a);
+            Hashgraph::from_checkpoint(&checkpoint, crypto::RosterHistory::new(registry));
+        let event_legacy = UnsignedEvent::new(node_a, None, None, Timestamp::new(999), Vec::new())
+            .sign(&key_a)
+            .unwrap();
         let hash_legacy = hg_legacy
             .insert_accepted(event_legacy, 10, 1, vec![10, 0], Some(2), None)
             .expect("legacy insert");

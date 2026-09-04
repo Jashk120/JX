@@ -2,34 +2,46 @@
 
 Gossip-about-gossip network layer for JKain.
 
-Implements Consensus Spec §5: nodes periodically pick a random peer,
-exchange event deltas over a pinned TLS connection, and fold the newly
-received events into a locally-created event of their own. Depends on
-`primitives` for the value types, `crypto` for hashing, signing, and
-membership, and `consensus` for the hashgraph that stores and orders events.
+Implements Consensus Spec §5: nodes periodically fan out to `k =
+FanoutMode::effective_k(N)` peers concurrently (`JoinSet`+`Semaphore(k)`,
+`ratio 0.6@N≤10 → 0.3@N≥30`, `k_max 4@N≤6, 17@7≤N≤99 (Hedera cap), 12@N≥100` —
+`N=6→4, 10→6, 29→9, 100→12`; Hedera `17` is cap not computed), exchange event deltas over
+pinned TLS (TCP/QUIC) connections, and fold the newly received events into a
+locally-created event of their own. Depends on `primitives` for the value
+types, `crypto` for hashing, signing, and membership, and `consensus` for the
+hashgraph that stores and orders events.
 
-Transport is raw TCP with TLS 1.3 (rustls) and length-prefixed canonical
-frames — the conservative, well-understood transport the whitepaper (§2.2)
-deliberately chooses for the consensus-hot path. `SyncTransport` is abstract
-so `TcpTransport` remains as benchmark/fallback; QUIC is design-locked in
-`docs/OPTIMIZATION.md` (G-track G1–G6, bounded fanout + scoring) and not yet
-implemented.
+Transport is `SyncTransport` over raw TCP with TLS 1.3 (rustls) and
+length-prefixed canonical frames — the conservative, well-understood transport
+the whitepaper (§2.2) deliberately chooses for the consensus-hot path — plus
+`QuicTransport` via `quinn`+`rustls` SPKI verifier (same `spki_fingerprint` pin,
+single `gossip_addr` as QUIC endpoint, `TcpTransport` fallback, `Frame`
+`[tag:u8][len:u32BE][payload]` unchanged over QUIC bidi streams). `SyncTransport`
+stays abstract so `TcpTransport` remains as benchmark/fallback; bounded fanout,
+`LruCache` hot-pool, per-peer dedup and `GossipMetrics` are implemented (T12)
+per `docs/OPTIMIZATION.md:3.4` (G-track G1–G6).
 
 ## Contents
 
 - `peer` / `peer_manager` — known peers (NodeId, address, reconnect address,
-  expected TLS fingerprint) and uniform-random selection for the sync target,
-  matching Hedera's unweighted behavior. `add_peer_from_key` admits a
-  runtime-added member by deriving its TLS pin from its Ed25519 consensus key
-  (the single-seed convention) and carrying its reconnect port.
+  expected TLS fingerprint) and `FanoutMode::Auto` scored selection
+  (`effective_k(N)=ceil(N*ratio)` clamped to `k_max 4@N≤6, 17@7≤N≤99 Hedera cap, 12@N≥100`,
+  ratio `0.6→0.3` — `N=6→4, 10→6, 29→9` (computed `9` vs cap `17`), `100→12`,
+  `pick_k` with ε-greedy exploration + backoff, matching Hedera's
+  unweighted behavior for k=1). `add_peer_from_key` admits a runtime-added
+  member by deriving its TLS pin from its Ed25519 consensus key (the
+  single-seed convention) and carrying its reconnect port.
 - `tls` — per-node TLS identity. The durable secret is an Ed25519 seed;
   a self-signed X.509 certificate is re-wrapped from it (via `rcgen`) on
   every startup. Peers pin by comparing the presented certificate's SPKI
   fingerprint against the address-book entry, independent of the consensus
   key registry.
-- `transport` — `SyncTransport` (connect / send / recv frame) and
-  `TcpTransport` over `tokio` + rustls. One persistent connection per peer,
-  reused across sync rounds.
+- `transport` — `SyncTransport` (connect / send / recv frame), `TcpTransport`
+  over `tokio` + rustls, and `QuicTransport` via `quinn` + `rustls` SPKI verifier
+  (same pin, QUIC bidi streams, TCP fallback). `LruCache` hot-pool outbound
+  (`outbound_capacity` 10@N=6, 30@N=100) reused across sync rounds with LRU
+  eviction; `GossipMetrics` tracks `sync_attempts/success`, `p50/p95_rtt`,
+  `cache_hit_rate`.
 - `proto` — the wire types: `SyncRequest` (a per-creator known summary),
   `SyncResponse` (a topologically-ordered event delta), `ReconnectRequest` /
   `ReconnectResponse` (Phase 4 checkpoint bootstrap), `Behind` (pruned-history
@@ -39,21 +51,27 @@ implemented.
   watermark with capacity guards on every counted field.
 - `frontier` — the sync summary and delta computation: `known_summary`
   builds the per-creator frontier from `Hashgraph::latest_event_by`, and
-  `delta_events` walks each creator's self-parent chain above the frontier,
-  then topologically sorts the union (Kahn's algorithm, both parents as
-  edges) so a receiver can insert every event parents-first.
+  `delta_events` / `delta_events_filtered` walks each creator's self-parent
+  chain above the frontier, then topologically sorts the union (Kahn's
+  algorithm, both parents as edges) so a receiver can insert every event
+  parents-first. `delta_events_filtered` applies per-peer `DedupState` via
+  `SyncConfig` (`self 1000 ms / ancestor 250 ms / non-ancestor 3000 ms`,
+  `filter_likely_duplicates`, per-peer isolation) to suppress redundant resends.
 - `sync` — `run_sync`: send the request, verify + insert the response
   events (skipping ones already present), create the initiator's own event
   (`self_parent` own last, `other_parent` the peer's last, monotonic
   `next_timestamp` clamped against `last_timestamp`), insert it, and push it
   back on the same stream. `next_timestamp` lives in `sync` so both the
-  driver and tests share the same clock-clamp logic.
+  driver and tests share the same clock-clamp logic. Fanout driver wraps
+  `run_sync` in `JoinSet`+`Semaphore(k)` with per-peer backpressure.
 - `node` — `GossipNode`: owns a `Hashgraph`, the TLS identity, the peer
-  table, the Fjall `StateDb` (live state + per-round snapshots + watermark),
-  and the async machinery (inbound accept loop + a sync driver on a fixed
-  interval + dedicated reconnect port). A per-round timeout bounds how long a
-  silent peer can stall the driver; a `stop` flag lets the driver drain
-  in-flight syncs and exit cleanly. Pluggable durable sinks:
+  table (`PeerManager` with scored `pick_k`), the `LruCache` hot-pool and
+  per-peer `DedupState` + `GossipMetrics`, the Fjall `StateDb` (live state +
+  per-round snapshots + watermark), and the async machinery (inbound accept
+  loop + a concurrent fanout sync driver on a fixed interval + dedicated
+  reconnect port). A per-round timeout bounds how long a silent peer can
+  stall the driver; a `stop` flag lets the driver drain `JoinSet` in-flight
+  syncs and exit cleanly. Pluggable durable sinks:
   `CheckpointSink`, `EventSink` (event log), `EventStreamSink` +
   `RecordSink` (mirror streams) + `RecordProofSink` (proof sidecar). Finalized
   events carrying a `MembershipOp::Add` payload are decoded and activated
@@ -71,13 +89,22 @@ implemented.
 
 ## Design
 
-- One initiator creates one event per sync round; the responder folds it
-  into its own next event. Over repeated random syncs both sides create
-  events, preserving exponential gossip spread.
+- Each interval fans out to `k` peers concurrently (`JoinSet`+`Semaphore(k)`,
+  `FanoutMode::Auto` `k_max 4@N≤6, 17@7≤N≤99 Hedera cap, 12@N≥100` (`N=6→4, 10→6, 29→9 vs cap 17, 100→12`),
+  ratio `0.6→0.3`, LRU hot-pool `10@N=6, 30@N=100`): one initiator creates one event per peer sync, each
+  responder folds it into its own next event. Over repeated scored `pick_k`
+  syncs both sides create events, preserving exponential gossip spread at
+  `O(log N)` rounds with `k`-way parallelism.
 - Already-present events are benign no-ops during insertion, so concurrent
-  or redundant syncs never fail.
-- Sync interval + timeout (`SyncTiming`) are the explicit tuning knobs the
-  spec leaves open; weighting peer selection is deferred to Phase 9 (G-track).
+  or redundant syncs never fail; per-peer `DedupState` (`SyncConfig`
+  `self 1000 ms / ancestor 250 ms / non-ancestor 3000 ms`) suppresses
+  redundant resends within the window (`filter_likely_duplicates`).
+- Sync interval + timeout (`SyncTiming`) and fanout (`FanoutMode`) are the
+  explicit tuning knobs the spec leaves open; scored peer selection
+  (`PeerScore`: frontier usefulness, EWMA success, latency, freshness,
+  diversity, backoff) drives `pick_k` with ε-greedy exploration. `GossipMetrics`
+  (`sync_attempts/success/failures`, `p50/p95_rtt_ms`, `delta_bytes_per_sync`,
+  `cache_hit_rate`) exposes the signals.
 - Timestamps are monotonic per creator: `next_timestamp` clamps `SystemTime`
   against the last emitted value, persisted per checkpoint, so clock
   regression cannot produce equal/decreasing timestamps.

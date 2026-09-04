@@ -49,7 +49,8 @@ fn verified_event(
 ) -> crypto::VerifiedEvent {
     let event =
         UnsignedEvent::new(creator, self_parent, other_parent, Timestamp::new(ts), Vec::new())
-            .sign(key);
+            .sign(key)
+            .unwrap();
     event.verify(registry).expect("test event should verify")
 }
 
@@ -81,7 +82,7 @@ fn single_hashgraph_crosses_membership_transition() {
     // Node 4 joins, activating the expanded roster at round 2.
     let key_d = SigningKey::generate(&mut OsRng);
     let node_d = NodeId::new(4);
-    let mut expanded = initial.clone();
+    let mut expanded = initial;
     expanded.register(
         node_d,
         key_d.verifying_key(),

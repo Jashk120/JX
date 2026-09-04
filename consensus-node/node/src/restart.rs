@@ -110,7 +110,8 @@ pub fn build_reconnect_response(
     check_own_key(checkpoint, node_id, expected_key)?;
     let bytes = snapshot_for_round(state_db, checkpoint.payload.round)?;
     let roster_history = RosterHistory::new(checkpoint.payload.roster_snapshot.clone());
-    let roster_history_bytes = consensus::encode_roster_history(&roster_history);
+    let roster_history_bytes =
+        consensus::encode_roster_history(&roster_history).expect("roster history bounded");
     let last_timestamp = state_db.watermark().unwrap_or(None).unwrap_or(0);
     Ok(gossip::ReconnectResponse {
         signed_checkpoint: checkpoint.clone(),
@@ -159,7 +160,7 @@ pub fn replay_response(
             format!(
                 "replayed event {:?} failed verification against the roster active at its \
                      birth round",
-                record.event.hash()
+                record.event.hash().expect("hash bounded")
             )
         })?;
         retained.push(record);
@@ -176,7 +177,8 @@ pub fn replay_response(
     Ok(gossip::ReconnectResponse {
         signed_checkpoint: checkpoint.clone(),
         state_bytes: bytes,
-        roster_history_bytes: consensus::encode_roster_history(&roster_history),
+        roster_history_bytes: consensus::encode_roster_history(&roster_history)
+            .expect("roster history bounded"),
         decided_round: checkpoint.payload.round,
         retained,
         last_timestamp,
@@ -314,7 +316,7 @@ mod tests {
     fn empty_state_bytes_and_root() -> (Vec<u8>, [u8; 32]) {
         let db = TestDb::new();
         let state = state::State::new(db.db.state_keyspace());
-        (state.to_bytes(), state.root())
+        (state.to_bytes().expect("to_bytes succeeds"), state.root())
     }
 
     #[test]
@@ -337,7 +339,7 @@ mod tests {
         other
             .apply(&state::Op::Put { key: b"k".to_vec(), value: b"v".to_vec() })
             .expect("apply to fresh state succeeds");
-        db.db.snapshot(3, &other.to_bytes()).expect("snapshot");
+        db.db.snapshot(3, &other.to_bytes().expect("to_bytes succeeds")).expect("snapshot");
         let state = PersistedCheckpoint { checkpoint };
         assert!(!verify_persisted(&state, &db.db), "mismatched state bytes must fail");
     }
@@ -460,7 +462,8 @@ mod tests {
             primitives::Timestamp::new(1),
             Vec::new(),
         )
-        .sign(&key1);
+        .sign(&key1)
+        .expect("sign bounded");
         event_log
             .append(&consensus::RetainedEvent {
                 event: valid,

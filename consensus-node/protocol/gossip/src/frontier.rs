@@ -2,6 +2,10 @@ use std::collections::{
     HashMap,
     VecDeque,
 };
+use std::time::{
+    Duration,
+    Instant,
+};
 
 use crypto::{
     Hashable,
@@ -17,6 +21,74 @@ use crate::error::{
     GossipError,
     Result,
 };
+
+#[derive(Clone, Debug)]
+pub struct SyncConfig {
+    pub filter_likely_duplicates: bool,
+    pub non_ancestor_threshold: Duration,
+    pub ancestor_threshold: Duration,
+    pub self_threshold: Duration,
+}
+
+impl Default for SyncConfig {
+    fn default() -> Self {
+        Self {
+            filter_likely_duplicates: true,
+            non_ancestor_threshold: Duration::from_millis(3000),
+            ancestor_threshold: Duration::from_millis(250),
+            self_threshold: Duration::from_millis(1000),
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct DedupState {
+    sent: std::collections::HashMap<
+        (primitives::EventHash, primitives::NodeId),
+        (Instant, bool, bool),
+    >,
+}
+
+impl DedupState {
+    pub fn should_filter(
+        &mut self,
+        hash: &primitives::EventHash,
+        target_peer: primitives::NodeId,
+        is_self: bool,
+        is_ancestor: bool,
+        config: &SyncConfig,
+    ) -> bool {
+        if !config.filter_likely_duplicates {
+            return false;
+        }
+        let now = Instant::now();
+        let key = (*hash, target_peer);
+        if let Some((sent_at, prev_self, prev_ancestor)) = self.sent.get(&key) {
+            let elapsed = now.duration_since(*sent_at);
+            let threshold = if is_self || *prev_self {
+                config.self_threshold
+            } else if is_ancestor || *prev_ancestor {
+                config.ancestor_threshold
+            } else {
+                config.non_ancestor_threshold
+            };
+            if elapsed < threshold {
+                return true;
+            }
+        }
+        self.sent.insert(key, (now, is_self, is_ancestor));
+        false
+    }
+
+    pub fn prune_expired(&mut self, config: &SyncConfig) {
+        let now = Instant::now();
+        let max =
+            config.non_ancestor_threshold.max(config.ancestor_threshold).max(config.self_threshold);
+        // Prune at max_threshold + slack (1000ms) — 4000ms with defaults.
+        let prune_after = max + Duration::from_millis(1000);
+        self.sent.retain(|_, (t, _, _)| now.duration_since(*t) < prune_after);
+    }
+}
 
 /// Builds the per-creator "highest seq I hold" summary that a sync request
 /// carries (Consensus Spec §5). Uses `Hashgraph::latest_event_by`, so it is
@@ -47,13 +119,13 @@ pub fn known_summary(
 pub fn delta_events(
     hashgraph: &consensus::Hashgraph,
     known: &[(NodeId, u64)],
+    registry: &MembershipRegistry,
 ) -> Result<Vec<Event>> {
     let known_seq: HashMap<NodeId, u64> = known.iter().copied().collect();
-    let mut creators: std::collections::HashSet<NodeId> = known_seq.keys().copied().collect();
-    for hash in hashgraph.all_event_hashes() {
-        if let Some(record) = hashgraph.get(&hash) {
-            creators.insert(*record.event().creator());
-        }
+    let mut creators: std::collections::HashSet<NodeId> =
+        registry.member_ids().into_iter().collect();
+    for k in known_seq.keys() {
+        creators.insert(*k);
     }
 
     let mut collected: HashMap<EventHash, Event> = HashMap::new();
@@ -75,6 +147,39 @@ pub fn delta_events(
     topo_sort(&collected)
 }
 
+pub fn delta_events_filtered(
+    hashgraph: &consensus::Hashgraph,
+    known: &[(NodeId, u64)],
+    registry: &MembershipRegistry,
+    self_id: NodeId,
+    target_peer: NodeId,
+    dedup: &mut DedupState,
+    config: &SyncConfig,
+) -> Result<Vec<Event>> {
+    let events = delta_events(hashgraph, known, registry)?;
+    if !config.filter_likely_duplicates {
+        return Ok(events);
+    }
+    let mut out = Vec::with_capacity(events.len());
+    for event in events {
+        let is_self = *event.creator() == self_id;
+        let hash = event.hash().expect("hash bounded");
+        let is_ancestor = if is_self {
+            false
+        } else {
+            hashgraph
+                .latest_event_by(&self_id)
+                .and_then(|latest| hashgraph.is_ancestor(&hash, latest).ok())
+                .unwrap_or(false)
+        };
+        if !dedup.should_filter(&hash, target_peer, is_self, is_ancestor, config) {
+            out.push(event);
+        }
+    }
+    dedup.prune_expired(config);
+    Ok(out)
+}
+
 /// Kahn's algorithm over the collected delta. Dependency edges are an
 /// event's parents, but only when those parents are also part of the delta
 /// — a parent outside the delta is already known to the receiver.
@@ -87,7 +192,7 @@ fn topo_sort(events: &HashMap<EventHash, Event>) -> Result<Vec<Event>> {
         children.entry(*hash).or_default();
     }
     for event in events.values() {
-        let hash = event.hash();
+        let hash = event.hash().expect("hash bounded");
         for parent in [event.self_parent(), event.other_parent()].into_iter().flatten() {
             if events.contains_key(parent) {
                 children.entry(*parent).or_default().push(hash);
@@ -183,8 +288,8 @@ mod tests {
                 Timestamp::new(1),
                 Vec::new(),
             );
-            let event = unsigned.sign(&key);
-            let verified = event.clone().verify(&self.registry).expect("signs correctly");
+            let event = unsigned.sign(&key).expect("sign bounded");
+            let verified = event.verify(&self.registry).expect("signs correctly");
             self.hashgraph.insert(verified).expect("inserts")
         }
     }
@@ -208,10 +313,10 @@ mod tests {
     fn delta_empty_when_peer_knows_everything() {
         let mut h = Harness::new(&[1, 2]);
         let g1 = h.make_event(1, None, None);
-        h.make_event(2, Some(g1), None);
+        h.make_event(2, None, Some(g1));
 
         let summary = known_summary(&h.hashgraph, &h.registry);
-        let delta = delta_events(&h.hashgraph, &summary).expect("no delta");
+        let delta = delta_events(&h.hashgraph, &summary, &h.registry).expect("no delta");
         assert!(delta.is_empty());
     }
 
@@ -223,8 +328,8 @@ mod tests {
         let g3 = h.make_event(1, Some(g2), None);
 
         let known = vec![(NodeId::new(1), 1u64), (NodeId::new(2), 0u64)];
-        let delta = delta_events(&h.hashgraph, &known).expect("delta computes");
-        let hashes: Vec<_> = delta.iter().map(|e| e.hash()).collect();
+        let delta = delta_events(&h.hashgraph, &known, &h.registry).expect("delta computes");
+        let hashes: Vec<_> = delta.iter().map(|e| e.hash().expect("hash bounded")).collect();
         assert_eq!(hashes, vec![g2, g3]);
     }
 
@@ -238,8 +343,8 @@ mod tests {
         let b1 = h.make_event(2, None, Some(a2));
 
         let known = vec![(NodeId::new(1), 0u64), (NodeId::new(2), 0u64)];
-        let delta = delta_events(&h.hashgraph, &known).expect("delta computes");
-        let hashes: Vec<_> = delta.iter().map(|e| e.hash()).collect();
+        let delta = delta_events(&h.hashgraph, &known, &h.registry).expect("delta computes");
+        let hashes: Vec<_> = delta.iter().map(|e| e.hash().expect("hash bounded")).collect();
 
         let pos_a1 = hashes.iter().position(|&h| h == a1).unwrap();
         let pos_a2 = hashes.iter().position(|&h| h == a2).unwrap();
@@ -256,7 +361,7 @@ mod tests {
         h.make_event(2, None, Some(a2));
 
         let known = vec![(NodeId::new(1), 0u64), (NodeId::new(2), 0u64)];
-        let delta = delta_events(&h.hashgraph, &known).expect("delta computes");
+        let delta = delta_events(&h.hashgraph, &known, &h.registry).expect("delta computes");
 
         // Insert the delta into a fresh hashgraph; every insert must succeed
         // (parents present) because the delta is topologically ordered.
@@ -272,9 +377,13 @@ mod tests {
         let h = Harness::new(&[1]);
         let key = key_for(&h, 1);
         let event = UnsignedEvent::new(NodeId::new(1), None, None, Timestamp::new(1), Vec::new())
-            .sign(&key);
-        let expected_hash = event.hash();
-        assert_eq!(event.verify(&h.registry).map(|v| v.event().hash()), Ok(expected_hash));
+            .sign(&key)
+            .expect("sign bounded");
+        let expected_hash = event.hash().expect("hash bounded");
+        assert_eq!(
+            event.verify(&h.registry).map(|v| v.event().hash().expect("hash bounded")),
+            Ok(expected_hash)
+        );
     }
 
     #[test]
@@ -285,8 +394,8 @@ mod tests {
         let c1 = h.make_event(3, None, Some(b1));
         let c2 = h.make_event(3, Some(c1), Some(a1));
         let known = vec![(NodeId::new(1), 1u64), (NodeId::new(2), 1u64)];
-        let delta = delta_events(&h.hashgraph, &known).expect("delta computes");
-        let hashes: Vec<_> = delta.iter().map(|e| e.hash()).collect();
+        let delta = delta_events(&h.hashgraph, &known, &h.registry).expect("delta computes");
+        let hashes: Vec<_> = delta.iter().map(|e| e.hash().expect("hash bounded")).collect();
         assert!(hashes.contains(&c1), "union must include unknown creator 3 events");
         assert!(
             hashes.contains(&c2),
@@ -300,7 +409,228 @@ mod tests {
         let a1 = h.make_event(1, None, None);
         h.make_event(2, None, Some(a1));
         let summary = known_summary(&h.hashgraph, &h.registry);
-        let delta = delta_events(&h.hashgraph, &summary).expect("delta");
+        let delta = delta_events(&h.hashgraph, &summary, &h.registry).expect("delta");
         assert!(delta.is_empty(), "fully known should still be empty with union");
+    }
+
+    #[test]
+    fn dedup_filter_disabled_never_filters() {
+        let mut dedup = DedupState::default();
+        let config = SyncConfig { filter_likely_duplicates: false, ..Default::default() };
+        let hash = primitives::EventHash::new([1u8; 32]);
+        let peer = NodeId::new(10);
+        assert!(!dedup.should_filter(&hash, peer, true, false, &config));
+        assert!(!dedup.should_filter(&hash, peer, true, false, &config));
+        assert!(!dedup.should_filter(&hash, peer, false, true, &config));
+    }
+
+    #[test]
+    fn dedup_self_threshold_filters_within_window() {
+        let mut dedup = DedupState::default();
+        let config = SyncConfig {
+            filter_likely_duplicates: true,
+            self_threshold: Duration::from_millis(50),
+            ancestor_threshold: Duration::from_millis(25),
+            non_ancestor_threshold: Duration::from_millis(100),
+        };
+        let hash = primitives::EventHash::new([2u8; 32]);
+        let peer = NodeId::new(10);
+        assert!(!dedup.should_filter(&hash, peer, true, false, &config));
+        assert!(dedup.should_filter(&hash, peer, true, false, &config));
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(!dedup.should_filter(&hash, peer, true, false, &config));
+    }
+
+    #[test]
+    fn dedup_ancestor_threshold_shorter_than_self() {
+        let mut dedup = DedupState::default();
+        let config = SyncConfig {
+            filter_likely_duplicates: true,
+            self_threshold: Duration::from_millis(100),
+            ancestor_threshold: Duration::from_millis(30),
+            non_ancestor_threshold: Duration::from_millis(200),
+        };
+        let hash = primitives::EventHash::new([3u8; 32]);
+        let peer = NodeId::new(10);
+        assert!(!dedup.should_filter(&hash, peer, false, true, &config));
+        assert!(dedup.should_filter(&hash, peer, false, true, &config));
+        std::thread::sleep(Duration::from_millis(40));
+        assert!(
+            !dedup.should_filter(&hash, peer, false, true, &config),
+            "ancestor threshold expired"
+        );
+    }
+
+    #[test]
+    fn dedup_non_ancestor_threshold_longest() {
+        let mut dedup = DedupState::default();
+        let config = SyncConfig {
+            filter_likely_duplicates: true,
+            self_threshold: Duration::from_millis(30),
+            ancestor_threshold: Duration::from_millis(20),
+            non_ancestor_threshold: Duration::from_millis(80),
+        };
+        let hash = primitives::EventHash::new([4u8; 32]);
+        let peer = NodeId::new(10);
+        assert!(!dedup.should_filter(&hash, peer, false, false, &config));
+        assert!(dedup.should_filter(&hash, peer, false, false, &config));
+        std::thread::sleep(Duration::from_millis(40));
+        assert!(
+            dedup.should_filter(&hash, peer, false, false, &config),
+            "non-ancestor threshold still active after 40ms"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!dedup.should_filter(&hash, peer, false, false, &config));
+    }
+
+    #[test]
+    fn dedup_prev_self_upgrades_threshold() {
+        let mut dedup = DedupState::default();
+        let config = SyncConfig {
+            filter_likely_duplicates: true,
+            self_threshold: Duration::from_millis(100),
+            ancestor_threshold: Duration::from_millis(20),
+            non_ancestor_threshold: Duration::from_millis(200),
+        };
+        let hash = primitives::EventHash::new([5u8; 32]);
+        let peer = NodeId::new(10);
+        assert!(!dedup.should_filter(&hash, peer, true, false, &config));
+        assert!(
+            dedup.should_filter(&hash, peer, false, false, &config),
+            "prev_self flag must keep self_threshold"
+        );
+        assert!(
+            dedup.should_filter(&hash, peer, false, true, &config),
+            "prev_self flag dominates ancestor flag too"
+        );
+    }
+
+    #[test]
+    fn dedup_prev_ancestor_upgrades_threshold() {
+        let mut dedup = DedupState::default();
+        let config = SyncConfig {
+            filter_likely_duplicates: true,
+            self_threshold: Duration::from_millis(100),
+            ancestor_threshold: Duration::from_millis(80),
+            non_ancestor_threshold: Duration::from_millis(200),
+        };
+        let hash = primitives::EventHash::new([6u8; 32]);
+        let peer = NodeId::new(10);
+        assert!(!dedup.should_filter(&hash, peer, false, true, &config));
+        assert!(
+            dedup.should_filter(&hash, peer, false, false, &config),
+            "prev_ancestor flag must keep ancestor_threshold"
+        );
+    }
+
+    #[test]
+    fn dedup_threshold_branching_self_dominates() {
+        let mut dedup = DedupState::default();
+        let config = SyncConfig::default();
+        assert_eq!(config.self_threshold, Duration::from_millis(1000));
+        assert_eq!(config.ancestor_threshold, Duration::from_millis(250));
+        assert_eq!(config.non_ancestor_threshold, Duration::from_millis(3000));
+        let hash = primitives::EventHash::new([7u8; 32]);
+        let peer = NodeId::new(10);
+        assert!(!dedup.should_filter(&hash, peer, true, false, &config));
+        assert!(dedup.should_filter(&hash, peer, true, true, &config));
+        assert!(dedup.should_filter(&hash, peer, false, true, &config));
+    }
+
+    #[test]
+    fn delta_filtered_uses_dedup_and_prunes() {
+        let mut h = Harness::new(&[1, 2]);
+        let a1 = h.make_event(1, None, None);
+        let a2 = h.make_event(1, Some(a1), None);
+        let known = vec![(NodeId::new(1), 0u64), (NodeId::new(2), 0u64)];
+        let mut dedup = DedupState::default();
+        let config = SyncConfig::default();
+        let peer = NodeId::new(10);
+        let first = delta_events_filtered(
+            &h.hashgraph,
+            &known,
+            &h.registry,
+            NodeId::new(1),
+            peer,
+            &mut dedup,
+            &config,
+        )
+        .expect("filtered delta");
+        assert_eq!(first.len(), 2);
+        let second = delta_events_filtered(
+            &h.hashgraph,
+            &known,
+            &h.registry,
+            NodeId::new(1),
+            peer,
+            &mut dedup,
+            &config,
+        )
+        .expect("second filtered delta");
+        assert!(second.is_empty(), "second call within dedup window should filter all");
+        let all = delta_events(&h.hashgraph, &known, &h.registry).expect("unfiltered");
+        assert!(all.iter().any(|e| e.hash().expect("hash bounded") == a2));
+    }
+
+    #[test]
+    fn dedup_per_peer_isolation() {
+        let mut dedup = DedupState::default();
+        let config = SyncConfig::default();
+        let hash = primitives::EventHash::new([8u8; 32]);
+        let peer_a = NodeId::new(10);
+        let peer_b = NodeId::new(11);
+        assert!(!dedup.should_filter(&hash, peer_a, false, false, &config));
+        assert!(dedup.should_filter(&hash, peer_a, false, false, &config));
+        assert!(
+            !dedup.should_filter(&hash, peer_b, false, false, &config),
+            "different peer must not be filtered"
+        );
+        assert!(dedup.should_filter(&hash, peer_b, false, false, &config));
+        assert!(dedup.should_filter(&hash, peer_a, false, false, &config));
+    }
+
+    #[test]
+    fn delta_filtered_per_peer_isolation() {
+        let mut h = Harness::new(&[1, 2]);
+        let a1 = h.make_event(1, None, None);
+        let _a2 = h.make_event(1, Some(a1), None);
+        let known = vec![(NodeId::new(1), 0u64), (NodeId::new(2), 0u64)];
+        let mut dedup = DedupState::default();
+        let config = SyncConfig::default();
+        let peer_a = NodeId::new(10);
+        let peer_b = NodeId::new(11);
+        let first_a = delta_events_filtered(
+            &h.hashgraph,
+            &known,
+            &h.registry,
+            NodeId::new(1),
+            peer_a,
+            &mut dedup,
+            &config,
+        )
+        .expect("first peer_a");
+        assert_eq!(first_a.len(), 2);
+        let first_b = delta_events_filtered(
+            &h.hashgraph,
+            &known,
+            &h.registry,
+            NodeId::new(1),
+            peer_b,
+            &mut dedup,
+            &config,
+        )
+        .expect("first peer_b should not be filtered");
+        assert_eq!(first_b.len(), 2, "different peer must receive same delta");
+        let second_a = delta_events_filtered(
+            &h.hashgraph,
+            &known,
+            &h.registry,
+            NodeId::new(1),
+            peer_a,
+            &mut dedup,
+            &config,
+        )
+        .expect("second peer_a");
+        assert!(second_a.is_empty(), "peer_a second call filtered");
     }
 }

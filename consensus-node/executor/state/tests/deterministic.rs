@@ -114,7 +114,8 @@ impl Clique {
         );
         self.ts += 1;
         let key = &self.keys[author as usize - 1];
-        let verified = unsigned.sign(key).verify(&self.registry).expect("test event verifies");
+        let verified =
+            unsigned.sign(key).unwrap().verify(&self.registry).expect("test event verifies");
         let hash = self.hg.insert(verified).expect("test insert succeeds");
         self.events.insert(label, hash);
     }
@@ -176,7 +177,10 @@ fn same_transaction_order_yields_bit_identical_state() {
     }
 
     assert_eq!(left.state(), right.state());
-    assert_eq!(left.state().to_bytes(), right.state().to_bytes());
+    assert_eq!(
+        left.state().to_bytes().expect("to_bytes succeeds"),
+        right.state().to_bytes().expect("to_bytes succeeds")
+    );
 
     assert_eq!(left.state().get(b"alice"), Some(b"300".to_vec()));
     assert_eq!(left.state().get(b"bob"), Some(b"200".to_vec()));
@@ -207,7 +211,10 @@ fn same_finalized_order_yields_bit_identical_state() {
     }
 
     assert_eq!(left.state(), right.state());
-    assert_eq!(left.state().to_bytes(), right.state().to_bytes());
+    assert_eq!(
+        left.state().to_bytes().expect("to_bytes succeeds"),
+        right.state().to_bytes().expect("to_bytes succeeds")
+    );
     assert!(!left.state().is_empty(), "payload transactions must reach the state");
 }
 
@@ -221,7 +228,7 @@ fn finalized_events_follow_consensus_order() {
 
     let mut prev_round = 0u64;
     for event in &events {
-        let hash = event.hash();
+        let hash = event.hash().unwrap();
         let round = clique.hg.round_received(&hash).expect("finalized events are ordered");
         assert!(round >= prev_round, "roundReceived must be non-decreasing along the order");
         prev_round = round;

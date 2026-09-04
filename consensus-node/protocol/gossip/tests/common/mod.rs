@@ -357,6 +357,7 @@ pub fn make_event_with_payload(
         payload,
     )
     .sign(key)
+    .expect("sign bounded")
 }
 
 /// Inserts an already-signed event directly into one node's hashgraph,
@@ -368,7 +369,7 @@ pub async fn insert_event(
     registry: &MembershipRegistry,
     event: Event,
 ) -> EventHash {
-    let hash = event.hash();
+    let hash = event.hash().expect("hash bounded");
     let verified = event.verify(registry).expect("valid signature");
     let mut hashgraph = node.node.hashgraph.lock().await;
     hashgraph.insert(verified).expect("insert");

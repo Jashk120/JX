@@ -68,7 +68,7 @@ pub struct RetainedEvent {
 /// itself. It deliberately shares `RetainedEvent` with the reconnect
 /// protocol so one type describes both the on-wire retained graph and the
 /// on-log event set.
-pub fn encode_retained_event(record: &RetainedEvent) -> Vec<u8> {
+pub fn encode_retained_event(record: &RetainedEvent) -> Result<Vec<u8>, primitives::Error> {
     let mut buf = Vec::new();
     buf.extend_from_slice(&record.seq.to_be_bytes());
     buf.extend_from_slice(&record.round.to_be_bytes());
@@ -79,31 +79,21 @@ pub fn encode_retained_event(record: &RetainedEvent) -> Vec<u8> {
         }
         None => buf.push(0x00),
     }
-    let ancestor_len = match u32::try_from(record.ancestor_seqs.len()) {
-        Ok(v) => v,
-        Err(_) => panic!(
-            "{}",
-            primitives::Error::OutOfRange {
-                field: "RetainedEvent ancestor_seqs length",
-                got: record.ancestor_seqs.len().to_string()
-            }
-        ),
-    };
+    let ancestor_len =
+        u32::try_from(record.ancestor_seqs.len()).map_err(|_| primitives::Error::OutOfRange {
+            field: "RetainedEvent ancestor_seqs length",
+            got: record.ancestor_seqs.len().to_string(),
+        })?;
     buf.extend_from_slice(&ancestor_len.to_be_bytes());
     for seq in &record.ancestor_seqs {
         buf.extend_from_slice(&seq.to_be_bytes());
     }
-    let event_bytes = record.event.canonical_bytes();
-    let event_len = match u32::try_from(event_bytes.len()) {
-        Ok(v) => v,
-        Err(_) => panic!(
-            "{}",
-            primitives::Error::OutOfRange {
-                field: "RetainedEvent event length",
-                got: event_bytes.len().to_string()
-            }
-        ),
-    };
+    let event_bytes = record.event.canonical_bytes()?;
+    let event_len =
+        u32::try_from(event_bytes.len()).map_err(|_| primitives::Error::OutOfRange {
+            field: "RetainedEvent event length",
+            got: event_bytes.len().to_string(),
+        })?;
     buf.extend_from_slice(&event_len.to_be_bytes());
     buf.extend_from_slice(&event_bytes);
     match record.consensus_timestamp {
@@ -113,7 +103,7 @@ pub fn encode_retained_event(record: &RetainedEvent) -> Vec<u8> {
         }
         None => buf.push(0x00),
     }
-    buf
+    Ok(buf)
 }
 
 /// The inverse of [`encode_retained_event`]. Returns `None` on truncation, a
@@ -205,7 +195,7 @@ fn take_optional_hash(cursor: &mut &[u8]) -> Option<Option<EventHash>> {
 ///   per signer: [signer_id: u64 BE]
 /// [aggregate_sig: 96 bytes]
 /// ```
-pub fn encode_signed_checkpoint(sc: &SignedCheckpoint) -> Vec<u8> {
+pub fn encode_signed_checkpoint(sc: &SignedCheckpoint) -> Result<Vec<u8>, primitives::Error> {
     let mut buf = Vec::new();
     buf.extend_from_slice(&sc.payload.round.to_be_bytes());
     buf.extend_from_slice(&sc.payload.records_root);
@@ -213,34 +203,24 @@ pub fn encode_signed_checkpoint(sc: &SignedCheckpoint) -> Vec<u8> {
     buf.extend_from_slice(&sc.payload.roster_hash);
     buf.extend_from_slice(&sc.payload.prev_checkpoint_hash);
     let roster_bytes = sc.payload.roster_snapshot.to_bytes();
-    let roster_len = match u32::try_from(roster_bytes.len()) {
-        Ok(v) => v,
-        Err(_) => panic!(
-            "{}",
-            primitives::Error::OutOfRange {
-                field: "SignedCheckpoint roster_snapshot length",
-                got: roster_bytes.len().to_string()
-            }
-        ),
-    };
+    let roster_len =
+        u32::try_from(roster_bytes.len()).map_err(|_| primitives::Error::OutOfRange {
+            field: "SignedCheckpoint roster_snapshot length",
+            got: roster_bytes.len().to_string(),
+        })?;
     buf.extend_from_slice(&roster_len.to_be_bytes());
     buf.extend_from_slice(&roster_bytes);
-    let signer_count = match u32::try_from(sc.signers.len()) {
-        Ok(v) => v,
-        Err(_) => panic!(
-            "{}",
-            primitives::Error::OutOfRange {
-                field: "SignedCheckpoint signers length",
-                got: sc.signers.len().to_string()
-            }
-        ),
-    };
+    let signer_count =
+        u32::try_from(sc.signers.len()).map_err(|_| primitives::Error::OutOfRange {
+            field: "SignedCheckpoint signers length",
+            got: sc.signers.len().to_string(),
+        })?;
     buf.extend_from_slice(&signer_count.to_be_bytes());
     for signer in &sc.signers {
         buf.extend_from_slice(&signer.get().to_be_bytes());
     }
     buf.extend_from_slice(&sc.aggregate_sig.to_bytes());
-    buf
+    Ok(buf)
 }
 
 /// The inverse of [`encode_signed_checkpoint`]. Rebuilds the
@@ -258,7 +238,8 @@ pub fn decode_signed_checkpoint(bytes: &[u8]) -> Option<SignedCheckpoint> {
     let roster_len = take_u32(&mut cursor)? as usize;
     let roster_bytes = take_exact(&mut cursor, roster_len)?;
     let roster_snapshot = MembershipRegistry::from_bytes(roster_bytes)?;
-    if roster_snapshot.hash() != roster_hash {
+    let computed_hash = roster_snapshot.hash().ok()?;
+    if computed_hash != roster_hash {
         return None;
     }
     let payload = CheckpointPayload {
@@ -297,37 +278,26 @@ pub fn decode_signed_checkpoint(bytes: &[u8]) -> Option<SignedCheckpoint> {
 /// ```
 /// where the registry bytes are [`MembershipRegistry::to_bytes`] — the same
 /// canonical form `roster_hash` is computed over.
-pub fn encode_roster_history(rh: &RosterHistory) -> Vec<u8> {
+pub fn encode_roster_history(rh: &RosterHistory) -> Result<Vec<u8>, primitives::Error> {
     let entries: Vec<(&u64, &MembershipRegistry)> = rh.snapshots().collect();
     let mut buf = Vec::new();
-    let entry_count = match u32::try_from(entries.len()) {
-        Ok(v) => v,
-        Err(_) => panic!(
-            "{}",
-            primitives::Error::OutOfRange {
-                field: "RosterHistory entry count",
-                got: entries.len().to_string()
-            }
-        ),
-    };
+    let entry_count = u32::try_from(entries.len()).map_err(|_| primitives::Error::OutOfRange {
+        field: "RosterHistory entry count",
+        got: entries.len().to_string(),
+    })?;
     buf.extend_from_slice(&entry_count.to_be_bytes());
     for (round, registry) in entries {
         buf.extend_from_slice(&round.to_be_bytes());
         let registry_bytes = registry.to_bytes();
-        let registry_len = match u32::try_from(registry_bytes.len()) {
-            Ok(v) => v,
-            Err(_) => panic!(
-                "{}",
-                primitives::Error::OutOfRange {
-                    field: "RosterHistory registry length",
-                    got: registry_bytes.len().to_string()
-                }
-            ),
-        };
+        let registry_len =
+            u32::try_from(registry_bytes.len()).map_err(|_| primitives::Error::OutOfRange {
+                field: "RosterHistory registry length",
+                got: registry_bytes.len().to_string(),
+            })?;
         buf.extend_from_slice(&registry_len.to_be_bytes());
         buf.extend_from_slice(&registry_bytes);
     }
-    buf
+    Ok(buf)
 }
 
 /// The inverse of [`encode_roster_history`]. Returns `None` on truncation or
@@ -396,7 +366,7 @@ mod tests {
             round,
             crate::checkpoint::compute_records_root(&[]),
             [7u8; 32],
-            roster_snapshot.clone(),
+            roster_snapshot,
         );
         let mut sigs = Vec::new();
         for &signer in signers {
@@ -418,7 +388,8 @@ mod tests {
     #[test]
     fn signed_checkpoint_round_trips_one_signer() {
         let sc = signed_checkpoint(3, &[1]);
-        let decoded = decode_signed_checkpoint(&encode_signed_checkpoint(&sc)).expect("decodes");
+        let decoded =
+            decode_signed_checkpoint(&encode_signed_checkpoint(&sc).unwrap()).expect("decodes");
         assert_eq!(decoded.payload.round, sc.payload.round);
         assert_eq!(decoded.payload.state_hash, sc.payload.state_hash);
         assert_eq!(decoded.payload.roster_hash, sc.payload.roster_hash);
@@ -433,7 +404,7 @@ mod tests {
         for signers in [&[1, 2, 3][..], &[1, 2, 3, 4][..]] {
             let sc = signed_checkpoint(9, signers);
             let decoded =
-                decode_signed_checkpoint(&encode_signed_checkpoint(&sc)).expect("decodes");
+                decode_signed_checkpoint(&encode_signed_checkpoint(&sc).unwrap()).expect("decodes");
             assert_eq!(decoded.payload.roster_snapshot, sc.payload.roster_snapshot);
             assert_eq!(decoded.signers.len(), signers.len());
             assert_eq!(decoded.aggregate_sig, sc.aggregate_sig);
@@ -444,7 +415,7 @@ mod tests {
     #[test]
     fn signed_checkpoint_decode_rejects_truncation() {
         let sc = signed_checkpoint(3, &[1, 2, 3]);
-        let bytes = encode_signed_checkpoint(&sc);
+        let bytes = encode_signed_checkpoint(&sc).unwrap();
         for cut in [1, 40, 79, bytes.len() - 1] {
             assert_eq!(decode_signed_checkpoint(&bytes[..cut]), None, "cut at {cut}");
         }
@@ -453,7 +424,7 @@ mod tests {
     #[test]
     fn signed_checkpoint_decode_rejects_trailing_bytes() {
         let sc = signed_checkpoint(3, &[1]);
-        let mut bytes = encode_signed_checkpoint(&sc);
+        let mut bytes = encode_signed_checkpoint(&sc).unwrap();
         bytes.push(0);
         assert_eq!(decode_signed_checkpoint(&bytes), None);
     }
@@ -462,7 +433,7 @@ mod tests {
     fn signed_checkpoint_decode_rejects_roster_hash_mismatch() {
         let mut sc = signed_checkpoint(3, &[1, 2]);
         sc.payload.roster_hash = [0xAA; 32];
-        let mut bytes = encode_signed_checkpoint(&sc);
+        let mut bytes = encode_signed_checkpoint(&sc).unwrap();
         // The payload's roster_hash was overwritten after encoding, so the
         // bytes now carry a snapshot whose hash disagrees with the header.
         let end = 8 + 32;
@@ -473,7 +444,8 @@ mod tests {
     #[test]
     fn roster_history_round_trips_single_snapshot() {
         let history = RosterHistory::new(registry_of(&[1, 2]));
-        let decoded = decode_roster_history(&encode_roster_history(&history)).expect("decodes");
+        let decoded =
+            decode_roster_history(&encode_roster_history(&history).unwrap()).expect("decodes");
         assert_eq!(decoded.roster_for_round(1), history.roster_for_round(1));
         assert_eq!(decoded.roster_for_round(50), history.roster_for_round(50));
     }
@@ -483,7 +455,8 @@ mod tests {
         let mut history = RosterHistory::new(registry_of(&[1, 2]));
         history.schedule(5, registry_of(&[1, 2, 3]));
         history.schedule(9, registry_of(&[1, 2, 3, 4]));
-        let decoded = decode_roster_history(&encode_roster_history(&history)).expect("decodes");
+        let decoded =
+            decode_roster_history(&encode_roster_history(&history).unwrap()).expect("decodes");
         assert_eq!(decoded.roster_for_round(4), history.roster_for_round(4));
         assert_eq!(decoded.roster_for_round(5), history.roster_for_round(5));
         assert_eq!(decoded.roster_for_round(9), history.roster_for_round(9));
@@ -492,7 +465,7 @@ mod tests {
     #[test]
     fn roster_history_decode_rejects_truncation_and_empty() {
         let history = RosterHistory::new(registry_of(&[1]));
-        let bytes = encode_roster_history(&history);
+        let bytes = encode_roster_history(&history).unwrap();
         assert_eq!(decode_roster_history(&bytes[..bytes.len() - 1]), None);
         // Empty history (no entries) is rejected.
         assert!(decode_roster_history(&[]).is_none());
@@ -516,7 +489,7 @@ mod tests {
             round_received: None,
             consensus_timestamp: None,
         };
-        assert_eq!(decode_retained_event(&encode_retained_event(&record)), Some(record));
+        assert_eq!(decode_retained_event(&encode_retained_event(&record).unwrap()), Some(record));
     }
 
     #[test]
@@ -531,7 +504,7 @@ mod tests {
             round_received: Some(3),
             consensus_timestamp: Some(Timestamp::new(999)),
         };
-        assert_eq!(decode_retained_event(&encode_retained_event(&record)), Some(record));
+        assert_eq!(decode_retained_event(&encode_retained_event(&record).unwrap()), Some(record));
     }
 
     #[test]
@@ -546,7 +519,7 @@ mod tests {
             round_received: Some(3),
             consensus_timestamp: Some(Timestamp::new(77)),
         };
-        let bytes = encode_retained_event(&record);
+        let bytes = encode_retained_event(&record).unwrap();
         for cut in [1, 9, 17, bytes.len() - 1] {
             assert_eq!(decode_retained_event(&bytes[..cut]), None, "cut at {cut}");
         }
@@ -564,7 +537,7 @@ mod tests {
             round_received: None,
             consensus_timestamp: None,
         };
-        let mut bytes = encode_retained_event(&record);
+        let mut bytes = encode_retained_event(&record).unwrap();
         bytes.push(0);
         assert_eq!(decode_retained_event(&bytes), None);
     }
@@ -581,7 +554,7 @@ mod tests {
             round_received: None,
             consensus_timestamp: None,
         };
-        let mut bytes = encode_retained_event(&record);
+        let mut bytes = encode_retained_event(&record).unwrap();
         // Flip the round_received tag to an invalid value (0x7f).
         bytes[16] = 0x7f;
         assert_eq!(decode_retained_event(&bytes), None);
@@ -599,7 +572,7 @@ mod tests {
             round_received: None,
             consensus_timestamp: None,
         };
-        let mut bytes = encode_retained_event(&record);
+        let mut bytes = encode_retained_event(&record).unwrap();
         // Corrupt the ancestor_seqs count (u32 BE after the round_received tag)
         // so the decoder cannot read that many rows — a structural failure.
         bytes[17..21].copy_from_slice(&u32::MAX.to_be_bytes());
@@ -609,7 +582,7 @@ mod tests {
     #[test]
     fn signed_checkpoint_decode_rejects_hostile_sig_count_without_allocation() {
         let sc = signed_checkpoint(3, &[1]);
-        let mut bytes = encode_signed_checkpoint(&sc);
+        let mut bytes = encode_signed_checkpoint(&sc).unwrap();
         // Layout: round(8) || records_root(32) || state_hash(32) ||
         // roster_hash(32) || prev_checkpoint_hash(32) || roster_len(u32)…
         let roster_len =
@@ -622,7 +595,7 @@ mod tests {
     #[test]
     fn roster_history_decode_rejects_hostile_entry_count_without_allocation() {
         let history = RosterHistory::new(registry_of(&[1]));
-        let mut bytes = encode_roster_history(&history);
+        let mut bytes = encode_roster_history(&history).unwrap();
         bytes[0..4].copy_from_slice(&u32::MAX.to_be_bytes());
         assert_eq!(decode_roster_history(&bytes), None);
     }

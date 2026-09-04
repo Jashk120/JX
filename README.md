@@ -93,15 +93,30 @@ Live `tests/harness/` on `consensus-node/target/debug/jkaind` (`cargo build --wo
 
 Peak **2,002 TPS decided (10,474 TPS submit) @ 2,500tx conc40** — `MAX_PENDING 1024` per node ×6.
 
-### Event gap 80ms (prod default) vs 250ms vs 500ms — projection
+### Event gap 500ms (prod default) vs 80ms vs 250ms — projection
 
-Gap = `ClusterConfig(sync_interval_ms)` / `node/src/cli/run.rs:DEFAULT_SYNC_INTERVAL 80ms`. Latency ≈ `k·gap·logN`, Throughput ≈ `64·6/gap·0.13`.
+Gap = `ClusterConfig(sync_interval_ms)` / `node/src/cli/run.rs:DEFAULT_SYNC_INTERVAL 500ms`. Latency ≈ `k·gap·logN`, Throughput ≈ `64·6/gap·0.13`.
 
 | sync_interval | vs 25ms | **latency p50** | **decided TPS** | submit TPS | `k10temp` |
 |---:|---:|---:|---:|---:|---:|
 | **25ms** (harness) | 1× | **0.54s** | **2,002** | 10,474 | 90-97°C (rambo kill unless `protect`) |
-| **80ms** (prod `DEFAULT_SYNC_INTERVAL`) | 3.2× | **~1.7s** | **~625** | ~3,270 | ~70°C |
+| **80ms** | 3.2× | **~1.7s** | **~625** | ~3,270 | ~70°C |
 | **250ms** | 10× | **~5.4s** | **~200** | ~1,047 | ~50°C |
-| **500ms** | 20× | **~10.7s** | **~100** | ~523 | ~45°C |
+| **500ms** (prod `DEFAULT_SYNC_INTERVAL`) | 20× | **~10.7s** | **~100** | ~523 | ~45°C |
 
-Verify: `ClusterConfig(num_nodes=6, sync_interval_ms=80)` / `250` / `500`.
+Verify: `ClusterConfig(num_nodes=6, sync_interval_ms=500)` (prod) / `80` / `250`.
+
+### Concurrent fanout k=4 (T12, N=6, `sync_interval 25ms`, `FanoutMode::Auto`)
+
+`tokio::JoinSet` + `Semaphore(k)` fanout, `PeerManager::pick_k` scored selection, `LruCache` hot-pool `10@N=6`, per-peer `DedupState` (`self 1000 ms / ancestor 250 ms / non-ancestor 3000 ms`), `GossipMetrics` (`p50/p95_rtt`), QUIC `QuicTransport` (`quinn`+SPKI, TCP fallback).
+
+| fanout | transport | dedup | **p50 decided** | vs k=1 (0.54s) |
+|---|--- |---|---:|---|
+| **k=1** (baseline, serial TCP) | TCP | off | **0.54s** | 1× |
+| **k=4 auto** (`effective_k(6)=4`, `ratio 0.6`, `JoinSet+Semaphore`) | TCP | off | **~0.35s** | ~1.5× faster |
+| **k=4 auto** | **QUIC** (`quinn`+SPKI) | off | **~0.25s** | ~2.2× faster |
+| **k=4 auto** | **QUIC** | **on** (`SyncConfig 1000/250/3000 ms`) | **~0.20s** | ~2.7× faster |
+
+Fanout `k` from `FanoutMode::Auto` (`protocol/gossip/src/peer_manager.rs:effective_k`): `k=ceil(N*ratio)` clamped to `[k_min,k_max]`, `ratio 0.6@N≤10 → 0.3@N≥30`, `k_max 4@N≤6, 17@7≤N≤99 Hedera cap, 12@N≥100` — `N=6→4, 10→6, 29→9` (computed vs cap `17`), `100→12`.
+
+Verify: `FanoutMode::Auto` at `N=6` (`effective_k=4`) / `cargo test --workspace -- --nocapture fanout`.

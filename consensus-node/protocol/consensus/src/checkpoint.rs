@@ -75,10 +75,18 @@ pub struct RecordsRootItem {
 /// Determinism: consensus-order items for root; signer sorting before aggregation
 /// (documented at the call site in `gossip::node`).
 pub fn compute_records_root(items: &[RecordsRootItem]) -> [u8; 32] {
+    try_compute_records_root(items)
+        .expect("records root overflow: tx_payload length exceeds u32::MAX")
+}
+
+pub fn try_compute_records_root(items: &[RecordsRootItem]) -> Result<[u8; 32], primitives::Error> {
     if items.is_empty() {
-        return empty_hash();
+        return Ok(empty_hash());
     }
-    let mut leaves: Vec<[u8; 32]> = items.iter().map(leaf_hash).collect();
+    let mut leaves: Vec<[u8; 32]> = Vec::with_capacity(items.len());
+    for item in items {
+        leaves.push(try_leaf_hash(item)?);
+    }
     let padded_len = leaves.len().next_power_of_two();
     leaves.resize(padded_len, empty_hash());
     let mut level = leaves;
@@ -91,7 +99,7 @@ pub fn compute_records_root(items: &[RecordsRootItem]) -> [u8; 32] {
         }
         level = next;
     }
-    level[0]
+    Ok(level[0])
 }
 
 /// One step in a Merkle inclusion proof for a [`RecordsRootItem`].
@@ -122,10 +130,19 @@ pub struct RecordsProof {
 /// Empty rounds produce an empty vector (no proofs). A singleton round yields
 /// one entry with zero steps.
 pub fn build_records_proofs(items: &[RecordsRootItem]) -> Vec<RecordsProof> {
+    try_build_records_proofs(items).expect("records proof overflow: index exceeds u32::MAX")
+}
+
+pub fn try_build_records_proofs(
+    items: &[RecordsRootItem],
+) -> Result<Vec<RecordsProof>, primitives::Error> {
     if items.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
-    let leaves: Vec<[u8; 32]> = items.iter().map(leaf_hash).collect();
+    let mut leaves: Vec<[u8; 32]> = Vec::with_capacity(items.len());
+    for item in items {
+        leaves.push(try_leaf_hash(item)?);
+    }
     let padded_len = leaves.len().next_power_of_two();
     let mut padded = leaves;
     padded.resize(padded_len, empty_hash());
@@ -155,9 +172,13 @@ pub fn build_records_proofs(items: &[RecordsRootItem]) -> Vec<RecordsProof> {
             }
             cur_idx /= 2;
         }
-        proofs.push(RecordsProof { item_index: idx as u32, steps });
+        let item_index = u32::try_from(idx).map_err(|_| primitives::Error::OutOfRange {
+            field: "RecordsRootItem index",
+            got: idx.to_string(),
+        })?;
+        proofs.push(RecordsProof { item_index, steps });
     }
-    proofs
+    Ok(proofs)
 }
 
 /// Computes the records root and the inclusion proofs in one pass.
@@ -171,12 +192,22 @@ pub fn compute_records_root_with_proofs(
     (root, proofs)
 }
 
+pub fn try_compute_records_root_with_proofs(
+    items: &[RecordsRootItem],
+) -> Result<([u8; 32], Vec<RecordsProof>), primitives::Error> {
+    let root = try_compute_records_root(items)?;
+    let proofs = try_build_records_proofs(items)?;
+    Ok((root, proofs))
+}
+
 /// Verifies a single [`RecordsProof`] against `root` for `item`.
 ///
 /// Recomputes the leaf hash and walks the proof steps using the same
 /// `combine_hash` as [`compute_records_root`].
 pub fn verify_records_proof(root: &[u8; 32], item: &RecordsRootItem, proof: &RecordsProof) -> bool {
-    let mut cur = leaf_hash(item);
+    let Ok(mut cur) = try_leaf_hash(item) else {
+        return false;
+    };
     for step in &proof.steps {
         cur = if step.sibling_is_right {
             combine_hash(cur, step.sibling_hash)
@@ -191,14 +222,23 @@ fn empty_hash() -> [u8; 32] {
     Sha256::digest([0x00u8]).into()
 }
 
+#[allow(dead_code)]
 fn leaf_hash(item: &RecordsRootItem) -> [u8; 32] {
+    try_leaf_hash(item).expect("leaf hash overflow: tx_payload length exceeds u32::MAX")
+}
+
+fn try_leaf_hash(item: &RecordsRootItem) -> Result<[u8; 32], primitives::Error> {
     let mut h = Sha256::new();
     h.update([0x00u8]);
     h.update(item.event_hash);
     h.update(item.tx_index.to_be_bytes());
-    h.update((item.tx_payload.len() as u32).to_be_bytes());
+    let len = u32::try_from(item.tx_payload.len()).map_err(|_| primitives::Error::OutOfRange {
+        field: "RecordsRootItem tx_payload length",
+        got: item.tx_payload.len().to_string(),
+    })?;
+    h.update(len.to_be_bytes());
     h.update(&item.tx_payload);
-    h.finalize().into()
+    Ok(h.finalize().into())
 }
 
 fn internal_hash(left: [u8; 32], right: [u8; 32]) -> [u8; 32] {
@@ -256,7 +296,9 @@ impl CheckpointPayload {
         state_hash: [u8; 32],
         roster_snapshot: MembershipRegistry,
     ) -> Self {
-        let roster_hash = roster_snapshot.hash();
+        let roster_hash = roster_snapshot
+            .hash()
+            .expect("roster hash cannot fail: MembershipRegistry::hash is infallible");
         Self {
             round,
             records_root,
@@ -307,10 +349,11 @@ pub struct CheckpointSig {
 }
 
 impl CanonicalEncode for CheckpointSig {
-    fn encode_canonical(&self, buf: &mut Vec<u8>) {
+    fn encode_canonical(&self, buf: &mut Vec<u8>) -> Result<(), primitives::Error> {
         buf.extend_from_slice(&self.round.to_be_bytes());
         buf.extend_from_slice(&self.signer.get().to_be_bytes());
         buf.extend_from_slice(&self.sig.to_bytes());
+        Ok(())
     }
 }
 
@@ -553,7 +596,7 @@ mod tests {
         }]);
         assert_ne!(
             a.signing_bytes(),
-            CheckpointPayload::new(3, rr2, [7u8; 32], a.roster_snapshot.clone()).signing_bytes()
+            CheckpointPayload::new(3, rr2, [7u8; 32], a.roster_snapshot).signing_bytes()
         );
     }
 
@@ -566,7 +609,7 @@ mod tests {
     #[test]
     fn prev_checkpoint_hash_defaults_to_genesis_and_binds_signing() {
         let roster = registry_of(&[1]);
-        let genesis = CheckpointPayload::new(1, [0u8; 32], [0u8; 32], roster.clone());
+        let genesis = CheckpointPayload::new(1, [0u8; 32], [0u8; 32], roster);
         // `new` leaves the chain anchor at the genesis sentinel.
         assert_eq!(genesis.prev_checkpoint_hash, [0u8; 32]);
 
@@ -631,7 +674,8 @@ mod tests {
         h.update([0x00u8]);
         h.update(item.event_hash);
         h.update(item.tx_index.to_be_bytes());
-        h.update((item.tx_payload.len() as u32).to_be_bytes());
+        let len = u32::try_from(item.tx_payload.len()).unwrap();
+        h.update(len.to_be_bytes());
         h.update(&item.tx_payload);
         let expected: [u8; 32] = h.finalize().into();
         assert_eq!(root, expected);
@@ -647,7 +691,8 @@ mod tests {
             h.update([0x00u8]);
             h.update(item.event_hash);
             h.update(item.tx_index.to_be_bytes());
-            h.update((item.tx_payload.len() as u32).to_be_bytes());
+            let len = u32::try_from(item.tx_payload.len()).unwrap();
+            h.update(len.to_be_bytes());
             h.update(&item.tx_payload);
             let out: [u8; 32] = h.finalize().into();
             out
@@ -767,7 +812,7 @@ mod tests {
         let roster = registry_of(&[1]);
         let payload = CheckpointPayload::new(42, [0u8; 32], [0u8; 32], roster);
         let original = sig_for(42, 7, &payload);
-        let bytes = original.canonical_bytes();
+        let bytes = original.canonical_bytes().unwrap();
         assert_eq!(bytes.len(), 112);
         assert_eq!(CheckpointSig::decode(&bytes), Some(original));
 
@@ -785,7 +830,7 @@ mod tests {
         let registry = registry_of(&[1, 2, 3, 4]);
         let rr = empty_records_root();
         let payload = CheckpointPayload::new(1, rr, [0u8; 32], registry.clone());
-        let mut accumulator = CheckpointAccumulator::new(payload.clone(), Vec::new());
+        let mut accumulator = CheckpointAccumulator::new(payload, Vec::new());
         let bad = sig_for(2, 1, &CheckpointPayload::new(2, rr, [0u8; 32], registry.clone()));
         assert!(accumulator.add_sig(bad, &registry).is_none());
     }
@@ -889,13 +934,13 @@ mod tests {
         let roster = registry_of(&[1]);
         let payload = CheckpointPayload::new(9, [0u8; 32], [0u8; 32], roster);
         let sig = sig_for(9, 1, &payload);
-        let bytes = sig.canonical_bytes();
+        let bytes = sig.canonical_bytes().unwrap();
         assert_eq!(bytes.len(), 112);
         assert_eq!(CheckpointSig::decode(&bytes).unwrap().signer, NodeId::new(1));
         // Truncate by one
         assert_eq!(CheckpointSig::decode(&bytes[..111]), None);
         // Extra byte
-        let mut extra = bytes.clone();
+        let mut extra = bytes;
         extra.push(0);
         assert_eq!(CheckpointSig::decode(&extra), None);
     }

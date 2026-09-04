@@ -155,7 +155,7 @@ impl Executor {
         let new_max = finalized.iter().map(|(_, round)| *round).max().unwrap_or(0);
         let mut any_new = false;
         for (event, round_received) in finalized {
-            let hash = event.hash();
+            let hash = event.hash().expect("hash bounded");
             if self.executed.contains(&hash) {
                 continue;
             }
@@ -185,7 +185,7 @@ impl Executor {
         let new_max = finalized.iter().map(|(_, round)| *round).max().unwrap_or(0);
         let mut any_new = false;
         for (event, round_received) in finalized {
-            let hash = event.hash();
+            let hash = event.hash().expect("hash bounded");
             if self.executed.contains(&hash) {
                 continue;
             }
@@ -859,17 +859,16 @@ mod tests {
         let mut exec_b = new_executor();
         let mut pending_b: BTreeMap<u64, Vec<MembershipOp>> = BTreeMap::new();
         let mut wm_b = 0u64;
-        assert!(
-            exec_b.bucket_finalized(&mut pending_b, &mut wm_b, &[(new_event.clone(), 5)]).is_ok()
-        );
+        assert!(exec_b.bucket_finalized(&mut pending_b, &mut wm_b, &[(new_event, 5)]).is_ok());
         assert_eq!(exec_b.state().get(b"late"), None);
-        assert!(
-            exec_b.bucket_finalized(&mut pending_b, &mut wm_b, &[(late_event.clone(), 2)]).is_ok()
-        );
+        assert!(exec_b.bucket_finalized(&mut pending_b, &mut wm_b, &[(late_event, 2)]).is_ok());
         assert_eq!(exec_b.state().get(b"late"), Some(b"1".to_vec()));
 
         assert_eq!(exec_a.state().root(), exec_b.state().root());
-        assert_eq!(exec_a.state().to_bytes(), exec_b.state().to_bytes());
+        assert_eq!(
+            exec_a.state().to_bytes().expect("to_bytes succeeds"),
+            exec_b.state().to_bytes().expect("to_bytes succeeds")
+        );
     }
 
     #[test]
