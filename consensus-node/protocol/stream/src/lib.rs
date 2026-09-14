@@ -61,6 +61,15 @@ pub const STREAMS_SUBDIR: &str = "streams";
 /// Event file window: close an `.esf` after this many events.
 pub const DEFAULT_EVENTS_PER_FILE: usize = 10_000;
 
+/// Hard cap on a stream writer's queued (not yet written) messages.
+///
+/// Both writers use a lossless unbounded queue so `append`/`flush`/`submit`
+/// never silently drop while the writer task is alive; the queue depth is
+/// tracked and this cap is the health signal threshold. Enqueueing past the
+/// cap still queues (nothing is dropped) but logs a rate-limited error and
+/// trips the writer's `degraded` flag, observable via `is_degraded()`.
+pub const WRITER_QUEUE_HARD_CAP: usize = 1_000_000;
+
 /// Event file name prefix, e.g. `events-00000042.esf`.
 pub const EVENT_FILE_PREFIX: &str = "events-";
 /// Event file name suffix.

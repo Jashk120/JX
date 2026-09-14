@@ -125,8 +125,13 @@ The gossip layer (`GossipNode`) holds the mirror sinks:
   proof sidecar (typically the same writer as `record_sink`; kept separate so
   a dedicated proof writer can be used if desired).
 
-All writers consume an ordered channel on a dedicated tokio task, so the
-consensus hot path never blocks on disk.
+All writers consume a lossless unbounded channel on a dedicated tokio task,
+so the consensus hot path never blocks on disk and nothing is silently
+dropped while the writer task is alive (`unbounded_send` only fails when the
+task is gone, which is logged as an error). Queue depth is tracked
+(`pending_len`); breaching `WRITER_QUEUE_HARD_CAP` (1 000 000) trips a sticky
+`degraded` flag (`is_degraded`) and logs a rate-limited error. `barrier()`
+awaits every previously queued write.
 
 `jkaind` opens `<data>/streams/` and registers the writers with the node's
 signing material (`bls_identity` for record checkpoints, `signing_key` for
@@ -136,14 +141,18 @@ event sigs).
 
 A mirror (or a test acting as one) verifies a directory with
 `verify::verify_record_stream_dir(dir, node_id, trusted_roster_hash)` /
+`verify::verify_record_stream_dir_rosters(dir, node_id, trusted_roster_hashes)` /
 `verify::verify_event_stream_dir(dir, node_key)`: chain continuity across
-files, the `.esf` signature files, and — for record files — the embedded
-checkpoint quorum (anchored against `trusted_roster_hash` or the embedded
-roster when empty), the Merkle `records_root`, `prev_checkpoint_hash`
+files, consecutive rounds (a missing middle round is rejected with
+`RoundGap` even when the running-hash chain links across the hole), the `.esf`
+signature files, and — for record files — the embedded
+checkpoint quorum (anchored against the trusted roster hash, or — via the
+`_rosters` variant — against a trusted roster-hash set spanning membership
+changes; an empty set and any round outside the set fail closed), the Merkle `records_root`, `prev_checkpoint_hash`
 continuity, the sorted/deduped `state_diffs`, and the companion
 `.rsf_proofs` file (count == items, index order, 32-byte siblings, and
 `verify_records_proof` per item). Truncation, trailing bytes, tampering,
-reordering, history splices, and forged rosters are all rejected.
+reordering, history splices, missing rounds, and forged rosters are all rejected.
 
 The record stream is byte-identical across the cluster for the rounds a node
 has written: `consensus_order(round)` is deterministic, prost encoding is

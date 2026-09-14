@@ -19,6 +19,19 @@ use std::path::{
     Path,
     PathBuf,
 };
+use std::sync::atomic::{
+    AtomicBool,
+    AtomicUsize,
+    Ordering,
+};
+use std::sync::{
+    Arc,
+    Mutex,
+};
+use std::time::{
+    Duration,
+    Instant,
+};
 
 use consensus::RetainedEvent;
 use ed25519_dalek::SigningKey;
@@ -41,6 +54,7 @@ use crate::{
     EVENT_FILE_PREFIX,
     EVENT_FILE_SUFFIX,
     STREAM_VERSION,
+    WRITER_QUEUE_HARD_CAP,
     event_file_name,
     pb,
     running_hash,
@@ -91,8 +105,18 @@ impl WriterState {
 /// insertion order, on a background task. Construct with
 /// [`EventStreamWriter::open`]; register it on a node via
 /// `set_event_stream_sink`.
+///
+/// The queue is lossless: `append`/`flush` enqueue on an unbounded channel,
+/// so nothing is dropped while the writer task is alive. Queue depth is
+/// tracked (`pending_len`); breaching [`WRITER_QUEUE_HARD_CAP`] trips the
+/// sticky `degraded` flag (`is_degraded`) and logs a rate-limited error.
+/// `unbounded_send` only fails when the writer task is gone, which is also
+/// logged as an error.
 pub struct EventStreamWriter {
-    sender: mpsc::Sender<EventStreamMsg>,
+    sender: mpsc::UnboundedSender<EventStreamMsg>,
+    pending: Arc<AtomicUsize>,
+    degraded: Arc<AtomicBool>,
+    last_cap_warn: Arc<Mutex<Option<Instant>>>,
     _task: tokio::task::JoinHandle<()>,
 }
 
@@ -104,7 +128,9 @@ impl EventStreamWriter {
     pub fn open(dir: &Path, signing_key: SigningKey, events_per_file: usize) -> Result<Self> {
         fs::create_dir_all(dir)?;
         let (next_index, running_hash) = resume_state(dir)?;
-        let (sender, receiver) = mpsc::channel(64);
+        let (sender, receiver) = mpsc::unbounded_channel();
+        let pending = Arc::new(AtomicUsize::new(0));
+        let degraded = Arc::new(AtomicBool::new(false));
         let writer_dir = dir.to_path_buf();
         let task = tokio::spawn(run_writer(
             writer_dir,
@@ -112,14 +138,68 @@ impl EventStreamWriter {
             events_per_file,
             receiver,
             WriterState::from_resume(next_index, running_hash),
+            Arc::clone(&pending),
         ));
-        Ok(Self { sender, _task: task })
+        Ok(Self {
+            sender,
+            pending,
+            degraded,
+            last_cap_warn: Arc::new(Mutex::new(None)),
+            _task: task,
+        })
+    }
+
+    /// Enqueues `message`, tracking depth and tripping the degraded flag past
+    /// the hard cap. Returns false only when the writer task is gone.
+    fn enqueue(&self, message: EventStreamMsg) -> bool {
+        let depth = self.pending.fetch_add(1, Ordering::Relaxed) + 1;
+        if depth > WRITER_QUEUE_HARD_CAP {
+            self.degraded.store(true, Ordering::Relaxed);
+            self.warn_cap_breached(depth);
+        }
+        if self.sender.send(message).is_err() {
+            self.pending.fetch_sub(1, Ordering::Relaxed);
+            return false;
+        }
+        true
+    }
+
+    /// Rate-limited (one per minute) error log for hard-cap breaches.
+    fn warn_cap_breached(&self, depth: usize) {
+        let should_log = self
+            .last_cap_warn
+            .lock()
+            .map(|mut last| {
+                let due = last.is_none_or(|at| at.elapsed() >= Duration::from_secs(60));
+                if due {
+                    *last = Some(Instant::now());
+                }
+                due
+            })
+            .unwrap_or(true);
+        if should_log {
+            eprintln!(
+                "[stream] event writer queue depth {depth} exceeds hard cap \
+                 {WRITER_QUEUE_HARD_CAP}; writer is degraded (disk is behind)"
+            );
+        }
+    }
+
+    /// Whether the queue has ever breached [`WRITER_QUEUE_HARD_CAP`]. Sticky:
+    /// once tripped it stays set for the writer's lifetime.
+    pub fn is_degraded(&self) -> bool {
+        self.degraded.load(Ordering::Relaxed)
+    }
+
+    /// The number of messages queued but not yet written to disk.
+    pub fn pending_len(&self) -> usize {
+        self.pending.load(Ordering::Relaxed)
     }
 
     /// Awaits until every previously queued append has been written to disk.
     pub async fn barrier(&self) {
         let (ack, receiver) = oneshot::channel();
-        if self.sender.send(EventStreamMsg::Barrier { ack }).await.is_err() {
+        if !self.enqueue(EventStreamMsg::Barrier { ack }) {
             return;
         }
         let _ = receiver.await;
@@ -130,8 +210,8 @@ impl storage::EventSink for EventStreamWriter {
     /// Queues a freshly inserted event for the writer task. Non-blocking, so
     /// the consensus hot path never waits on disk.
     fn append(&self, record: &RetainedEvent) {
-        if self.sender.try_send(EventStreamMsg::Append(Box::new(record.clone()))).is_err() {
-            eprintln!("[stream] event writer task is gone or full; dropping event append");
+        if !self.enqueue(EventStreamMsg::Append(Box::new(record.clone()))) {
+            eprintln!("[stream] event writer task is gone; dropping event append");
         }
     }
 
@@ -149,8 +229,8 @@ impl storage::EventSink for EventStreamWriter {
     /// Closes the current file if it holds any events, so a flush leaves the
     /// stream durable up to the last appended event.
     fn flush(&self) {
-        if self.sender.try_send(EventStreamMsg::Flush).is_err() {
-            eprintln!("[stream] event writer task is gone or full; drop during flush");
+        if !self.enqueue(EventStreamMsg::Flush) {
+            eprintln!("[stream] event writer task is gone; drop during flush");
         }
     }
 }
@@ -161,8 +241,9 @@ async fn run_writer(
     dir: PathBuf,
     signing_key: SigningKey,
     events_per_file: usize,
-    mut receiver: mpsc::Receiver<EventStreamMsg>,
+    mut receiver: mpsc::UnboundedReceiver<EventStreamMsg>,
     mut state: WriterState,
+    pending: Arc<AtomicUsize>,
 ) {
     while let Some(message) = receiver.recv().await {
         match message {
@@ -182,13 +263,12 @@ async fn run_writer(
                 }
             }
             EventStreamMsg::Flush => {
-                if state.buffer.is_empty() {
-                    continue;
-                }
-                match write_event_file(&dir, &signing_key, &state) {
-                    Ok(()) => state.advance(),
-                    Err(e) => {
-                        eprintln!("[stream] failed to flush event stream file: {e}");
+                if !state.buffer.is_empty() {
+                    match write_event_file(&dir, &signing_key, &state) {
+                        Ok(()) => state.advance(),
+                        Err(e) => {
+                            eprintln!("[stream] failed to flush event stream file: {e}");
+                        }
                     }
                 }
             }
@@ -196,6 +276,7 @@ async fn run_writer(
                 let _ = ack.send(());
             }
         }
+        pending.fetch_sub(1, Ordering::Relaxed);
     }
     if !state.buffer.is_empty() {
         match write_event_file(&dir, &signing_key, &state) {

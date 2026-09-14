@@ -27,6 +27,7 @@ use stream::record::{
 use stream::{
     EventStreamWriter,
     RecordStreamWriter,
+    StreamError,
 };
 
 /// An empty hashgraph shared by the record-writer tests (the record writer
@@ -190,4 +191,93 @@ async fn record_verifier_rejects_tampering_and_reordering() {
         .is_err(),
         "a reordered stream must fail chain verification"
     );
+}
+
+/// A directory missing a middle round must fail verification with `RoundGap`,
+/// even when the running-hash chain still links: the middle round here is
+/// empty, so round 3's start equals round 1's end and the chain alone cannot
+/// see the hole.
+#[tokio::test]
+async fn record_verifier_rejects_missing_middle_round() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let writer =
+        RecordStreamWriter::open(dir.path(), node_key(1), empty_hashgraph()).expect("opens");
+    for round in 1..=3 {
+        writer.submit_items(signed_checkpoint(round, &[1, 2, 3, 4], &[1, 2, 3]), Vec::new());
+    }
+    writer.barrier().await;
+    let trusted_hash = registry_of(&[1, 2, 3, 4]).hash().expect("hash bounded");
+    assert!(
+        stream::verify::verify_record_stream_dir(
+            dir.path(),
+            primitives::NodeId::new(1),
+            trusted_hash
+        )
+        .is_ok(),
+        "consecutive rounds verify"
+    );
+
+    let files = record_files_in(dir.path()).expect("files");
+    assert_eq!(files.len(), 3);
+    fs::remove_file(&files[1].1).expect("remove round 2");
+    let err = stream::verify::verify_record_stream_dir(
+        dir.path(),
+        primitives::NodeId::new(1),
+        trusted_hash,
+    )
+    .expect_err("a missing middle round must fail verification");
+    assert!(
+        matches!(err, StreamError::RoundGap { expected: 2, found: 3 }),
+        "missing round 2 must report RoundGap, got: {err}"
+    );
+}
+
+/// A burst larger than the old bounded (64-slot) queue must reach disk
+/// intact: every appended event lands in exactly one file, in order.
+#[tokio::test]
+async fn burst_event_appends_are_lossless() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let writer = EventStreamWriter::open(dir.path(), node_key(1), 10_000).expect("opens");
+    for seq in 1..=5_000u64 {
+        writer.append(&sample_record(1, seq, 1));
+    }
+    writer.flush();
+    writer.barrier().await;
+    assert_eq!(writer.pending_len(), 0, "barrier drains every queued append");
+    assert!(!writer.is_degraded(), "a 5k burst stays far below the hard cap");
+
+    let files = event_files_in(dir.path()).expect("files");
+    assert_eq!(files.len(), 1);
+    let file = read_event_stream_file(&fs::read(&files[0].1).expect("read")).expect("decodes");
+    assert_eq!(file.events.len(), 5_000, "no burst append was dropped");
+    for (position, event) in file.events.iter().enumerate() {
+        assert_eq!(event.seq, position as u64 + 1, "insertion order is preserved");
+    }
+}
+
+/// A burst of whole decided rounds must reach disk intact: one file per
+/// round, no gaps.
+#[tokio::test]
+async fn burst_record_submits_are_lossless() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let writer =
+        RecordStreamWriter::open(dir.path(), node_key(1), empty_hashgraph()).expect("opens");
+    for round in 1..=300u64 {
+        let items = vec![stream::pb::RecordItem {
+            event_hash: vec![round as u8; 32],
+            tx_index: 0,
+            tx_payload: format!("r{round}").into_bytes(),
+        }];
+        let cp = common::signed_checkpoint_with_items(round, &[1, 2, 3, 4], &[1, 2, 3], &items);
+        writer.submit_items(cp, items);
+    }
+    writer.barrier().await;
+    assert_eq!(writer.pending_len(), 0, "barrier drains every queued round");
+    assert!(!writer.is_degraded(), "a 300-round burst stays far below the hard cap");
+
+    let files = record_files_in(dir.path()).expect("files");
+    assert_eq!(files.len(), 300, "no submitted round was dropped");
+    let trusted_hash = registry_of(&[1, 2, 3, 4]).hash().expect("hash bounded");
+    stream::verify::verify_record_stream_dir(dir.path(), primitives::NodeId::new(1), trusted_hash)
+        .expect("the burst stream verifies with consecutive rounds");
 }

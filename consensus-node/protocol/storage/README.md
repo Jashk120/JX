@@ -46,6 +46,9 @@ set since the prune floor.
   on the canonical binary encoding — not protobuf.
 - `round_received` is recorded lazily by the node as ordering completes, so
   a replay reproduces the exact finalized order.
+- The `by_seq` key space is guarded with checked arithmetic: `recover_next_seq`
+  and `append` return a `Corrupt` error on exhaustion instead of wrapping to
+  0 and overwriting sequence 0.
 
 Dependencies: `primitives`, `crypto`, `consensus` (for the record type and
 codec), `fjall`.

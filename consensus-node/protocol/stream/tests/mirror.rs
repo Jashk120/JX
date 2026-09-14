@@ -451,3 +451,62 @@ async fn esf_tamper_still_caught_by_sig() {
         ".esf tamper must be caught by .esf_sig"
     );
 }
+
+/// A stream spanning a legitimate membership change verifies against the
+/// trusted roster-hash set, and fails closed when a round's roster is not
+/// covered (or the set is empty). Rounds 1-2 run roster {1,2,3,4}, rounds
+/// 3-4 run roster {1,2,3,5}.
+#[tokio::test]
+async fn roster_change_verifies_with_trusted_set() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let writer = RecordStreamWriter::open(
+        dir.path(),
+        node_key(1),
+        Arc::new(tokio::sync::Mutex::new(consensus::Hashgraph::new(&common::registry_of(&[
+            1, 2, 3, 4,
+        ])))),
+    )
+    .expect("writer");
+    for round in 1..=4 {
+        let members: &[u64] = if round <= 2 { &[1, 2, 3, 4] } else { &[1, 2, 3, 5] };
+        let items = vec![pb::RecordItem {
+            event_hash: vec![round as u8; 32],
+            tx_index: 0,
+            tx_payload: format!("r{round}").into_bytes(),
+        }];
+        let checkpoint = common::signed_checkpoint_with_items(round, members, &[1, 2, 3], &items);
+        writer.submit_items(checkpoint, items);
+    }
+    writer.barrier().await;
+
+    let hash_before = registry_of(&[1, 2, 3, 4]).hash().expect("hash bounded");
+    let hash_after = registry_of(&[1, 2, 3, 5]).hash().expect("hash bounded");
+    assert_ne!(hash_before, hash_after, "the rosters must actually differ");
+
+    verify::verify_record_stream_dir_rosters(
+        dir.path(),
+        primitives::NodeId::new(1),
+        &[hash_before, hash_after],
+    )
+    .expect("a stream spanning a roster change verifies against the trusted set");
+
+    assert!(
+        verify::verify_record_stream_dir_rosters(
+            dir.path(),
+            primitives::NodeId::new(1),
+            &[hash_before]
+        )
+        .is_err(),
+        "rounds 3-4 use an uncovered roster hash and must fail closed"
+    );
+    assert!(
+        verify::verify_record_stream_dir_rosters(dir.path(), primitives::NodeId::new(1), &[])
+            .is_err(),
+        "an empty trusted set must fail closed"
+    );
+    assert!(
+        verify::verify_record_stream_dir(dir.path(), primitives::NodeId::new(1), hash_before)
+            .is_err(),
+        "the single-hash wrapper still rejects the post-change rounds"
+    );
+}

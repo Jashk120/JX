@@ -20,6 +20,15 @@ use std::path::{
     PathBuf,
 };
 use std::sync::Arc;
+use std::sync::atomic::{
+    AtomicBool,
+    AtomicUsize,
+    Ordering,
+};
+use std::time::{
+    Duration,
+    Instant,
+};
 
 use consensus::{
     Hashgraph,
@@ -48,6 +57,7 @@ use crate::{
     RECORD_FILE_PREFIX,
     RECORD_FILE_SUFFIX,
     STREAM_VERSION,
+    WRITER_QUEUE_HARD_CAP,
     pb,
     proof,
     record_file_name,
@@ -85,9 +95,17 @@ enum RecordStreamMsg {
 /// `.rsf_sig` — content binding via `records_root` + BLS aggregate replaces it).
 /// Construct with [`RecordStreamWriter::open`]; register it on a node via
 /// `set_record_sink`.
+///
+/// The queue is lossless: `submit` enqueues on an unbounded channel, so no
+/// decided round is dropped while the writer task is alive. Queue depth is
+/// tracked (`pending_len`); breaching [`WRITER_QUEUE_HARD_CAP`] trips the
+/// sticky `degraded` flag (`is_degraded`) and logs a rate-limited error.
 pub struct RecordStreamWriter {
     hashgraph: Arc<Mutex<Hashgraph>>,
-    sender: mpsc::Sender<RecordStreamMsg>,
+    sender: mpsc::UnboundedSender<RecordStreamMsg>,
+    pending: Arc<AtomicUsize>,
+    degraded: Arc<AtomicBool>,
+    last_cap_warn: Arc<std::sync::Mutex<Option<Instant>>>,
     _task: tokio::task::JoinHandle<()>,
 }
 
@@ -102,11 +120,25 @@ impl RecordStreamWriter {
     ) -> Result<Self> {
         fs::create_dir_all(dir)?;
         let (next_round, running_hash) = resume_state(dir)?;
-        let (sender, receiver) = mpsc::channel(64);
+        let (sender, receiver) = mpsc::unbounded_channel();
+        let pending = Arc::new(AtomicUsize::new(0));
+        let degraded = Arc::new(AtomicBool::new(false));
         let writer_dir = dir.to_path_buf();
-        let task =
-            tokio::spawn(run_writer(writer_dir, signing_key, receiver, (next_round, running_hash)));
-        Ok(Self { hashgraph, sender, _task: task })
+        let task = tokio::spawn(run_writer(
+            writer_dir,
+            signing_key,
+            receiver,
+            (next_round, running_hash),
+            Arc::clone(&pending),
+        ));
+        Ok(Self {
+            hashgraph,
+            sender,
+            pending,
+            degraded,
+            last_cap_warn: Arc::new(std::sync::Mutex::new(None)),
+            _task: task,
+        })
     }
 
     /// Queues the record file for `checkpoint`'s round. The items are
@@ -136,15 +168,62 @@ impl RecordStreamWriter {
     ) {
         let round = checkpoint.payload.round;
         let msg = RecordStreamMsg::Write { checkpoint, items, diffs };
-        if self.sender.try_send(msg).is_err() {
-            eprintln!("[stream] record writer task is gone or full; dropping round {round}");
+        if !self.enqueue(msg) {
+            eprintln!("[stream] record writer task is gone; dropping round {round}");
         }
+    }
+
+    /// Enqueues `message`, tracking depth and tripping the degraded flag past
+    /// the hard cap. Returns false only when the writer task is gone.
+    fn enqueue(&self, message: RecordStreamMsg) -> bool {
+        let depth = self.pending.fetch_add(1, Ordering::Relaxed) + 1;
+        if depth > WRITER_QUEUE_HARD_CAP {
+            self.degraded.store(true, Ordering::Relaxed);
+            self.warn_cap_breached(depth);
+        }
+        if self.sender.send(message).is_err() {
+            self.pending.fetch_sub(1, Ordering::Relaxed);
+            return false;
+        }
+        true
+    }
+
+    /// Rate-limited (one per minute) error log for hard-cap breaches.
+    fn warn_cap_breached(&self, depth: usize) {
+        let should_log = self
+            .last_cap_warn
+            .lock()
+            .map(|mut last| {
+                let due = last.is_none_or(|at| at.elapsed() >= Duration::from_secs(60));
+                if due {
+                    *last = Some(Instant::now());
+                }
+                due
+            })
+            .unwrap_or(true);
+        if should_log {
+            eprintln!(
+                "[stream] record writer queue depth {depth} exceeds hard cap \
+                 {WRITER_QUEUE_HARD_CAP}; writer is degraded (disk is behind)"
+            );
+        }
+    }
+
+    /// Whether the queue has ever breached [`WRITER_QUEUE_HARD_CAP`]. Sticky:
+    /// once tripped it stays set for the writer's lifetime.
+    pub fn is_degraded(&self) -> bool {
+        self.degraded.load(Ordering::Relaxed)
+    }
+
+    /// The number of messages queued but not yet written to disk.
+    pub fn pending_len(&self) -> usize {
+        self.pending.load(Ordering::Relaxed)
     }
 
     /// Awaits until every previously queued file has been written to disk.
     pub async fn barrier(&self) {
         let (ack, receiver) = oneshot::channel();
-        if self.sender.send(RecordStreamMsg::Barrier { ack }).await.is_err() {
+        if !self.enqueue(RecordStreamMsg::Barrier { ack }) {
             return;
         }
         let _ = receiver.await;
@@ -166,34 +245,37 @@ impl RecordSink for RecordStreamWriter {
 async fn run_writer(
     dir: PathBuf,
     signing_key: SigningKey,
-    mut receiver: mpsc::Receiver<RecordStreamMsg>,
+    mut receiver: mpsc::UnboundedReceiver<RecordStreamMsg>,
     mut state: (u64, [u8; 32]),
+    pending: Arc<AtomicUsize>,
 ) {
     while let Some(message) = receiver.recv().await {
         match message {
             RecordStreamMsg::Write { checkpoint, items, diffs } => {
                 let round = checkpoint.payload.round;
-                if round < state.0 {
-                    continue;
+                if round >= state.0 {
+                    let write = write_record_file(
+                        &dir,
+                        &signing_key,
+                        &checkpoint,
+                        &items,
+                        &diffs,
+                        &mut state.1,
+                    );
+                    if let Err(e) = write {
+                        eprintln!(
+                            "[stream] failed to write record stream file for round {round}: {e}"
+                        );
+                    } else {
+                        state.0 = round + 1;
+                    }
                 }
-                let write = write_record_file(
-                    &dir,
-                    &signing_key,
-                    &checkpoint,
-                    &items,
-                    &diffs,
-                    &mut state.1,
-                );
-                if let Err(e) = write {
-                    eprintln!("[stream] failed to write record stream file for round {round}: {e}");
-                    continue;
-                }
-                state.0 = round + 1;
             }
             RecordStreamMsg::Barrier { ack } => {
                 let _ = ack.send(());
             }
         }
+        pending.fetch_sub(1, Ordering::Relaxed);
     }
 }
 

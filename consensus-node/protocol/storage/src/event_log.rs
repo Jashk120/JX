@@ -85,7 +85,9 @@ impl EventLog {
     }
 
     /// The next `by_seq` key: one past the highest persisted key, so appends
-    /// after a reopen never collide with previously written records.
+    /// after a reopen never collide with previously written records. Fails
+    /// when the key space is exhausted (highest key is `u64::MAX`) rather
+    /// than wrapping to 0 and overwriting sequence 0.
     fn recover_next_seq(by_seq: &Keyspace) -> Result<u64> {
         let Some(guard) = by_seq.last_key_value() else {
             return Ok(0);
@@ -99,7 +101,9 @@ impl EventLog {
                 .try_into()
                 .map_err(|_| EventLogError::Corrupt("by_seq key not u64 BE".into()))?,
         );
-        Ok(last + 1)
+        last.checked_add(1).ok_or_else(|| {
+            EventLogError::Corrupt("by_seq key space exhausted; refusing to wrap".into())
+        })
     }
 
     /// Appends `record` to the log. Idempotent by `EventHash`: a second
@@ -120,7 +124,13 @@ impl EventLog {
             }
             return Ok(false);
         }
-        let log_seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+        let log_seq = self.next_seq.load(Ordering::Relaxed);
+        if log_seq == u64::MAX {
+            return Err(EventLogError::Corrupt(
+                "by_seq key space exhausted; refusing to wrap".into(),
+            ));
+        }
+        self.next_seq.store(log_seq + 1, Ordering::Relaxed);
         self.write_both(log_seq, hash.as_bytes().as_slice(), record)?;
         Ok(true)
     }
@@ -209,6 +219,13 @@ impl EventLog {
     pub fn flush(&self) -> Result<()> {
         self.db.persist(PersistMode::SyncAll)?;
         Ok(())
+    }
+
+    /// Test-only override of the next `by_seq` key, for forcing sequence
+    /// exhaustion without writing 2^64 records.
+    #[cfg(test)]
+    fn set_next_seq_for_test(&self, seq: u64) {
+        self.next_seq.store(seq, Ordering::Relaxed);
     }
 
     /// Writes `record` under both `log_seq` (in `by_seq`) and `hash` (in
@@ -670,6 +687,47 @@ mod tests {
         let log = EventLog::open(dir.path()).expect("opens");
         let missing = EventHash::new([0xDE; 32]);
         log.set_round_received(&missing, 99).expect("noop for missing hash");
+    }
+
+    #[test]
+    fn append_fails_instead_of_wrapping_at_u64_max() {
+        let dir = tempdir().expect("temp dir");
+        let log = EventLog::open(dir.path()).expect("opens");
+        log.set_next_seq_for_test(u64::MAX);
+
+        let err = log.append(&sample_record(1, 1, 1)).expect_err("exhausted append must fail");
+        match err {
+            EventLogError::Corrupt(msg) => {
+                assert!(msg.contains("exhausted"), "error should mention exhaustion: {msg}");
+            }
+            other => panic!("expected Corrupt, got: {other}"),
+        }
+        // The counter must not have wrapped: a second fresh append still
+        // fails instead of overwriting sequence 0.
+        let err = log.append(&sample_record(2, 2, 1)).expect_err("counter must not wrap");
+        match err {
+            EventLogError::Corrupt(_) => {}
+            other => panic!("expected Corrupt, got: {other}"),
+        }
+        assert_eq!(log.event_count().expect("count"), 0);
+    }
+
+    #[test]
+    fn recover_next_seq_fails_when_last_key_is_u64_max() {
+        let dir = tempdir().expect("temp dir");
+        let log = EventLog::open(dir.path()).expect("opens");
+        let record = sample_record(1, 1, 1);
+        log.by_seq
+            .insert(u64::MAX.to_be_bytes(), encode_value(0, &record))
+            .expect("inject max key");
+
+        let err = EventLog::recover_next_seq(&log.by_seq).expect_err("recovery must fail");
+        match err {
+            EventLogError::Corrupt(msg) => {
+                assert!(msg.contains("exhausted"), "error should mention exhaustion: {msg}");
+            }
+            other => panic!("expected Corrupt, got: {other}"),
+        }
     }
 
     #[test]

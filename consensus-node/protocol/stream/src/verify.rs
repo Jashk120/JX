@@ -79,8 +79,9 @@ pub fn verify_event_stream_dir(dir: &Path, node_key: &VerifyingKey) -> Result<()
 }
 
 /// Verifies a whole record-stream directory exactly as a mirror would: chain
-/// continuity + BLS aggregate verification (anchored against
-/// `trusted_roster_hash`) + content binding via `records_root`.
+/// continuity + consecutive-round coverage + BLS aggregate verification
+/// (anchored against `trusted_roster_hash`) + content binding via
+/// `records_root`.
 ///
 /// `trusted_roster_hash` anchors each checkpoint's `roster_snapshot` against
 /// a roster the caller already trusts. A mismatch is rejected before
@@ -88,20 +89,50 @@ pub fn verify_event_stream_dir(dir: &Path, node_key: &VerifyingKey) -> Result<()
 /// self-referential quorum trivially pass. There is no `None` path; callers
 /// must supply a trusted hash and fail-closed if none is available.
 ///
+/// Rounds must be consecutive: a directory holding rounds 1 and 3 (with 2
+/// missing) is rejected with [`StreamError::RoundGap`], even when the
+/// running-hash chain links across the gap.
+///
 /// Content binding: `records_root` in the checkpoint must equal
 /// `compute_records_root` over the file's `RecordItem` triples. The
 /// `.rsf_sig` file is not consulted — it no longer exists.
 pub fn verify_record_stream_dir(
     dir: &Path,
-    _node_id: NodeId,
+    node_id: NodeId,
     trusted_roster_hash: [u8; 32],
 ) -> Result<()> {
+    verify_record_stream_dir_rosters(dir, node_id, &[trusted_roster_hash])
+}
+
+/// Verifies a record-stream directory spanning roster changes: each record
+/// file's checkpoint `roster_hash` must be a member of
+/// `trusted_roster_hashes` before running the existing embedded-roster quorum
+/// (`cp.verify()`) and `records_root` binding. Fails closed on any round
+/// whose `roster_hash` is not covered, and on an empty trusted set. Rounds
+/// must be consecutive ([`StreamError::RoundGap`]).
+pub fn verify_record_stream_dir_rosters(
+    dir: &Path,
+    _node_id: NodeId,
+    trusted_roster_hashes: &[[u8; 32]],
+) -> Result<()> {
+    if trusted_roster_hashes.is_empty() {
+        return Err(StreamError::NoTrustedRoster);
+    }
     let files = record_files_in(dir)?;
     if files.is_empty() {
         return Err(StreamError::EmptyDirectory);
     }
     let mut previous_end: Option<[u8; 32]> = None;
+    let mut previous_round: Option<u64> = None;
     for (round, path) in files {
+        if let Some(previous) = previous_round {
+            let expected = previous
+                .checked_add(1)
+                .ok_or(StreamError::RoundGap { expected: u64::MAX, found: round })?;
+            if round != expected {
+                return Err(StreamError::RoundGap { expected, found: round });
+            }
+        }
         let bytes = fs::read(&path)?;
         let file = read_record_stream_file(&bytes)?;
         let start = digest_or_err(&file, &path, true)?;
@@ -113,10 +144,11 @@ pub fn verify_record_stream_dir(
                 "record file for round {round} has no checkpoint anchor"
             ))
         })?;
-        if !verify_checkpoint_binding(checkpoint, trusted_roster_hash, &file.items) {
+        if !verify_checkpoint_binding_set(checkpoint, trusted_roster_hashes, &file.items) {
             return Err(StreamError::BadQuorum);
         }
         previous_end = Some(end);
+        previous_round = Some(round);
     }
     Ok(())
 }
@@ -241,13 +273,13 @@ fn verify_checkpoint_quorum(checkpoint: &SignedCheckpoint, expected_roster_hash:
     checkpoint.verify()
 }
 
-fn verify_checkpoint_binding(
+fn verify_checkpoint_binding_set(
     checkpoint_pb: &pb::SignedCheckpoint,
-    trusted_roster_hash: [u8; 32],
+    trusted_roster_hashes: &[[u8; 32]],
     items: &[pb::RecordItem],
 ) -> bool {
     let Some(cp) = proto_to_signed_checkpoint(checkpoint_pb) else { return false };
-    if cp.payload.roster_hash != trusted_roster_hash {
+    if !trusted_roster_hashes.contains(&cp.payload.roster_hash) {
         return false;
     }
     if !cp.verify() {

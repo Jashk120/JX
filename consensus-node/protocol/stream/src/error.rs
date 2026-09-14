@@ -46,6 +46,12 @@ pub enum StreamError {
 
     #[error("the stream directory is empty")]
     EmptyDirectory,
+
+    #[error("record stream is missing round {expected} (found round {found})")]
+    RoundGap { expected: u64, found: u64 },
+
+    #[error("no trusted roster hashes supplied for record stream verification")]
+    NoTrustedRoster,
 }
 
 /// Result alias for the stream crate.
