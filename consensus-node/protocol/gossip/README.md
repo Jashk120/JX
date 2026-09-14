@@ -48,7 +48,15 @@ per `docs/OPTIMIZATION.md:3.4` (G-track G1–G6).
   signal), and the length-prefixed, tag-delimited frame format (`[tag: u8][len:
   u32 BE][payload]`). `ReconnectResponse` carries the signed checkpoint, state
   bytes, roster history, decided round, retained graph, and `last_timestamp`
-  watermark with capacity guards on every counted field.
+  watermark with capacity guards on every counted field. Applying a response
+  is validate-before-mutate: state-root, roster, own-key, every retained
+  signature, the retained graph's peer-supplied metadata (seq, `ancestor_seqs`,
+  birth round, ordering), and the decided-round bound are all checked — and the
+  retained graph rebuilt into a scratch `Hashgraph` — before any live or
+  durable state is touched, so a lying peer cannot wipe state or poison the
+  graph. The decided round must lie within the retained graph and its gap from
+  the checkpoint is capped by the transfer size, so a `u64::MAX` watermark
+  cannot force an unbounded `mark_decided_through`.
 - `frontier` — the sync summary and delta computation: `known_summary`
   builds the per-creator frontier from `Hashgraph::latest_event_by`, and
   `delta_events` / `delta_events_filtered` walks each creator's self-parent

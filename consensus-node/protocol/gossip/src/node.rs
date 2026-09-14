@@ -17,6 +17,7 @@ use consensus::{
     CheckpointSig,
     RETENTION_ROUNDS,
     RecordsRootItem,
+    RetainedEvent,
     SignedCheckpoint,
 };
 use crypto::{
@@ -2101,23 +2102,37 @@ impl GossipNode {
     /// graph into it, advances the activation watermarks past the checkpoint
     /// round, and records the accepted checkpoint.
     ///
+    /// Validate-before-mutate: every check (state-root, roster decode,
+    /// roster-hash, own key, every retained signature, the decided-round
+    /// bound, and every retained metadata record) completes before any live
+    /// or durable state is touched. The retained graph is first built into a
+    /// local scratch hashgraph — off the hashgraph lock, with no Fjall I/O —
+    /// and only swapped in once every insert succeeds, so a lying peer can
+    /// neither wipe this node's state partition nor poison its graph.
+    ///
     /// Returns `false` (without applying anything) if the response is
     /// inconsistent — a lying peer must never be able to crash this node via
     /// a panic. The caller keeps `needs_reconnect` set so a failed load is
     /// retried next interval.
     async fn apply_checkpoint(&self, response: ReconnectResponse) -> bool {
-        let checkpoint = &response.signed_checkpoint;
+        let ReconnectResponse {
+            signed_checkpoint: checkpoint,
+            state_bytes,
+            roster_history_bytes,
+            decided_round,
+            retained,
+            last_timestamp,
+        } = response;
         let cp_round = checkpoint.payload.round;
         let sink = self.event_sink.lock().await.clone();
 
         // 1. The served state bytes must rebuild to the committed Merkle
         //    root. The teacher serves the state exactly as it stood at the
         //    checkpoint round, so this holds; the learner replays only the
-        //    retained events newer than the checkpoint (step 7's watermark).
-        //    Validate before touching the live partition so invalid bytes
-        //    never wipe the current state — mirrors the
+        //    retained events newer than the checkpoint (step 9's watermark).
+        //    Pure check only — nothing is written yet — mirroring the
         //    `root_of_bytes == state_hash` guard in `accept_checkpoint`.
-        let Some(verified_root) = state::State::root_of_bytes(&response.state_bytes) else {
+        let Some(verified_root) = state::State::root_of_bytes(&state_bytes) else {
             tracing::error!("reconnect: invalid state bytes from peer");
             return false;
         };
@@ -2125,24 +2140,9 @@ impl GossipNode {
             tracing::error!("reconnect: state hash mismatch; rejecting checkpoint");
             return false;
         }
-        let state = {
-            if let Err(e) = self.state_db.clear_state() {
-                tracing::error!(error = %e, "reconnect: failed to reset state partition");
-                return false;
-            }
-            let Some(state) =
-                state::State::from_bytes(self.state_db.state_keyspace(), &response.state_bytes)
-            else {
-                tracing::error!("reconnect: invalid state bytes from peer");
-                return false;
-            };
-            state
-        };
-        debug_assert_eq!(state.root(), checkpoint.payload.state_hash);
 
         // 2. Decode the roster history.
-        let Some(roster_history) = consensus::decode_roster_history(&response.roster_history_bytes)
-        else {
+        let Some(roster_history) = consensus::decode_roster_history(&roster_history_bytes) else {
             tracing::error!("reconnect: invalid roster history from peer");
             return false;
         };
@@ -2181,20 +2181,115 @@ impl GossipNode {
             Ok(_) => {}
         }
 
-        // 4. Restore the executor from the checkpoint state — the state
-        //    exactly at the checkpoint round, so replaying the retained
-        //    window in `process_finalized_rounds` is exactly-once. The served
-        //    bytes are retained as this node's own snapshot for that round —
-        //    in memory (for reconnect serving) and in the state database's
-        //    `snap` keyspace (so a future restart restores and verifies the
-        //    same round) — so it can serve the same checkpoint to a future
-        //    learner.
-        *self.executor.lock().await = state::Executor::from_state(state);
-        if let Err(e) = self.state_db.snapshot(cp_round, &response.state_bytes) {
+        // 4. Verify every retained signature against the checkpoint roster: a
+        //    malicious teacher must not be able to poison the learner's graph
+        //    with forged events. The received records are kept intact for the
+        //    durable sinks; the verified copies feed the scratch graph below.
+        let mut verified_retained = Vec::with_capacity(retained.len());
+        for record in &retained {
+            let verified = match record.event.clone().verify(&checkpoint.payload.roster_snapshot) {
+                Ok(verified) => verified,
+                Err(e) => {
+                    tracing::error!(error = %e, "reconnect: retained event failed verification");
+                    return false;
+                }
+            };
+            verified_retained.push(RetainedEvent {
+                event: verified.into_inner(),
+                seq: record.seq,
+                round: record.round,
+                ancestor_seqs: record.ancestor_seqs.clone(),
+                round_received: record.round_received,
+                consensus_timestamp: record.consensus_timestamp,
+            });
+        }
+
+        // 5. Bound the teacher's decided watermark by the verified retained
+        //    graph. It must cover the checkpoint but never exceed the highest
+        //    birth round the transfer carries, and the number of rounds
+        //    `mark_decided_through` will mark is bounded by the transfer size:
+        //    every newly decided round carries at least one retained event.
+        //    Without both bounds a peer-supplied `u64::MAX` watermark would
+        //    force unbounded time/memory under the hashgraph lock.
+        let max_retained_round =
+            verified_retained.iter().map(|record| record.round).max().unwrap_or(cp_round);
+        let max_round_gap = verified_retained.len() as u64;
+        if decided_round < cp_round
+            || decided_round > max_retained_round
+            || decided_round - cp_round > max_round_gap
+        {
+            tracing::error!(
+                decided_round,
+                cp_round,
+                max_retained_round,
+                max_round_gap,
+                "reconnect: decided round outside the retained graph; rejecting checkpoint"
+            );
+            return false;
+        }
+
+        // 6. Order the transfer parents-first: retained records arrive in
+        //    arbitrary (HashMap) order, but `insert_accepted` validates each
+        //    record against the parents already present, so a child inserted
+        //    before its parent would dodge validation as "pruned".
+        let Some(order) = topo_sort_retained(&verified_retained) else {
+            tracing::error!("reconnect: retained graph is not topologically sortable");
+            return false;
+        };
+
+        // 7. Build the retained graph into a local scratch hashgraph — no
+        //    lock held, no Fjall I/O — so every metadata record is validated
+        //    (`insert_accepted` re-derives seq/ancestors/round/ordering)
+        //    before the live graph is touched. Any failure discards the
+        //    scratch and leaves the live state and hashgraph untouched.
+        let mut new_hg = consensus::Hashgraph::from_checkpoint(&checkpoint.payload, roster_history);
+        let mut slots: Vec<Option<RetainedEvent>> =
+            verified_retained.into_iter().map(Some).collect();
+        for index in order {
+            let Some(record) = slots[index].take() else {
+                tracing::error!("reconnect: retained order is inconsistent; rejecting checkpoint");
+                return false;
+            };
+            if let Err(e) = new_hg.insert_accepted(record, decided_round) {
+                tracing::error!(error = %e, "reconnect: retained event rejected");
+                return false;
+            }
+        }
+        // Rounds the teacher already finalized stay finalized here, so this
+        // node keeps producing matching checkpoints instead of re-deciding
+        // history it holds.
+        if let Err(e) = new_hg.mark_decided_through(decided_round) {
+            tracing::error!(error = %e, "reconnect: decided watermark rejected");
+            return false;
+        }
+
+        // 8. All validation passed. Do the fallible durable work first — the
+        //    state partition rebuild and its snapshot — so a storage failure
+        //    cannot leave a rebuilt hashgraph paired with stale or cleared
+        //    executor state. Only after this succeeds is any in-memory state
+        //    committed, and no step below can return early.
+        if let Err(e) = self.state_db.clear_state() {
+            tracing::error!(error = %e, "reconnect: failed to reset state partition");
+            return false;
+        }
+        let Some(state) = state::State::from_bytes(self.state_db.state_keyspace(), &state_bytes)
+        else {
+            tracing::error!("reconnect: invalid state bytes from peer");
+            return false;
+        };
+        debug_assert_eq!(state.root(), checkpoint.payload.state_hash);
+        if let Err(e) = self.state_db.snapshot(cp_round, &state_bytes) {
             tracing::error!(round = cp_round, error = %e, "reconnect: failed to persist state snapshot");
             return false;
         }
-        self.state_snapshots.lock().await.insert(cp_round, response.state_bytes.clone());
+
+        // 9. Commit the validated graph and executor together. The served
+        //    bytes are kept as this node's own snapshot for the round — in
+        //    memory (for reconnect serving) and in the `snap` keyspace above —
+        //    so it can serve the same checkpoint to a future learner.
+        *self.hashgraph.lock().await = new_hg;
+        *self.executor.lock().await = state::Executor::from_state(state);
+        self.state_snapshots.lock().await.insert(cp_round, state_bytes.clone());
         {
             let mut cumulative = self.cumulative_state_hashes.lock().await;
             cumulative.clear();
@@ -2202,61 +2297,17 @@ impl GossipNode {
             cumulative.insert(cp_round, checkpoint.payload.state_hash);
         }
 
-        // 5. Rebuild the hashgraph scaffold and load the teacher's retained
-        //    graph into it. The retained events carry their full record
-        //    metadata (seq, round, ancestor_seqs, ordering), so this node's
-        //    known-summary frontier is honest — it holds complete chains,
-        //    not just per-creator heads — and future delta syncs never
-        //    reference a parent it lacks. Retained events are
-        //    signature-verified against the checkpoint roster first: a
-        //    malicious teacher must not be able to poison the learner's
-        //    graph with forged events.
+        // 10. Fan the transferred records out to the durable sinks. Blocking
+        //     Fjall appends run outside the hashgraph lock (AH-4), in the
+        //     received order.
         let stream_sink = self.event_stream_sink.lock().await.clone();
-        // 5. Rebuild the hashgraph scaffold and load the teacher's retained
-        //    graph into it. Verification and insertion happen under the
-        //    hashgraph lock; durable appends are deferred until the lock is
-        //    released so blocking Fjall I/O never runs while a tokio Mutex is
-        //    held (AH-4: executor starvation / deadlock).
-        {
-            let mut hg = self.hashgraph.lock().await;
-            *hg = consensus::Hashgraph::from_checkpoint(&checkpoint.payload, roster_history);
-            for retained in &response.retained {
-                let verified = match retained
-                    .event
-                    .clone()
-                    .verify(&checkpoint.payload.roster_snapshot)
-                {
-                    Ok(verified) => verified,
-                    Err(e) => {
-                        tracing::error!(error = %e, "reconnect: retained event failed verification");
-                        return false;
-                    }
-                };
-                if let Err(e) = hg.insert_accepted(
-                    verified.into_inner(),
-                    retained.seq,
-                    retained.round,
-                    retained.ancestor_seqs.clone(),
-                    retained.round_received,
-                    retained.consensus_timestamp,
-                ) {
-                    tracing::error!(error = %e, "reconnect: retained event rejected");
-                    return false;
-                }
-            }
-            // Rounds the teacher already finalized stay finalized here, so
-            // this node keeps producing matching checkpoints instead of
-            // re-deciding history it holds.
-            hg.mark_decided_through(response.decided_round);
-        }
-        // Blocking Fjall appends outside the hashgraph lock (AH-4).
         if sink.is_some() || stream_sink.is_some() {
-            for retained in &response.retained {
+            for record in &retained {
                 if let Some(s) = &sink {
-                    s.append(retained);
+                    s.append(record);
                 }
                 if let Some(ss) = &stream_sink {
-                    ss.append(retained);
+                    ss.append(record);
                 }
             }
         }
@@ -2266,35 +2317,34 @@ impl GossipNode {
         // its birth round — regardless of whether this node learned the
         // history from a peer or from its own log.
         if let Some(sink) = &sink {
-            sink.set_roster_history(&response.roster_history_bytes);
+            sink.set_roster_history(&roster_history_bytes);
         }
 
-        // 6. The live verification registry mirrors the checkpoint roster.
+        // 11. The live verification registry mirrors the checkpoint roster.
         *self.registry.lock().await = checkpoint.payload.roster_snapshot.clone();
 
-        // 7. Advance the activation watermarks so `process_finalized_rounds`
-        //    does not re-process the rounds the checkpoint already covers.
+        // 12. Advance the activation watermarks so `process_finalized_rounds`
+        //     does not re-process the rounds the checkpoint already covers.
         {
             let mut activation = self.activation.lock().await;
             activation.processed_through_round = activation.processed_through_round.max(cp_round);
             activation.checkpoint_watermark = activation.checkpoint_watermark.max(cp_round);
         }
 
-        // 7b. Restore the monotonic timestamp watermark from durable checkpoint
-        //     state. `response.last_timestamp` is the teacher's (or local
-        //     restart's) watermark persisted with the checkpoint. Also consider
-        //     the max timestamp among retained own events to cover events emitted
-        //     after the checkpoint but before a crash. Do not rely solely on
-        //     retained events because pruning can remove the newest own event.
+        // 12b. Restore the monotonic timestamp watermark from durable checkpoint
+        //      state. `last_timestamp` is the teacher's (or local restart's)
+        //      watermark persisted with the checkpoint. Also consider the max
+        //      timestamp among retained own events to cover events emitted
+        //      after the checkpoint but before a crash. Do not rely solely on
+        //      retained events because pruning can remove the newest own event.
         {
-            let retained_max = response
-                .retained
+            let retained_max = retained
                 .iter()
-                .filter(|r| *r.event.creator() == self.node_id)
-                .map(|r| r.event.timestamp().get())
+                .filter(|record| *record.event.creator() == self.node_id)
+                .map(|record| record.event.timestamp().get())
                 .max()
                 .unwrap_or(0);
-            let target = response.last_timestamp.max(retained_max);
+            let target = last_timestamp.max(retained_max);
             self.last_timestamp.fetch_max(target, Ordering::Relaxed);
             // Persist the restored watermark so a subsequent restart sees it.
             let current = self.last_timestamp.load(Ordering::Relaxed);
@@ -2303,14 +2353,14 @@ impl GossipNode {
             }
         }
 
-        // 8. Record the accepted checkpoint so it is visible to
-        //    `signed_checkpoint_for` and future reconnects.
+        // 13. Record the accepted checkpoint so it is visible to
+        //      `signed_checkpoint_for` and future reconnects.
         self.signed_checkpoints.lock().await.push(checkpoint.clone());
 
-        // 9. Persist to durable storage via the registered sink, if any. The
-        //    checkpoint-round state snapshot was already written to the state
-        //    database's `snap` keyspace in step 4.
-        self.notify_checkpoint_accepted(checkpoint).await;
+        // 14. Persist to durable storage via the registered sink, if any. The
+        //     checkpoint-round state snapshot was already written to the state
+        //     database's `snap` keyspace in step 9.
+        self.notify_checkpoint_accepted(&checkpoint).await;
         true
     }
 
@@ -2466,6 +2516,48 @@ impl GossipNode {
     }
 }
 
+/// Orders retained records parents-first (Kahn's algorithm over the hashes
+/// present in the transfer) so `insert_accepted` validates each record
+/// against the parents the learner already holds. Parents absent from the
+/// transfer (pruned history) impose no edge. Returns `None` on a parent
+/// cycle or an unhashable event — both reject the checkpoint, never panic.
+fn topo_sort_retained(retained: &[RetainedEvent]) -> Option<Vec<usize>> {
+    let mut index_by_hash: HashMap<EventHash, usize> = HashMap::with_capacity(retained.len());
+    for (index, record) in retained.iter().enumerate() {
+        let hash = record.event.hash().ok()?;
+        index_by_hash.insert(hash, index);
+    }
+    let mut incoming = vec![0usize; retained.len()];
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); retained.len()];
+    for (index, record) in retained.iter().enumerate() {
+        for parent in
+            [record.event.self_parent(), record.event.other_parent()].into_iter().flatten()
+        {
+            if let Some(&parent_index) = index_by_hash.get(parent) {
+                children[parent_index].push(index);
+                incoming[index] += 1;
+            }
+        }
+    }
+    let mut ready: VecDeque<usize> = incoming
+        .iter()
+        .enumerate()
+        .filter(|&(_, degree)| *degree == 0)
+        .map(|(index, _)| index)
+        .collect();
+    let mut order = Vec::with_capacity(retained.len());
+    while let Some(index) = ready.pop_front() {
+        order.push(index);
+        for &child in &children[index] {
+            incoming[child] -= 1;
+            if incoming[child] == 0 {
+                ready.push_back(child);
+            }
+        }
+    }
+    (order.len() == retained.len()).then_some(order)
+}
+
 fn verify_pop_bytes(bls_key: &[u8; 48], pop: &[u8; 96]) -> bool {
     let Ok(pk) = blst::min_pk::PublicKey::from_bytes(bls_key) else {
         return false;
@@ -2613,7 +2705,7 @@ mod pending_sig_tests {
         node.outbound_checkpoint_sigs.lock().await.push(sig(5, 1));
         node.pending_checkpoint_sigs.lock().await.insert(3, vec![sig(3, 2)]);
         node.pending_checkpoint_sigs.lock().await.insert(5, vec![sig(5, 2)]);
-        node.hashgraph.lock().await.mark_decided_through(5);
+        node.hashgraph.lock().await.mark_decided_through(5).expect("empty graph marks");
         let snapshot = node.executor.lock().await.state().to_bytes().expect("to_bytes succeeds");
         let state_hash = state::State::root_of_bytes(&snapshot).expect("empty state hashes");
         let payload = consensus::CheckpointPayload::new(
@@ -2669,7 +2761,7 @@ mod rule1_chain_tests {
         let registry = registry_with(&[1, 2, 3, 4]);
         let hg = {
             let mut hg = consensus::Hashgraph::new(&registry);
-            hg.mark_decided_through(2);
+            hg.mark_decided_through(2).expect("empty graph marks");
             hg
         };
         let mut state_hashes = BTreeMap::new();
@@ -2717,7 +2809,7 @@ mod rule1_chain_tests {
     async fn genesis_prev_is_zeros_and_chain_is_pure() {
         let registry = registry_with(&[1, 2, 3, 4]);
         let mut hg = consensus::Hashgraph::new(&registry);
-        hg.mark_decided_through(1);
+        hg.mark_decided_through(1).expect("empty graph marks");
         let mut state_hashes = BTreeMap::new();
         state_hashes.insert(0, [0xAA; 32]);
         state_hashes.insert(1, [0x11; 32]);
@@ -2726,7 +2818,7 @@ mod rule1_chain_tests {
             .expect("round 1");
         assert_eq!(p1.prev_checkpoint_hash, [0u8; 32]);
 
-        hg.mark_decided_through(2);
+        hg.mark_decided_through(2).expect("empty graph marks");
         state_hashes.insert(2, [0x22; 32]);
         let p2 = GossipNode::canonical_checkpoint_payload_chained(&hg, 2, &state_hashes, &[])
             .expect("round 2");
@@ -2737,7 +2829,7 @@ mod rule1_chain_tests {
     async fn chained_payload_deterministic_across_pass_groupings() {
         let registry = registry_with(&[1, 2, 3, 4]);
         let mut hg = consensus::Hashgraph::new(&registry);
-        hg.mark_decided_through(3);
+        hg.mark_decided_through(3).expect("empty graph marks");
         let mut cumulative = BTreeMap::new();
         cumulative.insert(0, [0xAA; 32]);
         cumulative.insert(1, [0x11; 32]);
@@ -2774,5 +2866,132 @@ mod rule1_chain_tests {
         assert_eq!(payload2.prev_checkpoint_hash, payload1.signing_bytes_hash());
         assert_eq!(payload3_cumulative.prev_checkpoint_hash, payload2.signing_bytes_hash());
         assert_ne!(payload3_a.prev_checkpoint_hash, payload2.signing_bytes_hash());
+    }
+}
+
+#[cfg(test)]
+mod apply_checkpoint_tests {
+    use crypto::{
+        MembershipRegistry,
+        Signable,
+    };
+    use ed25519_dalek::SigningKey;
+    use primitives::{
+        NodeId,
+        Timestamp,
+        UnsignedEvent,
+    };
+    use tempfile::tempdir;
+
+    use super::*;
+
+    fn registry_with(nodes: &[u64]) -> MembershipRegistry {
+        let mut registry = MembershipRegistry::new();
+        for &id in nodes {
+            let k = SigningKey::from_bytes(&[id as u8; 32]);
+            let bls = crypto::BlsIdentity::from_ikm(&[id as u8; 32]).expect("bls");
+            registry.register(NodeId::new(id), k.verifying_key(), bls.public.to_bytes());
+        }
+        registry
+    }
+
+    fn quorum_checkpoint(
+        round: u64,
+        state_hash: [u8; 32],
+        roster: &MembershipRegistry,
+        signers: &[u64],
+    ) -> SignedCheckpoint {
+        let payload =
+            consensus::CheckpointPayload::new(round, [0u8; 32], state_hash, roster.clone());
+        let mut sigs = Vec::new();
+        for &signer in signers {
+            let bls = crypto::BlsIdentity::from_ikm(&[signer as u8; 32]).expect("bls");
+            sigs.push(bls.sign(&payload.signing_bytes()));
+        }
+        let refs: Vec<&blst::min_pk::Signature> = sigs.iter().collect();
+        let aggregate_sig = crypto::bls::aggregate(&refs).expect("aggregate succeeds");
+        SignedCheckpoint {
+            payload,
+            aggregate_sig,
+            signers: signers.iter().map(|&id| NodeId::new(id)).collect(),
+        }
+    }
+
+    /// A response that fails roster-history decoding must leave the live
+    /// state partition, the executor, and the hashgraph untouched. Before
+    /// validate-before-mutate, `apply_checkpoint` wiped and replaced the
+    /// state before decoding the roster, so this exact response destroyed
+    /// live state.
+    #[tokio::test]
+    async fn rejected_checkpoint_leaves_live_state_and_graph_untouched() {
+        let registry = registry_with(&[1, 2]);
+        let dir = tempdir().expect("tempdir");
+        let db = Arc::new(state::StateDb::open(dir.path()).expect("StateDb"));
+        let node = GossipNode::new(
+            NodeId::new(1),
+            SigningKey::from_bytes(&[1u8; 32]),
+            registry.clone(),
+            TlsIdentity::from_seed([0x41; 32], 1).expect("tls"),
+            Vec::new(),
+            SyncTiming::new(
+                std::time::Duration::from_millis(50),
+                std::time::Duration::from_secs(1),
+            ),
+            db,
+        );
+
+        // One live graph event the checkpoint must not disturb.
+        let live_event =
+            UnsignedEvent::new(NodeId::new(1), None, None, Timestamp::new(42), Vec::new())
+                .sign(&SigningKey::from_bytes(&[1u8; 32]))
+                .expect("sign bounded");
+        let live_hash = {
+            let verified = live_event.verify(&registry).expect("verifies");
+            node.hashgraph.lock().await.insert(verified).expect("inserts")
+        };
+        let live_state_bytes =
+            node.executor.lock().await.state().to_bytes().expect("to_bytes succeeds");
+
+        // Served state differs from live state and hashes correctly, so the
+        // failure lands on the undecodable roster history — after the point
+        // where the old code had already wiped the state partition.
+        let serve_dir = tempdir().expect("tempdir");
+        let serve_db = state::StateDb::open(serve_dir.path()).expect("StateDb");
+        let mut served = state::State::new(serve_db.state_keyspace());
+        served
+            .apply(&state::Op::Put { key: b"cp".to_vec(), value: b"1".to_vec() })
+            .expect("apply succeeds");
+        let state_bytes = served.to_bytes().expect("to_bytes succeeds");
+        assert_ne!(state_bytes, live_state_bytes, "served state must differ from live state");
+        let checkpoint = quorum_checkpoint(1, served.root(), &registry, &[1, 2]);
+        let response = ReconnectResponse {
+            signed_checkpoint: checkpoint,
+            state_bytes,
+            roster_history_bytes: vec![0xFF; 16],
+            decided_round: 1,
+            retained: Vec::new(),
+            last_timestamp: 0,
+        };
+
+        assert!(!node.apply_checkpoint(response).await, "garbage roster history is rejected");
+
+        assert!(
+            node.hashgraph.lock().await.get(&live_hash).is_some(),
+            "live graph event survives the rejection"
+        );
+        assert_eq!(
+            node.executor.lock().await.state().to_bytes().expect("to_bytes succeeds"),
+            live_state_bytes,
+            "live state bytes survive the rejection"
+        );
+        assert!(
+            node.signed_checkpoints.lock().await.is_empty(),
+            "no checkpoint is recorded on rejection"
+        );
+        assert_eq!(
+            node.last_timestamp.load(Ordering::Relaxed),
+            0,
+            "timestamp watermark is untouched on rejection"
+        );
     }
 }

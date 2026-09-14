@@ -173,13 +173,19 @@ pub fn replay_response(
         .map(|r| r.event.timestamp().get())
         .max()
         .unwrap_or(0);
+    // The log can hold events ordered *after* the persisted checkpoint round
+    // (rounds decided before the process stopped but not yet checkpointed to
+    // quorum). The apply path bounds every record's `round_received` by the
+    // response's `decided_round`, so report the highest ordering round the
+    // log actually carries, not just the checkpoint round.
+    let max_ordered = retained.iter().filter_map(|r| r.round_received).max().unwrap_or(0);
     let last_timestamp = watermark.max(retained_max);
     Ok(gossip::ReconnectResponse {
         signed_checkpoint: checkpoint.clone(),
         state_bytes: bytes,
         roster_history_bytes: consensus::encode_roster_history(&roster_history)
             .expect("roster history bounded"),
-        decided_round: checkpoint.payload.round,
+        decided_round: checkpoint.payload.round.max(max_ordered),
         retained,
         last_timestamp,
     })

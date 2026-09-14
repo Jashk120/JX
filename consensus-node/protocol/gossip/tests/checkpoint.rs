@@ -280,3 +280,128 @@ async fn from_checkpoint_rejects_roster_key_mismatched_to_the_learner() {
     .await;
     assert!(rotated.is_err(), "a rotated secret is rejected before restoring");
 }
+
+/// A minimal honest teacher graph: node 1's genesis plus its child, with the
+/// teacher's exact record metadata. Rounds stay at 1 (no supermajority bump
+/// with 2 members), so `decided_round: 1` is in-bounds and any rejection
+/// comes from the tampered field, not the watermark bound.
+fn honest_two_event_retained() -> (MembershipRegistry, Vec<consensus::RetainedEvent>) {
+    let registry = registry_for_ids(&[1, 4]);
+    let mut hg = consensus::Hashgraph::new(&registry);
+    let key1 = SigningKey::from_bytes(&consensus_seed(1));
+    let e1 = UnsignedEvent::new(NodeId::new(1), None, None, Timestamp::new(100), Vec::new())
+        .sign(&key1)
+        .expect("sign bounded");
+    let h1 = hg.insert(e1.verify(&registry).expect("valid")).expect("insert");
+    let e2 = UnsignedEvent::new(NodeId::new(1), Some(h1), None, Timestamp::new(101), Vec::new())
+        .sign(&key1)
+        .expect("sign bounded");
+    hg.insert(e2.verify(&registry).expect("valid")).expect("insert");
+    let retained = hg.retained_events();
+    assert_eq!(retained.len(), 2);
+    (registry, retained)
+}
+
+fn checkpoint_response_for(
+    roster: &MembershipRegistry,
+    state_bytes: Vec<u8>,
+    state_hash: [u8; 32],
+    retained: Vec<consensus::RetainedEvent>,
+    decided_round: u64,
+) -> ReconnectResponse {
+    let payload =
+        CheckpointPayload::new(1, consensus::compute_records_root(&[]), state_hash, roster.clone());
+    let mut accumulator = CheckpointAccumulator::new(payload.clone(), Vec::new());
+    accumulator.add_sig(checkpoint_sig_for(1, 1, &payload.signing_bytes()), roster);
+    let accepted = accumulator
+        .add_sig(checkpoint_sig_for(4, 1, &payload.signing_bytes()), roster)
+        .expect("2-node roster reaches quorum");
+    ReconnectResponse {
+        signed_checkpoint: accepted,
+        state_bytes,
+        roster_history_bytes: encode_roster_history(&RosterHistory::new(roster.clone()))
+            .expect("bounded"),
+        decided_round,
+        retained,
+        last_timestamp: 0,
+    }
+}
+
+fn empty_state_bytes_and_hash() -> (Vec<u8>, [u8; 32]) {
+    let state = state::State::new(temp_state_db().state_keyspace());
+    let bytes = state.to_bytes().expect("to_bytes succeeds");
+    let hash = state.root();
+    (bytes, hash)
+}
+
+async fn learner_from(
+    node_id: u64,
+    response: ReconnectResponse,
+) -> Result<GossipNode, gossip::GossipError> {
+    GossipNode::from_checkpoint(
+        NodeId::new(node_id),
+        SigningKey::from_bytes(&consensus_seed(node_id)),
+        TlsIdentity::from_seed(tls_seed(node_id), node_id).expect("identity"),
+        Vec::new(),
+        SyncTiming::new(SYNC_INTERVAL, SYNC_TIMEOUT),
+        response,
+        temp_state_db(),
+    )
+    .await
+}
+
+/// A retained record is signature-valid but carries a forged `ancestor_seqs`
+/// row: the learner must reject the checkpoint instead of storing the
+/// poisoned ancestry.
+#[tokio::test]
+async fn from_checkpoint_rejects_retained_with_forged_ancestor_seqs() {
+    let (roster, mut retained) = honest_two_event_retained();
+    let child = retained.iter_mut().find(|record| record.seq == 2).expect("child present");
+    child.ancestor_seqs = vec![99, 99];
+    let (state_bytes, state_hash) = empty_state_bytes_and_hash();
+    let response = checkpoint_response_for(&roster, state_bytes, state_hash, retained, 1);
+    assert!(learner_from(1, response).await.is_err(), "forged ancestor_seqs must be rejected");
+}
+
+/// A retained record is signature-valid but claims a `seq` that does not
+/// continue its creator chain: the learner must reject the checkpoint
+/// instead of corrupting its per-creator frontier.
+#[tokio::test]
+async fn from_checkpoint_rejects_retained_with_forged_seq() {
+    let (roster, mut retained) = honest_two_event_retained();
+    let child = retained.iter_mut().find(|record| record.seq == 2).expect("child present");
+    child.seq = 3;
+    let (state_bytes, state_hash) = empty_state_bytes_and_hash();
+    let response = checkpoint_response_for(&roster, state_bytes, state_hash, retained, 1);
+    assert!(learner_from(1, response).await.is_err(), "forged seq must be rejected");
+}
+
+/// A `decided_round` past the highest birth round the transfer carries would
+/// previously force an unbounded mark loop under the hashgraph lock. The
+/// learner must reject it up front, quickly.
+#[tokio::test]
+async fn from_checkpoint_rejects_huge_decided_round() {
+    let (roster, retained) = honest_two_event_retained();
+    let (state_bytes, state_hash) = empty_state_bytes_and_hash();
+    let response = checkpoint_response_for(&roster, state_bytes, state_hash, retained, u64::MAX);
+    let outcome = tokio::time::timeout(Duration::from_secs(10), learner_from(1, response)).await;
+    let rejected = outcome.expect("huge decided_round must be rejected quickly, not hang");
+    assert!(rejected.is_err(), "huge decided_round must be rejected");
+}
+
+/// A peer that inflates both a retained record's birth `round` and the
+/// response's `decided_round` to `u64::MAX` defeats the
+/// `decided_round <= max retained round` bound on its own; the transfer-size
+/// gap cap must still reject it promptly rather than drive
+/// `mark_decided_through` into an unbounded loop.
+#[tokio::test]
+async fn from_checkpoint_rejects_decided_round_gap_beyond_transfer() {
+    let (roster, mut retained) = honest_two_event_retained();
+    let child = retained.iter_mut().find(|record| record.seq == 2).expect("child present");
+    child.round = u64::MAX;
+    let (state_bytes, state_hash) = empty_state_bytes_and_hash();
+    let response = checkpoint_response_for(&roster, state_bytes, state_hash, retained, u64::MAX);
+    let outcome = tokio::time::timeout(Duration::from_secs(10), learner_from(1, response)).await;
+    let rejected = outcome.expect("inflated round + decided_round must be rejected, not hang");
+    assert!(rejected.is_err(), "decided_round gap beyond the transfer must be rejected");
+}

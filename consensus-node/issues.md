@@ -51,6 +51,44 @@ failed; `gofmt`/`go vet`/`go build`/`go test` clean in `mirror-node`.
 
 ---
 
+## Resolution Log — 2026-09-14 (second audit pass)
+
+Findings re-audited against source and fixed. Verification: `cargo +nightly fmt
+--all` clean, `cargo clippy --workspace --all-targets --locked -- -D warnings`
+clean, `cargo test --workspace --locked` green; `gofmt`/`go vet`/`go test`
+green in `mirror-node`, `block-node`, and `block-relay`.
+
+| ID | Location | Status | Resolution |
+|---|---|---|---|
+| P1-1 | `gossip/src/node.rs` `apply_checkpoint` | FIXED | Validate-before-mutate: state root, roster, own key, every retained signature and metadata record, and the decided-round bound are checked before any mutation; the retained graph is built into a scratch `Hashgraph`, and the fallible state rebuild/snapshot run before the in-memory graph/executor commit. A rejected response leaves live state untouched (+ regression test). |
+| P1-2 | `hashgraph.rs` `mark_decided_through`, `node.rs` | FIXED | `mark_decided_through` is fallible and rejects a round past the graph's stored max birth round; the node bounds `decided_round` to `[cp_round, max retained round]` and caps `decided_round - cp_round` by the transfer size (+ regression test for the inflated-round bypass). |
+| P1-3 | `hashgraph.rs` `insert_accepted` | FIXED (partial) | `seq` and `ancestor_seqs` are re-derived from present parents (same incremental rule as `insert`), birth `round` must be >= the parents' `base_round`, ordering metadata is bounded, and transferred forks are flagged. Retained records are topologically sorted before insertion. **Residual trust:** a record whose parents were pruned cannot have its `seq`/`ancestor_seqs`/`round` fully validated locally; binding the retained frontier into the quorum-signed checkpoint is the principled follow-up. |
+| P1-4 | `stream/src/event.rs`, `record.rs` | FIXED | Writers use a lossless queue with a hard cap + sticky degraded/health flag and pending-depth accessors; no silent drops. |
+| P1-5 | `stream/src/verify.rs` | FIXED | Record-stream verification rejects non-consecutive rounds (`RoundGap`). |
+| P1-6 | `mirror-node/internal/store` | FIXED | `state_diffs` child table added; `PutRecord`/`ListRecords` persist and reconstruct diffs (NULL tombstone vs empty value preserved). |
+| P1-7 | `mirror-node/internal/ingest` | FIXED | Record filename round must equal the signed payload round (and the checkpoint round via `VerifyRecordFile`); a mismatch releases the claim. |
+| P1-8 | `block-node/main.go` | FIXED | PUT bodies bounded by `http.MaxBytesReader` + a `Content-Length` precheck (`BLOCK_NODE_MAX_UPLOAD_BYTES`, default 256 MiB); over-limit returns 413. |
+| P2-9 | `stream/src/verify.rs` | FIXED | New `verify_record_stream_dir_rosters` accepts a trusted roster-hash set; the single-hash entry point stays as a wrapper. |
+| P2-10 | `block-relay/main.go` | FIXED | `.rsf_proofs` added to the relayed suffixes. |
+| P2-11 | `block-relay/main.go` | FIXED | A non-2xx PUT now sets a non-nil error instead of `lastErr = nil`. |
+| P2-12 | `block-relay/main.go` | FIXED | Files are opened with `O_NOFOLLOW`, `fstat`'d on the open fd, and streamed (no `Stat`-then-`ReadFile` TOCTOU, no full slurp). |
+| P2-13 | `storage/src/event_log.rs` | FIXED | `by_seq` recovery and append use checked arithmetic; the counter cannot wrap onto sequence 0. |
+
+### Residual / follow-up (pre-existing, not regressions)
+
+- **Reconnect metadata for pruned roots** (P1-3 partial) and **post-join
+  reconnects** (`Hashgraph::from_checkpoint` seeds the roster from the
+  checkpoint snapshot): a retained record whose creator joined after the
+  checkpoint round, or whose parents fall below the retention floor, cannot be
+  locally validated/bound. The principled fix is to commit a per-creator
+  frontier (hash + seq) into the quorum-signed checkpoint payload and to replay
+  the roster schedule — both larger protocol changes, deferred.
+- `apply_checkpoint` relies on `fetch_checkpoint` / `verify_persisted` for
+  checkpoint quorum verification; adding a local `checkpoint.verify()` is
+  defense-in-depth, deferred.
+
+---
+
 ## High
 
 ### H-1. Duplicate roster members bypass stream signature verification (forgery)

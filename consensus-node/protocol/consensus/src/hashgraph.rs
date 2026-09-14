@@ -269,7 +269,7 @@ impl Hashgraph {
             undecided_witnesses: HashMap::new(),
             highest_witness_round: checkpoint.round,
             fully_decided_rounds,
-            next_round_to_order: checkpoint.round + 1,
+            next_round_to_order: checkpoint.round.saturating_add(1),
         }
     }
 
@@ -387,18 +387,38 @@ impl Hashgraph {
 
     /// Phase 4 — records an already-accepted historical event (part of the
     /// retained graph transferred by a reconnect checkpoint) without running
-    /// the round/witness/fame machinery. The event's parents may be absent —
-    /// the caller has accepted all history up to the checkpoint — so no
-    /// parent validation is performed and no new elections are started.
+    /// the round/witness/fame machinery. The caller must insert parents
+    /// before children (topological order within one transfer) so each
+    /// record is checked against the parents the learner already holds.
+    ///
+    /// The event itself must already be signature-verified by the caller;
+    /// the record metadata (`seq`, `ancestor_seqs`, `round`,
+    /// `round_received`, `consensus_timestamp`) is peer-supplied and is
+    /// re-derived here instead of trusted:
+    /// - `seq` must continue the creator chain (`self_parent.seq + 1` when
+    ///   the self-parent is present, `1` for a parentless genesis event; any
+    ///   `seq >= 1` when the self-parent was pruned away).
+    /// - `ancestor_seqs` must equal the elementwise max of the present
+    ///   parents' rows (the same incremental rule [`Hashgraph::insert`]
+    ///   uses) with the own creator slot set to `seq`. With no parent
+    ///   present the peer row is accepted but the own slot must still equal
+    ///   `seq`.
+    /// - `round` must be at least the [`crate::round::base_round`] of the
+    ///   present parents. A birth `round` above that floor stays
+    ///   peer-asserted (the residual trust: an unordered event's exact birth
+    ///   round cannot be recomputed without the full witness view), so a
+    ///   malicious teacher can still shift an unordered event's round within
+    ///   `[base_round, decided_round]`.
+    /// - `round_received`/`consensus_timestamp` must agree (`Some` iff
+    ///   `Some` — no legacy zero-timestamp fabrication), with
+    ///   `round <= round_received <= decided_round`.
     ///
     /// When `round_received` is `Some`, the teacher's `consensus_timestamp`
     /// is restored verbatim so within-round ordering (which sorts by
-    /// timestamp) is identical on learner and teacher. Legacy records that
-    /// lack a timestamp (decoded as `None`) fall back to `Timestamp(0)` to
-    /// preserve backward compatibility with persisted event logs. `Some`
-    /// records are never re-ordered by a later `assign_order`. Events
-    /// transferred before their fame resolved keep `round_received: None` and
-    /// are ordered by this node's own machinery once their rounds are decided.
+    /// timestamp) is identical on learner and teacher. `Some` records are
+    /// never re-ordered by a later `assign_order`. Events transferred before
+    /// their fame resolved keep `round_received: None` and are ordered by
+    /// this node's own machinery once their rounds are decided.
     ///
     /// `ancestor_seqs` is the teacher's stored row for the event — the
     /// elementwise-max ancestry summary — without which this node's future
@@ -406,13 +426,17 @@ impl Hashgraph {
     /// creator's sequence number, which becomes the known-summary frontier.
     pub fn insert_accepted(
         &mut self,
-        event: Event,
-        seq: u64,
-        round: u64,
-        mut ancestor_seqs: Vec<u64>,
-        round_received: Option<u64>,
-        consensus_timestamp: Option<Timestamp>,
+        record: RetainedEvent,
+        decided_round: u64,
     ) -> Result<EventHash> {
+        let RetainedEvent {
+            event,
+            seq,
+            round,
+            mut ancestor_seqs,
+            round_received,
+            consensus_timestamp,
+        } = record;
         let hash = event.hash().map_err(|e| ConsensusError::EncodingFailed(e.to_string()))?;
         if self.events.contains_key(&hash) {
             return Err(InsertError::AlreadyPresent(hash));
@@ -426,8 +450,92 @@ impl Hashgraph {
             });
         }
         ancestor_seqs.resize(self.member_count, 0);
-        ancestor_seqs[creator_idx] = seq;
 
+        let self_parent_record = match event.self_parent() {
+            Some(parent) => self.events.get(parent),
+            None => None,
+        };
+        let other_parent_record = match event.other_parent() {
+            Some(parent) => self.events.get(parent),
+            None => None,
+        };
+        if let Some(record) = self_parent_record
+            && *record.event().creator() != creator
+        {
+            return Err(InsertError::InvalidSelfParent);
+        }
+
+        match self_parent_record {
+            Some(record) => {
+                let expected = record
+                    .seq()
+                    .checked_add(1)
+                    .ok_or(InsertError::InvalidRetainedSeq { expected: u64::MAX, got: seq })?;
+                if seq != expected {
+                    return Err(InsertError::InvalidRetainedSeq { expected, got: seq });
+                }
+            }
+            None if event.self_parent().is_none() => {
+                if seq != 1 {
+                    return Err(InsertError::InvalidRetainedSeq { expected: 1, got: seq });
+                }
+            }
+            None => {
+                if seq < 1 {
+                    return Err(InsertError::InvalidRetainedSeq { expected: 1, got: seq });
+                }
+            }
+        }
+
+        if self_parent_record.is_some() || other_parent_record.is_some() {
+            let mut expected = vec![0u64; self.member_count];
+            if let Some(record) = self_parent_record {
+                expected.copy_from_slice(record.ancestor_seqs());
+            }
+            if let Some(record) = other_parent_record {
+                for (slot, &value) in expected.iter_mut().zip(record.ancestor_seqs().iter()) {
+                    *slot = (*slot).max(value);
+                }
+            }
+            expected[creator_idx] = seq;
+            if ancestor_seqs != expected {
+                return Err(InsertError::InvalidRetainedAncestors);
+            }
+        } else if ancestor_seqs[creator_idx] != seq {
+            return Err(InsertError::InvalidRetainedAncestors);
+        }
+
+        let base_round = crate::round::base_round(
+            self_parent_record.map(EventRecord::round),
+            other_parent_record.map(EventRecord::round),
+        );
+        if round < base_round {
+            return Err(InsertError::InvalidRetainedRound { base: base_round, got: round });
+        }
+
+        match (round_received, consensus_timestamp) {
+            (Some(received), _) => {
+                if received < round || received > decided_round {
+                    return Err(InsertError::InvalidRetainedOrder);
+                }
+            }
+            (None, None) => {}
+            // A timestamp without an ordering round is inconsistent.
+            (None, Some(_)) => return Err(InsertError::InvalidRetainedOrder),
+        }
+
+        // Branch detection (Consensus Spec §3.2 / §1.3), mirroring `insert`:
+        // a transferred fork must flag its creator so future `see`/
+        // `strongly_see` match the teacher's view.
+        let branch_key = (creator, event.self_parent().copied());
+        match self.first_child.get(&branch_key) {
+            Some(existing) if *existing != hash => {
+                self.known_forkers[creator_idx] = true;
+            }
+            _ => {
+                self.first_child.entry(branch_key).or_insert(hash);
+            }
+        }
         self.by_creator_seq.entry((creator, seq)).or_insert(hash);
         match self.latest_by_creator.get(&creator) {
             Some(latest) => {
@@ -447,7 +555,11 @@ impl Hashgraph {
         }
 
         let consensus_timestamp = match (round_received, consensus_timestamp) {
-            (Some(_), Some(ts)) => Some(ts),
+            (Some(_), Some(timestamp)) => Some(timestamp),
+            // Legacy event-log records persist only `round_received`
+            // (`EventLog::set_round_received`), so the H-3 contract keeps the
+            // zero-timestamp fallback for them. A peer-supplied timestamp is
+            // used verbatim when present.
             (Some(_), None) => Some(Timestamp::new(0)),
             (None, _) => None,
         };
@@ -503,11 +615,27 @@ impl Hashgraph {
     /// finalized these rounds"), advancing the ordering watermark past them.
     /// Rounds marked here have their events already assigned (transferred
     /// records), so `assign_order` is a no-op for them.
-    pub fn mark_decided_through(&mut self, round: u64) {
+    ///
+    /// Fallible by design: a `round` past the highest birth round this graph
+    /// stores is rejected instead of iterating (`next_round_to_order..=round`)
+    /// blindly — a peer-supplied `u64::MAX` watermark would otherwise force
+    /// unbounded time and memory. The caller (reconnect apply) additionally
+    /// bounds `round` by the verified retained graph before calling. An empty
+    /// graph carries no bound, so an empty graph accepts any `round >=
+    /// next_round_to_order - 1`; only callers holding a verified bound may
+    /// pass a large watermark. A `round` below `next_round_to_order` is a
+    /// no-op and succeeds.
+    pub fn mark_decided_through(&mut self, round: u64) -> Result<()> {
+        if let Some(max_retained) = self.events.values().map(EventRecord::round).max()
+            && round > max_retained
+        {
+            return Err(InsertError::DecidedRoundBeyondRetained { decided: round, max_retained });
+        }
         for r in self.next_round_to_order..=round {
             self.fully_decided_rounds.insert(r);
         }
         self.order_decided_rounds();
+        Ok(())
     }
 
     /// Consensus Spec §5 — the newest stored event created by `node`, if
@@ -768,7 +896,7 @@ impl Hashgraph {
         // after `activation_round`, so events born at or below
         // `activation_round` keep the old quorum and only rounds strictly
         // above it use the expanded one.
-        self.roster_history.schedule(activation_round + 1, new_registry);
+        self.roster_history.schedule(activation_round.saturating_add(1), new_registry);
     }
 
     /// The number of members active at `round`, for unit-stake supermajority
@@ -1029,6 +1157,17 @@ mod tests {
                 .sign(key)
                 .unwrap();
         event.verify(&registry_of(&[(creator, key)])).expect("test event should verify")
+    }
+
+    fn retained(
+        event: Event,
+        seq: u64,
+        round: u64,
+        ancestor_seqs: Vec<u64>,
+        round_received: Option<u64>,
+        consensus_timestamp: Option<Timestamp>,
+    ) -> RetainedEvent {
+        RetainedEvent { event, seq, round, ancestor_seqs, round_received, consensus_timestamp }
     }
 
     #[test]
@@ -1640,20 +1779,23 @@ mod tests {
         let event = UnsignedEvent::new(node, None, None, Timestamp::new(100), Vec::new())
             .sign(&key)
             .unwrap();
-        let ancestor_seqs = vec![7u64];
+        let ancestor_seqs = vec![1u64];
         let hash = hg
             .insert_accepted(
-                event.clone(),
-                7,
+                retained(
+                    event.clone(),
+                    1,
+                    3,
+                    ancestor_seqs.clone(),
+                    Some(3),
+                    Some(Timestamp::new(555)),
+                ),
                 3,
-                ancestor_seqs.clone(),
-                Some(3),
-                Some(Timestamp::new(555)),
             )
             .expect("accepted event inserts");
 
         let record = hg.get(&hash).expect("record present");
-        assert_eq!(record.seq(), 7);
+        assert_eq!(record.seq(), 1);
         assert_eq!(record.round(), 3);
         assert_eq!(record.round_received(), Some(3));
         assert_eq!(record.consensus_timestamp(), Some(Timestamp::new(555)));
@@ -1665,7 +1807,10 @@ mod tests {
 
         // A duplicate accepted insert is rejected.
         assert_eq!(
-            hg.insert_accepted(event, 7, 3, ancestor_seqs, Some(3), Some(Timestamp::new(555))),
+            hg.insert_accepted(
+                retained(event, 1, 3, ancestor_seqs, Some(3), Some(Timestamp::new(555))),
+                3
+            ),
             Err(InsertError::AlreadyPresent(hash))
         );
     }
@@ -1688,8 +1833,9 @@ mod tests {
             .unwrap();
         // round_received None: the teacher had not ordered this event yet, so
         // the learner leaves it pending for its own ordering machinery.
-        let hash =
-            hg.insert_accepted(event, 7, 3, vec![7], None, None).expect("accepted event inserts");
+        let hash = hg
+            .insert_accepted(retained(event, 1, 3, vec![1], None, None), 5)
+            .expect("accepted event inserts");
         assert_eq!(hg.get(&hash).expect("present").round_received(), None);
         assert_eq!(hg.pending_order_events(), vec![hash]);
     }
@@ -1710,7 +1856,7 @@ mod tests {
             .sign(&SigningKey::generate(&mut OsRng))
             .unwrap();
         assert_eq!(
-            hg.insert_accepted(event, 1, 1, vec![1], Some(1), Some(Timestamp::new(0))),
+            hg.insert_accepted(retained(event, 1, 1, vec![1], Some(1), Some(Timestamp::new(0))), 1),
             Err(InsertError::UnknownCreator)
         );
     }
@@ -1733,9 +1879,227 @@ mod tests {
             .unwrap();
         // ancestor_seqs has 2 entries but the hashgraph only has 1 member.
         assert_eq!(
-            hg.insert_accepted(event, 1, 1, vec![1, 0], Some(1), Some(Timestamp::new(0))),
+            hg.insert_accepted(
+                retained(event, 1, 1, vec![1, 0], Some(1), Some(Timestamp::new(0))),
+                1
+            ),
             Err(InsertError::AncestorSeqsMismatch { expected: 1, got: 2 })
         );
+    }
+
+    #[test]
+    fn insert_accepted_rejects_forged_seq() {
+        let key_a = SigningKey::generate(&mut OsRng);
+        let key_b = SigningKey::generate(&mut OsRng);
+        let node_a = NodeId::new(1);
+        let node_b = NodeId::new(2);
+        let registry = registry_of(&[(node_a, &key_a), (node_b, &key_b)]);
+        let checkpoint = CheckpointPayload::new(
+            1,
+            crate::checkpoint::compute_records_root(&[]),
+            [0u8; 32],
+            registry.clone(),
+        );
+        let mut hg = Hashgraph::from_checkpoint(&checkpoint, RosterHistory::new(registry));
+
+        let parent = UnsignedEvent::new(node_a, None, None, Timestamp::new(100), Vec::new())
+            .sign(&key_a)
+            .unwrap();
+        let parent_hash = hg
+            .insert_accepted(retained(parent, 1, 1, vec![1, 0], None, None), 1)
+            .expect("parent inserts");
+
+        // A second genesis event from the same creator is not seq 1.
+        let fork = UnsignedEvent::new(node_a, None, None, Timestamp::new(101), Vec::new())
+            .sign(&key_a)
+            .unwrap();
+        assert_eq!(
+            hg.insert_accepted(retained(fork, 2, 1, vec![2, 0], None, None), 1),
+            Err(InsertError::InvalidRetainedSeq { expected: 1, got: 2 })
+        );
+
+        // The child must continue the chain exactly: parent seq 1 + 1.
+        let child =
+            UnsignedEvent::new(node_a, Some(parent_hash), None, Timestamp::new(102), Vec::new())
+                .sign(&key_a)
+                .unwrap();
+        assert_eq!(
+            hg.insert_accepted(retained(child, 5, 1, vec![5, 0], None, None), 1),
+            Err(InsertError::InvalidRetainedSeq { expected: 2, got: 5 })
+        );
+    }
+
+    #[test]
+    fn insert_accepted_rejects_forged_ancestor_seqs() {
+        let key_a = SigningKey::generate(&mut OsRng);
+        let key_b = SigningKey::generate(&mut OsRng);
+        let node_a = NodeId::new(1);
+        let node_b = NodeId::new(2);
+        let registry = registry_of(&[(node_a, &key_a), (node_b, &key_b)]);
+        let checkpoint = CheckpointPayload::new(
+            1,
+            crate::checkpoint::compute_records_root(&[]),
+            [0u8; 32],
+            registry.clone(),
+        );
+        let mut hg = Hashgraph::from_checkpoint(&checkpoint, RosterHistory::new(registry));
+
+        let parent_a = UnsignedEvent::new(node_a, None, None, Timestamp::new(100), Vec::new())
+            .sign(&key_a)
+            .unwrap();
+        let parent_a_hash = hg
+            .insert_accepted(retained(parent_a, 1, 1, vec![1, 0], None, None), 1)
+            .expect("parent inserts");
+
+        let child =
+            UnsignedEvent::new(node_a, Some(parent_a_hash), None, Timestamp::new(101), Vec::new())
+                .sign(&key_a)
+                .unwrap();
+        // Honest row is [2, 0]: the peer inflates node_b's slot.
+        assert_eq!(
+            hg.insert_accepted(retained(child.clone(), 2, 1, vec![2, 9], None, None), 1),
+            Err(InsertError::InvalidRetainedAncestors)
+        );
+        // The honest row is accepted.
+        hg.insert_accepted(retained(child, 2, 1, vec![2, 0], None, None), 1)
+            .expect("honest row inserts");
+    }
+
+    #[test]
+    fn insert_accepted_rejects_round_below_present_parents() {
+        let key = SigningKey::generate(&mut OsRng);
+        let node = NodeId::new(1);
+        let registry = registry_of(&[(node, &key)]);
+        let checkpoint = CheckpointPayload::new(
+            1,
+            crate::checkpoint::compute_records_root(&[]),
+            [0u8; 32],
+            registry.clone(),
+        );
+        let mut hg = Hashgraph::from_checkpoint(&checkpoint, RosterHistory::new(registry));
+
+        let parent = UnsignedEvent::new(node, None, None, Timestamp::new(100), Vec::new())
+            .sign(&key)
+            .unwrap();
+        let parent_hash = hg
+            .insert_accepted(retained(parent, 1, 2, vec![1], None, None), 2)
+            .expect("parent inserts");
+
+        let child =
+            UnsignedEvent::new(node, Some(parent_hash), None, Timestamp::new(101), Vec::new())
+                .sign(&key)
+                .unwrap();
+        assert_eq!(
+            hg.insert_accepted(retained(child, 2, 1, vec![2], None, None), 2),
+            Err(InsertError::InvalidRetainedRound { base: 2, got: 1 })
+        );
+    }
+
+    #[test]
+    fn insert_accepted_rejects_inconsistent_ordering_metadata() {
+        let key = SigningKey::generate(&mut OsRng);
+        let node = NodeId::new(1);
+        let registry = registry_of(&[(node, &key)]);
+        let checkpoint = CheckpointPayload::new(
+            1,
+            crate::checkpoint::compute_records_root(&[]),
+            [0u8; 32],
+            registry.clone(),
+        );
+        let mut hg = Hashgraph::from_checkpoint(&checkpoint, RosterHistory::new(registry));
+        let fresh = || {
+            UnsignedEvent::new(node, None, None, Timestamp::new(100), Vec::new())
+                .sign(&key)
+                .unwrap()
+        };
+
+        // An ordered record without a timestamp is accepted through the H-3
+        // legacy fallback (covered by the determinism test); only a timestamp
+        // without an ordering round is inconsistent.
+        // Timestamp without an ordering round.
+        assert_eq!(
+            hg.insert_accepted(retained(fresh(), 1, 1, vec![1], None, Some(Timestamp::new(7))), 5),
+            Err(InsertError::InvalidRetainedOrder)
+        );
+        // Ordered before the birth round.
+        assert_eq!(
+            hg.insert_accepted(
+                retained(fresh(), 1, 3, vec![1], Some(2), Some(Timestamp::new(7))),
+                5
+            ),
+            Err(InsertError::InvalidRetainedOrder)
+        );
+        // Ordered past the teacher's decided watermark.
+        assert_eq!(
+            hg.insert_accepted(
+                retained(fresh(), 1, 1, vec![1], Some(9), Some(Timestamp::new(7))),
+                5
+            ),
+            Err(InsertError::InvalidRetainedOrder)
+        );
+    }
+
+    #[test]
+    fn insert_accepted_accepts_pruned_parent_seq_with_own_slot_check() {
+        let key_a = SigningKey::generate(&mut OsRng);
+        let key_b = SigningKey::generate(&mut OsRng);
+        let node_a = NodeId::new(1);
+        let node_b = NodeId::new(2);
+        let registry = registry_of(&[(node_a, &key_a), (node_b, &key_b)]);
+        let checkpoint = CheckpointPayload::new(
+            1,
+            crate::checkpoint::compute_records_root(&[]),
+            [0u8; 32],
+            registry.clone(),
+        );
+        let mut hg = Hashgraph::from_checkpoint(&checkpoint, RosterHistory::new(registry));
+
+        // The self-parent was pruned away: the peer seq is accepted, but the
+        // own creator slot must still carry it.
+        let ghost = EventHash::new([9; 32]);
+        let event = UnsignedEvent::new(node_a, Some(ghost), None, Timestamp::new(100), Vec::new())
+            .sign(&key_a)
+            .unwrap();
+        let hash = hg
+            .insert_accepted(retained(event, 4, 1, vec![4, 0], None, None), 1)
+            .expect("pruned-parent record accepted");
+        assert_eq!(hg.get(&hash).expect("present").seq(), 4);
+
+        let bad_slot =
+            UnsignedEvent::new(node_a, Some(ghost), None, Timestamp::new(101), Vec::new())
+                .sign(&key_a)
+                .unwrap();
+        assert_eq!(
+            hg.insert_accepted(retained(bad_slot, 5, 1, vec![0, 0], None, None), 1),
+            Err(InsertError::InvalidRetainedAncestors)
+        );
+    }
+
+    #[test]
+    fn mark_decided_through_rejects_rounds_past_the_retained_graph() {
+        let key = SigningKey::generate(&mut OsRng);
+        let node = NodeId::new(1);
+        let registry = registry_of(&[(node, &key)]);
+        let checkpoint = CheckpointPayload::new(
+            1,
+            crate::checkpoint::compute_records_root(&[]),
+            [0u8; 32],
+            registry.clone(),
+        );
+        let mut hg = Hashgraph::from_checkpoint(&checkpoint, RosterHistory::new(registry));
+
+        let event = UnsignedEvent::new(node, None, None, Timestamp::new(100), Vec::new())
+            .sign(&key)
+            .unwrap();
+        hg.insert_accepted(retained(event, 1, 3, vec![1], Some(3), Some(Timestamp::new(10))), 3)
+            .expect("event inserts");
+
+        assert_eq!(
+            hg.mark_decided_through(u64::MAX),
+            Err(InsertError::DecidedRoundBeyondRetained { decided: u64::MAX, max_retained: 3 })
+        );
+        hg.mark_decided_through(3).expect("watermark within the retained graph applies");
+        assert!(hg.is_round_decided(3));
     }
 
     #[test]
@@ -1793,7 +2157,7 @@ mod tests {
         assert_eq!(hg.highest_decided_round(), 3);
         assert!(!hg.is_round_decided(4));
 
-        hg.mark_decided_through(6);
+        hg.mark_decided_through(6).expect("empty scaffold accepts the watermark");
         assert_eq!(hg.highest_decided_round(), 6);
         for round in 1..=6 {
             assert!(hg.is_round_decided(round), "round {round} decided");
@@ -1853,9 +2217,9 @@ mod tests {
         assert_eq!(teacher_order, vec![hash_b, hash_a], "teacher sorts by timestamp");
 
         // Transfer via retained events (teacher -> learner)
-        let retained = teacher.retained_events();
+        let retained_vec = teacher.retained_events();
         // Verify retained carries the timestamps
-        for re in &retained {
+        for re in &retained_vec {
             if re.event.hash().unwrap() == hash_a {
                 assert_eq!(re.consensus_timestamp, Some(ts_late));
                 assert_eq!(re.round_received, Some(5));
@@ -1865,7 +2229,7 @@ mod tests {
             }
         }
         // Encode/decode round-trip via storage wire format (backward compat)
-        for re in &retained {
+        for re in &retained_vec {
             let bytes = crate::reconnect::encode_retained_event(re).unwrap();
             let decoded = crate::reconnect::decode_retained_event(&bytes).expect("decode");
             assert_eq!(&decoded, re, "storage wire round-trip preserves timestamp");
@@ -1873,7 +2237,7 @@ mod tests {
         // Legacy old record without timestamp must decode as None (compat)
         {
             // Simulate old encoding by truncating the last byte (timestamp tag)
-            let re = retained.iter().find(|r| r.round_received.is_some()).unwrap();
+            let re = retained_vec.iter().find(|r| r.round_received.is_some()).unwrap();
             let mut old_bytes = crate::reconnect::encode_retained_event(re).unwrap();
             // Old format had no trailing timestamp field: remove it
             old_bytes.pop();
@@ -1893,15 +2257,18 @@ mod tests {
         );
         let history = crypto::RosterHistory::new(registry.clone());
         let mut learner = Hashgraph::from_checkpoint(&checkpoint, history);
-        for re in retained {
+        for re in retained_vec {
             learner
                 .insert_accepted(
-                    re.event,
-                    re.seq,
-                    re.round,
-                    re.ancestor_seqs,
-                    re.round_received,
-                    re.consensus_timestamp,
+                    retained(
+                        re.event,
+                        re.seq,
+                        re.round,
+                        re.ancestor_seqs,
+                        re.round_received,
+                        re.consensus_timestamp,
+                    ),
+                    5,
                 )
                 .expect("learner insert");
         }
@@ -1919,12 +2286,15 @@ mod tests {
         for re in retained2 {
             learner2
                 .insert_accepted(
-                    re.event,
-                    re.seq,
-                    re.round,
-                    re.ancestor_seqs,
-                    re.round_received,
-                    re.consensus_timestamp,
+                    retained(
+                        re.event,
+                        re.seq,
+                        re.round,
+                        re.ancestor_seqs,
+                        re.round_received,
+                        re.consensus_timestamp,
+                    ),
+                    5,
                 )
                 .expect("learner2 insert");
         }
@@ -1934,20 +2304,36 @@ mod tests {
             "two learners from same teacher must be deterministic"
         );
 
-        // Legacy fallback: insert_accepted with round_received Some but timestamp None
-        // must fabricate Timestamp(0) (backward compat for old persisted logs)
+        // Legacy fallback (H-3 contract): an ordered record without a
+        // consensus timestamp — what the durable event log produces, since
+        // `EventLog::set_round_received` persists only the round — inserts
+        // with `Timestamp(0)`; a timestamp on an unordered record is rejected.
         let mut hg_legacy =
-            Hashgraph::from_checkpoint(&checkpoint, crypto::RosterHistory::new(registry));
+            Hashgraph::from_checkpoint(&checkpoint, crypto::RosterHistory::new(registry.clone()));
         let event_legacy = UnsignedEvent::new(node_a, None, None, Timestamp::new(999), Vec::new())
             .sign(&key_a)
             .unwrap();
         let hash_legacy = hg_legacy
-            .insert_accepted(event_legacy, 10, 1, vec![10, 0], Some(2), None)
-            .expect("legacy insert");
+            .insert_accepted(retained(event_legacy, 1, 1, vec![1, 0], Some(2), None), 5)
+            .expect("legacy event-log record inserts");
         assert_eq!(
             hg_legacy.get(&hash_legacy).unwrap().consensus_timestamp(),
             Some(Timestamp::new(0)),
-            "legacy record without timestamp falls back to zero"
+            "legacy record without a timestamp falls back to zero"
+        );
+
+        let mut hg_strict =
+            Hashgraph::from_checkpoint(&checkpoint, crypto::RosterHistory::new(registry));
+        let unordered_with_ts =
+            UnsignedEvent::new(node_a, None, None, Timestamp::new(1000), Vec::new())
+                .sign(&key_a)
+                .unwrap();
+        assert_eq!(
+            hg_strict.insert_accepted(
+                retained(unordered_with_ts, 1, 1, vec![1, 0], None, Some(Timestamp::new(7))),
+                5
+            ),
+            Err(InsertError::InvalidRetainedOrder)
         );
     }
 }
