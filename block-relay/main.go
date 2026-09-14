@@ -1,7 +1,7 @@
 package main
 
 import (
-	"bytes"
+	"fmt"
 	"log"
 	"net/http"
 	"net/url"
@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -17,7 +18,7 @@ const (
 	defaultPollMS = 500
 )
 
-var allowedSuffixes = []string{".esf", ".rsf", ".esf_sig", ".ckpt"}
+var allowedSuffixes = []string{".esf", ".rsf", ".esf_sig", ".rsf_proofs", ".ckpt"}
 
 func isAllowed(name string) bool {
 	for _, s := range allowedSuffixes {
@@ -53,17 +54,6 @@ func pushOnce(dir string, seen map[string]bool, client *http.Client, baseURL str
 			log.Printf("skipped %s (seen)", name)
 			continue
 		}
-		// Verify regular file (not symlink to dir etc.)
-		info, err := e.Info()
-		if err != nil {
-			log.Printf("error stating %s: %v", name, err)
-			lastErr = err
-			continue
-		}
-		if !info.Mode().IsRegular() {
-			continue
-		}
-
 		escaped := url.PathEscape(name)
 		targetURL := base + "/v1/blocks/" + escaped
 
@@ -87,22 +77,38 @@ func pushOnce(dir string, seen map[string]bool, client *http.Client, baseURL str
 			continue
 		}
 
-		// Read file bytes
-		data, err := os.ReadFile(filepath.Join(dir, name))
+		// Open without following symlinks so a symlink swapped in after
+		// ReadDir is rejected at open time (no check-then-open race),
+		// then stat the open fd and stream it as the PUT body.
+		f, err := os.OpenFile(filepath.Join(dir, name), os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 		if err != nil {
-			log.Printf("error reading %s: %v", name, err)
+			log.Printf("error opening %s: %v", name, err)
 			lastErr = err
 			continue
 		}
+		fi, err := f.Stat()
+		if err != nil {
+			log.Printf("error stating %s: %v", name, err)
+			_ = f.Close()
+			lastErr = err
+			continue
+		}
+		if !fi.Mode().IsRegular() {
+			_ = f.Close()
+			continue
+		}
 
-		req2, err := http.NewRequest(http.MethodPut, targetURL, bytes.NewReader(data)) //nolint:noctx
+		req2, err := http.NewRequest(http.MethodPut, targetURL, f) //nolint:noctx
 		if err != nil {
 			log.Printf("error building PUT for %s: %v", name, err)
+			_ = f.Close()
 			lastErr = err
 			continue
 		}
 		req2.Header.Set("Content-Type", "application/octet-stream")
+		req2.ContentLength = fi.Size()
 		resp2, err := client.Do(req2)
+		_ = f.Close()
 		if err != nil {
 			log.Printf("error PUT %s: %v", name, err)
 			lastErr = err
@@ -111,7 +117,7 @@ func pushOnce(dir string, seen map[string]bool, client *http.Client, baseURL str
 		_ = resp2.Body.Close()
 		if resp2.StatusCode != http.StatusOK && resp2.StatusCode != http.StatusCreated && resp2.StatusCode != http.StatusNoContent {
 			log.Printf("error PUT %s: status %d", name, resp2.StatusCode)
-			lastErr = err
+			lastErr = fmt.Errorf("PUT %s: status %d", name, resp2.StatusCode)
 			continue
 		}
 		log.Printf("uploaded %s", name)

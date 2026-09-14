@@ -25,8 +25,10 @@ STREAMS_DIR=/data/streams BLOCK_NODE_URL=http://127.0.0.1:8080 STREAM_POLL_MS=10
 ## Behavior
 
 - Polls `STREAMS_DIR` every 500 ms (or `STREAM_POLL_MS`).
-- Pushes regular files whose suffix is in `{.esf, .rsf, .esf_sig, .ckpt}`. `.rsf_sig` is not pushed.
-- For each file: `HEAD /v1/blocks/<filename>` — if 200 skip; else `PUT` the bytes.
+- Pushes regular files whose suffix is in `{.esf, .rsf, .esf_sig, .rsf_proofs, .ckpt}`. `.rsf_sig` is not pushed.
+- For each file: `HEAD /v1/blocks/<filename>` — if 200 skip; else stream the file bytes via `PUT`.
+- Files are opened with `O_NOFOLLOW` and the open fd is stat-checked for a regular file, so symlink entries are skipped and never uploaded; uploads stream the open file (with `Content-Length`) instead of slurping it into memory.
+- A non-2xx `PUT` response is surfaced as an error and the file is retried next tick (not marked seen).
 - In-memory seen-set dedupes within a process; HEAD covers fresh restarts.
 - Unreachable block-node: logs and retries next tick, never crashes.
 - Files still being written: read errors are logged and retried next poll.

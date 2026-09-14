@@ -25,10 +25,12 @@ type fakeBlockNode struct {
 	puts  map[string][]byte
 	// headStatus overrides: name -> status to return for HEAD. Default logic: 200 if in puts, else 404.
 	headStatus map[string]int
+	// putStatus overrides: name -> status to return for PUT. Default: 200.
+	putStatus map[string]int
 }
 
 func newFake() *fakeBlockNode {
-	return &fakeBlockNode{puts: make(map[string][]byte), headStatus: make(map[string]int)}
+	return &fakeBlockNode{puts: make(map[string][]byte), headStatus: make(map[string]int), putStatus: make(map[string]int)}
 }
 
 func (f *fakeBlockNode) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -57,6 +59,11 @@ func (f *fakeBlockNode) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		buf := new(bytes.Buffer)
 		_, _ = buf.ReadFrom(r.Body)
 		f.mu.Lock()
+		if st, ok := f.putStatus[name]; ok {
+			f.mu.Unlock()
+			w.WriteHeader(st)
+			return
+		}
 		f.puts[name] = buf.Bytes()
 		f.mu.Unlock()
 		w.WriteHeader(http.StatusOK)
@@ -185,7 +192,7 @@ func TestPushOnce_unreachableSurvivesNTicks(t *testing.T) {
 
 func TestPushOnce_allAllowedSuffixes(t *testing.T) {
 	dir := t.TempDir()
-	for _, name := range []string{"a.esf", "b.rsf", "c.esf_sig", "checkpoint-1.ckpt"} {
+	for _, name := range []string{"a.esf", "b.rsf", "c.esf_sig", "d.rsf_proofs", "checkpoint-1.ckpt"} {
 		writeFile(t, dir, name, []byte("x"))
 	}
 	fake := newFake()
@@ -195,7 +202,7 @@ func TestPushOnce_allAllowedSuffixes(t *testing.T) {
 	_ = pushOnce(dir, seen, srv.Client(), srv.URL)
 	fake.mu.Lock()
 	defer fake.mu.Unlock()
-	for _, name := range []string{"a.esf", "b.rsf", "c.esf_sig", "checkpoint-1.ckpt"} {
+	for _, name := range []string{"a.esf", "b.rsf", "c.esf_sig", "d.rsf_proofs", "checkpoint-1.ckpt"} {
 		if _, ok := fake.puts[name]; !ok {
 			t.Errorf("expected %s to be uploaded", name)
 		}
@@ -219,6 +226,79 @@ func TestPushOnce_urlEscaping(t *testing.T) {
 	}
 }
 
+func TestPushOnce_relayRsfProofs(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "b.rsf_proofs", []byte("proof bytes"))
+	fake := newFake()
+	srv := httptest.NewServer(fake)
+	defer srv.Close()
+	seen := make(map[string]bool)
+	if err := pushOnce(dir, seen, srv.Client(), srv.URL); err != nil {
+		t.Fatalf("pushOnce: %v", err)
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	got, ok := fake.puts["b.rsf_proofs"]
+	if !ok {
+		t.Fatalf("expected PUT for b.rsf_proofs, puts=%v", fake.puts)
+	}
+	if string(got) != "proof bytes" {
+		t.Fatalf("bytes mismatch: %q", got)
+	}
+	if !seen["b.rsf_proofs"] {
+		t.Fatalf("seen should be marked after successful PUT")
+	}
+}
+
+func TestPushOnce_non2xxPutReturnsError(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "a.esf", []byte("data"))
+	fake := newFake()
+	fake.putStatus["a.esf"] = http.StatusInternalServerError
+	srv := httptest.NewServer(fake)
+	defer srv.Close()
+	seen := make(map[string]bool)
+	err := pushOnce(dir, seen, srv.Client(), srv.URL)
+	if err == nil {
+		t.Fatalf("expected non-nil error for non-2xx PUT, got nil")
+	}
+	if seen["a.esf"] {
+		t.Fatalf("seen must not be marked after failed PUT")
+	}
+}
+
+func TestPushOnce_symlinkSkipped(t *testing.T) {
+	dir := t.TempDir()
+	secret := []byte("super-secret-outside-streams")
+	outside := t.TempDir()
+	secretPath := filepath.Join(outside, "secret.txt")
+	if err := os.WriteFile(secretPath, secret, 0o644); err != nil {
+		t.Fatalf("WriteFile secret: %v", err)
+	}
+	linkName := "evil.rsf_proofs"
+	if err := os.Symlink(secretPath, filepath.Join(dir, linkName)); err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+	fake := newFake()
+	srv := httptest.NewServer(fake)
+	defer srv.Close()
+	seen := make(map[string]bool)
+	_ = pushOnce(dir, seen, srv.Client(), srv.URL)
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if _, ok := fake.puts[linkName]; ok {
+		t.Fatalf("symlink entry must not be uploaded")
+	}
+	for name, body := range fake.puts {
+		if bytes.Contains(body, secret) {
+			t.Fatalf("symlink target exfiltrated via %q", name)
+		}
+	}
+	if seen[linkName] {
+		t.Fatalf("seen must not be marked for symlink entry")
+	}
+}
+
 func TestIsAllowed(t *testing.T) {
 	cases := []struct {
 		name string
@@ -227,6 +307,7 @@ func TestIsAllowed(t *testing.T) {
 		{"a.esf", true},
 		{"a.rsf", true},
 		{"a.esf_sig", true},
+		{"a.rsf_proofs", true},
 		{"checkpoint-42.ckpt", true},
 		{"x.rsf_sig", false},
 		{"notes.txt", false},
