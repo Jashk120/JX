@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	blst "github.com/supranational/blst/bindings/go"
@@ -589,4 +590,113 @@ func TestUntrustedRosterFails(t *testing.T) {
 		t.Fatalf("RunOnce: %v", err)
 	}
 	assertCounts(t, st, 0, 0)
+}
+
+func TestRecordFilenameRoundMismatchRejected(t *testing.T) {
+	dir := t.TempDir()
+	priv := ed25519.NewKeyFromSeed(make([]byte, ed25519.SeedSize))
+	pub := priv.Public().(ed25519.PublicKey)
+	trusted := trustedHashForPriv(priv)
+
+	// Valid round-3 payload (BLS-signed, chain-anchored at genesis), stored
+	// under a round-5 filename.
+	writeRecordFileWithSig(t, dir, 3, priv, stream.ChainSeed, [32]byte{})
+	oldPath := filepath.Join(dir, stream.RecordFileName(3))
+	mismatchPath := filepath.Join(dir, stream.RecordFileName(5))
+	if err := os.Rename(oldPath, mismatchPath); err != nil {
+		t.Fatalf("rename to mismatched filename: %v", err)
+	}
+
+	st := store.NewMemStore()
+	ing := New(Config{StreamsDir: dir, PubKey: pub, TrustedRosterHash: trusted[:]}, st, quietLogger())
+
+	err := ing.ingestRecord(mismatchPath)
+	if err == nil {
+		t.Fatal("expected filename/payload round mismatch error, got nil")
+	}
+	if !strings.Contains(err.Error(), "disagrees") {
+		t.Fatalf("expected error to mention disagreement, got %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), "5") || !strings.Contains(err.Error(), "3") {
+		t.Fatalf("expected error to contain both rounds, got %q", err.Error())
+	}
+	assertCounts(t, st, 0, 0)
+
+	// Claim must be released so the file can be retried: a second attempt
+	// must fail verification again, not be silently skipped as seen/in-flight.
+	if err := ing.ingestRecord(mismatchPath); err == nil {
+		t.Fatal("expected retry of mismatched file to fail again (claim released), got nil")
+	}
+	ing.mu.Lock()
+	_, seen := ing.seenRecords[5]
+	_, inflight := ing.inFlightRecords[5]
+	_, seenPayload := ing.seenRecords[3]
+	anchorSet := ing.lastRecordEnd != nil
+	ing.mu.Unlock()
+	if seen || inflight || seenPayload {
+		t.Fatalf("mismatch must not mutate seen/in-flight state (seen5=%v inflight5=%v seen3=%v)", seen, inflight, seenPayload)
+	}
+	if anchorSet {
+		t.Fatal("rejected file must not advance the record chain anchor")
+	}
+	if ing.expectedPrev != nil {
+		t.Fatal("rejected file must not advance the prev checkpoint expectation")
+	}
+}
+
+func TestRecordCheckpointRoundMismatchRejected(t *testing.T) {
+	dir := t.TempDir()
+	priv := ed25519.NewKeyFromSeed(make([]byte, ed25519.SeedSize))
+	pub := priv.Public().(ed25519.PublicKey)
+	trusted := trustedHashForPriv(priv)
+
+	// Filename and payload round agree (0), but the checkpoint is validly
+	// signed for round 1: build a valid round-1 file, then retarget only the
+	// outer payload round to 0 under a round-0 filename. VerifyRecordFile
+	// must reject the payload/checkpoint disagreement.
+	writeRecordFileWithSig(t, dir, 1, priv, stream.ChainSeed, [32]byte{})
+	raw, err := os.ReadFile(filepath.Join(dir, stream.RecordFileName(1)))
+	if err != nil {
+		t.Fatalf("read round-1 file: %v", err)
+	}
+	var rsf pb.RecordStreamFile
+	if err := proto.Unmarshal(raw, &rsf); err != nil {
+		t.Fatalf("unmarshal round-1 file: %v", err)
+	}
+	rsf.Round = 0
+	out, err := proto.Marshal(&rsf)
+	if err != nil {
+		t.Fatalf("marshal retargeted file: %v", err)
+	}
+	if err := os.Remove(filepath.Join(dir, stream.RecordFileName(1))); err != nil {
+		t.Fatalf("remove round-1 file: %v", err)
+	}
+	path := filepath.Join(dir, stream.RecordFileName(0))
+	if err := os.WriteFile(path, out, 0o644); err != nil {
+		t.Fatalf("write retargeted file: %v", err)
+	}
+
+	st := store.NewMemStore()
+	ing := New(Config{StreamsDir: dir, PubKey: pub, TrustedRosterHash: trusted[:]}, st, quietLogger())
+
+	err = ing.ingestRecord(path)
+	if err == nil {
+		t.Fatal("expected checkpoint round mismatch error, got nil")
+	}
+	if !strings.Contains(err.Error(), "checkpoint round") {
+		t.Fatalf("expected error to mention checkpoint round, got %q", err.Error())
+	}
+	assertCounts(t, st, 0, 0)
+
+	// Claim released: retry must fail again rather than skip.
+	if err := ing.ingestRecord(path); err == nil {
+		t.Fatal("expected retry of checkpoint-mismatched file to fail again, got nil")
+	}
+	ing.mu.Lock()
+	_, seen := ing.seenRecords[0]
+	_, inflight := ing.inFlightRecords[0]
+	ing.mu.Unlock()
+	if seen || inflight {
+		t.Fatalf("checkpoint mismatch must not mutate seen/in-flight state (seen=%v inflight=%v)", seen, inflight)
+	}
 }

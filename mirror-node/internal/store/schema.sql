@@ -61,6 +61,16 @@ CREATE TABLE IF NOT EXISTS checkpoint_roster (
 ALTER TABLE checkpoint_roster ADD COLUMN IF NOT EXISTS bls_key BYTEA NOT NULL DEFAULT '' CHECK (bls_key = '' OR octet_length(bls_key) = 48);
 ALTER TABLE checkpoint_roster ADD COLUMN IF NOT EXISTS pop BYTEA NOT NULL DEFAULT '' CHECK (pop = '' OR octet_length(pop) = 96);
 
+-- repeated StateDiff state_diffs — ordered by key (ValidateStateDiffs order),
+-- hence the (round, key) primary key; value NULL = tombstone (absent),
+-- present-but-empty = ''
+CREATE TABLE IF NOT EXISTS state_diffs (
+    round BIGINT NOT NULL REFERENCES record_files(round),
+    key   BYTEA  NOT NULL CHECK (octet_length(key) > 0),
+    value BYTEA,
+    PRIMARY KEY (round, key)
+);
+
 -- ---------- event stream (.esf) ----------
 
 CREATE TABLE IF NOT EXISTS events (

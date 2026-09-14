@@ -137,10 +137,13 @@ MIRROR_DB_PATH=postgresql://user:password@ep-cool-name.us-east-2.aws.neon.tech/n
 - Deduplication lives in the database: records are unique per `round`,
   events per `(creator, seq)`; re-ingesting a file is a no-op, so restarts
   replay safely.
-- Writes are transactional: a record file's items and checkpoint children
-  commit atomically with the file row.
+- Writes are transactional: a record file's items, state diffs, and
+  checkpoint children commit atomically with the file row.
 - Reads reconstruct full protobuf messages; `ListEvents` preserves arrival
-  order via `ingested_seq`.
+  order via `ingested_seq`. State diffs round-trip in key order via the
+  `state_diffs` child table (`round, key` primary key, `value` nullable:
+  `NULL` = tombstone/absent, present-but-empty = `''`), matching the
+  `optional X -> nullable` mapping rule in `internal/store/schema.sql`.
 
 Store tests run against a real database only when `MIRROR_TEST_PG_DSN` is
 set, so plain `go test ./...` needs no database:

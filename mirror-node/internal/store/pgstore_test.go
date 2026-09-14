@@ -27,7 +27,7 @@ func newTestPGStore(t *testing.T) *PGStore {
 	}
 	t.Cleanup(st.Close)
 	if _, err := st.pool.Exec(context.Background(),
-		"TRUNCATE record_items, record_files, checkpoint_sigs, checkpoint_roster, event_transactions, events",
+		"TRUNCATE record_items, state_diffs, record_files, checkpoint_sigs, checkpoint_roster, event_transactions, events",
 	); err != nil {
 		t.Fatalf("truncate tables: %v", err)
 	}
@@ -61,6 +61,48 @@ func TestPGPutRecordDeduplicatesByRound(t *testing.T) {
 	}
 	if latest := st.LatestRound(); latest != 7 {
 		t.Fatalf("LatestRound = %d, want 7", latest)
+	}
+}
+
+func TestPGStateDiffsRoundTrip(t *testing.T) {
+	st := newTestPGStore(t)
+	want := &pb.RecordStreamFile{Version: 2, Round: 11,
+		StartRunningHash: hashFor(0xC0), EndRunningHash: hashFor(0xC1),
+		StateDiffs: []*pb.StateDiff{
+			{Key: []byte("a"), Value: []byte("v1")},
+			{Key: []byte("b"), Value: []byte{}},
+			{Key: []byte("c")},
+		},
+	}
+	if err := st.PutRecord(want); err != nil {
+		t.Fatalf("PutRecord: %v", err)
+	}
+	got := st.ListRecords()
+	if len(got) != 1 {
+		t.Fatalf("ListRecords = %d files, want 1", len(got))
+	}
+	if !proto.Equal(want, got[0]) {
+		t.Fatalf("state diff round trip mismatch:\n got: %+v\nwant: %+v", got[0], want)
+	}
+	diffs := got[0].StateDiffs
+	if len(diffs) != 3 {
+		t.Fatalf("stored %d state diffs, want 3", len(diffs))
+	}
+	for i, k := range []string{"a", "b", "c"} {
+		if string(diffs[i].GetKey()) != k {
+			t.Errorf("diff %d key = %q, want %q", i, diffs[i].GetKey(), k)
+		}
+	}
+	if diffs[0].Value == nil || string(diffs[0].Value) != "v1" {
+		t.Errorf("diff 0 value = %x, want v1", diffs[0].Value)
+	}
+	if diffs[1].Value == nil {
+		t.Errorf("diff 1 value is nil (tombstone), want present-but-empty")
+	} else if len(diffs[1].Value) != 0 {
+		t.Errorf("diff 1 value = %x, want empty", diffs[1].Value)
+	}
+	if diffs[2].Value != nil {
+		t.Errorf("diff 2 value = %x, want nil (tombstone)", diffs[2].Value)
 	}
 }
 

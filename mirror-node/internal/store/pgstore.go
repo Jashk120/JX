@@ -94,6 +94,20 @@ func (s *PGStore) PutRecord(f *pb.RecordStreamFile) error {
 			return fmt.Errorf("insert record_items round %d index %d: %w", f.Round, i, err)
 		}
 	}
+	// optional bytes value: absent (nil) = tombstone -> SQL NULL,
+	// present (even empty) -> the bytes.
+	for _, d := range f.StateDiffs {
+		var value any = d.Value
+		if d.Value == nil {
+			value = nil
+		}
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO state_diffs (round, key, value) VALUES ($1, $2, $3)`,
+			int64(f.Round), d.Key, value,
+		); err != nil {
+			return fmt.Errorf("insert state_diffs round %d key %x: %w", f.Round, d.Key, err)
+		}
+	}
 	if cp := f.GetCheckpoint(); cp != nil {
 		for _, signer := range cp.Signers {
 			if _, err := tx.Exec(ctx,
@@ -187,6 +201,10 @@ func (s *PGStore) ListRecords() []*pb.RecordStreamFile {
 		slog.Default().Error("pg ListRecords: load record_items", "err", err)
 		return nil
 	}
+	if err := s.attachStateDiffs(ctx, byRound); err != nil {
+		slog.Default().Error("pg ListRecords: load state_diffs", "err", err)
+		return nil
+	}
 	if err := s.attachCheckpointSigs(ctx, byRound); err != nil {
 		slog.Default().Error("pg ListRecords: load checkpoint_sigs", "err", err)
 		return nil
@@ -210,10 +228,10 @@ func (s *PGStore) listRecordFiles(ctx context.Context) ([]*pb.RecordStreamFile, 
 	var files []*pb.RecordStreamFile
 	for rows.Next() {
 		var (
-			round                        int64
-			version                      int32
-			start, end                   []byte
-			cpRound                      *int64
+			round                         int64
+			version                       int32
+			start, end                    []byte
+			cpRound                       *int64
 			state, ros, rec, aggSig, prev []byte
 		)
 		if err := rows.Scan(&round, &version, &start, &end, &cpRound, &state, &ros, &rec, &aggSig, &prev); err != nil {
@@ -268,6 +286,42 @@ func (s *PGStore) attachRecordItems(ctx context.Context, byRound map[uint64]*pb.
 			TxIndex:   uint32(txIndex),
 			TxPayload: payload,
 		})
+	}
+	return rows.Err()
+}
+
+func (s *PGStore) attachStateDiffs(ctx context.Context, byRound map[uint64]*pb.RecordStreamFile) error {
+	rows, err := s.pool.Query(ctx,
+		`SELECT round, key, value, value IS NULL AS is_null
+		 FROM state_diffs ORDER BY round, key`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var (
+			round  int64
+			key    []byte
+			value  []byte
+			isNull bool
+		)
+		if err := rows.Scan(&round, &key, &value, &isNull); err != nil {
+			return err
+		}
+		f := byRound[uint64(round)]
+		if f == nil {
+			continue
+		}
+		var diff *pb.StateDiff
+		if isNull {
+			diff = &pb.StateDiff{Key: key}
+		} else {
+			if value == nil {
+				value = []byte{}
+			}
+			diff = &pb.StateDiff{Key: key, Value: value}
+		}
+		f.StateDiffs = append(f.StateDiffs, diff)
 	}
 	return rows.Err()
 }

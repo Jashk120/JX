@@ -394,6 +394,9 @@ func (ing *Ingester) ingestRecord(path string) error {
 		if err != nil {
 			return err
 		}
+		if f.Round != index {
+			return fmt.Errorf("record filename round %d disagrees with payload round %d in %s", index, f.Round, path)
+		}
 		start, err := hashFromPB(f.StartRunningHash)
 		if err != nil {
 			return fmt.Errorf("record %s start hash: %w", path, err)
@@ -676,6 +679,9 @@ func (ing *Ingester) ingestRecordRemote(ctx context.Context, name string, listed
 		var f pb.RecordStreamFile
 		if err := unmarshalStrictRemote(raw, &f); err != nil {
 			return fmt.Errorf("unmarshal %s: %w", name, err)
+		}
+		if f.Round != index {
+			return fmt.Errorf("record filename round %d disagrees with payload round %d in %s", index, f.Round, name)
 		}
 		start, err := hashFromPB(f.StartRunningHash)
 		if err != nil {
