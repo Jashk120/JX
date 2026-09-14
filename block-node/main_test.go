@@ -15,7 +15,7 @@ import (
 
 func TestPutAndGetRoundtrip(t *testing.T) {
 	dir := t.TempDir()
-	h := newHandler(dir)
+	h := newHandler(dir, defaultMaxUploadBytes)
 
 	body := []byte("hello block-node")
 	req := httptest.NewRequest(http.MethodPut, "/v1/blocks/checkpoint-42.ckpt", bytes.NewReader(body))
@@ -47,7 +47,7 @@ func TestPutAndGetRoundtrip(t *testing.T) {
 
 func TestPutIdempotentNoRewrite(t *testing.T) {
 	dir := t.TempDir()
-	h := newHandler(dir)
+	h := newHandler(dir, defaultMaxUploadBytes)
 
 	name := "foo.esf"
 	first := []byte("first content")
@@ -99,7 +99,7 @@ func TestPutIdempotentNoRewrite(t *testing.T) {
 
 func TestGetMissing404(t *testing.T) {
 	dir := t.TempDir()
-	h := newHandler(dir)
+	h := newHandler(dir, defaultMaxUploadBytes)
 	req := httptest.NewRequest(http.MethodGet, "/v1/blocks/nope.esf", nil)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
@@ -110,7 +110,7 @@ func TestGetMissing404(t *testing.T) {
 
 func TestHead(t *testing.T) {
 	dir := t.TempDir()
-	h := newHandler(dir)
+	h := newHandler(dir, defaultMaxUploadBytes)
 	body := []byte("head content 12345")
 	// Put file.
 	reqPut := httptest.NewRequest(http.MethodPut, "/v1/blocks/head.bin", bytes.NewReader(body))
@@ -146,7 +146,7 @@ func TestHead(t *testing.T) {
 
 func TestListSorted(t *testing.T) {
 	dir := t.TempDir()
-	h := newHandler(dir)
+	h := newHandler(dir, defaultMaxUploadBytes)
 	names := []string{"zebra.ckpt", "a.esf", "m.rsf", "checkpoint-10.ckpt"}
 	for _, n := range names {
 		req := httptest.NewRequest(http.MethodPut, "/v1/blocks/"+n, strings.NewReader("x"))
@@ -185,7 +185,7 @@ func TestListSorted(t *testing.T) {
 
 func TestTraversalRejected(t *testing.T) {
 	dir := t.TempDir()
-	h := newHandler(dir)
+	h := newHandler(dir, defaultMaxUploadBytes)
 	cases := []string{
 		"..",
 		"a/b",
@@ -217,7 +217,7 @@ func TestTraversalRejected(t *testing.T) {
 
 func TestTraversalDotDotSlashEscape(t *testing.T) {
 	dir := t.TempDir()
-	h := newHandler(dir)
+	h := newHandler(dir, defaultMaxUploadBytes)
 	name := "..%2Fescape"
 	req := httptest.NewRequest(http.MethodPut, "/v1/blocks/"+name, strings.NewReader("evil"))
 	rec := httptest.NewRecorder()
@@ -229,7 +229,7 @@ func TestTraversalDotDotSlashEscape(t *testing.T) {
 
 func TestMethodNotAllowed(t *testing.T) {
 	dir := t.TempDir()
-	h := newHandler(dir)
+	h := newHandler(dir, defaultMaxUploadBytes)
 	// Seed a file.
 	reqPut := httptest.NewRequest(http.MethodPut, "/v1/blocks/file.bin", strings.NewReader("data"))
 	recPut := httptest.NewRecorder()
@@ -283,5 +283,73 @@ func TestValidNameUnit(t *testing.T) {
 	}
 	if validName("") {
 		t.Error("validName allowed empty")
+	}
+}
+
+func TestPutOverLimitReturns413(t *testing.T) {
+	dir := t.TempDir()
+	const limit int64 = 8
+	h := newHandler(dir, limit)
+
+	body := []byte("this body exceeds the limit")
+	req := httptest.NewRequest(http.MethodPut, "/v1/blocks/big.bin", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("PUT over limit got %d want 413", rec.Code)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "big.bin")); !os.IsNotExist(err) {
+		t.Fatalf("over-limit PUT left stored file: err=%v", err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("readdir: %v", err)
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".tmp-") {
+			t.Fatalf("over-limit PUT left temp file %q", e.Name())
+		}
+	}
+}
+
+func TestPutOverLimitUnknownLengthReturns413(t *testing.T) {
+	dir := t.TempDir()
+	const limit int64 = 8
+	h := newHandler(dir, limit)
+
+	body := []byte("streamed body exceeds limit")
+	req := httptest.NewRequest(http.MethodPut, "/v1/blocks/stream.bin", io.NopCloser(bytes.NewReader(body)))
+	req.ContentLength = -1
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("PUT over limit (unknown length) got %d want 413", rec.Code)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "stream.bin")); !os.IsNotExist(err) {
+		t.Fatalf("over-limit PUT left stored file: err=%v", err)
+	}
+}
+
+func TestPutAtLimitSucceeds(t *testing.T) {
+	dir := t.TempDir()
+	const limit int64 = 8
+	h := newHandler(dir, limit)
+
+	body := []byte("12345678")
+	req := httptest.NewRequest(http.MethodPut, "/v1/blocks/exact.bin", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PUT at limit got %d want 200", rec.Code)
+	}
+	req2 := httptest.NewRequest(http.MethodGet, "/v1/blocks/exact.bin", nil)
+	rec2 := httptest.NewRecorder()
+	h.ServeHTTP(rec2, req2)
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("GET got %d want 200", rec2.Code)
+	}
+	got, _ := io.ReadAll(rec2.Body)
+	if !bytes.Equal(got, body) {
+		t.Fatalf("GET bytes mismatch: got %q want %q", got, body)
 	}
 }

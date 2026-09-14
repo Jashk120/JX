@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -9,8 +10,11 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 )
+
+const defaultMaxUploadBytes int64 = 256 << 20
 
 func validName(name string) bool {
 	if name == "" {
@@ -31,7 +35,7 @@ func validName(name string) bool {
 	return true
 }
 
-func newHandler(dataDir string) http.Handler {
+func newHandler(dataDir string, maxUploadBytes int64) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		escaped := r.URL.EscapedPath()
 
@@ -102,7 +106,7 @@ func newHandler(dataDir string) http.Handler {
 
 			switch r.Method {
 			case http.MethodPut:
-				handlePut(w, r, dataDir, decodedName)
+				handlePut(w, r, dataDir, decodedName, maxUploadBytes)
 			case http.MethodGet:
 				handleGet(w, r, dataDir, decodedName)
 			case http.MethodHead:
@@ -117,13 +121,28 @@ func newHandler(dataDir string) http.Handler {
 	})
 }
 
-func handlePut(w http.ResponseWriter, r *http.Request, dataDir, name string) {
+func handlePut(w http.ResponseWriter, r *http.Request, dataDir, name string, maxUploadBytes int64) {
 	path := filepath.Join(dataDir, name)
+
+	// Bound the request body to prevent unbounded disk exhaustion.
+	r.Body = http.MaxBytesReader(w, r.Body, maxUploadBytes)
+	if r.ContentLength > maxUploadBytes {
+		http.Error(w, "request entity too large", http.StatusRequestEntityTooLarge)
+		return
+	}
 
 	// Idempotent: if file already exists, do not rewrite.
 	if _, err := os.Stat(path); err == nil {
 		// Drain body to reuse connection.
-		_, _ = io.Copy(io.Discard, r.Body)
+		if _, err := io.Copy(io.Discard, r.Body); err != nil {
+			var maxErr *http.MaxBytesError
+			if errors.As(err, &maxErr) {
+				http.Error(w, "request entity too large", http.StatusRequestEntityTooLarge)
+				return
+			}
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
 		w.WriteHeader(http.StatusOK)
 		return
 	} else if !os.IsNotExist(err) {
@@ -148,6 +167,11 @@ func handlePut(w http.ResponseWriter, r *http.Request, dataDir, name string) {
 	}()
 
 	if _, err := io.Copy(tmp, r.Body); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			http.Error(w, "request entity too large", http.StatusRequestEntityTooLarge)
+			return
+		}
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
@@ -245,7 +269,15 @@ func main() {
 	if err := os.MkdirAll(dataDir, 0o755); err != nil {
 		log.Fatalf("mkdir data dir: %v", err)
 	}
-	handler := newHandler(dataDir)
+	maxUploadBytes := defaultMaxUploadBytes
+	if v := os.Getenv("BLOCK_NODE_MAX_UPLOAD_BYTES"); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil || n <= 0 {
+			log.Fatalf("invalid BLOCK_NODE_MAX_UPLOAD_BYTES %q: must be a positive integer", v)
+		}
+		maxUploadBytes = n
+	}
+	handler := newHandler(dataDir, maxUploadBytes)
 	log.Printf("block-node listening on %s dataDir=%s", listenAddr, dataDir)
 	if err := http.ListenAndServe(listenAddr, handler); err != nil {
 		log.Fatalf("listen: %v", err)

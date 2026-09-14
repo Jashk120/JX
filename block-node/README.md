@@ -14,6 +14,7 @@ Dumb HTTP file store for JKaIN stream artifacts (`.esf`, `.esf_sig`, `.rsf`, `ch
 |---|---|---|---|
 | `BLOCK_NODE_DATA_DIR` | yes | `/data/blocks` | Directory where files are stored. Created if missing. |
 | `BLOCK_NODE_LISTEN_ADDR` | yes | `127.0.0.1:8080` | TCP address to listen on (`host:port`). |
+| `BLOCK_NODE_MAX_UPLOAD_BYTES` | no | `268435456` | Maximum PUT request body size in bytes (default 256 MiB). Must be a positive integer. Larger bodies are rejected with `413`; invalid values abort startup with an error. |
 
 Both must be set; the process exits on startup if either is missing.
 
@@ -21,7 +22,7 @@ Both must be set; the process exits on startup if either is missing.
 
 | Method | Path | Description |
 |---|---|---|
-| `PUT` | `/v1/blocks/{name}` | Store file (idempotent). If `{name}` already exists, returns `200` without rewriting. Otherwise writes atomically (temp file + rename). |
+| `PUT` | `/v1/blocks/{name}` | Store file (idempotent). If `{name}` already exists, returns `200` without rewriting. Otherwise writes atomically (temp file + rename). Bodies larger than `BLOCK_NODE_MAX_UPLOAD_BYTES` are rejected with `413` (`413` also when `Content-Length` exceeds the limit, before any bytes are written). |
 | `GET` | `/v1/blocks/{name}` | Fetch file bytes (`200`+`Content-Length`+`application/octet-stream`, or `404` if absent). |
 | `HEAD` | `/v1/blocks/{name}` | Same as GET but headers only (`200`+`Content-Length` if present, `404` if absent). |
 | `GET` | `/v1/blocks` | List stored names, lexicographically sorted, one per line (`text/plain`). |
@@ -83,4 +84,4 @@ go vet ./...
 go test ./...
 ```
 
-Structure for testability: `newHandler(dataDir string) http.Handler` builds the mux so tests inject `t.TempDir()` and drive it with `net/http/httptest`.
+Structure for testability: `newHandler(dataDir string, maxUploadBytes int64) http.Handler` builds the mux so tests inject `t.TempDir()` and drive it with `net/http/httptest`.
