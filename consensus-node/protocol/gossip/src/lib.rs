@@ -67,7 +67,13 @@ pub use reconnect::{
     fetch_checkpoint,
     verify_signed_checkpoint,
 };
-pub use sync::run_sync;
+pub use sync::{
+    SyncOutcome,
+    create_own_event,
+    insert_own_event,
+    run_sync,
+    run_sync_with_precreated_event,
+};
 pub use tls::TlsIdentity;
 pub use transport::{
     QuicTransport,

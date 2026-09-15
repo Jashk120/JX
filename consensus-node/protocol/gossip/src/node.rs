@@ -70,8 +70,10 @@ use crate::proto::{
 };
 use crate::reconnect::fetch_checkpoint;
 use crate::sync::{
+    insert_own_event,
     insert_verified,
     run_sync,
+    run_sync_with_precreated_event,
 };
 use crate::tls::TlsIdentity;
 use crate::transport::{
@@ -521,8 +523,10 @@ impl GossipNode {
     /// Queues a raw transaction payload to be included in this node's next
     /// own event. Payloads are drained by the sync driver, up to
     /// [`TX_PER_SYNC`] per round, and passed into the initiator's own event.
-    /// If that sync round fails the drained payloads are dropped — ordering
-    /// is consensus's job, so a dropped payload is simply not included.
+    /// If that sync round fails the drained payloads are returned to the
+    /// front of the queue (see [`Self::requeue_pending_transactions`]),
+    /// so a failed round retries them instead of dropping them — ordering
+    /// is consensus's job, so a retried payload is simply included later.
     /// Returns `true` if the payload was queued, `false` if the pending queue
     /// is full.
     pub async fn submit_transaction(&self, payload: Vec<u8>) -> bool {
@@ -568,11 +572,46 @@ impl GossipNode {
     }
 
     /// Drains up to [`TX_PER_SYNC`] pending payloads into transactions for
-    /// the next own event. Removes them from the queue; if the sync round
-    /// they were destined for fails, they are dropped (inclusion-only).
+    /// the next own event. Removes them from the queue; the caller must
+    /// return them via [`Self::requeue_pending_transactions`] if the sync
+    /// round they were destined for fails before their event was inserted.
     async fn drain_pending_transactions(&self) -> Vec<Transaction> {
         let mut pending = self.pending_transactions.lock().await;
         (0..TX_PER_SYNC).filter_map(|_| pending.pop_front().map(Transaction::from_bytes)).collect()
+    }
+
+    /// Returns drained payloads to the front of the pending queue, preserving
+    /// their original relative order, when the sync round they were drained
+    /// for failed before their event was inserted. Payloads whose event was
+    /// already inserted must NOT be passed here — they are in the graph and
+    /// requeueing them would duplicate them.
+    ///
+    /// Bounded by [`MAX_PENDING_TRANSACTIONS`]: payloads beyond the cap are
+    /// dropped and counted in `pending_dropped`, so a requeue can never grow
+    /// the queue without bound.
+    async fn requeue_pending_transactions(&self, txs: Vec<Transaction>) {
+        if txs.is_empty() {
+            return;
+        }
+        let mut dropped: u64 = 0;
+        {
+            let mut pending = self.pending_transactions.lock().await;
+            for tx in txs.iter().rev() {
+                if pending.len() >= MAX_PENDING_TRANSACTIONS {
+                    dropped += 1;
+                } else {
+                    pending.push_front(tx.payload().to_vec());
+                }
+            }
+        }
+        if dropped > 0 {
+            tracing::warn!(
+                dropped,
+                limit = MAX_PENDING_TRANSACTIONS,
+                "requeue overflow, dropping transactions"
+            );
+            self.gossip_metrics.lock().await.pending_dropped += dropped;
+        }
     }
 
     /// Registers `sink` as the durable checkpoint destination. It is invoked
@@ -855,6 +894,7 @@ impl GossipNode {
 
                 let registry = self.registry.lock().await.clone();
                 let payload = self.drain_pending_transactions().await;
+                let retry_payload = payload.clone();
                 let timestamp = self.next_timestamp();
                 let start = std::time::Instant::now();
                 let round = {
@@ -886,6 +926,11 @@ impl GossipNode {
                     Err(e) => {
                         consecutive_failures += 1;
                         self.peers.lock().await.record_failure(peer.node_id);
+                        // The drained payloads were never inserted (the round
+                        // failed before or during their event's creation), so
+                        // return them to the front of the queue for a retry
+                        // instead of silently dropping them.
+                        self.requeue_pending_transactions(retry_payload).await;
                         {
                             let mut m = self.gossip_metrics.lock().await;
                             m.sync_attempts += 1;
@@ -904,13 +949,13 @@ impl GossipNode {
                             );
                         }
                     }
-                    Ok(fresh) => {
+                    Ok(outcome) => {
                         consecutive_failures = 0;
                         let rtt = start.elapsed();
                         self.peers.lock().await.record_success(peer.node_id, rtt);
                         {
                             let mut m = self.gossip_metrics.lock().await;
-                            m.record_sync_success(rtt, fresh.len());
+                            m.record_sync_success(rtt, outcome.fresh.len());
                             if m.sync_attempts.is_multiple_of(10) {
                                 tracing::info!(
                                     sync_attempts = m.sync_attempts,
@@ -934,10 +979,21 @@ impl GossipNode {
                         }
                         tracing::debug!(
                             peer = ?peer.node_id,
-                            fresh_events = fresh.len(),
+                            fresh_events = outcome.fresh.len(),
+                            pushback_delivered = outcome.pushback_delivered,
+                            blocked = outcome.blocked,
                             "sync round succeeded"
                         );
-                        self.log_fresh_inserts(fresh).await;
+                        if !outcome.pushback_delivered {
+                            tracing::warn!(
+                                peer = ?peer.node_id,
+                                "own event push-back not delivered, will redeliver via next delta"
+                            );
+                        }
+                        if outcome.needs_reconnect() {
+                            self.needs_reconnect.store(true, Ordering::Release);
+                        }
+                        self.log_fresh_inserts(&outcome.fresh).await;
                         {
                             let mut guard = transport_arc.lock().await;
                             self.gossip_checkpoint_sigs(&mut *guard).await;
@@ -1025,14 +1081,88 @@ impl GossipNode {
             // code; the bound is enforced by `pick_k` alone.
             let mut join_set: JoinSet<()> = JoinSet::new();
             let payload = self.drain_pending_transactions().await;
+            // `k` distinct own events per tick, created sequentially before
+            // fanout: `k` concurrent `run_sync` tasks would otherwise all
+            // read the same `self_parent` before any of them inserts, forking
+            // our own chain every tick. Serialized creation chains them —
+            // event `i`'s `self_parent` is event `i-1`'s hash (the first's is
+            // the latest before the tick) — each with its own monotonic
+            // timestamp and payload shard, so no two share a `self_parent`.
+            // Each fanout task then disseminates its own distinct event.
+            let registry_snapshot = self.registry.lock().await.clone();
+            // Shard the drained payload across the `k` events (ceil split;
+            // empty shards when there is nothing to include).
+            let mut shards: Vec<Vec<Transaction>> = {
+                let n = peers.len().max(1);
+                let chunk = payload.len().div_ceil(n);
+                let mut shards = Vec::with_capacity(n);
+                let mut iter = payload.into_iter();
+                for _ in 0..n {
+                    let take = chunk.min(iter.len());
+                    shards.push(iter.by_ref().take(take).collect());
+                }
+                shards
+            };
+            let mut precreated: Vec<Option<Event>> = Vec::with_capacity(peers.len());
+            let mut precreated_hashes: Vec<EventHash> = Vec::with_capacity(peers.len());
+            let mut failed_at: Option<usize> = None;
+            for (i, peer) in peers.iter().enumerate() {
+                let (self_parent, other_parent) = {
+                    let hg = self.hashgraph.lock().await;
+                    let self_parent = hg.latest_event_by(&self.node_id).copied();
+                    let other_parent = hg.latest_event_by(&peer.node_id).copied();
+                    (self_parent, other_parent)
+                };
+                let timestamp = self.next_timestamp();
+                let shard = std::mem::take(&mut shards[i]);
+                match insert_own_event(
+                    &self.hashgraph,
+                    &registry_snapshot,
+                    self.node_id,
+                    &self.signing_key,
+                    self_parent,
+                    other_parent,
+                    shard,
+                    timestamp,
+                )
+                .await
+                {
+                    Ok(Some((event, hash))) => {
+                        precreated_hashes.push(hash);
+                        precreated.push(Some(event));
+                    }
+                    Ok(None) => {
+                        precreated.push(None);
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "per-tick own event insert failed, remaining fanout degrades to delta-only");
+                        failed_at = Some(i);
+                        precreated.push(None);
+                        let remaining = peers.len() - (i + 1);
+                        precreated.extend(std::iter::repeat_with(|| None).take(remaining));
+                        break;
+                    }
+                }
+            }
+            if !precreated_hashes.is_empty() {
+                self.log_fresh_inserts(&precreated_hashes).await;
+            }
+            if let Some(failed_idx) = failed_at {
+                let mut to_requeue: Vec<Transaction> = Vec::new();
+                to_requeue.extend(std::mem::take(&mut shards[failed_idx]));
+                for shard in shards.iter_mut().skip(failed_idx + 1) {
+                    to_requeue.extend(std::mem::take(shard));
+                }
+                self.requeue_pending_transactions(to_requeue).await;
+            }
             let mut spawned: usize = 0;
-            for peer in peers {
+            for (idx, peer) in peers.into_iter().enumerate() {
                 spawned += 1;
                 let outbound = outbound.clone();
                 let self_clone = self.clone();
                 let peer_clone = peer.clone();
-                let payload_clone = payload.clone();
-                let registry_clone = self_clone.registry.lock().await.clone();
+                let event_clone = precreated[idx].clone();
+                let registry_clone = registry_snapshot.clone();
                 let metrics = self_clone.gossip_metrics.clone();
                 join_set.spawn(async move {
                     let start = std::time::Instant::now();
@@ -1091,18 +1221,15 @@ impl GossipNode {
                             }
                         }
                     }
-                    let timestamp = self_clone.next_timestamp();
                     let result = tokio::time::timeout(
                         self_clone.sync_timing.sync_timeout,
-                        run_sync(
+                        run_sync_with_precreated_event(
                             &mut *guard,
                             &self_clone.hashgraph,
                             &registry_clone,
                             self_clone.node_id,
-                            &self_clone.signing_key,
                             peer_clone.node_id,
-                            payload_clone,
-                            timestamp,
+                            event_clone,
                         ),
                     )
                     .await;
@@ -1131,12 +1258,12 @@ impl GossipNode {
                             }
                             tracing::warn!(peer=?peer_clone.node_id, error=%e, "sync round failed");
                         }
-                        Ok(fresh) => {
+                        Ok(outcome) => {
                             let rtt = start.elapsed();
                             self_clone.peers.lock().await.record_success(peer_clone.node_id, rtt);
                             {
                                 let mut m = metrics.lock().await;
-                                m.record_sync_success(rtt, fresh.len());
+                                m.record_sync_success(rtt, outcome.fresh.len());
                                 if m.sync_attempts.is_multiple_of(10) {
                                     tracing::info!(
                                         sync_attempts = m.sync_attempts,
@@ -1157,7 +1284,16 @@ impl GossipNode {
                                     );
                                 }
                             }
-                            self_clone.log_fresh_inserts(&fresh).await;
+                            if !outcome.pushback_delivered {
+                                tracing::warn!(
+                                    peer = ?peer_clone.node_id,
+                                    "precreated event push-back not delivered, will redeliver via next delta"
+                                );
+                            }
+                            if outcome.needs_reconnect() {
+                                self_clone.needs_reconnect.store(true, Ordering::Release);
+                            }
+                            self_clone.log_fresh_inserts(&outcome.fresh).await;
                             self_clone.gossip_checkpoint_sigs(&mut *guard).await;
                         }
                     }
