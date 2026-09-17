@@ -70,10 +70,11 @@ use crate::proto::{
 };
 use crate::reconnect::fetch_checkpoint;
 use crate::sync::{
-    insert_own_event,
+    SyncOutcome,
+    create_own_event,
+    exchange_delta,
     insert_verified,
     run_sync,
-    run_sync_with_precreated_event,
 };
 use crate::tls::TlsIdentity;
 use crate::transport::{
@@ -307,6 +308,14 @@ pub struct GossipNode {
     /// the wall clock stalls or steps backwards. Stored as `AtomicU64` because
     /// the sync driver mutates it without holding any other lock.
     last_timestamp: AtomicU64,
+    /// Serializes the fanout driver's `k` per-tick own-event creations.
+    /// Delta exchanges run concurrently; only the post-delta read-parents +
+    /// sign + insert sequence takes this lock, so the tick's events chain
+    /// on `self_parent` while each keeps the `other_parent` of its own
+    /// sync peer as known after the delta (a fresh joiner's first event
+    /// therefore references the partner it just synced from, not the
+    /// pre-tick graph which may know no peer head at all).
+    own_event_lock: Mutex<()>,
     /// Notified whenever `accept_checkpoint` or `process_finalized_rounds`
     /// completes, so test helpers waiting for a persisted checkpoint or
     /// finalized state can wake without polling. Production code does not
@@ -437,6 +446,7 @@ impl GossipNode {
             pending_checkpoint_sigs: Mutex::new(BTreeMap::new()),
             needs_reconnect: AtomicBool::new(false),
             last_timestamp: AtomicU64::new(0),
+            own_event_lock: Mutex::new(()),
             checkpoint_notify: Arc::new(Notify::new()),
             pending_transactions: Mutex::new(VecDeque::new()),
             checkpoint_sink: Mutex::new(None),
@@ -764,11 +774,24 @@ impl GossipNode {
             }
 
             if self.needs_reconnect.load(Ordering::Acquire) {
-                let mut attempted = false;
-                if let Some(peer) = self.peers.lock().await.random_peer()
-                    && let Some(reconnect_addr) = peer.reconnect_addr
-                {
-                    attempted = true;
+                // Every reconnect-capable peer is tried each tick (from a
+                // random start offset): under parallel load a single random
+                // peer may be slow to answer, and one timed-out fetch must
+                // not stall the reconnect for a whole tick. The flag stays
+                // set until an apply succeeds, so a failed tick retries on
+                // the next interval instead of resuming delta-sync.
+                let candidates: Vec<(PeerInfo, std::net::SocketAddr)> = {
+                    let pm = self.peers.lock().await;
+                    pm.all()
+                        .into_iter()
+                        .filter_map(|peer| peer.reconnect_addr.map(|addr| (peer, addr)))
+                        .collect()
+                };
+                if !candidates.is_empty() {
+                    let offset = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.subsec_nanos() as usize)
+                        % candidates.len();
                     let trusted_roster_hash = {
                         let registry = self.registry.lock().await;
                         if registry.is_empty() {
@@ -777,34 +800,40 @@ impl GossipNode {
                         }
                         registry.hash().expect("hash bounded")
                     };
-                    tracing::info!(peer = ?peer.node_id, "reconnect attempt starting");
-                    let attempt = tokio::time::timeout(
-                        self.sync_timing.sync_timeout * 2,
-                        fetch_checkpoint(
-                            &self.identity,
-                            &peer,
-                            reconnect_addr,
-                            self.node_id,
-                            trusted_roster_hash,
-                        ),
-                    )
-                    .await;
-                    match attempt {
-                        Ok(Ok(response)) => {
-                            if self.apply_checkpoint(response).await {
-                                self.needs_reconnect.store(false, Ordering::Release);
-                                tracing::info!(peer = ?peer.node_id, "reconnect succeeded");
+                    for i in 0..candidates.len() {
+                        let (peer, reconnect_addr) = &candidates[(offset + i) % candidates.len()];
+                        tracing::info!(peer = ?peer.node_id, "reconnect attempt starting");
+                        let attempt = tokio::time::timeout(
+                            self.sync_timing.sync_timeout * 2,
+                            fetch_checkpoint(
+                                &self.identity,
+                                peer,
+                                *reconnect_addr,
+                                self.node_id,
+                                trusted_roster_hash,
+                            ),
+                        )
+                        .await;
+                        match attempt {
+                            Ok(Ok(response)) => {
+                                if self.apply_checkpoint(response).await {
+                                    self.needs_reconnect.store(false, Ordering::Release);
+                                    tracing::info!(peer = ?peer.node_id, "reconnect succeeded");
+                                    break;
+                                }
+                                tracing::warn!(
+                                    peer = ?peer.node_id,
+                                    "reconnect checkpoint rejected, trying next peer"
+                                );
+                            }
+                            Ok(Err(e)) => {
+                                tracing::warn!(error = %e, "reconnect attempt failed");
+                            }
+                            Err(_) => {
+                                tracing::warn!(peer = ?peer.node_id, "reconnect attempt timed out");
                             }
                         }
-                        Ok(Err(e)) => {
-                            tracing::warn!(error = %e, "reconnect attempt failed");
-                        }
-                        Err(_) => {
-                            tracing::warn!(peer = ?peer.node_id, "reconnect attempt timed out");
-                        }
                     }
-                }
-                if attempted {
                     continue;
                 }
             }
@@ -991,6 +1020,11 @@ impl GossipNode {
                             );
                         }
                         if outcome.needs_reconnect() {
+                            // No own event was created on a gapped graph, so
+                            // the drained payload never entered the graph —
+                            // retry it after the reconnect instead of
+                            // dropping it.
+                            self.requeue_pending_transactions(retry_payload).await;
                             self.needs_reconnect.store(true, Ordering::Release);
                         }
                         self.log_fresh_inserts(&outcome.fresh).await;
@@ -1081,18 +1115,20 @@ impl GossipNode {
             // code; the bound is enforced by `pick_k` alone.
             let mut join_set: JoinSet<()> = JoinSet::new();
             let payload = self.drain_pending_transactions().await;
-            // `k` distinct own events per tick, created sequentially before
-            // fanout: `k` concurrent `run_sync` tasks would otherwise all
-            // read the same `self_parent` before any of them inserts, forking
-            // our own chain every tick. Serialized creation chains them —
-            // event `i`'s `self_parent` is event `i-1`'s hash (the first's is
-            // the latest before the tick) — each with its own monotonic
-            // timestamp and payload shard, so no two share a `self_parent`.
-            // Each fanout task then disseminates its own distinct event.
+            // `k` distinct own events per tick: `k` concurrent tasks would
+            // otherwise all read the same `self_parent` before any of them
+            // inserts, forking our own chain every tick. Delta exchanges run
+            // concurrently, but each task creates its own event only after
+            // its delta under `own_event_lock` — so event `i`'s `self_parent`
+            // chains on whatever the tick created before it, each with its
+            // own monotonic timestamp and payload shard, and each task's
+            // `other_parent` is its own sync peer's head as known after the
+            // delta (not the pre-tick graph, which for a fresh joiner may
+            // know no peer head at all).
             let registry_snapshot = self.registry.lock().await.clone();
             // Shard the drained payload across the `k` events (ceil split;
             // empty shards when there is nothing to include).
-            let mut shards: Vec<Vec<Transaction>> = {
+            let shards: Vec<Vec<Transaction>> = {
                 let n = peers.len().max(1);
                 let chunk = payload.len().div_ceil(n);
                 let mut shards = Vec::with_capacity(n);
@@ -1103,65 +1139,14 @@ impl GossipNode {
                 }
                 shards
             };
-            let mut precreated: Vec<Option<Event>> = Vec::with_capacity(peers.len());
-            let mut precreated_hashes: Vec<EventHash> = Vec::with_capacity(peers.len());
-            let mut failed_at: Option<usize> = None;
-            for (i, peer) in peers.iter().enumerate() {
-                let (self_parent, other_parent) = {
-                    let hg = self.hashgraph.lock().await;
-                    let self_parent = hg.latest_event_by(&self.node_id).copied();
-                    let other_parent = hg.latest_event_by(&peer.node_id).copied();
-                    (self_parent, other_parent)
-                };
-                let timestamp = self.next_timestamp();
-                let shard = std::mem::take(&mut shards[i]);
-                match insert_own_event(
-                    &self.hashgraph,
-                    &registry_snapshot,
-                    self.node_id,
-                    &self.signing_key,
-                    self_parent,
-                    other_parent,
-                    shard,
-                    timestamp,
-                )
-                .await
-                {
-                    Ok(Some((event, hash))) => {
-                        precreated_hashes.push(hash);
-                        precreated.push(Some(event));
-                    }
-                    Ok(None) => {
-                        precreated.push(None);
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "per-tick own event insert failed, remaining fanout degrades to delta-only");
-                        failed_at = Some(i);
-                        precreated.push(None);
-                        let remaining = peers.len() - (i + 1);
-                        precreated.extend(std::iter::repeat_with(|| None).take(remaining));
-                        break;
-                    }
-                }
-            }
-            if !precreated_hashes.is_empty() {
-                self.log_fresh_inserts(&precreated_hashes).await;
-            }
-            if let Some(failed_idx) = failed_at {
-                let mut to_requeue: Vec<Transaction> = Vec::new();
-                to_requeue.extend(std::mem::take(&mut shards[failed_idx]));
-                for shard in shards.iter_mut().skip(failed_idx + 1) {
-                    to_requeue.extend(std::mem::take(shard));
-                }
-                self.requeue_pending_transactions(to_requeue).await;
-            }
             let mut spawned: usize = 0;
-            for (idx, peer) in peers.into_iter().enumerate() {
+            let mut shard_iter = shards.into_iter();
+            for peer in peers.into_iter() {
                 spawned += 1;
                 let outbound = outbound.clone();
                 let self_clone = self.clone();
                 let peer_clone = peer.clone();
-                let event_clone = precreated[idx].clone();
+                let shard = shard_iter.next().unwrap_or_default();
                 let registry_clone = registry_snapshot.clone();
                 let metrics = self_clone.gossip_metrics.clone();
                 join_set.spawn(async move {
@@ -1200,6 +1185,9 @@ impl GossipNode {
                                     m.sync_attempts += 1;
                                     m.sync_failures += 1;
                                 }
+                                // The shard never entered the graph, so return
+                                // it for a later retry instead of dropping it.
+                                self_clone.requeue_pending_transactions(shard).await;
                                 *guard = TcpTransport::new(self_clone.identity.clone());
                                 tracing::warn!(peer=?peer_clone.node_id, error=%e, "sync connect failed");
                                 return;
@@ -1211,6 +1199,7 @@ impl GossipNode {
                                     m.sync_attempts += 1;
                                     m.sync_failures += 1;
                                 }
+                                self_clone.requeue_pending_transactions(shard).await;
                                 *guard = TcpTransport::new(self_clone.identity.clone());
                                 tracing::warn!(
                                     peer=?peer_clone.node_id,
@@ -1221,16 +1210,71 @@ impl GossipNode {
                             }
                         }
                     }
+                    // Kept back for a retry if the round fails before the
+                    // shard's event is inserted (exchange/creation error or
+                    // timeout). Dropped on success: the payload is in the
+                    // graph then and must not be queued again. This mirrors
+                    // the `k <= 1` path's retry-payload discipline.
+                    let shard_retry = shard.clone();
                     let result = tokio::time::timeout(
                         self_clone.sync_timing.sync_timeout,
-                        run_sync_with_precreated_event(
-                            &mut *guard,
-                            &self_clone.hashgraph,
-                            &registry_clone,
-                            self_clone.node_id,
-                            peer_clone.node_id,
-                            event_clone,
-                        ),
+                        async {
+                            let (fresh, blocked) = exchange_delta(
+                                &mut *guard,
+                                &self_clone.hashgraph,
+                                &registry_clone,
+                                self_clone.node_id,
+                            )
+                            .await?;
+                            if blocked > 0 {
+                                tracing::warn!(
+                                    blocked,
+                                    "delta partially applied: MissingParent blocked the remainder, skipping own event until reconnect"
+                                );
+                                self_clone.requeue_pending_transactions(shard).await;
+                                return Ok::<SyncOutcome, GossipError>(SyncOutcome {
+                                    fresh,
+                                    pushback_delivered: true,
+                                    blocked,
+                                });
+                            }
+                            // Serialized per-tick creation: the delta above
+                            // ran concurrently, but only one task holds this
+                            // lock at a time, so each event's `self_parent`
+                            // chains on the tick's previous event while its
+                            // `other_parent` is this task's own sync peer as
+                            // known after the delta.
+                            let created = {
+                                let _lock = self_clone.own_event_lock.lock().await;
+                                let timestamp = self_clone.next_timestamp();
+                                create_own_event(
+                                    &self_clone.hashgraph,
+                                    &registry_clone,
+                                    self_clone.node_id,
+                                    &self_clone.signing_key,
+                                    peer_clone.node_id,
+                                    shard,
+                                    timestamp,
+                                )
+                                .await?
+                            };
+                            let mut pushback_delivered = true;
+                            let mut fresh_all = fresh;
+                            if let Some((event, hash)) = created {
+                                fresh_all.push(hash);
+                                if let Err(e) =
+                                    guard.send_frame(&Frame::Event(event)).await
+                                {
+                                    tracing::warn!(error = %e, "own event push-back failed, will redeliver via next delta");
+                                    pushback_delivered = false;
+                                }
+                            }
+                            Ok::<SyncOutcome, GossipError>(SyncOutcome {
+                                fresh: fresh_all,
+                                pushback_delivered,
+                                blocked,
+                            })
+                        },
                     )
                     .await;
                     let result = match result {
@@ -1248,6 +1292,7 @@ impl GossipNode {
                                 m.sync_attempts += 1;
                                 m.sync_failures += 1;
                             }
+                            self_clone.requeue_pending_transactions(shard_retry).await;
                             *guard = TcpTransport::new(self_clone.identity.clone());
                             if matches!(
                                 &e,
@@ -1259,6 +1304,7 @@ impl GossipNode {
                             tracing::warn!(peer=?peer_clone.node_id, error=%e, "sync round failed");
                         }
                         Ok(outcome) => {
+                            drop(shard_retry);
                             let rtt = start.elapsed();
                             self_clone.peers.lock().await.record_success(peer_clone.node_id, rtt);
                             {
@@ -1287,7 +1333,7 @@ impl GossipNode {
                             if !outcome.pushback_delivered {
                                 tracing::warn!(
                                     peer = ?peer_clone.node_id,
-                                    "precreated event push-back not delivered, will redeliver via next delta"
+                                    "own event push-back not delivered, will redeliver via next delta"
                                 );
                             }
                             if outcome.needs_reconnect() {

@@ -54,8 +54,11 @@ use crate::transport::SyncTransport;
 ///   payload is already in the graph and must NOT be requeued).
 /// * `blocked` — the number of delta events that could not be inserted
 ///   because the first `MissingParent` blocked the topologically-sorted
-///   remainder. The insertable prefix is still applied and the own event is
-///   still created; the caller should reconnect when this is non-zero.
+///   remainder. The insertable prefix is still applied but NO own event is
+///   created: building on a gapped graph would emit a parentless (or forked)
+///   event — e.g. a wiped node resuming with a bogus genesis event before its
+///   reconnect — so the caller must reconnect first and retry the payload.
+///   The caller must requeue its drained payload when this is non-zero.
 #[derive(Debug, Clone, Default)]
 pub struct SyncOutcome {
     /// Hashes freshly inserted this round, including the own event's hash
@@ -88,12 +91,21 @@ pub async fn run_sync(
     payload: Vec<Transaction>,
     timestamp: Timestamp,
 ) -> Result<SyncOutcome> {
-    let (mut fresh, blocked) = exchange_delta(transport, hashgraph, registry, node_id).await?;
+    let (fresh, blocked) = exchange_delta(transport, hashgraph, registry, node_id).await?;
+
+    if blocked > 0 {
+        tracing::warn!(
+            blocked,
+            "delta partially applied: MissingParent blocked the remainder, skipping own event until reconnect"
+        );
+        return Ok(SyncOutcome { fresh, pushback_delivered: true, blocked });
+    }
 
     let created =
         create_own_event(hashgraph, registry, node_id, signing_key, peer_id, payload, timestamp)
             .await?;
     let mut pushback_delivered = true;
+    let mut fresh = fresh;
     if let Some((event, hash)) = created {
         fresh.push(hash);
         if let Err(e) = transport.send_frame(&Frame::Event(event)).await {
@@ -107,13 +119,6 @@ pub async fn run_sync(
             tracing::warn!(error = %e, "own event push-back failed, will redeliver via next delta");
             pushback_delivered = false;
         }
-    }
-
-    if blocked > 0 {
-        tracing::warn!(
-            blocked,
-            "delta partially applied: MissingParent blocked the remainder, reconnect needed"
-        );
     }
 
     Ok(SyncOutcome { fresh, pushback_delivered, blocked })
@@ -164,13 +169,18 @@ pub async fn run_sync_with_precreated_event(
 /// delta, verify and insert each event. Returns the freshly inserted hashes
 /// plus the count of events left uninserted after the first `MissingParent`.
 ///
+/// `pub(crate)` so the fanout driver can exchange deltas concurrently and
+/// then serialize only own-event creation (post-delta parents) under its
+/// own lock — keeping `k` chained events per tick with per-slot
+/// `other_parent`s that reflect the just-synced peer head.
+///
 /// The delta arrives topologically sorted (parents first), so on the first
 /// `MissingParent` the insertable prefix is kept and the blocking event plus
 /// every event after it is counted as blocked — later events cannot be
 /// admitted without their parents. Non-parent errors (bad signatures,
 /// unknown creators) still abort the round: they signal a faulty peer, not a
 /// history gap.
-async fn exchange_delta(
+pub(crate) async fn exchange_delta(
     transport: &mut (impl SyncTransport + Send),
     hashgraph: &Arc<Mutex<consensus::Hashgraph>>,
     registry: &MembershipRegistry,
@@ -225,8 +235,9 @@ async fn exchange_delta(
 /// The read and the insert are deliberately split across two short lock
 /// holdings with only synchronous signing in between, so concurrent callers
 /// would still race on the same `self_parent` (an honest self-fork). The
-/// fanout driver therefore precreates its `k` per-tick events sequentially
-/// (see [`run_sync_with_precreated_event`]); concurrent use is not supported.
+/// fanout driver therefore serializes its `k` per-tick creations under its
+/// own-event lock after each task's delta exchange (see `node.rs`); concurrent
+/// use without that lock is not supported.
 pub async fn create_own_event(
     hashgraph: &Arc<Mutex<consensus::Hashgraph>>,
     registry: &MembershipRegistry,

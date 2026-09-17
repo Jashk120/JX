@@ -1059,10 +1059,16 @@ async fn reconnect_existing_node_catches_up() {
         }
     }
 
+    // The wipe left node 4 with an empty graph below the teachers' retained
+    // floor. Flag it for reconnect BEFORE resuming: otherwise the first
+    // post-wipe tick may delta-sync — or see an empty, dedup-filtered delta
+    // indistinguishable from "in sync" — and emit a parentless genesis event
+    // that trips the resumption wait below before any checkpoint is applied.
+    node4.request_reconnect();
+
     // Resume node 4 on fresh listeners (its original task ended when stopped).
     // Its peers still point at the teachers' live addresses. The first
-    // delta-sync gaps, the driver reconnects from a checkpoint, and node 4
-    // resumes producing events.
+    // tick reconnects from a checkpoint, and node 4 resumes producing events.
     let listener4b = bind_ephemeral().await;
     let reconnect4b = bind_ephemeral().await;
     let stop4b = Arc::new(AtomicBool::new(false));
@@ -1073,14 +1079,33 @@ async fn reconnect_existing_node_catches_up() {
             spawn4b.run_until_stopped_with_reconnect(listener4b, reconnect4b, stop_handle4b).await;
     });
 
-    wait_for_new_own_event(&node4, node4_id, &frozen_own, DEADLINE).await;
+    // Generous post-wipe budget: isolated runs already take ~18s total and
+    // parallel load slows the checkpoint fetch.
+    const RECONNECT_DEADLINE: Duration = Duration::from_secs(60);
+    wait_for_new_own_event(&node4, node4_id, &frozen_own, RECONNECT_DEADLINE).await;
 
     // The reconnect's apply_checkpoint restored node 4 from a served
     // checkpoint at or beyond the teachers' accepted floor. Node 4 had wiped
     // its graph empty, so the new event it produced just now is only reachable
     // by having applied that checkpoint — a clean catch-up always gaps against
     // the pruned retained window.
-    let applied = node4.latest_accepted_checkpoint_round().await;
+    //
+    // The first post-wipe event only proves the driver is live; the checkpoint
+    // fetch can lag it under parallel load, so poll for the applied checkpoint
+    // instead of asserting immediately (the old immediate assert fired before
+    // the reconnect landed).
+    let applied = timeout(RECONNECT_DEADLINE, async {
+        loop {
+            if let Some(round) = node4.latest_accepted_checkpoint_round().await
+                && round >= 4
+            {
+                return Some(round);
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("node 4 reconnects and applies a checkpoint at or beyond the teachers' floor");
     assert!(
         applied.is_some_and(|round| round >= 4),
         "node 4 must have reconnected and applied a checkpoint at or beyond the \
