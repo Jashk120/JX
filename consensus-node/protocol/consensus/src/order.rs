@@ -45,6 +45,8 @@
 //! `assign_order` scans the stored events once per finalized round (not per
 //! insertion), and events that are already ordered are skipped.
 
+use std::sync::atomic::Ordering;
+
 use primitives::{
     EventHash,
     NodeId,
@@ -199,7 +201,20 @@ impl Hashgraph {
                 }
             }
 
-            let event = self.creator_chain_event(witness, *node_id, *idx, low)?;
+            let event = match self.creator_chain_event(witness, *node_id, *idx, low) {
+                Some(event) => event,
+                None => {
+                    self.walk_metrics.first_seen_missing_boundary.fetch_add(1, Ordering::Relaxed);
+                    return None;
+                }
+            };
+            self.walk_metrics.first_seen_max_span.fetch_max(up_to - low, Ordering::Relaxed);
+            if let Some(boundary_round) = self.get(&event).map(|r| r.round()) {
+                self.walk_metrics.first_seen_max_round_span.fetch_max(
+                    witness_record.round().saturating_sub(boundary_round),
+                    Ordering::Relaxed,
+                );
+            }
             let replace = match earliest {
                 None => true,
                 Some((best_seq, best_event)) => {
@@ -531,6 +546,27 @@ mod tests {
             assert_eq!(g.hg.first_seen_timestamp(witness, &a1), Some(ts.get()));
         }
         assert_eq!(g.hg.consensus_timestamp(&a1), Some(ts));
+    }
+
+    /// Walk-diagnostic coverage: ordering the deep clique runs both chain
+    /// walks, so every span counter must be exercised. Round 1's `a1` is
+    /// first-seen by round-2 famous witnesses through `a1` itself (round 1),
+    /// which pins both the seq span (`up_to - 1 >= 1`) and the round span
+    /// (`2 - 1 >= 1`) deterministically — see
+    /// `simple_round_received_and_consensus_timestamp`.
+    #[test]
+    fn walk_metrics_record_spans_during_ordering() {
+        let g = build_deep_clique();
+        let snap = g.hg.walk_metrics();
+        assert!(
+            snap.member_chain_max_steps >= 1,
+            "insert-time strongly-see walks must record steps, got {snap:?}"
+        );
+        assert!(snap.first_seen_max_span >= 1, "ordering must span creator seqs, got {snap:?}");
+        assert!(
+            snap.first_seen_max_round_span >= 1,
+            "a round-2 witness first-seeing a round-1 event spans a round, got {snap:?}"
+        );
     }
 
     /// Spec §8 test 2 — even-median case. `a3` is seen by all four round-2

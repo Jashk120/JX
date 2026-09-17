@@ -3,6 +3,7 @@ use std::collections::{
     HashSet,
     VecDeque,
 };
+use std::sync::atomic::Ordering;
 
 use primitives::{
     EventHash,
@@ -131,19 +132,72 @@ impl Hashgraph {
             self.event_for_creator_seq(creator, up_to_seq)
         };
 
+        // The creator's frontier event itself is absent while the ancestry
+        // summary claims one exists (`up_to_seq != 0`): it was pruned. A
+        // `up_to_seq == 0` lookup is trivially empty ("no ancestor from this
+        // member"), never a hard stop.
+        if current.is_none() {
+            if up_to_seq != 0 {
+                self.walk_metrics.member_chain_hard_stops.fetch_add(1, Ordering::Relaxed);
+            }
+            // No event visited, so the round span is 0 by definition.
+            self.walk_metrics.member_chain_max_round_span.fetch_max(0, Ordering::Relaxed);
+            return Ok(false);
+        }
+
+        // Birth round of the starting event and the lowest birth round
+        // visited so far. The walk descends via self-parents (rounds are
+        // non-increasing along the chain), so the span is
+        // `start_round - deepest_round`.
+        let start_round = current.and_then(|hash| self.get(&hash).map(|r| r.round()));
+        let mut deepest_round = start_round;
+        let record_round_span = |start_round: Option<u64>, deepest_round: Option<u64>| {
+            let span = match (start_round, deepest_round) {
+                (Some(start), Some(deepest)) => start.saturating_sub(deepest),
+                _ => 0,
+            };
+            self.walk_metrics.member_chain_max_round_span.fetch_max(span, Ordering::Relaxed);
+        };
+
+        let mut steps: u64 = 0;
         while let Some(hash) = current {
+            steps += 1;
+            let record = self.get(&hash);
+            if let Some(round) = record.map(|r| r.round()) {
+                deepest_round = Some(deepest_round.map_or(round, |deepest| deepest.min(round)));
+            }
             if self.see(&hash, y)? {
+                self.walk_metrics.member_chain_max_steps.fetch_max(steps, Ordering::Relaxed);
+                record_round_span(start_round, deepest_round);
                 return Ok(true);
             }
             // Follow the self-parent chain, but stop when the parent was
             // pruned below the retained window (a border anchor's own parent
             // is intentionally dropped): a missing edge is a hard stop, not
-            // an error.
-            current = self.get(&hash).and_then(|r| {
-                let parent = r.event().self_parent().copied()?;
-                self.get(&parent).map(|_| parent)
-            });
+            // an error. A parentless record is genesis: a clean end, not a
+            // hard stop.
+            let parent = record.and_then(|r| r.event().self_parent().copied());
+            match parent {
+                None => {
+                    self.walk_metrics.member_chain_max_steps.fetch_max(steps, Ordering::Relaxed);
+                    record_round_span(start_round, deepest_round);
+                    return Ok(false);
+                }
+                Some(parent) => {
+                    if self.get(&parent).is_none() {
+                        self.walk_metrics.member_chain_hard_stops.fetch_add(1, Ordering::Relaxed);
+                        self.walk_metrics
+                            .member_chain_max_steps
+                            .fetch_max(steps, Ordering::Relaxed);
+                        record_round_span(start_round, deepest_round);
+                        return Ok(false);
+                    }
+                    current = Some(parent);
+                }
+            }
         }
+        self.walk_metrics.member_chain_max_steps.fetch_max(steps, Ordering::Relaxed);
+        record_round_span(start_round, deepest_round);
         Ok(false)
     }
 
@@ -254,6 +308,7 @@ mod tests {
 
     use super::*;
     use crate::hashgraph::Hashgraph;
+    use crate::reconnect::RetainedEvent;
 
     fn registry_of(nodes: &[(NodeId, &SigningKey)]) -> MembershipRegistry {
         let mut registry = MembershipRegistry::new();
@@ -453,6 +508,171 @@ mod tests {
         // A3 reaches A1 through A2, and B2 reaches A1; C and D do not.
         // Thus supermajority_count = 2; 2 * 3 = 6 is not > 4 * 2 = 8.
         assert!(!g.hg.strongly_see(&g.a3, &g.a1).unwrap());
+    }
+
+    #[test]
+    fn walk_metrics_record_member_chain_walks() {
+        let g = build_shared_graph();
+        // Inserts already walk member chains (`finalize_round`), so the
+        // counters are nonzero before this test walks anything itself.
+        let before = g.hg.walk_metrics();
+
+        assert!(g.hg.strongly_see(&g.a3, &g.b1).unwrap());
+
+        let after = g.hg.walk_metrics();
+        assert!(
+            after.member_chain_max_steps >= 1,
+            "a strongly_see walk must record at least one chain step, got {after:?}"
+        );
+        assert!(
+            after.member_chain_max_steps >= before.member_chain_max_steps,
+            "counters only move forward, got {before:?} -> {after:?}"
+        );
+        assert_eq!(
+            after.member_chain_hard_stops, before.member_chain_hard_stops,
+            "an unpruned graph must record no new hard stops, got {before:?} -> {after:?}"
+        );
+    }
+
+    #[test]
+    fn walk_metrics_count_pruned_hard_stops() {
+        let key_a = SigningKey::generate(&mut OsRng);
+        let key_b = SigningKey::generate(&mut OsRng);
+        let node_a = NodeId::new(1);
+        let node_b = NodeId::new(2);
+        let registry = registry_of(&[(node_a, &key_a), (node_b, &key_b)]);
+        let mut hg = Hashgraph::new(&registry);
+
+        let mut insert_live = |key: &SigningKey,
+                               creator: NodeId,
+                               self_parent: Option<EventHash>,
+                               other_parent: Option<EventHash>,
+                               ts: u64|
+         -> EventHash {
+            let unsigned = UnsignedEvent::new(
+                creator,
+                self_parent,
+                other_parent,
+                Timestamp::new(ts),
+                Vec::new(),
+            );
+            let signed = unsigned.sign(key).unwrap();
+            let verified = signed.verify(&registry).expect("test event should verify");
+            hg.insert(verified).expect("test event insertion should succeed")
+        };
+
+        let a1 = insert_live(&key_a, node_a, None, None, 1);
+        let _a2 = insert_live(&key_a, node_a, Some(a1), None, 2);
+        let b1 = insert_live(&key_b, node_b, None, None, 3);
+
+        // An event whose declared self-parent was pruned away (accepted via
+        // the reconnect path, which tolerates absent parents).
+        let ghost = EventHash::new([9; 32]);
+        let pruned = UnsignedEvent::new(node_a, Some(ghost), None, Timestamp::new(4), Vec::new())
+            .sign(&key_a)
+            .unwrap();
+        let a3 = hg
+            .insert_accepted(
+                RetainedEvent {
+                    event: pruned,
+                    seq: 4,
+                    round: 1,
+                    ancestor_seqs: vec![4, 0],
+                    round_received: None,
+                    consensus_timestamp: None,
+                },
+                1,
+            )
+            .expect("pruned-parent record inserts");
+        let a_idx = hg.member_index_of(&node_a).unwrap();
+        let b_idx = hg.member_index_of(&node_b).unwrap();
+
+        let before = hg.walk_metrics();
+        // a3 cannot see b1 (it predates any event from B), so the walk runs
+        // past a3 into the pruned edge and stops hard.
+        assert!(!hg.member_chain_reaches(&a3, node_a, a_idx, 4, &b1).unwrap());
+        let after = hg.walk_metrics();
+        assert_eq!(
+            after.member_chain_hard_stops,
+            before.member_chain_hard_stops + 1,
+            "a walk ending at a pruned edge is one hard stop, got {after:?}"
+        );
+        assert!(
+            after.member_chain_max_steps >= 1,
+            "the hard-stopped walk still records its steps, got {after:?}"
+        );
+
+        // A nonzero `up_to` whose frontier event itself is absent is a hard
+        // stop too; `up_to == 0` ("no ancestor from this member") never is.
+        assert!(!hg.member_chain_reaches(&a3, node_b, b_idx, 7, &b1).unwrap());
+        assert_eq!(hg.walk_metrics().member_chain_hard_stops, after.member_chain_hard_stops + 1);
+        assert!(!hg.member_chain_reaches(&a3, node_b, b_idx, 0, &b1).unwrap());
+        assert_eq!(hg.walk_metrics().member_chain_hard_stops, after.member_chain_hard_stops + 1);
+    }
+
+    #[test]
+    fn walk_metrics_record_member_chain_round_span() {
+        let key_a = SigningKey::generate(&mut OsRng);
+        let key_b = SigningKey::generate(&mut OsRng);
+        let node_a = NodeId::new(1);
+        let node_b = NodeId::new(2);
+        let registry = registry_of(&[(node_a, &key_a), (node_b, &key_b)]);
+        let mut hg = Hashgraph::new(&registry);
+
+        // Explicit birth rounds via the reconnect path (which takes `round`
+        // as given instead of running the fame machinery): A climbs 1 -> 3
+        // -> 5 while B stays at round 1, so a full descent spans 4 rounds.
+        let mut accept = |key: &SigningKey,
+                          creator: NodeId,
+                          self_parent: Option<EventHash>,
+                          seq: u64,
+                          round: u64,
+                          row: Vec<u64>,
+                          ts: u64|
+         -> EventHash {
+            let event =
+                UnsignedEvent::new(creator, self_parent, None, Timestamp::new(ts), Vec::new())
+                    .sign(key)
+                    .unwrap();
+            hg.insert_accepted(
+                RetainedEvent {
+                    event,
+                    seq,
+                    round,
+                    ancestor_seqs: row,
+                    round_received: None,
+                    consensus_timestamp: None,
+                },
+                round,
+            )
+            .expect("accepted record inserts")
+        };
+
+        let e1 = accept(&key_a, node_a, None, 1, 1, vec![1, 0], 1);
+        let e2 = accept(&key_a, node_a, Some(e1), 2, 3, vec![2, 0], 2);
+        let e3 = accept(&key_a, node_a, Some(e2), 3, 5, vec![3, 0], 3);
+        let b1 = accept(&key_b, node_b, None, 1, 1, vec![0, 1], 4);
+        let a_idx = hg.member_index_of(&node_a).unwrap();
+
+        let before = hg.walk_metrics();
+        // e3's chain never sees b1, so the walk descends e3 -> e2 -> e1 and
+        // ends at genesis: 3 steps spanning rounds 5 down to 1.
+        assert!(!hg.member_chain_reaches(&e3, node_a, a_idx, 3, &b1).unwrap());
+        let after = hg.walk_metrics();
+        assert_eq!(
+            after.member_chain_max_steps,
+            before.member_chain_max_steps.max(3),
+            "the walk visits exactly 3 events, got {before:?} -> {after:?}"
+        );
+        assert_eq!(
+            after.member_chain_max_round_span,
+            before.member_chain_max_round_span.max(4),
+            "the walk spans rounds 5 down to 1, got {before:?} -> {after:?}"
+        );
+        assert_eq!(
+            after.member_chain_hard_stops, before.member_chain_hard_stops,
+            "a clean genesis end is not a hard stop, got {before:?} -> {after:?}"
+        );
     }
 
     #[test]

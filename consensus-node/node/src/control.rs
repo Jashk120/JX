@@ -97,6 +97,27 @@ pub struct GossipMetricsReport {
     pub concurrent_syncs: usize,
 }
 
+/// Snapshot of the consensus ancestry-walk diagnostics (PLAN-4 Phase 0).
+/// Read-only counters measuring the `member_chain_reaches` and
+/// `first_seen_timestamp` chain walks, so the signed reconnect window `W`
+/// can be sized from live data.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct WalkMetricsReport {
+    pub member_chain_max_steps: u64,
+    pub member_chain_hard_stops: u64,
+    pub first_seen_max_span: u64,
+    pub first_seen_missing_boundary: u64,
+    /// Max birth-round span of a `member_chain_reaches` walk. Retention is
+    /// round-based, so `W` (in rounds) is sized off this figure.
+    /// `#[serde(default)]` keeps an older 4-field report parseable.
+    #[serde(default)]
+    pub member_chain_max_round_span: u64,
+    /// Max `witness_round - boundary_event_round` in `first_seen_timestamp`.
+    /// `#[serde(default)]` keeps an older 4-field report parseable.
+    #[serde(default)]
+    pub first_seen_max_round_span: u64,
+}
+
 /// The `status` report: node identity, current roster, known peers, and the
 /// ordering/checkpoint watermarks.
 #[derive(Debug, Serialize, Deserialize)]
@@ -113,6 +134,8 @@ pub struct StatusReport {
     pub checkpoint_roster: Vec<MemberReport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gossip_metrics: Option<GossipMetricsReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub walk_metrics: Option<WalkMetricsReport>,
 }
 
 /// One consensus member in the `status` report.
@@ -301,9 +324,21 @@ async fn dispatch(request: ControlRequest, node: &GossipNode) -> ControlResponse
 async fn status_response(node: &GossipNode) -> ControlResponse {
     let node_id = node.node_id.get();
     let peers = node.peers().await;
-    let (ordered_round, decided_round) = {
+    let (ordered_round, decided_round, walk_metrics) = {
         let hg = node.hashgraph.lock().await;
-        (hg.max_ordered_round(), hg.highest_decided_round())
+        let snapshot = hg.walk_metrics();
+        (
+            hg.max_ordered_round(),
+            hg.highest_decided_round(),
+            WalkMetricsReport {
+                member_chain_max_steps: snapshot.member_chain_max_steps,
+                member_chain_hard_stops: snapshot.member_chain_hard_stops,
+                first_seen_max_span: snapshot.first_seen_max_span,
+                first_seen_missing_boundary: snapshot.first_seen_missing_boundary,
+                member_chain_max_round_span: snapshot.member_chain_max_round_span,
+                first_seen_max_round_span: snapshot.first_seen_max_round_span,
+            },
+        )
     };
     // The live member set (structural, matching `is_consensus_member`): a
     // member shows up here as soon as its add op activates, consistent with
@@ -371,6 +406,7 @@ async fn status_response(node: &GossipNode) -> ControlResponse {
         latest_checkpoint_round,
         checkpoint_roster,
         gossip_metrics: Some(gossip_metrics),
+        walk_metrics: Some(walk_metrics),
     }))
 }
 

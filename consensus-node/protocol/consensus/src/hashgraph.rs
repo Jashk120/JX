@@ -2,6 +2,10 @@ use std::collections::{
     BTreeSet,
     HashMap,
 };
+use std::sync::atomic::{
+    AtomicU64,
+    Ordering,
+};
 
 use crypto::{
     Hashable,
@@ -144,6 +148,53 @@ impl EventRecord {
 
 pub type InsertError = ConsensusError;
 
+/// PLAN-4 Phase 0 — read-only, always-on diagnostic counters for the two
+/// ancestry chain walks (`member_chain_reaches` in `ancestry.rs` and
+/// `first_seen_timestamp` in `order.rs`). The signed reconnect window `W`
+/// must strictly exceed the maximum walk depth, and these counters measure
+/// that depth on a live cluster instead of guessing it.
+///
+/// `Relaxed` ordering is sufficient: `Hashgraph` is always behind a
+/// `tokio::sync::Mutex` in `GossipNode`, so no ordering beyond atomicity is
+/// needed. Methods that touch these counters stay `&self`.
+#[derive(Debug, Default)]
+pub struct WalkMetrics {
+    /// Max iterations of the `while let Some(hash) = current` loop in
+    /// `member_chain_reaches`.
+    pub(crate) member_chain_max_steps: AtomicU64,
+    /// Walks that ended because a declared self-parent was absent (pruned) —
+    /// not because the chain reached a genesis/parentless event and not
+    /// because `see` returned true. Includes the initial-lookup case where
+    /// the creator's frontier event itself was pruned.
+    pub(crate) member_chain_hard_stops: AtomicU64,
+    /// Max `up_to - low` (in sequence numbers) found in
+    /// `first_seen_timestamp` for a creator whose boundary event exists.
+    pub(crate) first_seen_max_span: AtomicU64,
+    /// Times the boundary event lookup (`creator_chain_event(..., low)`)
+    /// returned `None` in `first_seen_timestamp`.
+    pub(crate) first_seen_missing_boundary: AtomicU64,
+    /// Max birth-round span (`start_round - deepest_round`) of a
+    /// `member_chain_reaches` walk. Retention is round-based while the walk
+    /// itself is seq-based, so the reconnect window `W` (in rounds) is sized
+    /// off this figure; the seq-based `member_chain_max_steps` is secondary.
+    pub(crate) member_chain_max_round_span: AtomicU64,
+    /// Max `witness_round - boundary_event_round` found in
+    /// `first_seen_timestamp` for a creator whose boundary event exists.
+    pub(crate) first_seen_max_round_span: AtomicU64,
+}
+
+/// Plain `Copy` snapshot of [`WalkMetrics`], for reporting (e.g. the
+/// `jkaind status` JSON). Read via [`Hashgraph::walk_metrics`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WalkMetricsSnapshot {
+    pub member_chain_max_steps: u64,
+    pub member_chain_hard_stops: u64,
+    pub first_seen_max_span: u64,
+    pub first_seen_missing_boundary: u64,
+    pub member_chain_max_round_span: u64,
+    pub first_seen_max_round_span: u64,
+}
+
 /// This node's local copy of the hashgraph (Consensus Spec §1.2).
 /// Storage plus the ancestry caching strategy from §1.3's
 /// `[DECISION NEEDED]` note.
@@ -206,6 +257,9 @@ pub struct Hashgraph {
     /// Consensus Spec §4 — the lowest round whose `assignOrder` has not run
     /// yet. Rounds are finalized in strictly increasing order.
     next_round_to_order: u64,
+    /// PLAN-4 Phase 0 — diagnostic counters for the ancestry chain walks.
+    /// Read-only instrumentation; never affects consensus behavior.
+    pub(crate) walk_metrics: WalkMetrics,
 }
 
 impl Hashgraph {
@@ -229,6 +283,7 @@ impl Hashgraph {
             highest_witness_round: 0,
             fully_decided_rounds: BTreeSet::new(),
             next_round_to_order: 1,
+            walk_metrics: WalkMetrics::default(),
         }
     }
 
@@ -270,6 +325,7 @@ impl Hashgraph {
             highest_witness_round: checkpoint.round,
             fully_decided_rounds,
             next_round_to_order: checkpoint.round.saturating_add(1),
+            walk_metrics: WalkMetrics::default(),
         }
     }
 
@@ -858,6 +914,33 @@ impl Hashgraph {
 
     pub fn member_count(&self) -> usize {
         self.member_count
+    }
+
+    /// PLAN-4 Phase 0 — snapshot of the ancestry-walk diagnostic counters.
+    pub fn walk_metrics(&self) -> WalkMetricsSnapshot {
+        WalkMetricsSnapshot {
+            member_chain_max_steps: self
+                .walk_metrics
+                .member_chain_max_steps
+                .load(Ordering::Relaxed),
+            member_chain_hard_stops: self
+                .walk_metrics
+                .member_chain_hard_stops
+                .load(Ordering::Relaxed),
+            first_seen_max_span: self.walk_metrics.first_seen_max_span.load(Ordering::Relaxed),
+            first_seen_missing_boundary: self
+                .walk_metrics
+                .first_seen_missing_boundary
+                .load(Ordering::Relaxed),
+            member_chain_max_round_span: self
+                .walk_metrics
+                .member_chain_max_round_span
+                .load(Ordering::Relaxed),
+            first_seen_max_round_span: self
+                .walk_metrics
+                .first_seen_max_round_span
+                .load(Ordering::Relaxed),
+        }
     }
 
     /// Phase 4 — the round-indexed roster snapshots, for serializing a

@@ -30,6 +30,7 @@ pub use hashgraph::{
     FameStatus,
     Hashgraph,
     InsertError,
+    WalkMetricsSnapshot,
 };
 pub use reconnect::{
     RetainedEvent,
