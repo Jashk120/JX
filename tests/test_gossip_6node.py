@@ -218,6 +218,7 @@ async def test_6node_partition_and_heal() -> None:
             await mgr.submit_put(f"k-prepart-{i}".encode(), b"v", node_id=(i % 6) + 1)
         base = await wait_for_decided_round(mgr.nodes(), min_round=2, timeout=30.0, poll_interval=0.5)
         base_round = max(s.decided_round for s in base.values())
+        base_ckpt = max((s.latest_checkpoint_round or 0) for s in base.values())
         print(f"[test_6node_partition_and_heal] base decided={base_round}")
 
         mesh = mgr._mesh  # type: ignore[attr-defined]
@@ -260,7 +261,9 @@ async def test_6node_partition_and_heal() -> None:
         print(f"[test] healed decided: { {nid: s.decided_round for nid, s in healed.items()} }")
         assert frontiers_within_bound(healed, bound=3)
 
-        # no split-brain checkpoint: all nodes same roster
+        # Wait past the pre-partition checkpoint round: an un-checkpointed node
+        # reports an empty roster and would otherwise look like split-brain.
+        healed = await wait_for_checkpoint(mgr.nodes(), min_round=base_ckpt + 1, timeout=60.0, poll_interval=0.5)
         assert checkpoint_roster_consistent(healed), f"split-brain checkpoint: { {nid: [m.node_id for m in s.checkpoint_roster] for nid, s in healed.items()} }"
 
         # all 6 see each other as peers (allow transient 4+)
