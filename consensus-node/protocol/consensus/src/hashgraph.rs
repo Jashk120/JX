@@ -400,9 +400,12 @@ impl Hashgraph {
     ///   `seq >= 1` when the self-parent was pruned away).
     /// - `ancestor_seqs` must equal the elementwise max of the present
     ///   parents' rows (the same incremental rule [`Hashgraph::insert`]
-    ///   uses) with the own creator slot set to `seq`. With no parent
-    ///   present the peer row is accepted but the own slot must still equal
-    ///   `seq`.
+    ///   uses) with the own creator slot set to `seq` when no declared parent
+    ///   was pruned. When a declared parent is missing (pruned), the row
+    ///   cannot be re-derived: the own slot must equal `seq` and no slot may
+    ///   fall below the present parents' row (an elementwise floor).
+    ///   Overstatement of the pruned parent's contribution stays
+    ///   peer-asserted, as it already is when no parent is present.
     /// - `round` must be at least the [`crate::round::base_round`] of the
     ///   present parents. A birth `round` above that floor stays
     ///   peer-asserted (the residual trust: an unordered event's exact birth
@@ -487,7 +490,34 @@ impl Hashgraph {
             }
         }
 
-        if self_parent_record.is_some() || other_parent_record.is_some() {
+        // A declared parent that is not present was pruned; an *undeclared*
+        // parent contributes nothing and keeps the row fully re-derivable.
+        let self_pruned = event.self_parent().is_some() && self_parent_record.is_none();
+        let other_pruned = event.other_parent().is_some() && other_parent_record.is_none();
+
+        if self_pruned || other_pruned {
+            // A pruned parent's contribution cannot be recovered, so the row
+            // cannot be re-derived exactly. Require what is provable: own slot
+            // == seq, and no slot below the present parents' row.
+            // Overstatement of the pruned parent stays peer-asserted, as it
+            // already is when no parent is present.
+            let mut floor = vec![0u64; self.member_count];
+            if let Some(record) = self_parent_record {
+                floor.copy_from_slice(record.ancestor_seqs());
+            }
+            if let Some(record) = other_parent_record {
+                for (slot, &value) in floor.iter_mut().zip(record.ancestor_seqs().iter()) {
+                    *slot = (*slot).max(value);
+                }
+            }
+            if ancestor_seqs[creator_idx] != seq
+                || ancestor_seqs.iter().zip(floor.iter()).any(|(&row, &min)| row < min)
+            {
+                return Err(InsertError::InvalidRetainedAncestors);
+            }
+        } else if self_parent_record.is_some() || other_parent_record.is_some() {
+            // Every declared parent is present: the row is fully re-derivable,
+            // so require it exactly (the anti-forgery case).
             let mut expected = vec![0u64; self.member_count];
             if let Some(record) = self_parent_record {
                 expected.copy_from_slice(record.ancestor_seqs());
@@ -2073,6 +2103,96 @@ mod tests {
             hg.insert_accepted(retained(bad_slot, 5, 1, vec![0, 0], None, None), 1),
             Err(InsertError::InvalidRetainedAncestors)
         );
+    }
+
+    /// One parent present plus one pruned: the row must satisfy the present
+    /// parent's floor, not exact equality (a concurrent pruned parent breaks it).
+    #[test]
+    fn insert_accepted_accepts_row_above_pruned_parent_floor() {
+        let key_a = SigningKey::generate(&mut OsRng);
+        let key_b = SigningKey::generate(&mut OsRng);
+        let node_a = NodeId::new(1);
+        let node_b = NodeId::new(2);
+        let registry = registry_of(&[(node_a, &key_a), (node_b, &key_b)]);
+        let checkpoint = CheckpointPayload::new(
+            1,
+            crate::checkpoint::compute_records_root(&[]),
+            [0u8; 32],
+            registry.clone(),
+        );
+        let mut hg = Hashgraph::from_checkpoint(&checkpoint, RosterHistory::new(registry));
+
+        // a1 never saw creator B: row [1, 0].
+        let a1 = UnsignedEvent::new(node_a, None, None, Timestamp::new(100), Vec::new())
+            .sign(&key_a)
+            .unwrap();
+        let a1_hash =
+            hg.insert_accepted(retained(a1, 1, 1, vec![1, 0], None, None), 1).expect("a1 inserts");
+
+        // The child's other-parent (creator B) was pruned and is absent, so
+        // exactly one parent is present. Its honest row [2, 1] carries the
+        // pruned concurrent parent's creator-B slot, which a1's row lacks.
+        let pruned_b = EventHash::new([7; 32]);
+        let child = UnsignedEvent::new(
+            node_a,
+            Some(a1_hash),
+            Some(pruned_b),
+            Timestamp::new(101),
+            Vec::new(),
+        )
+        .sign(&key_a)
+        .unwrap();
+        hg.insert_accepted(retained(child, 2, 1, vec![2, 1], None, None), 1)
+            .expect("row above the present parent's floor inserts");
+    }
+
+    /// The floor still rejects understatement of the present parent, and the
+    /// own slot must equal `seq`.
+    #[test]
+    fn insert_accepted_rejects_row_below_pruned_parent_floor() {
+        let key_a = SigningKey::generate(&mut OsRng);
+        let key_b = SigningKey::generate(&mut OsRng);
+        let node_a = NodeId::new(1);
+        let node_b = NodeId::new(2);
+        let registry = registry_of(&[(node_a, &key_a), (node_b, &key_b)]);
+        let checkpoint = CheckpointPayload::new(
+            1,
+            crate::checkpoint::compute_records_root(&[]),
+            [0u8; 32],
+            registry.clone(),
+        );
+        let mut hg = Hashgraph::from_checkpoint(&checkpoint, RosterHistory::new(registry));
+
+        // a1 saw creator B: row [1, 1] establishes a non-zero floor.
+        let a1 = UnsignedEvent::new(node_a, None, None, Timestamp::new(100), Vec::new())
+            .sign(&key_a)
+            .unwrap();
+        let a1_hash =
+            hg.insert_accepted(retained(a1, 1, 1, vec![1, 1], None, None), 1).expect("a1 inserts");
+
+        let pruned_b = EventHash::new([7; 32]);
+        let child = |ts: u64| {
+            UnsignedEvent::new(
+                node_a,
+                Some(a1_hash),
+                Some(pruned_b),
+                Timestamp::new(ts),
+                Vec::new(),
+            )
+            .sign(&key_a)
+            .unwrap()
+        };
+
+        assert_eq!(
+            hg.insert_accepted(retained(child(101), 2, 1, vec![2, 0], None, None), 1),
+            Err(InsertError::InvalidRetainedAncestors)
+        );
+        assert_eq!(
+            hg.insert_accepted(retained(child(102), 2, 1, vec![1, 1], None, None), 1),
+            Err(InsertError::InvalidRetainedAncestors)
+        );
+        hg.insert_accepted(retained(child(103), 2, 1, vec![2, 1], None, None), 1)
+            .expect("honest row inserts");
     }
 
     #[test]
