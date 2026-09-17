@@ -467,3 +467,86 @@ ancestry fast/slow fork paths; TLS pinning/SPKI derivation; restart/replay idemp
 proto↔Go field parity for all 11 messages; running-hash domain bytes and item-hash
 byte equality across Rust/Go; canonical roster/checkpoint signing-byte layouts;
 cluster-init secrets git-ignored.
+
+---
+
+# Open — 2026-09-17 (e2e stress pass)
+
+Findings from a 6-node stress run of the Python harness in `tests/` against the
+**release** binary (no thermal throttling: k10temp 66–73 °C, no `rambo` events).
+Reproduce:
+
+```bash
+cd consensus-node && cargo build --release --bin jkaind
+cd ..
+JKAIND_BIN=$PWD/consensus-node/target/release/jkaind JKAIN_KEEP_TMP=1 \
+  python3 -m pytest tests/test_gossip_6node.py::test_6node_convergence_no_latency -v -s
+```
+
+`JKAIN_KEEP_TMP=1` keeps `/tmp/jkain-harness-*` so node logs survive a failure.
+
+## CP-1. Checkpoint acceptance stalls on a node while it keeps deciding rounds
+
+- **Severity:** high (liveness). **Confidence:** certain (observed live).
+- **Evidence** (live status poll, 6 nodes direct, `decided` / `latest_checkpoint_round`):
+
+  | t | decided | checkpoint |
+  |---:|---|---|
+  | 60 s | all 24 | `{1:16, 2:16, 3:17, 4:22, 5:20, 6:20}` |
+  | 180 s | all ~69 | `{1:34, 2:65, 3:67, 4:65, 5:20, 6:65}` |
+
+  Node 5 held checkpoint round 20 for 120 s while every node decided round 69;
+  node 1 held round 34 for ~95 s. Observed starvation set varies per run.
+- **Effect:** `wait_for_checkpoint` over all 6 nodes is unreliable.
+  `tests/test_gossip_6node.py:78` (60 s timeout) and the post-heal checkpoint wait
+  in `test_6node_partition_and_heal` (`test_gossip_6node.py:266`) fail intermittently.
+- **Ruled out:** thermal throttling (release binary, cool); state/snapshot divergence
+  (no `refusing to accept checkpoint` in node logs); payload non-determinism on the
+  accepted branch (quorums did form, at rounds 20–67).
+- **Mechanism (traced in code):** a node accepts a checkpoint for round R only after
+  `produce_checkpoint` created an accumulator for it (`protocol/gossip/src/node.rs:1740-1744`),
+  and `produce_pending_checkpoints` advances sequentially, breaking at the first round
+  where `hg.is_round_decided(round)` is false (`node.rs:1679-1694`). A node whose local
+  view of round R never completes stops producing/accepting R and every later round while
+  its `decided_round` (ordering) keeps advancing. Signature collection is a second,
+  independent window: `accept_checkpoint` drops own sigs for accepted rounds
+  (`node.rs:1962-1965`) and `gossip_checkpoint_sigs` re-sends only until local accept
+  (`node.rs:2084-2093`), so a late producer may never collect 5-of-6.
+- **Attempted fix (REVERTED, insufficient):** retain own outbound sigs while
+  `sig.round + RETENTION_ROUNDS > accept_round` instead of dropping immediately. Starved
+  nodes fall further behind than the 2-round window, so this did not resolve it. Do not
+  re-apply without a companion fix for the `is_round_decided` gate.
+- **Follow-up:** (a) instrument `is_round_decided(R)` / `checkpoint_watermark` per node;
+  (b) add a checkpoint-lag detector that triggers the existing
+  `fetch_checkpoint` / `apply_checkpoint` path when local acceptance trails
+  `decided_round` by more than `RETENTION_ROUNDS`; (c) `apply_checkpoint` does not clear
+  `checkpoint_accumulators` / `pending_checkpoint_sigs` / `outbound_checkpoint_sigs`
+  (`node.rs:2420+`), so stale pre-partition entries linger after a heal.
+
+## CP-2. First-checkpoint latency is marginal against the 60 s harness timeout
+
+- **Severity:** medium (test flakiness). **Confidence:** certain (observed).
+- Some nodes accept their first checkpoint at ~60 s under the 25 ms sync interval, so
+  `wait_for_checkpoint(min_round=1, timeout=60.0)` passes or fails run to run even when
+  no node is permanently starved. Do not simply raise the timeout — CP-1's uneven
+  acceptance means the wait can be arbitrarily long for a lagging node.
+
+## Test-harness defects fixed (2026-09-17)
+
+| Commit | Fix |
+|---|---|
+| `51f42e3` | `ClusterManager.submit_put`/`submit_tx` pinned every default submission to node 1; now round-robin. |
+| `f0c624f` | `test_6node_out_of_order_and_backpressure` waited on `min_before + 1` but asserted each node advanced past its own value — false stall failure under skew. |
+| `73a198d` | `cleanup()` deleted node logs before failures could be post-mortemed; `JKAIN_KEEP_TMP=1` now preserves them. |
+| `a9bddcc` | `test_6node_partition_and_heal` asserted checkpoint-roster consistency immediately after heal; un-checkpointed nodes report an empty roster. Now waits past the pre-partition checkpoint round. |
+
+## Known test-harness caveats (not fixed)
+
+- `tests/harness/test_gap_vs_fanout_sweep.py:172-178` pins p50 to `0.15–1.2 s`, a band
+  calibrated on other hardware. Measured p50 on this box is ~2.6–3.5 s. Left unchanged:
+  recalibrating without a stable baseline would mask regressions.
+- `tests/test_finality_tps.py` latency sweep asserts monotonicity (`80 ms p50 > 0 ms p50`),
+  which run-to-run variance exceeds; flaky by construction.
+- Harness port allocation is `bind(0)` + close then re-bind, so proxy/node startup can
+  hit a transient `EADDRINUSE`; retry the run.
+
