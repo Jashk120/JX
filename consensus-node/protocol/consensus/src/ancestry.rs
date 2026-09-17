@@ -169,6 +169,19 @@ impl Hashgraph {
             if self.see(&hash, y)? {
                 self.walk_metrics.member_chain_max_steps.fetch_max(steps, Ordering::Relaxed);
                 record_round_span(start_round, deepest_round);
+                // Transition-only depth: this event is where the walk flips
+                // to `see == true`. Other exits (genesis, pruned edge) never
+                // touch these two counters.
+                self.walk_metrics
+                    .member_chain_max_transition_steps
+                    .fetch_max(steps, Ordering::Relaxed);
+                let transition_span = match (start_round, record.map(|r| r.round())) {
+                    (Some(start), Some(transition)) => start.saturating_sub(transition),
+                    _ => 0,
+                };
+                self.walk_metrics
+                    .member_chain_max_transition_round_span
+                    .fetch_max(transition_span, Ordering::Relaxed);
                 return Ok(true);
             }
             // Follow the self-parent chain, but stop when the parent was
@@ -532,6 +545,21 @@ mod tests {
             after.member_chain_hard_stops, before.member_chain_hard_stops,
             "an unpruned graph must record no new hard stops, got {before:?} -> {after:?}"
         );
+        // strongly_see(a3, b1) hits on every member chain, so the
+        // transition-only counters must move too.
+        assert!(
+            after.member_chain_max_transition_steps >= 1,
+            "a strongly_see hit must record a transition step, got {before:?} -> {after:?}"
+        );
+        assert!(
+            after.member_chain_max_transition_steps >= before.member_chain_max_transition_steps,
+            "transition counters only move forward, got {before:?} -> {after:?}"
+        );
+        assert!(
+            after.member_chain_max_transition_round_span
+                >= before.member_chain_max_transition_round_span,
+            "transition counters only move forward, got {before:?} -> {after:?}"
+        );
     }
 
     #[test]
@@ -608,6 +636,19 @@ mod tests {
         assert_eq!(hg.walk_metrics().member_chain_hard_stops, after.member_chain_hard_stops + 1);
         assert!(!hg.member_chain_reaches(&a3, node_b, b_idx, 0, &b1).unwrap());
         assert_eq!(hg.walk_metrics().member_chain_hard_stops, after.member_chain_hard_stops + 1);
+
+        // None of the three walks above transitions, so the transition-only
+        // counters must be untouched throughout.
+        let end = hg.walk_metrics();
+        assert_eq!(
+            end.member_chain_max_transition_steps, before.member_chain_max_transition_steps,
+            "hard-stop walks must not record transitions, got {before:?} -> {end:?}"
+        );
+        assert_eq!(
+            end.member_chain_max_transition_round_span,
+            before.member_chain_max_transition_round_span,
+            "hard-stop walks must not record transitions, got {before:?} -> {end:?}"
+        );
     }
 
     #[test]
@@ -672,6 +713,24 @@ mod tests {
         assert_eq!(
             after.member_chain_hard_stops, before.member_chain_hard_stops,
             "a clean genesis end is not a hard stop, got {before:?} -> {after:?}"
+        );
+
+        // A direct transition: e3 already sees e2, so the walk flips at step
+        // 1 on e3 itself — transition span rounds 5 - 5 = 0, while the plain
+        // max-step counter (already 3) does not move.
+        assert!(hg.member_chain_reaches(&e3, node_a, a_idx, 3, &e2).unwrap());
+        let transition = hg.walk_metrics();
+        assert_eq!(
+            transition.member_chain_max_transition_steps, 1,
+            "one transition at step 1, got {after:?} -> {transition:?}"
+        );
+        assert_eq!(
+            transition.member_chain_max_transition_round_span, 0,
+            "transition event is the round-5 start itself, got {after:?} -> {transition:?}"
+        );
+        assert_eq!(
+            transition.member_chain_max_steps, 3,
+            "a 1-step walk must not move the plain max, got {after:?} -> {transition:?}"
         );
     }
 

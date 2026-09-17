@@ -116,6 +116,15 @@ pub struct WalkMetricsReport {
     /// `#[serde(default)]` keeps an older 4-field report parseable.
     #[serde(default)]
     pub first_seen_max_round_span: u64,
+    /// Max steps of a `member_chain_reaches` walk ending on the `see == true`
+    /// transition (other exits excluded).
+    /// `#[serde(default)]` keeps an older report parseable.
+    #[serde(default)]
+    pub member_chain_max_transition_steps: u64,
+    /// Max `start_round - transition_event_round` over those walks.
+    /// `#[serde(default)]` keeps an older report parseable.
+    #[serde(default)]
+    pub member_chain_max_transition_round_span: u64,
 }
 
 /// The `status` report: node identity, current roster, known peers, and the
@@ -337,6 +346,9 @@ async fn status_response(node: &GossipNode) -> ControlResponse {
                 first_seen_missing_boundary: snapshot.first_seen_missing_boundary,
                 member_chain_max_round_span: snapshot.member_chain_max_round_span,
                 first_seen_max_round_span: snapshot.first_seen_max_round_span,
+                member_chain_max_transition_steps: snapshot.member_chain_max_transition_steps,
+                member_chain_max_transition_round_span: snapshot
+                    .member_chain_max_transition_round_span,
             },
         )
     };

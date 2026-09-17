@@ -181,6 +181,16 @@ pub struct WalkMetrics {
     /// Max `witness_round - boundary_event_round` found in
     /// `first_seen_timestamp` for a creator whose boundary event exists.
     pub(crate) first_seen_max_round_span: AtomicU64,
+    /// Max iterations of the `while let Some(hash) = current` loop in
+    /// `member_chain_reaches`, counting ONLY walks that end on the
+    /// `see(hash, y) == true` transition. Non-transition exits (genesis,
+    /// pruned hard stop) can descend to the creator's genesis and would
+    /// otherwise dominate the max; the spike reads the transition depth.
+    pub(crate) member_chain_max_transition_steps: AtomicU64,
+    /// Max `start_round - transition_event_round` over the same
+    /// transition-only walks: the `see`-TRUE transition depth in rounds,
+    /// which is what the round-based window `W` must exceed.
+    pub(crate) member_chain_max_transition_round_span: AtomicU64,
 }
 
 /// Plain `Copy` snapshot of [`WalkMetrics`], for reporting (e.g. the
@@ -193,6 +203,8 @@ pub struct WalkMetricsSnapshot {
     pub first_seen_missing_boundary: u64,
     pub member_chain_max_round_span: u64,
     pub first_seen_max_round_span: u64,
+    pub member_chain_max_transition_steps: u64,
+    pub member_chain_max_transition_round_span: u64,
 }
 
 /// This node's local copy of the hashgraph (Consensus Spec §1.2).
@@ -939,6 +951,14 @@ impl Hashgraph {
             first_seen_max_round_span: self
                 .walk_metrics
                 .first_seen_max_round_span
+                .load(Ordering::Relaxed),
+            member_chain_max_transition_steps: self
+                .walk_metrics
+                .member_chain_max_transition_steps
+                .load(Ordering::Relaxed),
+            member_chain_max_transition_round_span: self
+                .walk_metrics
+                .member_chain_max_transition_round_span
                 .load(Ordering::Relaxed),
         }
     }
