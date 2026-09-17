@@ -17,10 +17,18 @@ use crypto::{
     Hashable,
     MembershipRegistry,
 };
-use primitives::NodeId;
+use primitives::{
+    EventHash,
+    NodeId,
+};
 use sha2::{
     Digest,
     Sha256,
+};
+
+use crate::hashgraph::{
+    EventRecord,
+    Hashgraph,
 };
 
 /// Rounds of raw events to keep after a checkpoint round is confirmed, so a
@@ -100,6 +108,137 @@ pub fn try_compute_records_root(items: &[RecordsRootItem]) -> Result<[u8; 32], p
         level = next;
     }
     Ok(level[0])
+}
+
+/// Domain separation tag prefixing every [`compute_window_root`] leaf. It
+/// replaces the bare `0x00` prefix of [`compute_records_root`] so the window
+/// tree can never collide with the records tree (or `CheckpointDST`), even
+/// for byte-identical event hashes.
+const WINDOW_ROOT_DST: &[u8] = b"JKAIN-WINDOW-ROOT-V1";
+
+/// Computes the canonical signed-window Merkle root over decided history.
+///
+/// The canonical set is `window(round, W) = { events with `round_received`
+/// in `[round.saturating_sub(W), round]` }`, ordered by `round_received`
+/// ascending with ties broken by `Hashgraph::consensus_order(r)` within each
+/// round. A pure function of decided history: every honest node holding the
+/// same decided rounds derives the identical root, regardless of local
+/// retention or acceptance progress.
+///
+/// Each event in that order contributes one leaf (see `window_leaf_hash`):
+///
+/// ```text
+/// leaf = SHA256("JKAIN-WINDOW-ROOT-V1" || event_hash[32] || seq[u64 BE]
+///   || birth_round[u64 BE] || rr_tag[u8] (|| rr[u64 BE] when Some)
+///   || ts_tag[u8] (|| ts[u64 BE] when Some)
+///   || width[u32 BE] || ancestor_seqs[u64 BE x width])
+/// ```
+///
+/// Width normalization: `width` is `hg.member_count_at_round(round)` — the
+/// decided-history roster width at the checkpoint round — and each record's
+/// stored `ancestor_seqs` row is truncated or zero-padded to exactly that
+/// many slots. The raw stored row must not be used directly:
+/// `Hashgraph::add_member` appends a zero slot to every stored row, so the
+/// raw width is node/moment-dependent and the leaf would not be canonical.
+///
+/// Leaves fold through the same padded power-of-two `combine_hash` /
+/// `empty_hash` construction as [`compute_records_root`]. An empty window
+/// yields `empty_hash()`, identical to an empty [`compute_records_root`].
+pub fn compute_window_root(hg: &Hashgraph, round: u64, window_rounds: u64) -> [u8; 32] {
+    try_compute_window_root(hg, round, window_rounds)
+        .expect("window root overflow: canonical member count exceeds u32::MAX")
+}
+
+pub fn try_compute_window_root(
+    hg: &Hashgraph,
+    round: u64,
+    window_rounds: u64,
+) -> Result<[u8; 32], primitives::Error> {
+    let start = round.saturating_sub(window_rounds);
+    let mut hashes: Vec<EventHash> = Vec::new();
+    for r in start..=round {
+        hashes.extend(hg.consensus_order(r));
+    }
+    if hashes.is_empty() {
+        return Ok(empty_hash());
+    }
+    let canonical_width = hg.member_count_at_round(round);
+    let width_u32 = u32::try_from(canonical_width).map_err(|_| primitives::Error::OutOfRange {
+        field: "window_root member count",
+        got: canonical_width.to_string(),
+    })?;
+    let mut leaves: Vec<[u8; 32]> = Vec::with_capacity(hashes.len());
+    for hash in &hashes {
+        let record = hg.get(hash).ok_or_else(|| primitives::Error::OutOfRange {
+            field: "window_root event",
+            got: hash_hex(hash),
+        })?;
+        leaves.push(window_leaf_hash(hash, record, canonical_width, width_u32));
+    }
+    let padded_len = leaves.len().next_power_of_two();
+    leaves.resize(padded_len, empty_hash());
+    let mut level = leaves;
+    while level.len() > 1 {
+        let mut next = Vec::with_capacity(level.len() / 2);
+        for chunk in level.chunks(2) {
+            let left = chunk[0];
+            let right = chunk[1];
+            next.push(combine_hash(left, right));
+        }
+        level = next;
+    }
+    Ok(level[0])
+}
+
+/// One window leaf: the `WINDOW_ROOT_DST`-tagged binding of an event's
+/// identity (`event_hash`, creator `seq`, birth `round`) to its ordering
+/// metadata (`round_received`, `consensus_timestamp`) and its ancestry
+/// summary (`ancestor_seqs`, normalized to `canonical_width` slots).
+fn window_leaf_hash(
+    hash: &EventHash,
+    record: &EventRecord,
+    canonical_width: usize,
+    width_u32: u32,
+) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(WINDOW_ROOT_DST);
+    h.update(hash.as_bytes());
+    h.update(record.seq().to_be_bytes());
+    h.update(record.round().to_be_bytes());
+    match record.round_received() {
+        Some(round_received) => {
+            h.update([1u8]);
+            h.update(round_received.to_be_bytes());
+        }
+        None => {
+            h.update([0u8]);
+        }
+    }
+    match record.consensus_timestamp() {
+        Some(timestamp) => {
+            h.update([1u8]);
+            h.update(timestamp.get().to_be_bytes());
+        }
+        None => {
+            h.update([0u8]);
+        }
+    }
+    h.update(width_u32.to_be_bytes());
+    let row = record.ancestor_seqs();
+    for i in 0..canonical_width {
+        h.update(row.get(i).copied().unwrap_or(0).to_be_bytes());
+    }
+    h.finalize().into()
+}
+
+/// Lowercase hex of an event hash, for the missing-event error payload.
+fn hash_hex(hash: &EventHash) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(64);
+    for byte in hash.as_bytes() {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
 }
 
 /// One step in a Merkle inclusion proof for a [`RecordsRootItem`].
@@ -533,9 +672,21 @@ impl CheckpointAccumulator {
 #[cfg(test)]
 mod tests {
     use crypto::bls::BlsIdentity;
+    use crypto::{
+        Hashable,
+        RosterHistory,
+        Signable,
+    };
+    use ed25519_dalek::SigningKey;
+    use primitives::{
+        Event,
+        Timestamp,
+        UnsignedEvent,
+    };
     use rand::rngs::OsRng;
 
     use super::*;
+    use crate::reconnect::RetainedEvent;
 
     fn bls_for(id: u64) -> BlsIdentity {
         BlsIdentity::from_ikm(&[id as u8; 32]).expect("bls ikm")
@@ -943,5 +1094,193 @@ mod tests {
         let mut extra = bytes;
         extra.push(0);
         assert_eq!(CheckpointSig::decode(&extra), None);
+    }
+
+    fn window_keys(ids: &[u64]) -> Vec<(NodeId, SigningKey)> {
+        ids.iter().map(|&id| (NodeId::new(id), SigningKey::generate(&mut OsRng))).collect()
+    }
+
+    fn window_registry(keys: &[(NodeId, SigningKey)]) -> MembershipRegistry {
+        let mut registry = MembershipRegistry::new();
+        for (id, key) in keys {
+            let bls = BlsIdentity::from_ikm(&[id.get() as u8; 32]).expect("bls ikm");
+            registry.register(*id, key.verifying_key(), bls.public.to_bytes());
+        }
+        registry
+    }
+
+    fn sign_window_event(
+        key: &SigningKey,
+        creator: NodeId,
+        self_parent: Option<EventHash>,
+        ts: u64,
+    ) -> Event {
+        UnsignedEvent::new(creator, self_parent, None, Timestamp::new(ts), Vec::new())
+            .sign(key)
+            .expect("test event signs")
+    }
+
+    #[derive(Clone)]
+    struct WindowEventDef {
+        event: Event,
+        seq: u64,
+        round: u64,
+        ancestor_seqs: Vec<u64>,
+        round_received: u64,
+        consensus_ts: u64,
+    }
+
+    fn window_graph(
+        registry: &MembershipRegistry,
+        checkpoint_round: u64,
+        defs: &[WindowEventDef],
+    ) -> Hashgraph {
+        let payload = CheckpointPayload::new(
+            checkpoint_round,
+            compute_records_root(&[]),
+            [0u8; 32],
+            registry.clone(),
+        );
+        let mut hg = Hashgraph::from_checkpoint(&payload, RosterHistory::new(registry.clone()));
+        for def in defs {
+            hg.insert_accepted(
+                RetainedEvent {
+                    event: def.event.clone(),
+                    seq: def.seq,
+                    round: def.round,
+                    ancestor_seqs: def.ancestor_seqs.clone(),
+                    round_received: Some(def.round_received),
+                    consensus_timestamp: Some(Timestamp::new(def.consensus_ts)),
+                },
+                checkpoint_round,
+            )
+            .expect("window fixture inserts");
+        }
+        hg
+    }
+
+    fn two_member_window_defs(keys: &[(NodeId, SigningKey)]) -> Vec<WindowEventDef> {
+        let (node_a, key_a) = &keys[0];
+        let (node_b, key_b) = &keys[1];
+        let event_a1 = sign_window_event(key_a, *node_a, None, 10);
+        let event_b1 = sign_window_event(key_b, *node_b, None, 20);
+        let hash_a1: EventHash = event_a1.hash().expect("test event hashes");
+        let hash_b1: EventHash = event_b1.hash().expect("test event hashes");
+        let event_a2 = sign_window_event(key_a, *node_a, Some(hash_a1), 30);
+        let event_b2 = sign_window_event(key_b, *node_b, Some(hash_b1), 40);
+        vec![
+            WindowEventDef {
+                event: event_a1,
+                seq: 1,
+                round: 1,
+                ancestor_seqs: vec![1, 0],
+                round_received: 1,
+                consensus_ts: 100,
+            },
+            WindowEventDef {
+                event: event_b1,
+                seq: 1,
+                round: 1,
+                ancestor_seqs: vec![0, 1],
+                round_received: 1,
+                consensus_ts: 200,
+            },
+            WindowEventDef {
+                event: event_a2,
+                seq: 2,
+                round: 1,
+                ancestor_seqs: vec![2, 0],
+                round_received: 2,
+                consensus_ts: 300,
+            },
+            WindowEventDef {
+                event: event_b2,
+                seq: 2,
+                round: 1,
+                ancestor_seqs: vec![0, 2],
+                round_received: 2,
+                consensus_ts: 400,
+            },
+        ]
+    }
+
+    #[test]
+    fn window_root_is_deterministic() {
+        let keys = window_keys(&[1, 2]);
+        let registry = window_registry(&keys);
+        let defs = two_member_window_defs(&keys);
+        let first = window_graph(&registry, 5, &defs);
+        let second = window_graph(&registry, 5, &defs);
+        assert_eq!(compute_window_root(&first, 2, 1), compute_window_root(&second, 2, 1));
+    }
+
+    #[test]
+    fn window_root_changes_with_window_rounds() {
+        let keys = window_keys(&[1, 2]);
+        let registry = window_registry(&keys);
+        let defs = two_member_window_defs(&keys);
+        let hg = window_graph(&registry, 5, &defs);
+        let narrow = compute_window_root(&hg, 2, 0);
+        let wide = compute_window_root(&hg, 2, 1);
+        assert_ne!(narrow, wide);
+    }
+
+    #[test]
+    fn window_root_empty_is_records_root_empty() {
+        let keys = window_keys(&[1, 2]);
+        let registry = window_registry(&keys);
+        let hg = window_graph(&registry, 5, &[]);
+        assert_eq!(compute_window_root(&hg, 0, 0), compute_records_root(&[]));
+    }
+
+    #[test]
+    fn window_root_binds_record_metadata() {
+        let keys = window_keys(&[1, 2]);
+        let registry = window_registry(&keys);
+        let defs = two_member_window_defs(&keys);
+        let baseline = window_graph(&registry, 5, &defs);
+        // Exactly one in-window event carries different ordering metadata;
+        // its consensus order slot is unchanged (150 < 200), so only the
+        // leaf binding can move the root.
+        let mut altered = defs.clone();
+        altered[0].consensus_ts = 150;
+        let changed = window_graph(&registry, 5, &altered);
+        assert_ne!(compute_window_root(&baseline, 2, 1), compute_window_root(&changed, 2, 1));
+    }
+
+    #[test]
+    fn window_root_ignores_rows_appended_by_add_member() {
+        let keys = window_keys(&[1, 2]);
+        let before_registry = window_registry(&keys[..1]);
+        let after_registry = window_registry(&keys);
+        let (node_a, key_a) = &keys[0];
+        let event_a1 = sign_window_event(key_a, *node_a, None, 10);
+        let hash_a1: EventHash = event_a1.hash().expect("test event hashes");
+        let event_a2 = sign_window_event(key_a, *node_a, Some(hash_a1), 30);
+        let defs = vec![
+            WindowEventDef {
+                event: event_a1,
+                seq: 1,
+                round: 1,
+                ancestor_seqs: vec![1],
+                round_received: 1,
+                consensus_ts: 100,
+            },
+            WindowEventDef {
+                event: event_a2,
+                seq: 2,
+                round: 1,
+                ancestor_seqs: vec![2],
+                round_received: 1,
+                consensus_ts: 200,
+            },
+        ];
+        let mut hg = window_graph(&before_registry, 5, &defs);
+        let before = compute_window_root(&hg, 1, 5);
+        hg.add_member(NodeId::new(2), 10, after_registry);
+        // The stored rows really did grow a trailing zero slot ...
+        assert_eq!(hg.get(&hash_a1).expect("present").ancestor_seqs_len(), 2);
+        // ... yet the canonical root for round 1 is unchanged.
+        assert_eq!(compute_window_root(&hg, 1, 5), before);
     }
 }
