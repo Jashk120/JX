@@ -289,3 +289,4 @@ Both ensure cleanup even on failure (process groups killed, temp dirs removed).
 - **Ports colliding**: harness allocates ephemeral ports; transient `wait_for_health` timeouts usually indicate a slow build or resource pressure – increase `timeout=30` in `ClusterManager.start()`.
 - **Flaky under loss**: `test_6node_latency_jitter_100ms` allows bound≤5 and tolerates missing checkpoint under 5% loss.
 - **Logs**: `mgr.collect_logs(node_id, tail=200)` or per-node `data-*/logs/jkaind.log` and `diagnosis.log` in `ClusterManager.tmp_dir`.
+- **Post-mortem after a failure**: `cleanup()` normally deletes the temp dir, taking the node logs with it. Set `JKAIN_KEEP_TMP=1` to preserve `/tmp/jkain-harness-*` (including `data-*/logs/jkaind.log` and `diagnosis.log`) for inspection.

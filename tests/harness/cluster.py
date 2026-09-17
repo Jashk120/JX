@@ -30,6 +30,12 @@ from .proxy import LatencyMesh
 
 logger = logging.getLogger(__name__)
 
+_TRUTHY = ("1", "true", "yes", "on")
+
+
+def _keep_tmp_enabled() -> bool:
+    return os.environ.get("JKAIN_KEEP_TMP", "").strip().lower() in _TRUTHY
+
 
 # ---------------------------------------------------------------------------
 # Helpers: port allocation, binary discovery
@@ -771,10 +777,13 @@ class ClusterManager:
             self._mesh = None
         # remove temp dir
         if self._tmp_dir and self._owns_tmp and self._tmp_dir.exists():
-            try:
-                shutil.rmtree(str(self._tmp_dir), ignore_errors=True)
-            except Exception as e:
-                logger.warning("cleanup rmtree %s error: %s", self._tmp_dir, e)
+            if _keep_tmp_enabled():
+                logger.warning("JKAIN_KEEP_TMP set: preserving cluster dir %s", self._tmp_dir)
+            else:
+                try:
+                    shutil.rmtree(str(self._tmp_dir), ignore_errors=True)
+                except Exception as e:
+                    logger.warning("cleanup rmtree %s error: %s", self._tmp_dir, e)
         self._started = False
         # unregister atexit
         try:
@@ -794,7 +803,7 @@ class ClusterManager:
                         proc.kill()
                 except Exception:
                     pass
-        if self._tmp_dir and self._owns_tmp and self._tmp_dir.exists():
+        if self._tmp_dir and self._owns_tmp and self._tmp_dir.exists() and not _keep_tmp_enabled():
             try:
                 shutil.rmtree(str(self._tmp_dir), ignore_errors=True)
             except Exception:
