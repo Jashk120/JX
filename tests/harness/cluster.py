@@ -287,6 +287,7 @@ class ClusterManager:
         self.config = config
         self._tmp_dir: Optional[Path] = None
         self._owns_tmp: bool = False
+        self._rr_index: int = 0
         self.cluster_info: Optional[ClusterInfo] = None
         self._nodes: Dict[int, NodeHandle] = {}
         self._mesh: Optional[LatencyMesh] = None
@@ -524,13 +525,28 @@ class ClusterManager:
 
     # -- tx submission -----------------------------------------------------
 
+    def _pick_node(self, node_id: Optional[int]) -> int:
+        """Resolve an explicit node id, or round-robin across running nodes.
+
+        Callers that omit ``node_id`` expect load to be spread across the
+        cluster (see the suite's "round-robin" comments); returning the first
+        node every time pins all load to one node and skews stall/perf tests.
+        """
+        if node_id is not None:
+            return node_id
+        if not self._nodes:
+            raise RuntimeError("cluster not started")
+        running = sorted(nid for nid, handle in self._nodes.items() if handle.is_running())
+        candidates = running or sorted(self._nodes)
+        chosen = candidates[self._rr_index % len(candidates)]
+        self._rr_index += 1
+        return chosen
+
     async def submit_tx(self, payload: bytes, node_id: Optional[int] = None) -> Dict:
         """Submit transaction payload to a specific node or round-robin."""
         if not self._nodes:
             raise RuntimeError("cluster not started")
-        if node_id is None:
-            # pick first healthy node
-            node_id = next(iter(self._nodes))
+        node_id = self._pick_node(node_id)
         handle = self._nodes.get(node_id)
         if handle is None:
             raise KeyError(f"unknown node_id {node_id}")
@@ -538,12 +554,13 @@ class ClusterManager:
         return await client.submit_tx(payload)
 
     async def submit_put(self, key: bytes, value: bytes, node_id: Optional[int] = None) -> Dict:
-        """Encode and submit a Put operation."""
+        """Encode and submit a Put operation (round-robin when node_id is None)."""
         if not self._nodes:
             raise RuntimeError("cluster not started")
-        if node_id is None:
-            node_id = next(iter(self._nodes))
-        handle = self._nodes[node_id]
+        node_id = self._pick_node(node_id)
+        handle = self._nodes.get(node_id)
+        if handle is None:
+            raise KeyError(f"unknown node_id {node_id}")
         client = ControlClient(handle.control_socket, timeout=5.0)
         return await client.submit_put(key, value)
 
