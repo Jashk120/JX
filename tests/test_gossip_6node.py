@@ -474,9 +474,11 @@ async def test_6node_out_of_order_and_backpressure() -> None:
         before_ordered = {nid: s.ordered_round for nid, s in before.items()}
         print(f"[test] ordered before wait: {before_ordered}")
 
-        # wait for ordered to advance on all nodes (at least +1)
-        min_before = min(before_ordered.values()) if before_ordered else 0
-        ordered_statuses = await wait_for_ordered_round(mgr.nodes(), min_round=min_before + 1, timeout=45.0, poll_interval=0.5)
+        # max_before + 1, not min_before + 1: waiting on the global minimum
+        # lets an already-ahead node pass without moving, which then trips the
+        # strict per-node assert below on a healthy cluster.
+        max_before = max(before_ordered.values()) if before_ordered else 0
+        ordered_statuses = await wait_for_ordered_round(mgr.nodes(), min_round=max_before + 1, timeout=45.0, poll_interval=0.5)
         print(f"[test] ordered after: { {nid: s.ordered_round for nid, s in ordered_statuses.items()} }")
 
         # also decided should progress
