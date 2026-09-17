@@ -1,13 +1,13 @@
-# PLAN-2 Step 7 Golden Vectors
+# PLAN-4 Phase A Golden Vectors (file kept as `plan2_golden.json` for history)
 
 Shared fixtures proving Rust and Go compute identical `records_root` (Merkle with Hiero prefixes),
-`signing_bytes` (136B), and `StateDiff` encoding (sorted LWW, tombstone) byte-for-byte.
+`signing_bytes` (200B), and `StateDiff` encoding (sorted LWW, tombstone) byte-for-byte.
 
 ## File
 
 - `plan2_golden.json` — deterministic vectors, no randomness, no `OsRng`.
   - `records_root_vectors`: 7 vectors (0,1,2,3,4,5 items plus empty-payload edge) with `expected_root_hex`.
-  - `signing_bytes_vectors`: 6 vectors (genesis zeros, chained non-zero, varied round/roster) with 136B `expected_signing_bytes_hex`.
+  - `signing_bytes_vectors`: 6 vectors (genesis zeros, chained non-zero, varied round/roster), each with `window_root_hex` + `roster_history_root_hex`, with 200B `expected_signing_bytes_hex`.
   - `diff_encoding_vectors`: 6 vectors (empty, single put, sorted puts, tombstone, binary keys) with per-diff `proto_hex` (prost == Go deterministic).
 
 Copied to `mirror-node/internal/stream/testdata/plan2_golden.json` (identical).
@@ -40,7 +40,7 @@ CGO_ENABLED=1 go test ./mirror-node/internal/stream -run Golden -v
 ## Consumption
 
 - Rust: `consensus-node/protocol/stream/tests/golden.rs` loads this JSON via
-  `CARGO_MANIFEST_DIR` and asserts `compute_records_root`, `signing_bytes` (136B),
+  `CARGO_MANIFEST_DIR` and asserts `compute_records_root`, `signing_bytes` (200B),
   and `StateDiff` prost encoding match `expected_*_hex`. Run:
 
   ```bash

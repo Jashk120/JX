@@ -27,7 +27,7 @@ Vectors prove:
 - `ComputeRecordsRoot` (Go) == `compute_records_root` (Rust): empty `SHA256(0x00)`,
   leaf `SHA256(0x00||event_hash||tx_index_be||len_be||payload)`,
   internal `SHA256(0x02||l||r)`, singleton `SHA256(0x01||c)`, padded power-of-two.
-- `CheckpointSigningBytes` (Go) == `signing_bytes` (Rust): 136B `round_be8||records_root||state_hash||roster_hash||prev_checkpoint_hash`.
+- `CheckpointSigningBytes` (Go) == `signing_bytes` (Rust): 200B `round_be8||records_root||state_hash||roster_hash||prev_checkpoint_hash||window_root||roster_history_root`.
 - `StateDiff` sorted LWW + tombstone (`value` absent) protobuf encoding matches
   (`prost` vs Go `proto.MarshalOptions{Deterministic:true}`).
 

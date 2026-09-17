@@ -12,8 +12,8 @@
 // Both file types are chained by a running hash (§5 of PHASE8_MIRROR_STREAMS.md).
 // Event files are accompanied by an Ed25519 `.esf_sig` sidecar; record files
 // have no `.rsf_sig` — since 1313db5/PLAN-1 they are authenticated via
-// `records_root` + BLS aggregate over 136 B signing_bytes, with a
-// `.rsf_proofs` Merkle sidecar for selective disclosure. STREAM_VERSION 3.
+// `records_root` + BLS aggregate over 200 B signing_bytes, with a
+// `.rsf_proofs` Merkle sidecar for selective disclosure. STREAM_VERSION 4.
 //
 // This schema lives at the monorepo root `proto/` so it can be shared
 // between `consensus-node` (Rust, `protocol/stream`) and future crates
@@ -124,6 +124,8 @@ message SignedCheckpoint {
   bytes       aggregate_sig = 7; // 96-byte BLS12-381 aggregate signature
   repeated uint64 signers   = 8;
   bytes prev_checkpoint_hash = 9; // 32 bytes, SHA-256 of previous checkpoint
+  bytes window_root = 10; // 32 bytes, signed-window Merkle root
+  bytes roster_history_root = 11; // 32 bytes, roster-history commitment
 }
 
 message RecordStreamFile {

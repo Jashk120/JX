@@ -167,15 +167,29 @@ mod tests {
         }
 
         #[allow(dead_code)]
-        fn signing_bytes(&self, round: u64) -> [u8; 136] {
+        fn signing_bytes(&self, round: u64) -> [u8; 200] {
             let rr = compute_records_root(&[]);
-            let payload = CheckpointPayload::new(round, rr, [7u8; 32], self.registry.clone());
+            let payload = CheckpointPayload::new(
+                round,
+                rr,
+                [7u8; 32],
+                [0u8; 32],
+                [0u8; 32],
+                self.registry.clone(),
+            );
             payload.signing_bytes()
         }
 
         fn checkpoint(&self, round: u64, signers: &[u64]) -> SignedCheckpoint {
             let rr = compute_records_root(&[]);
-            let payload = CheckpointPayload::new(round, rr, [7u8; 32], self.registry.clone());
+            let payload = CheckpointPayload::new(
+                round,
+                rr,
+                [7u8; 32],
+                [0u8; 32],
+                [0u8; 32],
+                self.registry.clone(),
+            );
             let mut sigs: Vec<&blst::min_pk::Signature> = Vec::new();
             let mut sig_owned = Vec::new();
             for &s in signers {
@@ -217,7 +231,14 @@ mod tests {
     fn forged_signature_fails_verify() {
         let cluster = Cluster::of(&[1, 2, 3, 4]);
         let rr = compute_records_root(&[]);
-        let payload = CheckpointPayload::new(3, rr, [7u8; 32], cluster.registry.clone());
+        let payload = CheckpointPayload::new(
+            3,
+            rr,
+            [7u8; 32],
+            [0u8; 32],
+            [0u8; 32],
+            cluster.registry.clone(),
+        );
         // Two honest sigs
         let s1 = cluster
             .bls_ids
@@ -249,7 +270,14 @@ mod tests {
     fn signer_not_in_roster_fails() {
         let cluster = Cluster::of(&[1, 2, 3, 4]);
         let rr = compute_records_root(&[]);
-        let payload = CheckpointPayload::new(3, rr, [7u8; 32], cluster.registry.clone());
+        let payload = CheckpointPayload::new(
+            3,
+            rr,
+            [7u8; 32],
+            [0u8; 32],
+            [0u8; 32],
+            cluster.registry.clone(),
+        );
         let s1 = cluster
             .bls_ids
             .iter()
@@ -298,7 +326,14 @@ mod tests {
     fn duplicate_signer_fails() {
         let cluster = Cluster::of(&[1, 2, 3, 4]);
         let rr = compute_records_root(&[]);
-        let payload = CheckpointPayload::new(3, rr, [7u8; 32], cluster.registry.clone());
+        let payload = CheckpointPayload::new(
+            3,
+            rr,
+            [7u8; 32],
+            [0u8; 32],
+            [0u8; 32],
+            cluster.registry.clone(),
+        );
         let s1 = cluster
             .bls_ids
             .iter()

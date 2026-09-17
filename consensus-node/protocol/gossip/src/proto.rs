@@ -775,6 +775,8 @@ mod tests {
             42,
             consensus::compute_records_root(&[]),
             [0u8; 32],
+            [0u8; 32],
+            [0u8; 32],
             {
                 let mut r = crypto::MembershipRegistry::new();
                 r.register(
@@ -916,6 +918,8 @@ mod tests {
             4,
             consensus::compute_records_root(&[]),
             [7u8; 32],
+            [0u8; 32],
+            [0u8; 32],
             registry.clone(),
         );
         let bls1 = crypto::BlsIdentity::from_ikm(&[1u8; 32]).expect("bls");

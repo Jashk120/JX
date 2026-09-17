@@ -235,8 +235,14 @@ async fn forged_roster_rejected_with_trusted_hash() {
             })
             .collect();
         let records_root = consensus::compute_records_root(&rr_items);
-        let forged_payload =
-            consensus::CheckpointPayload::new(*round, records_root, [0xaa; 32], forged_roster);
+        let forged_payload = consensus::CheckpointPayload::new(
+            *round,
+            records_root,
+            [0xaa; 32],
+            [0u8; 32],
+            [0u8; 32],
+            forged_roster,
+        );
         let signing_bytes = forged_payload.signing_bytes();
         let mut forged_s_tuples: Vec<(primitives::NodeId, blst::min_pk::Signature)> = [1, 10, 11]
             .iter()
@@ -359,7 +365,14 @@ async fn wrong_dst_or_other_keys_aggregate_fails() {
     // Build a payload honestly, then sign it with keys 5,6,7 but claim signers 1,2,3.
     let honest_roster = common::registry_of(&[1, 2, 3, 4]);
     let rr = consensus::compute_records_root(&[]);
-    let payload = consensus::CheckpointPayload::new(9, rr, [9u8; 32], honest_roster.clone());
+    let payload = consensus::CheckpointPayload::new(
+        9,
+        rr,
+        [9u8; 32],
+        [0u8; 32],
+        [0u8; 32],
+        honest_roster.clone(),
+    );
     let signing_bytes = payload.signing_bytes();
     let rogue_sigs: Vec<blst::min_pk::Signature> = [5, 6, 7]
         .iter()
@@ -396,6 +409,8 @@ async fn wrong_dst_or_other_keys_aggregate_fails() {
         10,
         consensus::compute_records_root(&[]),
         [10u8; 32],
+        [0u8; 32],
+        [0u8; 32],
         common::registry_of(&[1, 2, 3, 4]),
     );
     // Use blst directly with wrong DST.

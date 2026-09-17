@@ -35,6 +35,8 @@ type signingVector struct {
 	StateHashHex            string `json:"state_hash_hex"`
 	RosterHashHex           string `json:"roster_hash_hex"`
 	PrevCheckpointHashHex   string `json:"prev_checkpoint_hash_hex"`
+	WindowRootHex           string `json:"window_root_hex"`
+	RosterHistoryRootHex    string `json:"roster_history_root_hex"`
 	ExpectedSigningBytesHex string `json:"expected_signing_bytes_hex"`
 }
 type diffVector struct {
@@ -151,10 +153,12 @@ func TestGoldenSigningBytes(t *testing.T) {
 		sh := mustDecodeHex(t, vec.StateHashHex)
 		rh := mustDecodeHex(t, vec.RosterHashHex)
 		prev := mustDecodeHex(t, vec.PrevCheckpointHashHex)
+		window := mustDecodeHex(t, vec.WindowRootHex)
+		history := mustDecodeHex(t, vec.RosterHistoryRootHex)
 		for _, p := range []struct {
 			name string
 			b    []byte
-		}{{"rr", rr}, {"sh", sh}, {"rh", rh}, {"prev", prev}} {
+		}{{"rr", rr}, {"sh", sh}, {"rh", rh}, {"prev", prev}, {"window", window}, {"history", history}} {
 			if len(p.b) != 32 {
 				t.Fatalf("vector %q %s len %d want 32", vec.Name, p.name, len(p.b))
 			}
@@ -165,20 +169,22 @@ func TestGoldenSigningBytes(t *testing.T) {
 			StateHash:          sh,
 			RosterHash:         rh,
 			PrevCheckpointHash: prev,
+			WindowRoot:         window,
+			RosterHistoryRoot:  history,
 		}
 		signing := CheckpointSigningBytes(cp)
-		if len(signing) != 136 {
-			t.Fatalf("vector %q signing len %d want 136", vec.Name, len(signing))
+		if len(signing) != 200 {
+			t.Fatalf("vector %q signing len %d want 200", vec.Name, len(signing))
 		}
 		exp := mustDecodeHex(t, vec.ExpectedSigningBytesHex)
-		if len(exp) != 136 {
-			t.Fatalf("vector %q expected len %d want 136", vec.Name, len(exp))
+		if len(exp) != 200 {
+			t.Fatalf("vector %q expected len %d want 200", vec.Name, len(exp))
 		}
 		if string(signing[:]) != string(exp) {
 			t.Fatalf("signing_bytes mismatch vector %q:\n got %x\nwant %x", vec.Name, signing, exp)
 		}
-		// Also verify that the bytes are exactly round||rr||sh||rh||prev.
-		var manual [136]byte
+		// Also verify that the bytes are exactly round||rr||sh||rh||prev||window||history.
+		var manual [200]byte
 		manual[0] = byte(vec.Round >> 56)
 		manual[1] = byte(vec.Round >> 48)
 		manual[2] = byte(vec.Round >> 40)
@@ -191,8 +197,10 @@ func TestGoldenSigningBytes(t *testing.T) {
 		copy(manual[40:72], sh)
 		copy(manual[72:104], rh)
 		copy(manual[104:136], prev)
+		copy(manual[136:168], window)
+		copy(manual[168:200], history)
 		if signing != manual {
-			t.Fatalf("vector %q manual 136B mismatch", vec.Name)
+			t.Fatalf("vector %q manual 200B mismatch", vec.Name)
 		}
 	}
 }

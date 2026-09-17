@@ -36,12 +36,12 @@ test-support shared test timing constants (SYNC_INTERVAL, DEADLINE, …)
 - `storage/` — the durable event log: a Fjall database appending every
   verified event on insert (Phase 8), so a restarting node replays its
   retained graph instead of reconnecting from a peer.
-- `stream/` — the mirror-facing stream files (Phase 8, `STREAM_VERSION` 3):
+- `stream/` — the mirror-facing stream files (Phase 8, `STREAM_VERSION` 4):
   append-only, running-hash-chained `.esf` event files (every gossip event,
   the offline DAG source, with `.esf_sig` Ed25519 sigs) and `.rsf` record
   files (one per decided round, anchored to the threshold-signed checkpoint
   state root — **no `.rsf_sig`**; authenticated via Merkle `records_root` +
-  136-byte BLS aggregate + `prev_checkpoint_hash` chain), plus after-image
+  200-byte BLS aggregate + `prev_checkpoint_hash` chain), plus after-image
   `state_diffs` and a `.rsf_proofs` Merkle sidecar, and the mirror-side
   verifier. Protobuf on disk; the schema lives shared at the monorepo root
   `proto/jkain_stream.proto` compiled by both Rust and Go.

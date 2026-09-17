@@ -93,8 +93,8 @@ func buildBLSSignedCheckpoint(t *testing.T, round uint64, items []*pb.RecordItem
 	}()
 	recordsRoot := ComputeRecordsRoot(items)
 	stateHash := sha256.Sum256([]byte("state"))
-	// signing_bytes = round||records_root||state_hash||roster_hash
-	var signingBytes [136]byte
+	// signing_bytes = round||records_root||state_hash||roster_hash||prev||window||roster_history
+	var signingBytes [200]byte
 	binary.BigEndian.PutUint64(signingBytes[0:8], round)
 	copy(signingBytes[8:40], recordsRoot[:])
 	copy(signingBytes[40:72], stateHash[:])

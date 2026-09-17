@@ -12,8 +12,8 @@ at the repo root `proto/jkain_stream.proto` — no vendored copies.
     files (file + metadata signatures).
   - `.rsf` record stream files (one per decided round), **with no `.rsf_sig`**.
     Since `1313db5` / PLAN-1, record authenticity is via content binding:
-    `records_root` + BLS aggregate checkpoint over the 136-byte
-    `round||records_root||state_hash||roster_hash||prev_checkpoint_hash`.
+    `records_root` + BLS aggregate checkpoint over the 200-byte
+    `round||records_root||state_hash||roster_hash||prev_checkpoint_hash||window_root||roster_history_root`.
     Each `.rsf` is accompanied by a `.rsf_proofs` sidecar carrying per-item
     Merkle inclusion proofs (see `RecordsProofFile`).
 
@@ -21,8 +21,10 @@ at the repo root `proto/jkain_stream.proto` — no vendored copies.
 
 ## Wire format and versions
 
-- **`STREAM_VERSION` 3** — stamped inside every `EventStreamFile` /
+- **`STREAM_VERSION` 4** — stamped inside every `EventStreamFile` /
   `RecordStreamFile` and `RecordsProofFile` (see `protocol/stream/src/lib.rs`).
+  Bump 3 → 4 was for PLAN-4 Phase A: `window_root` + `roster_history_root`
+  in checkpoints (signing_bytes 136 B → 200 B).
   Bump 2 → 3 was for PLAN-2: `prev_checkpoint_hash` chaining of checkpoints
   (history splice resistance), Merkle `records_root` (padded power-of-two,
   Hiero domain-separated prefixes `0x00`/`0x01`/`0x02`), after-image

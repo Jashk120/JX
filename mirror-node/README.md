@@ -3,7 +3,7 @@
 Go mirror node for JKaIN. It tails the consensus node's **mirror stream files**
 emitted into `<data>/streams/` (`.esf` + `.esf_sig`, `.rsf` + `.rsf_proofs`,
 `.ckpt`) and exposes a read-only HTTP API over the verified history.
-`STREAM_VERSION` 3, `FORMAT_VERSION` 5 on the consensus side.
+`STREAM_VERSION` 4, `FORMAT_VERSION` 6 on the consensus side.
 
 Protobuf schema: [`../proto/jkain_stream.proto`](../proto/jkain_stream.proto)
 — the single shared schema, compiled directly from the repo root (no vendored
@@ -102,7 +102,7 @@ Each stream file is checked before ingestion:
 - **Event signature file** (`.esf_sig`) – `file_signature` over `SHA256(file)`
   and `metadata_signature` over header hash, both Ed25519. No `.rsf_sig` file
   exists — record authenticity is content-bound.
-- **BLS checkpoint** (record files) – roster hash anchoring (optional `trusted_roster_hash` check), **Merkle `records_root`** (padded power-of-two, Hiero domain-separated: `empty=SHA256(0x00)`, `leaf=SHA256(0x00||event_hash||tx_index||len||payload)`, `internal=SHA256(0x02||l||r)`, `singleton=SHA256(0x01||c)`) recomputed via `ComputeRecordsRoot` and checked against the checkpoint's `records_root`, and BLS12-381 aggregate signature verification over **136 B** `round||records_root||state_hash||roster_hash||prev_checkpoint_hash` with DST `JKAIN-CHECKPOINT-BLS-V1` (48-byte G1 bls_keys, 96-byte G2 aggregate_sig, quorum `count*3>total*2`). No `.rsf_sig` file.
+- **BLS checkpoint** (record files) – roster hash anchoring (optional `trusted_roster_hash` check), **Merkle `records_root`** (padded power-of-two, Hiero domain-separated: `empty=SHA256(0x00)`, `leaf=SHA256(0x00||event_hash||tx_index||len||payload)`, `internal=SHA256(0x02||l||r)`, `singleton=SHA256(0x01||c)`) recomputed via `ComputeRecordsRoot` and checked against the checkpoint's `records_root`, and BLS12-381 aggregate signature verification over **200 B** `round||records_root||state_hash||roster_hash||prev_checkpoint_hash||window_root||roster_history_root` with DST `JKAIN-CHECKPOINT-BLS-V1` (48-byte G1 bls_keys, 96-byte G2 aggregate_sig, quorum `count*3>total*2`). No `.rsf_sig` file.
 - **Chained history** – `prev_checkpoint_hash` continuity: each `.rsf`'s checkpoint must commit to `SHA256(prev_signing_bytes)` (genesis `[0;32]`), enforced across consecutive rounds.
 - **State diffs** – `ValidateStateDiffs`: sorted ascending by key, no duplicates, non-empty keys, LWW within the round; `value=None` is a tombstone.
 - **Proofs sidecar** (`.rsf_proofs` / `RecordsProofFile`) – per-item Merkle inclusion proofs (`item_index`, `ProofStep{sibling_hash[32], sibling_is_right}`), count == items, `VerifyRecordsProof` per item against the `records_root`. Missing sidecar file is tolerated as empty-verify; tampered proofs fail.

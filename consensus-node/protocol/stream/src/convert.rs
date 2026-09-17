@@ -94,7 +94,8 @@ fn proto_signature(bytes: &[u8]) -> Option<Signature> {
 /// The mirror `SignedCheckpoint` for the canonical consensus form. The roster
 /// snapshot is emitted as sorted `(node_id, key)` triples, and the BLS
 /// aggregate signature covers `payload.signing_bytes()` (round || records_root
-/// || state_hash || roster_hash || prev_checkpoint_hash).
+/// || state_hash || roster_hash || prev_checkpoint_hash || window_root
+/// || roster_history_root).
 pub fn signed_checkpoint_to_proto(checkpoint: &SignedCheckpoint) -> pb::SignedCheckpoint {
     pb::SignedCheckpoint {
         round: checkpoint.payload.round,
@@ -128,6 +129,8 @@ pub fn signed_checkpoint_to_proto(checkpoint: &SignedCheckpoint) -> pb::SignedCh
         aggregate_sig: checkpoint.aggregate_sig.to_bytes().to_vec(),
         signers: checkpoint.signers.iter().map(|n| n.get()).collect(),
         prev_checkpoint_hash: checkpoint.payload.prev_checkpoint_hash.to_vec(),
+        window_root: checkpoint.payload.window_root.to_vec(),
+        roster_history_root: checkpoint.payload.roster_history_root.to_vec(),
     }
 }
 
@@ -140,6 +143,8 @@ pub fn proto_to_signed_checkpoint(checkpoint: &pb::SignedCheckpoint) -> Option<S
     let roster_hash: [u8; 32] = checkpoint.roster_hash.clone().try_into().ok()?;
     let records_root: [u8; 32] = checkpoint.records_root.clone().try_into().ok()?;
     let prev_checkpoint_hash: [u8; 32] = checkpoint.prev_checkpoint_hash.clone().try_into().ok()?;
+    let window_root: [u8; 32] = checkpoint.window_root.clone().try_into().ok()?;
+    let roster_history_root: [u8; 32] = checkpoint.roster_history_root.clone().try_into().ok()?;
     let agg_bytes: [u8; 96] = checkpoint.aggregate_sig.clone().try_into().ok()?;
     let aggregate_sig = blst::min_pk::Signature::from_bytes(&agg_bytes).ok()?;
     let roster_snapshot = roster_from_members(&checkpoint.roster_snapshot)?;
@@ -152,6 +157,8 @@ pub fn proto_to_signed_checkpoint(checkpoint: &pb::SignedCheckpoint) -> Option<S
         state_hash,
         roster_hash,
         prev_checkpoint_hash,
+        window_root,
+        roster_history_root,
         roster_snapshot,
     };
     let signers = checkpoint.signers.iter().map(|s| primitives::NodeId::new(*s)).collect();
@@ -367,7 +374,7 @@ mod tests {
     fn signed_checkpoint_round_trips_through_proto() {
         let roster = registry_of(&[1, 2, 3]);
         let rr = compute_records_root(&[]);
-        let payload = CheckpointPayload::new(4, rr, [7u8; 32], roster);
+        let payload = CheckpointPayload::new(4, rr, [7u8; 32], [0u8; 32], [0u8; 32], roster);
         let agg = crypto::BlsIdentity::from_ikm(&[1u8; 32]).unwrap().sign(&payload.signing_bytes());
         let checkpoint = SignedCheckpoint {
             payload,
@@ -379,6 +386,8 @@ mod tests {
         assert_eq!(decoded.payload.round, checkpoint.payload.round);
         assert_eq!(decoded.payload.state_hash, checkpoint.payload.state_hash);
         assert_eq!(decoded.payload.roster_hash, checkpoint.payload.roster_hash);
+        assert_eq!(decoded.payload.window_root, checkpoint.payload.window_root);
+        assert_eq!(decoded.payload.roster_history_root, checkpoint.payload.roster_history_root);
         assert_eq!(decoded.signers, checkpoint.signers);
     }
 
@@ -386,7 +395,7 @@ mod tests {
     fn proto_checkpoint_rejects_roster_hash_mismatch() {
         let roster = registry_of(&[1, 2]);
         let rr = compute_records_root(&[]);
-        let payload = CheckpointPayload::new(1, rr, [0u8; 32], roster);
+        let payload = CheckpointPayload::new(1, rr, [0u8; 32], [0u8; 32], [0u8; 32], roster);
         let agg = crypto::BlsIdentity::from_ikm(&[1u8; 32]).unwrap().sign(&payload.signing_bytes());
         let checkpoint = SignedCheckpoint {
             payload,
@@ -402,7 +411,7 @@ mod tests {
     fn proto_checkpoint_rejects_duplicate_roster_node_ids() {
         let roster = registry_of(&[1, 2]);
         let rr = compute_records_root(&[]);
-        let payload = CheckpointPayload::new(1, rr, [0u8; 32], roster);
+        let payload = CheckpointPayload::new(1, rr, [0u8; 32], [0u8; 32], [0u8; 32], roster);
         let agg = crypto::BlsIdentity::from_ikm(&[1u8; 32]).unwrap().sign(&payload.signing_bytes());
         let checkpoint = SignedCheckpoint {
             payload,

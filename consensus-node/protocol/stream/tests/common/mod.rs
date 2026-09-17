@@ -59,8 +59,14 @@ pub fn signed_checkpoint_with_items(
         })
         .collect();
     let records_root = consensus::compute_records_root(&rr_items);
-    let payload =
-        CheckpointPayload::new(round, records_root, [round as u8; 32], registry_of(members));
+    let payload = CheckpointPayload::new(
+        round,
+        records_root,
+        [round as u8; 32],
+        [0u8; 32],
+        [0u8; 32],
+        registry_of(members),
+    );
     let signing_bytes = payload.signing_bytes();
     let mut sigs = Vec::new();
     for &signer in signers {

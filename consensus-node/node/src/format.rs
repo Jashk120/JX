@@ -22,7 +22,10 @@ use anyhow::{
 /// break; roster canonical bytes grew and the checkpoint codec changed).
 /// 5 = chained checkpoints via `prev_checkpoint_hash` (hard genesis break;
 /// signing_bytes carry the previous round's hash, binding history).
-pub const CURRENT_FORMAT: u32 = 5;
+/// 6 = 200-byte checkpoint signing bytes (window_root + roster_history_root)
+/// (hard genesis break; checkpoints commit to the signed window and the
+/// roster-history selection).
+pub const CURRENT_FORMAT: u32 = 6;
 
 /// The filename of the version stamp inside the data directory.
 const FORMAT_VERSION_FILE: &str = "FORMAT_VERSION";
@@ -44,7 +47,7 @@ pub fn check_or_init_data_dir(data_dir: &Path) -> Result<()> {
             bail!(
                 "data/ format version {version} is incompatible with this binary \
                  (expects {CURRENT_FORMAT}). This is a hard genesis break \
-                 (FORMAT_VERSION 4→5: chained checkpoints via prev_checkpoint_hash); wipe data/ and \
+                 (FORMAT_VERSION 5→6: 200-byte checkpoint signing bytes (window_root + roster_history_root)); wipe data/ and \
                  re-run `jkaind init` for a fresh genesis to continue."
             );
         }
@@ -95,6 +98,21 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("incompatible"), "must mention incompatible: {msg}");
         assert!(msg.contains("3") || msg.contains("5"), "must mention version numbers: {msg}");
+        assert!(
+            msg.contains("fresh genesis") || msg.contains("wipe data"),
+            "must point at fresh genesis: {msg}"
+        );
+    }
+
+    #[test]
+    fn old_version_5_is_rejected_with_fresh_genesis_hint() {
+        let dir = tempdir().expect("temp dir");
+        fs::create_dir_all(dir.path()).expect("create dir");
+        fs::write(dir.path().join(FORMAT_VERSION_FILE), "5").expect("write 5");
+        let err = check_or_init_data_dir(dir.path()).expect_err("version 5 must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("incompatible"), "must mention incompatible: {msg}");
+        assert!(msg.contains("5") || msg.contains("6"), "must mention version numbers: {msg}");
         assert!(
             msg.contains("fresh genesis") || msg.contains("wipe data"),
             "must point at fresh genesis: {msg}"

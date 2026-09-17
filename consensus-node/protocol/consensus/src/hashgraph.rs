@@ -20,7 +20,10 @@ use primitives::{
     Timestamp,
 };
 
-use crate::checkpoint::CheckpointPayload;
+use crate::checkpoint::{
+    CheckpointPayload,
+    SIGNED_WINDOW_ROUNDS,
+};
 use crate::error::{
     ConsensusError,
     Result,
@@ -1052,8 +1055,13 @@ impl Hashgraph {
     /// Phase 3 — the checkpoint payload for `round`, once that round is fully
     /// decided. The caller supplies the Merkle root of the deterministic
     /// state and the `records_root` binding; the roster snapshot and its hash
-    /// are taken from this node's roster history at that round. Returns `None`
-    /// while `round` is not yet decided.
+    /// are taken from this node's roster history at that round, and the
+    /// `window_root` / `roster_history_root` commitments are computed over
+    /// `SIGNED_WINDOW_ROUNDS` of decided history. Returns `None` while
+    /// `round` is not yet decided, or when either commitment fails: with
+    /// `RETENTION_ROUNDS == SIGNED_WINDOW_ROUNDS` the window must be
+    /// retained, so a failure is an invariant violation and skipping the
+    /// checkpoint is the safe response (never panic on the production path).
     pub fn checkpoint_payload(
         &self,
         round: u64,
@@ -1064,7 +1072,22 @@ impl Hashgraph {
             return None;
         }
         let roster_snapshot = self.registry_at_round(round);
-        Some(CheckpointPayload::new(round, records_root, state_hash, roster_snapshot))
+        let window_root =
+            crate::checkpoint::try_compute_window_root(self, round, SIGNED_WINDOW_ROUNDS).ok()?;
+        let roster_history_root = crate::checkpoint::compute_roster_history_root(
+            self.roster_history(),
+            round,
+            SIGNED_WINDOW_ROUNDS,
+        )
+        .ok()?;
+        Some(CheckpointPayload::new(
+            round,
+            records_root,
+            state_hash,
+            window_root,
+            roster_history_root,
+            roster_snapshot,
+        ))
     }
 
     /// Phase 3 — removes every event with `round_received <
@@ -1864,6 +1887,8 @@ mod tests {
             5,
             crate::checkpoint::compute_records_root(&[]),
             [0u8; 32],
+            [0u8; 32],
+            [0u8; 32],
             registry.clone(),
         );
         let roster_history = RosterHistory::new(registry);
@@ -1886,6 +1911,8 @@ mod tests {
             5,
             crate::checkpoint::compute_records_root(&[]),
             [0u8; 32],
+            [0u8; 32],
+            [0u8; 32],
             registry.clone(),
         );
         let history = RosterHistory::new(registry);
@@ -1904,6 +1931,8 @@ mod tests {
         let checkpoint = CheckpointPayload::new(
             5,
             crate::checkpoint::compute_records_root(&[]),
+            [0u8; 32],
+            [0u8; 32],
             [0u8; 32],
             registry.clone(),
         );
@@ -1957,6 +1986,8 @@ mod tests {
             5,
             crate::checkpoint::compute_records_root(&[]),
             [0u8; 32],
+            [0u8; 32],
+            [0u8; 32],
             registry.clone(),
         );
         let mut hg = Hashgraph::from_checkpoint(&checkpoint, RosterHistory::new(registry));
@@ -1980,6 +2011,8 @@ mod tests {
             1,
             crate::checkpoint::compute_records_root(&[]),
             [0u8; 32],
+            [0u8; 32],
+            [0u8; 32],
             registry.clone(),
         );
         let mut hg = Hashgraph::from_checkpoint(&checkpoint, RosterHistory::new(registry));
@@ -2002,6 +2035,8 @@ mod tests {
         let checkpoint = CheckpointPayload::new(
             1,
             crate::checkpoint::compute_records_root(&[]),
+            [0u8; 32],
+            [0u8; 32],
             [0u8; 32],
             registry.clone(),
         );
@@ -2030,6 +2065,8 @@ mod tests {
         let checkpoint = CheckpointPayload::new(
             1,
             crate::checkpoint::compute_records_root(&[]),
+            [0u8; 32],
+            [0u8; 32],
             [0u8; 32],
             registry.clone(),
         );
@@ -2073,6 +2110,8 @@ mod tests {
             1,
             crate::checkpoint::compute_records_root(&[]),
             [0u8; 32],
+            [0u8; 32],
+            [0u8; 32],
             registry.clone(),
         );
         let mut hg = Hashgraph::from_checkpoint(&checkpoint, RosterHistory::new(registry));
@@ -2107,6 +2146,8 @@ mod tests {
             1,
             crate::checkpoint::compute_records_root(&[]),
             [0u8; 32],
+            [0u8; 32],
+            [0u8; 32],
             registry.clone(),
         );
         let mut hg = Hashgraph::from_checkpoint(&checkpoint, RosterHistory::new(registry));
@@ -2136,6 +2177,8 @@ mod tests {
         let checkpoint = CheckpointPayload::new(
             1,
             crate::checkpoint::compute_records_root(&[]),
+            [0u8; 32],
+            [0u8; 32],
             [0u8; 32],
             registry.clone(),
         );
@@ -2183,6 +2226,8 @@ mod tests {
             1,
             crate::checkpoint::compute_records_root(&[]),
             [0u8; 32],
+            [0u8; 32],
+            [0u8; 32],
             registry.clone(),
         );
         let mut hg = Hashgraph::from_checkpoint(&checkpoint, RosterHistory::new(registry));
@@ -2220,6 +2265,8 @@ mod tests {
         let checkpoint = CheckpointPayload::new(
             1,
             crate::checkpoint::compute_records_root(&[]),
+            [0u8; 32],
+            [0u8; 32],
             [0u8; 32],
             registry.clone(),
         );
@@ -2261,6 +2308,8 @@ mod tests {
         let checkpoint = CheckpointPayload::new(
             1,
             crate::checkpoint::compute_records_root(&[]),
+            [0u8; 32],
+            [0u8; 32],
             [0u8; 32],
             registry.clone(),
         );
@@ -2306,6 +2355,8 @@ mod tests {
         let checkpoint = CheckpointPayload::new(
             1,
             crate::checkpoint::compute_records_root(&[]),
+            [0u8; 32],
+            [0u8; 32],
             [0u8; 32],
             registry.clone(),
         );
@@ -2373,6 +2424,8 @@ mod tests {
         let checkpoint = CheckpointPayload::new(
             3,
             crate::checkpoint::compute_records_root(&[]),
+            [0u8; 32],
+            [0u8; 32],
             [0u8; 32],
             registry.clone(),
         );
@@ -2475,6 +2528,8 @@ mod tests {
         let checkpoint = crate::checkpoint::CheckpointPayload::new(
             1,
             crate::checkpoint::compute_records_root(&[]),
+            [0u8; 32],
+            [0u8; 32],
             [0u8; 32],
             registry.clone(),
         );

@@ -3,7 +3,7 @@
 //! A [`CheckpointPayload`] is the unsigned commitment every node makes once a
 //! round is decided: the round, the Merkle root of the deterministic `State`,
 //! and the SHA-256 of the canonical roster active at that round. Each node
-//! signs [`CheckpointPayload::signing_bytes`] — a fixed 104 bytes — and the
+//! signs [`CheckpointPayload::signing_bytes`] — a fixed 200 bytes — and the
 //! resulting [`CheckpointSig`]s are gossiped. A [`CheckpointAccumulator`]
 //! collects them per round and yields a [`SignedCheckpoint`] the first time
 //! the signers exceed 2/3 of the roster active at that round. That accepted
@@ -32,13 +32,21 @@ use crate::hashgraph::{
     Hashgraph,
 };
 
+/// Signed-window length in rounds (PLAN-4 Phase A wire break).
+///
+/// Value recommended by `docs/issues/phase0-walk-depth-spike.md`: measured
+/// transition depth 2 rounds, 8x margin, aligned with
+/// `CHECKPOINT_LAG_ROUNDS`. Pending owner ratification.
+pub const SIGNED_WINDOW_ROUNDS: u64 = 16;
+
 /// Rounds of raw events to keep after a checkpoint round is confirmed, so a
 /// peer that fell behind by up to this many rounds can still delta-sync
-/// normally (Phase 3, retention margin). Distinct from the checkpoint
-/// cadence: this is a pruning-retention buffer, not a frequency. The gossip
-/// layer subtracts it from the confirmed round before calling
-/// `Hashgraph::prune_before_round`.
-pub const RETENTION_ROUNDS: u64 = 2;
+/// normally. This is the signed-window length / prune floor (PLAN-4 Hard
+/// Condition 1): `checkpoint_payload` commits to the window
+/// `[R - SIGNED_WINDOW_ROUNDS, R]`, so retention must hold exactly that
+/// window. The gossip layer subtracts it from the confirmed round before
+/// calling `Hashgraph::prune_before_round`.
+pub const RETENTION_ROUNDS: u64 = SIGNED_WINDOW_ROUNDS;
 
 /// One record item's content for [`compute_records_root`].
 ///
@@ -493,17 +501,31 @@ pub struct CheckpointPayload {
     /// derives the identical value for round `R` regardless of local
     /// acceptance progress. All-zero at genesis.
     pub prev_checkpoint_hash: [u8; 32],
+    /// Merkle root of the canonical signed window
+    /// `[round - SIGNED_WINDOW_ROUNDS, round]` (PLAN-4 Phase A), computed via
+    /// [`compute_window_root`].
+    pub window_root: [u8; 32],
+    /// Commitment to the canonical roster-history selection for `round`
+    /// (PLAN-4 Phase A), computed via [`compute_roster_history_root`], so the
+    /// reconnect's `roster_history_bytes` stop being peer-asserted.
+    pub roster_history_root: [u8; 32],
     /// The roster active at `round`, for self-description.
     pub roster_snapshot: MembershipRegistry,
 }
 
 impl CheckpointPayload {
     /// Builds the payload, deriving `roster_hash` from the canonical
-    /// serialization of `roster_snapshot`.
+    /// serialization of `roster_snapshot`. Both `window_root` and
+    /// `roster_history_root` are explicit parameters: callers that do not
+    /// compute them (tests) pass `[0u8; 32]`; production callers
+    /// (`Hashgraph::checkpoint_payload`) compute them over
+    /// `SIGNED_WINDOW_ROUNDS` of decided history.
     pub fn new(
         round: u64,
         records_root: [u8; 32],
         state_hash: [u8; 32],
+        window_root: [u8; 32],
+        roster_history_root: [u8; 32],
         roster_snapshot: MembershipRegistry,
     ) -> Self {
         let roster_hash = roster_snapshot
@@ -517,6 +539,8 @@ impl CheckpointPayload {
             // Genesis sentinel: a payload built without explicit chaining is
             // its own history root.
             prev_checkpoint_hash: [0u8; 32],
+            window_root,
+            roster_history_root,
             roster_snapshot,
         }
     }
@@ -530,16 +554,19 @@ impl CheckpointPayload {
     }
 
     /// Canonical bytes signed by each node: `round (8 BE) || records_root (32)
-    /// || state_hash (32) || roster_hash (32) || prev_checkpoint_hash (32)`.
-    /// Compact and unambiguous — every node derives the identical 136 bytes
+    /// || state_hash (32) || roster_hash (32) || prev_checkpoint_hash (32)
+    /// || window_root (32) || roster_history_root (32)`.
+    /// Compact and unambiguous — every node derives the identical 200 bytes
     /// for the same decided round.
-    pub fn signing_bytes(&self) -> [u8; 136] {
-        let mut buf = [0u8; 136];
+    pub fn signing_bytes(&self) -> [u8; 200] {
+        let mut buf = [0u8; 200];
         buf[..8].copy_from_slice(&self.round.to_be_bytes());
         buf[8..40].copy_from_slice(&self.records_root);
         buf[40..72].copy_from_slice(&self.state_hash);
         buf[72..104].copy_from_slice(&self.roster_hash);
         buf[104..136].copy_from_slice(&self.prev_checkpoint_hash);
+        buf[136..168].copy_from_slice(&self.window_root);
+        buf[168..200].copy_from_slice(&self.roster_history_root);
         buf
     }
     /// `SHA256(signing_bytes())` — exactly what round `R + 1` embeds as its
@@ -689,7 +716,7 @@ impl CheckpointAccumulator {
     }
 
     /// The signing bytes every collected signature is over.
-    pub fn signing_bytes(&self) -> [u8; 136] {
+    pub fn signing_bytes(&self) -> [u8; 200] {
         self.payload.signing_bytes()
     }
 
@@ -801,17 +828,33 @@ mod tests {
     fn checkpoint_payload_signing_bytes_is_deterministic() {
         let roster = registry_of(&[1, 2, 3, 4]);
         let rr = empty_records_root();
-        let a = CheckpointPayload::new(3, rr, [7u8; 32], roster.clone());
-        let b = CheckpointPayload::new(3, rr, [7u8; 32], roster);
+        let a = CheckpointPayload::new(3, rr, [7u8; 32], [0u8; 32], [0u8; 32], roster.clone());
+        let b = CheckpointPayload::new(3, rr, [7u8; 32], [0u8; 32], [0u8; 32], roster);
         assert_eq!(a.signing_bytes(), b.signing_bytes());
-        assert_eq!(a.signing_bytes().len(), 136);
+        assert_eq!(a.signing_bytes().len(), 200);
         assert_ne!(
             a.signing_bytes(),
-            CheckpointPayload::new(4, rr, [7u8; 32], a.roster_snapshot.clone()).signing_bytes()
+            CheckpointPayload::new(
+                4,
+                rr,
+                [7u8; 32],
+                [0u8; 32],
+                [0u8; 32],
+                a.roster_snapshot.clone()
+            )
+            .signing_bytes()
         );
         assert_ne!(
             a.signing_bytes(),
-            CheckpointPayload::new(3, rr, [8u8; 32], a.roster_snapshot.clone()).signing_bytes()
+            CheckpointPayload::new(
+                3,
+                rr,
+                [8u8; 32],
+                [0u8; 32],
+                [0u8; 32],
+                a.roster_snapshot.clone()
+            )
+            .signing_bytes()
         );
         // Different records_root changes the commitment.
         let rr2 = compute_records_root(&[RecordsRootItem {
@@ -821,35 +864,52 @@ mod tests {
         }]);
         assert_ne!(
             a.signing_bytes(),
-            CheckpointPayload::new(3, rr2, [7u8; 32], a.roster_snapshot).signing_bytes()
+            CheckpointPayload::new(3, rr2, [7u8; 32], [0u8; 32], [0u8; 32], a.roster_snapshot)
+                .signing_bytes()
         );
     }
 
     #[test]
-    fn signing_bytes_length_is_136() {
+    fn signing_bytes_length_is_200() {
         let roster = registry_of(&[1]);
-        let payload = CheckpointPayload::new(1, [0u8; 32], [0u8; 32], roster);
-        assert_eq!(payload.signing_bytes().len(), 136);
+        let payload = CheckpointPayload::new(1, [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32], roster);
+        assert_eq!(payload.signing_bytes().len(), 200);
+    }
+    #[test]
+    fn signing_bytes_binds_window_and_roster_history_roots() {
+        let roster = registry_of(&[1]);
+        let base =
+            CheckpointPayload::new(1, [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32], roster.clone());
+        let other_window =
+            CheckpointPayload::new(1, [0u8; 32], [0u8; 32], [5u8; 32], [0u8; 32], roster.clone());
+        let other_history =
+            CheckpointPayload::new(1, [0u8; 32], [0u8; 32], [0u8; 32], [6u8; 32], roster);
+        assert_ne!(base.signing_bytes(), other_window.signing_bytes());
+        assert_ne!(base.signing_bytes(), other_history.signing_bytes());
+        assert_eq!(&other_window.signing_bytes()[136..168], &[5u8; 32][..]);
+        assert_eq!(&other_history.signing_bytes()[168..200], &[6u8; 32][..]);
     }
     #[test]
     fn prev_checkpoint_hash_defaults_to_genesis_and_binds_signing() {
         let roster = registry_of(&[1]);
-        let genesis = CheckpointPayload::new(1, [0u8; 32], [0u8; 32], roster);
+        let genesis = CheckpointPayload::new(1, [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32], roster);
         // `new` leaves the chain anchor at the genesis sentinel.
         assert_eq!(genesis.prev_checkpoint_hash, [0u8; 32]);
 
         let chained = genesis.clone().with_prev_checkpoint_hash([9u8; 32]);
-        // Chaining changes the signed bytes — but only in the tail 32.
+        // Chaining changes the signed bytes — but only in the prev 32.
         assert_ne!(genesis.signing_bytes(), chained.signing_bytes());
         assert_eq!(&genesis.signing_bytes()[..104], &chained.signing_bytes()[..104]);
-        assert_eq!(&chained.signing_bytes()[104..], &[9u8; 32][..]);
+        assert_eq!(&chained.signing_bytes()[104..136], &[9u8; 32][..]);
+        assert_eq!(&genesis.signing_bytes()[136..], &chained.signing_bytes()[136..]);
     }
     #[test]
     fn signing_bytes_hash_binds_the_full_chain() {
         let roster = registry_of(&[1]);
-        let a = CheckpointPayload::new(1, [0u8; 32], [0u8; 32], roster.clone())
-            .with_prev_checkpoint_hash([1u8; 32]);
-        let b = CheckpointPayload::new(1, [0u8; 32], [0u8; 32], roster)
+        let a =
+            CheckpointPayload::new(1, [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32], roster.clone())
+                .with_prev_checkpoint_hash([1u8; 32]);
+        let b = CheckpointPayload::new(1, [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32], roster)
             .with_prev_checkpoint_hash([2u8; 32]);
         // Different ancestry ⇒ different commitment, even for an otherwise
         // identical round. This is the property that kills history splices.
@@ -956,7 +1016,8 @@ mod tests {
         let members: Vec<(u64, BlsIdentity)> = ids.iter().map(|&id| (id, bls_for(id))).collect();
         let registry = registry_of_with_bls(&members);
         let rr = empty_records_root();
-        let payload = CheckpointPayload::new(1, rr, [0u8; 32], registry.clone());
+        let payload =
+            CheckpointPayload::new(1, rr, [0u8; 32], [0u8; 32], [0u8; 32], registry.clone());
         let mut accumulator = CheckpointAccumulator::new(payload.clone(), Vec::new());
         assert!(accumulator.add_sig(sig_for(1, 1, &payload), &registry).is_none());
         assert!(accumulator.add_sig(sig_for(1, 2, &payload), &registry).is_none());
@@ -972,7 +1033,8 @@ mod tests {
     fn accumulator_rejects_below_quorum() {
         let registry = registry_of(&[1, 2, 3, 4]);
         let rr = empty_records_root();
-        let payload = CheckpointPayload::new(1, rr, [0u8; 32], registry.clone());
+        let payload =
+            CheckpointPayload::new(1, rr, [0u8; 32], [0u8; 32], [0u8; 32], registry.clone());
         let mut accumulator = CheckpointAccumulator::new(payload.clone(), Vec::new());
         assert!(accumulator.add_sig(sig_for(1, 1, &payload), &registry).is_none());
         assert!(accumulator.add_sig(sig_for(1, 2, &payload), &registry).is_none());
@@ -985,7 +1047,8 @@ mod tests {
         let members: Vec<(u64, BlsIdentity)> = ids.iter().map(|&id| (id, bls_for(id))).collect();
         let round_roster = registry_of_with_bls(&members);
         let rr = empty_records_root();
-        let payload = CheckpointPayload::new(1, rr, [0u8; 32], round_roster.clone());
+        let payload =
+            CheckpointPayload::new(1, rr, [0u8; 32], [0u8; 32], [0u8; 32], round_roster.clone());
         let mut accumulator = CheckpointAccumulator::new(payload.clone(), Vec::new());
         // 5th node joins after the checkpoint round
         let live_roster = {
@@ -1003,7 +1066,8 @@ mod tests {
         let accepted = accumulator.add_sig(sig_for(1, 3, &payload), &round_roster);
         assert!(accepted.is_some(), "quorum computed from the round roster");
 
-        let live_payload = CheckpointPayload::new(1, rr, [0u8; 32], live_roster.clone());
+        let live_payload =
+            CheckpointPayload::new(1, rr, [0u8; 32], [0u8; 32], [0u8; 32], live_roster.clone());
         let mut stale = CheckpointAccumulator::new(live_payload.clone(), Vec::new());
         // Need sigs for live roster's payload
         let sig1 = sig_for(1, 1, &live_payload);
@@ -1020,7 +1084,8 @@ mod tests {
         let members: Vec<(u64, BlsIdentity)> = ids.iter().map(|&id| (id, bls_for(id))).collect();
         let registry = registry_of_with_bls(&members);
         let rr = empty_records_root();
-        let payload = CheckpointPayload::new(1, rr, [0u8; 32], registry.clone());
+        let payload =
+            CheckpointPayload::new(1, rr, [0u8; 32], [0u8; 32], [0u8; 32], registry.clone());
         let mut accumulator = CheckpointAccumulator::new(payload.clone(), Vec::new());
         accumulator.add_sig(sig_for(1, 1, &payload), &registry);
         assert!(accumulator.add_sig(sig_for(1, 1, &payload), &registry).is_none());
@@ -1035,7 +1100,8 @@ mod tests {
     #[test]
     fn checkpoint_sig_round_trips_through_canonical_bytes() {
         let roster = registry_of(&[1]);
-        let payload = CheckpointPayload::new(42, [0u8; 32], [0u8; 32], roster);
+        let payload =
+            CheckpointPayload::new(42, [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32], roster);
         let original = sig_for(42, 7, &payload);
         let bytes = original.canonical_bytes().unwrap();
         assert_eq!(bytes.len(), 112);
@@ -1054,9 +1120,14 @@ mod tests {
     fn wrong_round_sig_is_ignored() {
         let registry = registry_of(&[1, 2, 3, 4]);
         let rr = empty_records_root();
-        let payload = CheckpointPayload::new(1, rr, [0u8; 32], registry.clone());
+        let payload =
+            CheckpointPayload::new(1, rr, [0u8; 32], [0u8; 32], [0u8; 32], registry.clone());
         let mut accumulator = CheckpointAccumulator::new(payload, Vec::new());
-        let bad = sig_for(2, 1, &CheckpointPayload::new(2, rr, [0u8; 32], registry.clone()));
+        let bad = sig_for(
+            2,
+            1,
+            &CheckpointPayload::new(2, rr, [0u8; 32], [0u8; 32], [0u8; 32], registry.clone()),
+        );
         assert!(accumulator.add_sig(bad, &registry).is_none());
     }
 
@@ -1064,9 +1135,11 @@ mod tests {
     fn non_member_sig_is_ignored() {
         let registry = registry_of(&[1, 2, 3, 4]);
         let rr = empty_records_root();
-        let payload = CheckpointPayload::new(1, rr, [0u8; 32], registry.clone());
+        let payload =
+            CheckpointPayload::new(1, rr, [0u8; 32], [0u8; 32], [0u8; 32], registry.clone());
         let mut accumulator = CheckpointAccumulator::new(payload, Vec::new());
-        let bad_payload = CheckpointPayload::new(1, rr, [0u8; 32], registry.clone());
+        let bad_payload =
+            CheckpointPayload::new(1, rr, [0u8; 32], [0u8; 32], [0u8; 32], registry.clone());
         let bad_sig = sig_for(1, 5, &bad_payload);
         assert!(accumulator.add_sig(bad_sig, &registry).is_none());
         assert!(accumulator.sigs.is_empty());
@@ -1075,7 +1148,8 @@ mod tests {
     #[test]
     fn accumulator_carries_snapshot_bytes() {
         let registry = registry_of(&[1, 2, 3]);
-        let payload = CheckpointPayload::new(1, [0u8; 32], [0u8; 32], registry);
+        let payload =
+            CheckpointPayload::new(1, [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32], registry);
         let snapshot = vec![7u8; 4];
         let accumulator = CheckpointAccumulator::new(payload, snapshot.clone());
         assert_eq!(accumulator.snapshot(), &[7u8; 4]);
@@ -1088,7 +1162,8 @@ mod tests {
         let members: Vec<(u64, BlsIdentity)> = ids.iter().map(|&id| (id, bls_for(id))).collect();
         let registry = registry_of_with_bls(&members);
         let rr = empty_records_root();
-        let payload = CheckpointPayload::new(5, rr, [0xABu8; 32], registry.clone());
+        let payload =
+            CheckpointPayload::new(5, rr, [0xABu8; 32], [0u8; 32], [0u8; 32], registry.clone());
         let mut acc = CheckpointAccumulator::new(payload.clone(), Vec::new());
         acc.add_sig(sig_for(5, 1, &payload), &registry);
         acc.add_sig(sig_for(5, 2, &payload), &registry);
@@ -1101,7 +1176,8 @@ mod tests {
     fn below_quorum_returns_none_no_acceptance() {
         let registry = registry_of(&[1, 2, 3, 4]);
         let rr = empty_records_root();
-        let payload = CheckpointPayload::new(1, rr, [0u8; 32], registry.clone());
+        let payload =
+            CheckpointPayload::new(1, rr, [0u8; 32], [0u8; 32], [0u8; 32], registry.clone());
         let mut acc = CheckpointAccumulator::new(payload.clone(), Vec::new());
         assert!(acc.add_sig(sig_for(1, 1, &payload), &registry).is_none());
         assert!(acc.add_sig(sig_for(1, 2, &payload), &registry).is_none());
@@ -1115,13 +1191,21 @@ mod tests {
         let members: Vec<(u64, BlsIdentity)> = ids.iter().map(|&id| (id, bls_for(id))).collect();
         let registry = registry_of_with_bls(&members);
         let rr = empty_records_root();
-        let payload = CheckpointPayload::new(1, rr, [0u8; 32], registry.clone());
+        let payload =
+            CheckpointPayload::new(1, rr, [0u8; 32], [0u8; 32], [0u8; 32], registry.clone());
         let mut acc = CheckpointAccumulator::new(payload.clone(), Vec::new());
         // Two honest
         acc.add_sig(sig_for(1, 1, &payload), &registry);
         acc.add_sig(sig_for(1, 2, &payload), &registry);
         // Tampered: signer 3 but signed wrong message (different records_root)
-        let wrong_payload = CheckpointPayload::new(1, [0xFFu8; 32], [0u8; 32], registry.clone());
+        let wrong_payload = CheckpointPayload::new(
+            1,
+            [0xFFu8; 32],
+            [0u8; 32],
+            [0u8; 32],
+            [0u8; 32],
+            registry.clone(),
+        );
         let tampered = sig_for(1, 3, &wrong_payload);
         let accepted = acc.add_sig(tampered, &registry).expect("quorum reached even with bad sig");
         // Aggregate includes tampered sig, so verify must fail
@@ -1136,7 +1220,8 @@ mod tests {
             honest_ids.iter().map(|&id| (id, bls_for(id))).collect();
         let registry = registry_of_with_bls(&members);
         let rr = empty_records_root();
-        let payload = CheckpointPayload::new(7, rr, [11u8; 32], registry.clone());
+        let payload =
+            CheckpointPayload::new(7, rr, [11u8; 32], [0u8; 32], [0u8; 32], registry.clone());
         // Build an accumulator and feed two honest sigs
         let mut acc = CheckpointAccumulator::new(payload.clone(), Vec::new());
         acc.add_sig(sig_for(7, 1, &payload), &registry);
@@ -1157,7 +1242,7 @@ mod tests {
     #[test]
     fn wire_112_roundtrip_and_truncation_rejection() {
         let roster = registry_of(&[1]);
-        let payload = CheckpointPayload::new(9, [0u8; 32], [0u8; 32], roster);
+        let payload = CheckpointPayload::new(9, [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32], roster);
         let sig = sig_for(9, 1, &payload);
         let bytes = sig.canonical_bytes().unwrap();
         assert_eq!(bytes.len(), 112);
@@ -1212,6 +1297,8 @@ mod tests {
         let payload = CheckpointPayload::new(
             checkpoint_round,
             compute_records_root(&[]),
+            [0u8; 32],
+            [0u8; 32],
             [0u8; 32],
             registry.clone(),
         );

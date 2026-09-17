@@ -11,8 +11,10 @@ at the monorepo root `proto/jkain_stream.proto` and is shared between
 `consensus-node` and future crates; `protocol/stream/build.rs` compiles it via
 `../../../proto` and generates it with `build.rs` (prost).
 
-`STREAM_VERSION` 3 is stamped inside every `EventStreamFile` /
-`RecordStreamFile` and `RecordsProofFile`. The bump 2 → 3 covered chained
+`STREAM_VERSION` 4 is stamped inside every `EventStreamFile` /
+`RecordStreamFile` and `RecordsProofFile`. The bump 3 → 4 covered the PLAN-4
+Phase A wire break (`window_root` + `roster_history_root`, signing_bytes
+136 B → 200 B); the bump 2 → 3 covered chained
 checkpoints (`prev_checkpoint_hash`, signing_bytes 104 B → 136 B), Merkle
 `records_root` (padded power-of-two with Hiero domain-separated prefixes), the
 `state_diffs` field in `RecordStreamFile`, and the companion `.rsf_proofs`
@@ -31,7 +33,7 @@ sidecar.
 `version||start_running_hash||end_running_hash`). **`.rsf` files have no
 `.rsf_sig`** — since `1313db5` / PLAN-1 they are authenticated by content
 binding: `records_root` recomputed from `items` and the BLS aggregate over
-136-byte signing_bytes.
+200-byte signing_bytes.
 
 Every stream file is chained by the §5 running hash (SHA-256,
 domain-separated, seed `[0u8; 32]`): `item_hash = SHA256(DOMAIN||"item"||item)`,
@@ -66,8 +68,8 @@ implementations; the Go mirror uses the same SHA-256 construction byte-for-byte
 
 ## Checkpoint chaining
 
-`CheckpointPayload::signing_bytes` is `round(8 BE)||records_root(32)||state_hash(32)||roster_hash(32)||prev_checkpoint_hash(32)` = **136 B** (was 104 B before
-PLAN-2). `prev_checkpoint_hash` is `SHA256(signing_bytes(prev_round))`,
+`CheckpointPayload::signing_bytes` is `round(8 BE)||records_root(32)||state_hash(32)||roster_hash(32)||prev_checkpoint_hash(32)||window_root(32)||roster_history_root(32)` = **200 B** (was 136 B before
+PLAN-4 Phase A). `prev_checkpoint_hash` is `SHA256(signing_bytes(prev_round))`,
 genesis `[0;32]`. `SignedCheckpoint::verify` checks distinct signers in the
 embedded roster, `valid*3>total*2`, and `crypto::bls::verify_aggregate` over
 those bytes with DST `JKAIN-CHECKPOINT-BLS-V1`. The mirror also checks

@@ -1,8 +1,8 @@
-//! PLAN-2 Step 7 golden vectors: Rust↔Go byte-equality.
+//! PLAN-4 Phase A golden vectors: Rust↔Go byte-equality.
 //!
 //! Consumes `tests/testdata/plan2_golden.json` (shared with Go) and proves:
 //! - `compute_records_root` matches expected hex for 0..5 items (incl. empty payload, padding).
-//! - `CheckpointPayload::signing_bytes` 136B matches expected hex.
+//! - `CheckpointPayload::signing_bytes` 200B matches expected hex.
 //! - `StateDiff` sorted LWW + tombstone protobuf encoding matches expected hex.
 
 use std::fs;
@@ -46,6 +46,8 @@ struct SigningVector {
     state_hash_hex: String,
     roster_hash_hex: String,
     prev_checkpoint_hash_hex: String,
+    window_root_hex: String,
+    roster_history_root_hex: String,
     expected_signing_bytes_hex: String,
 }
 #[derive(Deserialize)]
@@ -120,7 +122,7 @@ fn records_root_golden_vectors_match_rust() {
 }
 
 #[test]
-fn signing_bytes_golden_vectors_are_136b_and_match() {
+fn signing_bytes_golden_vectors_are_200b_and_match() {
     let golden = load_golden();
     assert!(golden.signing_bytes_vectors.len() >= 5, "need at least 5 signing_bytes vectors");
     let has_genesis =
@@ -135,18 +137,26 @@ fn signing_bytes_golden_vectors_are_136b_and_match() {
         let sh = hex_decode(&vec.state_hash_hex);
         let rh = hex_decode(&vec.roster_hash_hex);
         let prev = hex_decode(&vec.prev_checkpoint_hash_hex);
+        let window = hex_decode(&vec.window_root_hex);
+        let history = hex_decode(&vec.roster_history_root_hex);
         assert_eq!(rr.len(), 32, "vector {} rr len", vec.name);
         assert_eq!(sh.len(), 32, "vector {} sh len", vec.name);
         assert_eq!(rh.len(), 32, "vector {} rh len", vec.name);
         assert_eq!(prev.len(), 32, "vector {} prev len", vec.name);
+        assert_eq!(window.len(), 32, "vector {} window len", vec.name);
+        assert_eq!(history.len(), 32, "vector {} history len", vec.name);
         let mut rr_a = [0u8; 32];
         let mut sh_a = [0u8; 32];
         let mut rh_a = [0u8; 32];
         let mut prev_a = [0u8; 32];
+        let mut window_a = [0u8; 32];
+        let mut history_a = [0u8; 32];
         rr_a.copy_from_slice(&rr);
         sh_a.copy_from_slice(&sh);
         rh_a.copy_from_slice(&rh);
         prev_a.copy_from_slice(&prev);
+        window_a.copy_from_slice(&window);
+        history_a.copy_from_slice(&history);
 
         // Build payload via roster hash directly (avoid MembershipRegistry hashing).
         // We construct a dummy registry and then override roster_hash by directly
@@ -154,30 +164,33 @@ fn signing_bytes_golden_vectors_are_136b_and_match() {
         let mut registry = crypto::MembershipRegistry::new();
         // Register a dummy member so roster_snapshot is non-empty for hash consistency,
         // but we will not use its hash; we use the fixture hashes directly via manual
-        // signing bytes construction. Instead verify manual 136B construction equals
+        // signing bytes construction. Instead verify manual 200B construction equals
         // CheckpointPayload::signing_bytes when payload fields are set to fixture values.
         let dummy_key = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]).verifying_key();
         let dummy_bls = crypto::BlsIdentity::from_ikm(&[1u8; 32]).unwrap().public.to_bytes();
         registry.register(primitives::NodeId::new(1), dummy_key, dummy_bls);
-        let mut payload = CheckpointPayload::new(vec.round, rr_a, sh_a, registry);
+        let mut payload =
+            CheckpointPayload::new(vec.round, rr_a, sh_a, window_a, history_a, registry);
         // Override roster_hash to fixture value (new() derives it; we patch).
         payload.roster_hash = rh_a;
         payload.prev_checkpoint_hash = prev_a;
 
         let signing = payload.signing_bytes();
-        assert_eq!(signing.len(), 136, "vector {} len", vec.name);
+        assert_eq!(signing.len(), 200, "vector {} len", vec.name);
         let expected = hex_decode(&vec.expected_signing_bytes_hex);
-        assert_eq!(expected.len(), 136, "vector {} expected len", vec.name);
+        assert_eq!(expected.len(), 200, "vector {} expected len", vec.name);
         assert_eq!(signing.to_vec(), expected, "signing_bytes mismatch for vector '{}'", vec.name);
 
         // Also verify manual concatenation equals payload.signing_bytes.
-        let mut manual = [0u8; 136];
+        let mut manual = [0u8; 200];
         manual[..8].copy_from_slice(&vec.round.to_be_bytes());
         manual[8..40].copy_from_slice(&rr_a);
         manual[40..72].copy_from_slice(&sh_a);
         manual[72..104].copy_from_slice(&rh_a);
         manual[104..136].copy_from_slice(&prev_a);
-        assert_eq!(signing, manual, "manual 136B mismatch for {}", vec.name);
+        manual[136..168].copy_from_slice(&window_a);
+        manual[168..200].copy_from_slice(&history_a);
+        assert_eq!(signing, manual, "manual 200B mismatch for {}", vec.name);
     }
 }
 

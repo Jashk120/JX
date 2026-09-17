@@ -301,6 +301,8 @@ mod tests {
             round,
             consensus::compute_records_root(&[]),
             state_hash,
+            [0u8; 32],
+            [0u8; 32],
             registry,
         );
         let mut accumulator = CheckpointAccumulator::new(payload.clone(), Vec::new());

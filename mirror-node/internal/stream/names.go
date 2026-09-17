@@ -2,8 +2,11 @@ package stream
 
 import "fmt"
 
+// Version is the stream wire version stamped inside every EventStreamFile /
+// RecordStreamFile / RecordsProofFile. 4 = PLAN-4 Phase A wire break:
+// checkpoints carry window_root + roster_history_root (200-byte signing bytes).
 const (
-	Version              = 3
+	Version              = 4
 	StreamsSubdir        = "streams"
 	DefaultEventsPerFile = 10000
 

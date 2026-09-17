@@ -28,11 +28,13 @@ order finalization. Depends on `primitives` for the value types and
   `RetainedEvent` record (event + record metadata) shared by the reconnect
   protocol and the Phase 8 durable event log.
 - `checkpoint` — `SignedCheckpoint` / `CheckpointPayload` / `CheckpointSig` /
-  `CheckpointAccumulator` and `RETENTION_ROUNDS` (prune floor, still 2).
-  Payload signing bytes are **136 B** domain-separated:
-  `round(8 BE)||records_root(32)||state_hash(32)||roster_hash(32)||prev_checkpoint_hash(32)`
+  `CheckpointAccumulator`, `SIGNED_WINDOW_ROUNDS` (16, signed-window length)
+  and `RETENTION_ROUNDS` (prune floor, equals the signed-window length).
+  Payload signing bytes are **200 B** domain-separated:
+  `round(8 BE)||records_root(32)||state_hash(32)||roster_hash(32)||prev_checkpoint_hash(32)||window_root(32)||roster_history_root(32)`
   (was 72 B → 104 B in PLAN-1 with `records_root`, then 104 B → 136 B in
-  PLAN-2 with `prev_checkpoint_hash`). Quorum is `valid * 3 > total * 2`
+  PLAN-2 with `prev_checkpoint_hash`, then 136 B → 200 B in PLAN-4 Phase A
+  with `window_root` + `roster_history_root`). Quorum is `valid * 3 > total * 2`
   (one-member-one-vote, unit stake). `prev_checkpoint_hash` chains history:
   round `R+1` commits to `SHA256(signing_bytes(R))`, genesis `[0;32]`.
   Also exposes `compute_records_root` / `build_records_proofs` /
@@ -67,5 +69,7 @@ vectors asserting equality.
   `roundReceived` (see `protocol/gossip/src/node.rs` activation). The
   membership registry for a `Hashgraph` is still snapshot-scoped; execution
   (KV + DID) lives in `executor/state`, not here.
-- `RETENTION_ROUNDS` is unchanged by PLAN-2 (still 2); pruning policy is
-  orthogonal to checkpoint chaining.
+- `RETENTION_ROUNDS` equals `SIGNED_WINDOW_ROUNDS` (16) since PLAN-4 Phase A
+  (was 2): the checkpoint commits to the window `[R-16, R]`, so retention
+  must hold exactly that window — pruning policy is coupled to the
+  signed-window length (PLAN-4 Hard Condition 1).

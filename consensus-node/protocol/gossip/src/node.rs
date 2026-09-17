@@ -2142,7 +2142,7 @@ impl GossipNode {
 
     /// The signing bytes the node's checkpoint for `round` is over, if one
     /// has been produced. Tests use this to craft valid signatures.
-    pub async fn checkpoint_signing_bytes(&self, round: u64) -> Option<[u8; 136]> {
+    pub async fn checkpoint_signing_bytes(&self, round: u64) -> Option<[u8; 200]> {
         self.checkpoint_accumulators
             .lock()
             .await
@@ -2945,7 +2945,7 @@ fn verify_pop_bytes(bls_key: &[u8; 48], pop: &[u8; 96]) -> bool {
 /// from a member not in that roster is rejected.
 fn verify_checkpoint_sig(
     sig: &CheckpointSig,
-    signing_bytes: &[u8; 136],
+    signing_bytes: &[u8; 200],
     roster: &MembershipRegistry,
 ) -> bool {
     let Some(bls_bytes) = roster.bls_key_for(&sig.signer) else {
@@ -3016,7 +3016,7 @@ mod pending_sig_tests {
     fn sig(round: u64, signer: u64) -> CheckpointSig {
         let bls = crypto::BlsIdentity::from_ikm(&[signer as u8; 32]).expect("bls");
         // Dummy payload for signing not validated in pending tests; sign a fixed message.
-        let dummy = [0u8; 136];
+        let dummy = [0u8; 200];
         CheckpointSig { round, signer: NodeId::new(signer), sig: bls.sign(&dummy) }
     }
 
@@ -3050,7 +3050,9 @@ mod pending_sig_tests {
     async fn pending_drops_round_at_or_below_watermark() {
         let (registry, _) = registry_with(&[1, 2, 3]);
         let node = make_node(registry.clone()).await;
-        let payload = consensus::CheckpointPayload::new(10, [0u8; 32], [0u8; 32], registry);
+        let payload = consensus::CheckpointPayload::new(
+            10, [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32], registry,
+        );
         let agg = {
             let bls = crypto::BlsIdentity::from_ikm(&[1u8; 32]).expect("bls");
             bls.sign(&payload.signing_bytes())
@@ -3084,6 +3086,8 @@ mod pending_sig_tests {
             5,
             [0u8; 32],
             state_hash,
+            [0u8; 32],
+            [0u8; 32],
             node.registry.lock().await.clone(),
         );
         let agg = {
@@ -3273,8 +3277,14 @@ mod apply_checkpoint_tests {
         roster: &MembershipRegistry,
         signers: &[u64],
     ) -> SignedCheckpoint {
-        let payload =
-            consensus::CheckpointPayload::new(round, [0u8; 32], state_hash, roster.clone());
+        let payload = consensus::CheckpointPayload::new(
+            round,
+            [0u8; 32],
+            state_hash,
+            [0u8; 32],
+            [0u8; 32],
+            roster.clone(),
+        );
         let mut sigs = Vec::new();
         for &signer in signers {
             let bls = crypto::BlsIdentity::from_ikm(&[signer as u8; 32]).expect("bls");
@@ -3442,6 +3452,8 @@ mod checkpoint_only_tests {
             round,
             [0u8; 32],
             state_hash,
+            [0u8; 32],
+            [0u8; 32],
             node.registry.lock().await.clone(),
         );
         node.checkpoint_accumulators
@@ -3517,6 +3529,8 @@ mod checkpoint_only_tests {
             3,
             [0u8; 32],
             [9u8; 32],
+            [0u8; 32],
+            [0u8; 32],
             payload.roster_snapshot.clone(),
         );
         assert_ne!(tampered.signing_bytes(), payload.signing_bytes());
@@ -3544,6 +3558,8 @@ mod checkpoint_only_tests {
             3,
             [0u8; 32],
             [9u8; 32],
+            [0u8; 32],
+            [0u8; 32],
             node.registry.lock().await.clone(),
         );
         node.checkpoint_accumulators
@@ -3570,6 +3586,8 @@ mod checkpoint_only_tests {
             5,
             [0u8; 32],
             payload.state_hash,
+            [0u8; 32],
+            [0u8; 32],
             payload.roster_snapshot.clone(),
         );
         assert!(!node.adopt_signed_checkpoint(aggregate_for(&future, &[1, 2, 3])).await);
@@ -3580,6 +3598,8 @@ mod checkpoint_only_tests {
             4,
             [0u8; 32],
             payload.state_hash,
+            [0u8; 32],
+            [0u8; 32],
             payload.roster_snapshot.clone(),
         );
         assert!(!node.adopt_signed_checkpoint(aggregate_for(&foreign, &[1, 2, 3])).await);

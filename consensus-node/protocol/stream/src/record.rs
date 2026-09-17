@@ -451,6 +451,8 @@ mod tests {
             round,
             consensus::compute_records_root(&[]),
             [round as u8; 32],
+            [0u8; 32],
+            [0u8; 32],
             roster,
         );
         let agg =
@@ -607,7 +609,8 @@ mod tests {
         let root = consensus::compute_records_root(&rr_items);
         let cp = {
             let roster = registry_of(&[1, 2, 3]);
-            let payload = consensus::CheckpointPayload::new(5, root, [5u8; 32], roster);
+            let payload =
+                consensus::CheckpointPayload::new(5, root, [5u8; 32], [0u8; 32], [0u8; 32], roster);
             let agg = crypto::BlsIdentity::from_ikm(&[0u8; 32])
                 .expect("bls")
                 .sign(&payload.signing_bytes());

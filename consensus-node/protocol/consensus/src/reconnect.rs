@@ -190,6 +190,8 @@ fn take_optional_hash(cursor: &mut &[u8]) -> Option<Option<EventHash>> {
 /// [state_hash: 32 bytes]
 /// [roster_hash: 32 bytes]
 /// [prev_checkpoint_hash: 32 bytes]
+/// [window_root: 32 bytes]
+/// [roster_history_root: 32 bytes]
 /// [roster_snapshot_len: u32 BE][roster_snapshot bytes]
 /// [signer_count: u32 BE]
 ///   per signer: [signer_id: u64 BE]
@@ -202,6 +204,8 @@ pub fn encode_signed_checkpoint(sc: &SignedCheckpoint) -> Result<Vec<u8>, primit
     buf.extend_from_slice(&sc.payload.state_hash);
     buf.extend_from_slice(&sc.payload.roster_hash);
     buf.extend_from_slice(&sc.payload.prev_checkpoint_hash);
+    buf.extend_from_slice(&sc.payload.window_root);
+    buf.extend_from_slice(&sc.payload.roster_history_root);
     let roster_bytes = sc.payload.roster_snapshot.to_bytes();
     let roster_len =
         u32::try_from(roster_bytes.len()).map_err(|_| primitives::Error::OutOfRange {
@@ -235,6 +239,8 @@ pub fn decode_signed_checkpoint(bytes: &[u8]) -> Option<SignedCheckpoint> {
     let state_hash = take_exact(&mut cursor, 32)?.try_into().ok()?;
     let roster_hash = take_exact(&mut cursor, 32)?.try_into().ok()?;
     let prev_checkpoint_hash = take_exact(&mut cursor, 32)?.try_into().ok()?;
+    let window_root = take_exact(&mut cursor, 32)?.try_into().ok()?;
+    let roster_history_root = take_exact(&mut cursor, 32)?.try_into().ok()?;
     let roster_len = take_u32(&mut cursor)? as usize;
     let roster_bytes = take_exact(&mut cursor, roster_len)?;
     let roster_snapshot = MembershipRegistry::from_bytes(roster_bytes)?;
@@ -248,6 +254,8 @@ pub fn decode_signed_checkpoint(bytes: &[u8]) -> Option<SignedCheckpoint> {
         state_hash,
         roster_hash,
         prev_checkpoint_hash,
+        window_root,
+        roster_history_root,
         roster_snapshot,
     };
 
@@ -366,6 +374,8 @@ mod tests {
             round,
             crate::checkpoint::compute_records_root(&[]),
             [7u8; 32],
+            [0u8; 32],
+            [0u8; 32],
             roster_snapshot,
         );
         let mut sigs = Vec::new();
@@ -584,10 +594,11 @@ mod tests {
         let sc = signed_checkpoint(3, &[1]);
         let mut bytes = encode_signed_checkpoint(&sc).unwrap();
         // Layout: round(8) || records_root(32) || state_hash(32) ||
-        // roster_hash(32) || prev_checkpoint_hash(32) || roster_len(u32)…
+        // roster_hash(32) || prev_checkpoint_hash(32) || window_root(32) ||
+        // roster_history_root(32) || roster_len(u32)…
         let roster_len =
-            u32::from_be_bytes(bytes[8 + 32 * 4..8 + 32 * 4 + 4].try_into().unwrap()) as usize;
-        let sig_count_offset = 8 + 32 * 4 + 4 + roster_len;
+            u32::from_be_bytes(bytes[8 + 32 * 6..8 + 32 * 6 + 4].try_into().unwrap()) as usize;
+        let sig_count_offset = 8 + 32 * 6 + 4 + roster_len;
         bytes[sig_count_offset..sig_count_offset + 4].copy_from_slice(&u32::MAX.to_be_bytes());
         assert_eq!(decode_signed_checkpoint(&bytes), None);
     }

@@ -52,7 +52,7 @@ func buildBLSPayload(t *testing.T, round uint64, items []*pb.RecordItem, members
 	rosterHash := sha256.Sum256(buf)
 	recordsRoot := stream.ComputeRecordsRoot(items)
 	stateHash := sha256.Sum256([]byte("state-for-bls-tests"))
-	var signingBytes [136]byte
+	var signingBytes [200]byte
 	binary.BigEndian.PutUint64(signingBytes[0:8], round)
 	copy(signingBytes[8:40], recordsRoot[:])
 	copy(signingBytes[40:72], stateHash[:])
@@ -182,7 +182,7 @@ func TestBLSQuorumRequiresTwoThirds(t *testing.T) {
 	rosterHash2 := sha256.Sum256(buf)
 	recordsRoot := stream.ComputeRecordsRoot(items)
 	stateHash := sha256.Sum256([]byte("state-for-bls-tests"))
-	var signingBytes [136]byte
+	var signingBytes [200]byte
 	binary.BigEndian.PutUint64(signingBytes[0:8], 11)
 	copy(signingBytes[8:40], recordsRoot[:])
 	copy(signingBytes[40:72], stateHash[:])

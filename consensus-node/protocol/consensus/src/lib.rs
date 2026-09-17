@@ -16,6 +16,7 @@ pub use checkpoint::{
     RecordsProof,
     RecordsProofStep,
     RecordsRootItem,
+    SIGNED_WINDOW_ROUNDS,
     SignedCheckpoint,
     build_records_proofs,
     compute_records_root,

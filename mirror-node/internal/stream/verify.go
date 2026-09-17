@@ -367,13 +367,20 @@ func ValidateStateDiffs(diffs []*pb.StateDiff) error {
 	return nil
 }
 
-func CheckpointSigningBytes(cp *pb.SignedCheckpoint) [136]byte {
-	var out [136]byte
+// CheckpointSigningBytes is the canonical 200-byte commitment every node
+// signs: round(8 BE) || records_root(32) || state_hash(32) ||
+// roster_hash(32) || prev_checkpoint_hash(32) || window_root(32) ||
+// roster_history_root(32). Byte-identical to consensus
+// CheckpointPayload::signing_bytes.
+func CheckpointSigningBytes(cp *pb.SignedCheckpoint) [200]byte {
+	var out [200]byte
 	binary.BigEndian.PutUint64(out[0:8], cp.Round)
 	copy(out[8:40], cp.RecordsRoot)
 	copy(out[40:72], cp.StateHash)
 	copy(out[72:104], cp.RosterHash)
 	copy(out[104:136], cp.PrevCheckpointHash)
+	copy(out[136:168], cp.WindowRoot)
+	copy(out[168:200], cp.RosterHistoryRoot)
 	return out
 }
 
@@ -609,12 +616,14 @@ func verifyCheckpointQuorum(cp *pb.SignedCheckpoint, trustedRosterHash []byte) e
 	if !sig.SigValidate(false) {
 		return fmt.Errorf("aggregate_sig failed signature validation")
 	}
-	var signingBytes [136]byte
+	var signingBytes [200]byte
 	binary.BigEndian.PutUint64(signingBytes[0:8], cp.Round)
 	copy(signingBytes[8:40], cp.RecordsRoot)
 	copy(signingBytes[40:72], cp.StateHash)
 	copy(signingBytes[72:104], cp.RosterHash)
 	copy(signingBytes[104:136], cp.PrevCheckpointHash)
+	copy(signingBytes[136:168], cp.WindowRoot)
+	copy(signingBytes[168:200], cp.RosterHistoryRoot)
 	if sig.FastAggregateVerify(false, pks, signingBytes[:], CheckpointDST) {
 		return nil
 	}

@@ -255,6 +255,8 @@ mod tests {
             round,
             consensus::compute_records_root(&[]),
             [round as u8; 32],
+            [0u8; 32],
+            [0u8; 32],
             roster,
         );
         let mut sigs = Vec::new();

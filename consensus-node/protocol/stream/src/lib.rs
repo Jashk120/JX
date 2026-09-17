@@ -11,7 +11,7 @@
 //!   the round's finalized transactions in consensus order plus the round's
 //!   threshold-signed `SignedCheckpoint` (the state-root anchor). **No
 //!   `.rsf_sig`**: since `1313db5`/`PLAN-1` record files are content-bound via
-//!   Merkle `records_root` plus 136-byte BLS aggregate and
+//!   Merkle `records_root` plus 200-byte BLS aggregate and
 //!   `prev_checkpoint_hash` chain, with a companion `.rsf_proofs` Merkle
 //!   sidecar.
 //!
@@ -51,9 +51,10 @@ pub use record::{
 };
 
 /// The version stamped inside every `EventStreamFile` / `RecordStreamFile`
-/// message. 3 = chained checkpoints via `prev_checkpoint_hash` (signing_bytes
-/// grew to 136 B and now bind history; see `protocol/consensus/src/checkpoint.rs`).
-pub const STREAM_VERSION: u32 = 3;
+/// message. 4 = PLAN-4 Phase A wire break: checkpoints carry `window_root`
+/// and `roster_history_root` (signing_bytes grew to 200 B; see
+/// `protocol/consensus/src/checkpoint.rs`).
+pub const STREAM_VERSION: u32 = 4;
 
 /// Subdirectory (under the data dir) holding the stream files.
 pub const STREAMS_SUBDIR: &str = "streams";

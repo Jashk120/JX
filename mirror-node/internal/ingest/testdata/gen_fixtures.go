@@ -51,7 +51,7 @@ func main() {
 	}
 	recordsRoot := stream.ComputeRecordsRoot(items)
 	stateHash := sha256.Sum256([]byte("test-state-root"))
-	var signingBytes [136]byte
+	var signingBytes [200]byte
 	binary.BigEndian.PutUint64(signingBytes[0:8], 1)
 	copy(signingBytes[8:40], recordsRoot[:])
 	copy(signingBytes[40:72], stateHash[:])

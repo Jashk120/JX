@@ -13,14 +13,14 @@ shared key-value state.
 protocol/     consensus-critical network layer
   primitives/    value types (zero dependencies)
   crypto/        hashing, signing, membership
-  consensus/     virtual-voting Hashgraph: rounds, fame, order, checkpoints (FORMAT_VERSION 5)
+  consensus/     virtual-voting Hashgraph: rounds, fame, order, checkpoints (FORMAT_VERSION 6)
   storage/       Fjall-backed durable event log + roster history
   stream/        mirror stream files: .esf events (+ .esf_sig) + .rsf records (+ .rsf_proofs sidecar)
   gossip/        pinned-TLS gossip network + GossipNode runtime
   test-support/  shared test timing helpers (SYNC_INTERVAL, DEADLINE)
 executor/     deterministic execution layer
   state/        Fjall-backed KV executor + Merkle tree + DID (did:jkain) — emits sorted after-image state_diffs
-node/         the jkaind daemon: config, persistence, restart recovery (FORMAT_VERSION 5, STREAM_VERSION 3)
+node/         the jkaind daemon: config, persistence, restart recovery (FORMAT_VERSION 6, STREAM_VERSION 4)
 ```
 
 Shared protobuf schema lives at the repo root `proto/jkain_stream.proto` and is
@@ -139,7 +139,7 @@ Available `run` flags:
 | `--cluster <path>` | *(required)* | Genesis `cluster.toml` |
 | `--node-id <id>` | *(required)* | This node's `NodeId` |
 | `--secret <path>` | *(required)* | `secret-<id>.bin` (64-byte genesis or 32-byte single-seed for dynamic members) |
-| `--data <dir>` | `data` | Data dir for checkpoints (`<data>/checkpoints/`), state DB (`<data>/statedb/`), event log (`<data>/eventlog/`), streams (`<data>/streams/` — `.esf`+`.esf_sig`, `.rsf`+`.rsf_proofs`, `.ckpt`) — `FORMAT_VERSION` 5, `STREAM_VERSION` 3 |
+| `--data <dir>` | `data` | Data dir for checkpoints (`<data>/checkpoints/`), state DB (`<data>/statedb/`), event log (`<data>/eventlog/`), streams (`<data>/streams/` — `.esf`+`.esf_sig`, `.rsf`+`.rsf_proofs`, `.ckpt`) — `FORMAT_VERSION` 6, `STREAM_VERSION` 4 |
 | `--gossip-port <port>` | from `cluster.toml` | Override gossip listen port |
 | `--reconnect-port <port>` | from `cluster.toml` | Override reconnect listen port (or force one for a gossip-only member) |
 | `--control-socket <path>` | `<data>/jkaind.sock` | Unix control socket (0600) |

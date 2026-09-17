@@ -57,7 +57,7 @@ fn registry_for_ids(ids: &[u64]) -> MembershipRegistry {
 fn checkpoint_sig_for(
     signer: u64,
     round: u64,
-    signing_bytes: &[u8; 136],
+    signing_bytes: &[u8; 200],
 ) -> consensus::CheckpointSig {
     let bls = crypto::BlsIdentity::from_ikm(&consensus_seed(signer)).expect("bls");
     let sig = bls.sign(signing_bytes);
@@ -233,8 +233,14 @@ async fn from_checkpoint_rejects_roster_key_mismatched_to_the_learner() {
     let state = state::State::new(temp_state_db().state_keyspace());
     let state_bytes = state.to_bytes().expect("to_bytes succeeds");
     let state_hash = state.root();
-    let payload =
-        CheckpointPayload::new(1, consensus::compute_records_root(&[]), state_hash, roster.clone());
+    let payload = CheckpointPayload::new(
+        1,
+        consensus::compute_records_root(&[]),
+        state_hash,
+        [0u8; 32],
+        [0u8; 32],
+        roster.clone(),
+    );
 
     // Both members sign: the 2-node roster's quorum is all of them.
     let mut accumulator = CheckpointAccumulator::new(payload.clone(), Vec::new());
@@ -309,8 +315,14 @@ fn checkpoint_response_for(
     retained: Vec<consensus::RetainedEvent>,
     decided_round: u64,
 ) -> ReconnectResponse {
-    let payload =
-        CheckpointPayload::new(1, consensus::compute_records_root(&[]), state_hash, roster.clone());
+    let payload = CheckpointPayload::new(
+        1,
+        consensus::compute_records_root(&[]),
+        state_hash,
+        [0u8; 32],
+        [0u8; 32],
+        roster.clone(),
+    );
     let mut accumulator = CheckpointAccumulator::new(payload.clone(), Vec::new());
     accumulator.add_sig(checkpoint_sig_for(1, 1, &payload.signing_bytes()), roster);
     let accepted = accumulator

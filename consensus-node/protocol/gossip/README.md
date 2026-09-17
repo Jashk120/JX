@@ -88,7 +88,7 @@ per `docs/OPTIMIZATION.md:3.4` (G-track G1–G6).
   `records_root`, then gossiped as `Frame::CheckpointSig` on every successful
   sync until quorum. Chained payloads embed `prev_checkpoint_hash`
   (PLAN-2 Rule 1: pure function of decided history — the hash of the
-  previous round's 136-byte signing_bytes — with a stored-checkpoint fallback
+  previous round's 200-byte signing_bytes — with a stored-checkpoint fallback
   for pruned-K restarts and genesis `[0;32]`); the gossip hot path never
   invents a chain hash from local acceptance progress.
 
