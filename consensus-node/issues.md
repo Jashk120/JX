@@ -487,7 +487,7 @@ JKAIND_BIN=$PWD/consensus-node/target/release/jkaind JKAIN_KEEP_TMP=1 \
 
 ## CP-1. Checkpoint acceptance stalls on a node while it keeps deciding rounds
 
-- **Severity:** high (liveness). **Confidence:** certain (observed live).
+- **Severity:** high (liveness). **Status:** FIXED (checkpoint-only transfer).
 - **Evidence** (live status poll, 6 nodes direct, `decided` / `latest_checkpoint_round`):
 
   | t | decided | checkpoint |
@@ -503,25 +503,45 @@ JKAIND_BIN=$PWD/consensus-node/target/release/jkaind JKAIN_KEEP_TMP=1 \
 - **Ruled out:** thermal throttling (release binary, cool); state/snapshot divergence
   (no `refusing to accept checkpoint` in node logs); payload non-determinism on the
   accepted branch (quorums did form, at rounds 20–67).
-- **Mechanism (traced in code):** a node accepts a checkpoint for round R only after
-  `produce_checkpoint` created an accumulator for it (`protocol/gossip/src/node.rs:1740-1744`),
-  and `produce_pending_checkpoints` advances sequentially, breaking at the first round
-  where `hg.is_round_decided(round)` is false (`node.rs:1679-1694`). A node whose local
-  view of round R never completes stops producing/accepting R and every later round while
-  its `decided_round` (ordering) keeps advancing. Signature collection is a second,
-  independent window: `accept_checkpoint` drops own sigs for accepted rounds
-  (`node.rs:1962-1965`) and `gossip_checkpoint_sigs` re-sends only until local accept
-  (`node.rs:2084-2093`), so a late producer may never collect 5-of-6.
-- **Attempted fix (REVERTED, insufficient):** retain own outbound sigs while
-  `sig.round + RETENTION_ROUNDS > accept_round` instead of dropping immediately. Starved
-  nodes fall further behind than the 2-round window, so this did not resolve it. Do not
-  re-apply without a companion fix for the `is_round_decided` gate.
-- **Follow-up:** (a) instrument `is_round_decided(R)` / `checkpoint_watermark` per node;
-  (b) add a checkpoint-lag detector that triggers the existing
-  `fetch_checkpoint` / `apply_checkpoint` path when local acceptance trails
-  `decided_round` by more than `RETENTION_ROUNDS`; (c) `apply_checkpoint` does not clear
-  `checkpoint_accumulators` / `pending_checkpoint_sigs` / `outbound_checkpoint_sigs`
-  (`node.rs:2420+`), so stale pre-partition entries linger after a heal.
+- **Root cause (confirmed):** a checkpoint needs a 5-of-6 BLS quorum over one round's
+  payload. Every node produces and gossips its own signature, but `accept_checkpoint`
+  drops a node's own sigs for rounds `<= accepted` (`node.rs:1962-1965`) and
+  `gossip_checkpoint_sigs` re-sends only what remains (`node.rs:2080-2093`). A round's
+  signature-availability window therefore closes the moment the majority accepts it, so a
+  node that is even slightly late can never assemble quorum for that round and recovers
+  only by racing into a fresh one (observed `10 → 46` jump). `RETENTION_ROUNDS = 2`
+  (`consensus/src/checkpoint.rs:32`) is the snapshot-servability floor, not a signature
+  window — at ~2.4 rounds/s it is ~0.8 s, versus a 30–45-round observed lag.
+- **Ruled out:** thermal throttling (release binary, cool); state/snapshot divergence
+  (no `refusing to accept checkpoint` in node logs); ordering/round-decision stall
+  (`ordered_round == decided_round` on every node throughout the watched run, so
+  `is_round_decided` was *not* gating production); payload non-determinism on the
+  accepted branch (quorums did form, at rounds 20–67).
+- **Fix (this pass) — checkpoint-only recovery:** new internal gossip frames
+  `CheckpointRequest` / `CheckpointResponse` (`proto.rs`, tags `0x07` / `0x08`, reusing
+  the canonical `SignedCheckpoint` codec); a lag detector (`CHECKPOINT_LAG_ROUNDS = 16`)
+  arms a fetch when `decided − accepted` exceeds it; the learner verifies the peer's BLS
+  aggregate against **the exact payload it independently produced** (accumulator
+  `signing_bytes` equality, then `SignedCheckpoint::verify`) and adopts through the
+  existing `accept_checkpoint` with the accumulator's snapshot and retained per-round
+  diffs. The learner keeps its own hashgraph — no state/graph transfer — so
+  `insert_accepted` and the P1-3 residual are not involved. Verified:
+  `test_6node_convergence_no_latency` and `test_6node_partition_and_heal` pass on the
+  release binary, with `checkpoint-only fetch succeeded` in the node logs.
+- **Residual (deferred):**
+  - Adoption jumps the accepted watermark to the fetched round, so `.rsf` record files
+    for the skipped rounds are not emitted by this node (per-round diffs are retained
+    only until acceptance). Other nodes emit them and the runtime mirror ingests
+    per-file; `verify_record_stream_dir` (test-time, per-node contiguity) would reject a
+    gapped directory.
+  - The full `fetch_checkpoint` / `apply_checkpoint` reconnect path is still unusable for
+    live lag: `insert_accepted` rejects legitimate transfers with
+    `InvalidRetainedAncestors` when a transferred event has exactly one pruned parent
+    (`hashgraph.rs:490-503`), and that branch has no test coverage. Deferred to the
+    signed-frontier change (P1-3 follow-up above).
+  - `apply_checkpoint` does not clear `checkpoint_accumulators` /
+    `pending_checkpoint_sigs` / `outbound_checkpoint_sigs` / `checkpoint_diffs` on a full
+    reconnect, so stale pre-partition entries linger after a heal.
 
 ## CP-2. First-checkpoint latency is marginal against the 60 s harness timeout
 
