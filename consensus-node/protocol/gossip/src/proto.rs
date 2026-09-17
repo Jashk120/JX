@@ -25,6 +25,12 @@ pub enum MessageType {
     /// behind the history this node has pruned (Phase 4). The requester
     /// must reconnect from a checkpoint.
     Behind = 0x06,
+    /// Checkpoint-only request: the learner asks for the teacher's latest
+    /// accepted [`consensus::SignedCheckpoint`] without state bytes or the
+    /// retained graph (checkpoint-lag recovery).
+    CheckpointRequest = 0x07,
+    /// Checkpoint-only response: the teacher's aggregated signed checkpoint.
+    CheckpointResponse = 0x08,
 }
 
 impl MessageType {
@@ -37,6 +43,8 @@ impl MessageType {
             0x04 => Ok(Self::Reconnect),
             0x05 => Ok(Self::ReconnectResponse),
             0x06 => Ok(Self::Behind),
+            0x07 => Ok(Self::CheckpointRequest),
+            0x08 => Ok(Self::CheckpointResponse),
             other => Err(GossipError::framing(format!("unknown message tag {other:#04x}"))),
         }
     }
@@ -110,6 +118,12 @@ pub enum Frame {
     /// The responder could not build a delta for the requester because the
     /// requester is behind the history the responder has pruned.
     Behind,
+    /// Checkpoint-only request (empty payload): the learner asks for the
+    /// teacher's latest accepted signed checkpoint, without state bytes or
+    /// the retained graph.
+    CheckpointRequest,
+    /// Checkpoint-only response: the teacher's aggregated signed checkpoint.
+    CheckpointResponse(consensus::SignedCheckpoint),
 }
 
 impl Frame {
@@ -122,6 +136,8 @@ impl Frame {
             Self::Reconnect(_) => MessageType::Reconnect,
             Self::ReconnectResponse(_) => MessageType::ReconnectResponse,
             Self::Behind => MessageType::Behind,
+            Self::CheckpointRequest => MessageType::CheckpointRequest,
+            Self::CheckpointResponse(_) => MessageType::CheckpointResponse,
         }
     }
 
@@ -202,6 +218,12 @@ impl Frame {
                 }
             }
             Self::Behind => {}
+            Self::CheckpointRequest => {}
+            Self::CheckpointResponse(checkpoint) => {
+                let cp_bytes = consensus::reconnect::encode_signed_checkpoint(checkpoint)
+                    .map_err(|e| GossipError::framing(e.to_string()))?;
+                payload.extend_from_slice(&cp_bytes);
+            }
         }
 
         let len =
@@ -472,6 +494,18 @@ impl Frame {
                 let cursor = Cursor::new(payload);
                 cursor.finish()?;
                 Ok(Self::Behind)
+            }
+            MessageType::CheckpointRequest => {
+                let cursor = Cursor::new(payload);
+                cursor.finish()?;
+                Ok(Self::CheckpointRequest)
+            }
+            MessageType::CheckpointResponse => {
+                let signed_checkpoint = consensus::reconnect::decode_signed_checkpoint(payload)
+                    .ok_or_else(|| {
+                        GossipError::framing("invalid signed checkpoint in checkpoint response")
+                    })?;
+                Ok(Self::CheckpointResponse(signed_checkpoint))
             }
         }
     }
@@ -831,6 +865,38 @@ mod tests {
         .expect("parses");
         assert_eq!(decoded, Frame::Behind);
         assert_eq!(frame.message_type(), MessageType::Behind);
+    }
+
+    #[test]
+    fn checkpoint_only_frames_round_trip() {
+        let request = Frame::CheckpointRequest;
+        let decoded = Frame::from_bytes(
+            &request
+                .to_bytes()
+                .expect("frame to_bytes must succeed: payload bounded by MAX_FRAME_SIZE"),
+        )
+        .expect("parses");
+        assert_eq!(decoded, Frame::CheckpointRequest);
+        assert_eq!(request.message_type(), MessageType::CheckpointRequest);
+
+        let response = sample_reconnect_response();
+        let frame = Frame::CheckpointResponse(response.signed_checkpoint.clone());
+        let bytes = frame
+            .to_bytes()
+            .expect("frame to_bytes must succeed: payload bounded by MAX_FRAME_SIZE");
+        let decoded = Frame::from_bytes(&bytes).expect("parses");
+        assert_eq!(decoded, frame);
+        assert_eq!(frame.message_type(), MessageType::CheckpointResponse);
+        // Byte-for-byte stability: encoding the decoded frame reproduces the
+        // exact wire bytes.
+        let Frame::CheckpointResponse(decoded_checkpoint) = decoded else {
+            panic!("decoded to the wrong frame type");
+        };
+        assert_eq!(decoded_checkpoint, response.signed_checkpoint);
+        assert_eq!(
+            Frame::CheckpointResponse(decoded_checkpoint).to_bytes().expect("re-encode succeeds"),
+            bytes
+        );
     }
 
     /// A real `SignedCheckpoint`-bearing response with a live roster, one

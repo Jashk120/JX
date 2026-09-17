@@ -317,6 +317,8 @@ fn frame_name(frame: &Frame) -> &'static str {
         Frame::Reconnect(_) => "Reconnect",
         Frame::ReconnectResponse(_) => "ReconnectResponse",
         Frame::Behind => "Behind",
+        Frame::CheckpointRequest => "CheckpointRequest",
+        Frame::CheckpointResponse(_) => "CheckpointResponse",
     }
 }
 

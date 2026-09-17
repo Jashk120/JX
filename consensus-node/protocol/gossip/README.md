@@ -116,6 +116,17 @@ per `docs/OPTIMIZATION.md:3.4` (G-track G1–G6).
 - Checkpoint signatures are gossiped on the same stream as events
   (`Frame::CheckpointSig`), re-sent until quorum (`valid * 3 > total * 2`).
   A node that has not yet produced its own payload buffers inbound sigs.
+  A node that misses a round's collection window can never close it via
+  gossip (peers drop their own sigs on acceptance and only re-send what
+  remains), so when the decided round runs more than `CHECKPOINT_LAG_ROUNDS`
+  (16) ahead of the latest accepted checkpoint the node arms a
+  checkpoint-only fetch: it sends `Frame::CheckpointRequest` (tag `0x07`,
+  empty payload) to a peer's reconnect port and adopts the
+  `Frame::CheckpointResponse` (tag `0x08`) aggregate via
+  `adopt_signed_checkpoint` — accepted only over the exact payload the
+  learner independently produced (`signing_bytes` equality) with a valid BLS
+  aggregate — through the normal `accept_checkpoint` path, keeping its own
+  graph with no state transfer.
 - Per-round `state_diffs` are captured alongside the state hash in
   `process_finalized_rounds` (one call to `bucket_finalized_with_diffs` per
   round, LWW within the round, sorted for determinism) and carried through

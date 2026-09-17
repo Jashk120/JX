@@ -68,7 +68,10 @@ use crate::proto::{
     ReconnectResponse,
     SyncResponse,
 };
-use crate::reconnect::fetch_checkpoint;
+use crate::reconnect::{
+    fetch_checkpoint,
+    fetch_checkpoint_only,
+};
 use crate::sync::{
     SyncOutcome,
     create_own_event,
@@ -253,6 +256,14 @@ pub fn outbound_capacity(n: usize) -> NonZeroUsize {
 
 const MAX_PENDING_SIGS_PER_ROUND: usize = 64;
 
+/// How far the decided round may run ahead of the latest accepted checkpoint
+/// round before the node arms a checkpoint-only fetch. A node that misses a
+/// round's signature-collection window can never close it later: peers drop
+/// their own sigs once they accept (`accept_checkpoint` prunes `outbound`)
+/// and only re-send what remains, so quorum for the missed round is
+/// unreachable through gossip alone.
+const CHECKPOINT_LAG_ROUNDS: u64 = 16;
+
 const MAX_PENDING_TRANSACTIONS: usize = 1_024;
 
 /// A JKain node: owns a hashgraph, a TLS identity, the known-peer table,
@@ -279,6 +290,13 @@ pub struct GossipNode {
     /// One in-flight [`CheckpointAccumulator`] per round whose checkpoint
     /// this node has produced but not yet accepted. Removed on acceptance.
     checkpoint_accumulators: Mutex<HashMap<u64, CheckpointAccumulator>>,
+    /// Per-round state diffs captured at checkpoint production, keyed by
+    /// round. The [`CheckpointAccumulator`] does not carry diffs (consensus
+    /// must not depend on `stream::pb`), so they are retained here until the
+    /// round is accepted — at which point `accept_checkpoint` needs them to
+    /// emit a valid `.rsf`. Pruned alongside `outbound`/`pending` on
+    /// acceptance (`<= round`).
+    checkpoint_diffs: Mutex<HashMap<u64, Vec<stream::pb::StateDiff>>>,
     /// Accepted checkpoints, ascending by round.
     signed_checkpoints: Mutex<Vec<SignedCheckpoint>>,
     /// Per-round serialized state (`State::to_bytes()`), keyed by round,
@@ -302,6 +320,12 @@ pub struct GossipNode {
     /// checkpoint. Only ever set by the sync driver and read on the next loop
     /// iteration, so an `AtomicBool` (no mutex) suffices.
     needs_reconnect: AtomicBool,
+    /// Set when the decided round has run more than [`CHECKPOINT_LAG_ROUNDS`]
+    /// ahead of the latest accepted checkpoint round, signalling that this
+    /// node missed a signature-collection window and must fetch an aggregated
+    /// checkpoint (checkpoint-only, no state transfer) from a peer. Same
+    /// set-once-per-tick, read-next-tick discipline as `needs_reconnect`.
+    needs_checkpoint_sync: AtomicBool,
     /// Monotonic last-emitted timestamp (millis since epoch) for this node's
     /// own events. Used by [`Self::next_timestamp`] to clamp `SystemTime` so
     /// two successive calls never return equal or decreasing values, even if
@@ -440,11 +464,13 @@ impl GossipNode {
             state_db,
             activation: Mutex::new(ActivationState::default()),
             checkpoint_accumulators: Mutex::new(HashMap::new()),
+            checkpoint_diffs: Mutex::new(HashMap::new()),
             signed_checkpoints: Mutex::new(Vec::new()),
             state_snapshots: Mutex::new(BTreeMap::new()),
             outbound_checkpoint_sigs: Mutex::new(Vec::new()),
             pending_checkpoint_sigs: Mutex::new(BTreeMap::new()),
             needs_reconnect: AtomicBool::new(false),
+            needs_checkpoint_sync: AtomicBool::new(false),
             last_timestamp: AtomicU64::new(0),
             own_event_lock: Mutex::new(()),
             checkpoint_notify: Arc::new(Notify::new()),
@@ -835,6 +861,65 @@ impl GossipNode {
                         }
                     }
                     continue;
+                }
+            }
+
+            if self.needs_checkpoint_sync.load(Ordering::Acquire) {
+                // Checkpoint lag (not graph lag): the event graph is healthy
+                // but a missed signature-collection window left one or more
+                // produced checkpoints unaccepted. Every reconnect-capable
+                // peer is tried each tick (from a random start offset), like
+                // the full-reconnect path above. A fetched aggregate is
+                // adopted only if it commits to the exact payload this node
+                // produced; the flag stays set until an adoption succeeds, so
+                // a failed tick retries on the next interval. `needs_reconnect`
+                // is untouched — the graph needs no state transfer.
+                let candidates: Vec<(PeerInfo, std::net::SocketAddr)> = {
+                    let pm = self.peers.lock().await;
+                    pm.all()
+                        .into_iter()
+                        .filter_map(|peer| peer.reconnect_addr.map(|addr| (peer, addr)))
+                        .collect()
+                };
+                if !candidates.is_empty() {
+                    let offset = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.subsec_nanos() as usize)
+                        % candidates.len();
+                    for i in 0..candidates.len() {
+                        let (peer, reconnect_addr) = &candidates[(offset + i) % candidates.len()];
+                        tracing::info!(peer = ?peer.node_id, "checkpoint-only fetch starting");
+                        let attempt = tokio::time::timeout(
+                            self.sync_timing.sync_timeout * 2,
+                            fetch_checkpoint_only(&self.identity, peer, *reconnect_addr),
+                        )
+                        .await;
+                        match attempt {
+                            Ok(Ok(checkpoint)) => {
+                                if self.adopt_signed_checkpoint(checkpoint).await {
+                                    self.needs_checkpoint_sync.store(false, Ordering::Release);
+                                    tracing::info!(
+                                        peer = ?peer.node_id,
+                                        "checkpoint-only fetch succeeded"
+                                    );
+                                    break;
+                                }
+                                tracing::warn!(
+                                    peer = ?peer.node_id,
+                                    "checkpoint-only adoption rejected, trying next peer"
+                                );
+                            }
+                            Ok(Err(e)) => {
+                                tracing::warn!(error = %e, "checkpoint-only fetch failed");
+                            }
+                            Err(_) => {
+                                tracing::warn!(
+                                    peer = ?peer.node_id,
+                                    "checkpoint-only fetch timed out"
+                                );
+                            }
+                        }
+                    }
                 }
             }
 
@@ -1662,6 +1747,7 @@ impl GossipNode {
             let diffs: BTreeMap<u64, Vec<stream::pb::StateDiff>> = BTreeMap::new();
             self.produce_pending_checkpoints(&cumulative_state_hashes, &snapshots, &diffs).await;
         }
+        self.arm_checkpoint_lag_reconnect().await;
         self.checkpoint_notify.notify_waiters();
     }
 
@@ -1716,6 +1802,7 @@ impl GossipNode {
             return;
         };
         let diffs_for_round = diffs.get(&round).cloned().unwrap_or_default();
+        self.checkpoint_diffs.lock().await.insert(round, diffs_for_round.clone());
         let signed_snapshot = self.signed_checkpoints.lock().await.clone();
         let payload = {
             let hg = self.hashgraph.lock().await;
@@ -1967,6 +2054,10 @@ impl GossipNode {
             let mut pending = self.pending_checkpoint_sigs.lock().await;
             pending.retain(|r, _| *r > round);
         }
+        {
+            let mut diffs = self.checkpoint_diffs.lock().await;
+            diffs.retain(|r, _| *r > round);
+        }
         let prune_before_round = round.saturating_sub(RETENTION_ROUNDS);
         {
             let mut snapshots = self.state_snapshots.lock().await;
@@ -2075,6 +2166,90 @@ impl GossipNode {
     /// to flag a checkpoint roster that disagrees with the live registry.
     pub async fn latest_signed_checkpoint(&self) -> Option<SignedCheckpoint> {
         self.signed_checkpoints.lock().await.last().cloned()
+    }
+
+    /// Arms a checkpoint-only fetch when the decided round has run more than
+    /// [`CHECKPOINT_LAG_ROUNDS`] ahead of the latest accepted checkpoint
+    /// round. Called at the end of [`Self::process_finalized_rounds`].
+    async fn arm_checkpoint_lag_reconnect(&self) {
+        let decided = self.hashgraph.lock().await.highest_decided_round();
+        let accepted =
+            self.signed_checkpoints.lock().await.last().map(|c| c.payload.round).unwrap_or(0);
+        if decided.saturating_sub(accepted) > CHECKPOINT_LAG_ROUNDS {
+            self.needs_checkpoint_sync.store(true, Ordering::Release);
+        }
+    }
+
+    /// Whether a checkpoint-only fetch is currently armed (observability /
+    /// test helper).
+    pub fn needs_checkpoint_only_sync(&self) -> bool {
+        self.needs_checkpoint_sync.load(Ordering::Acquire)
+    }
+
+    /// Adopts a peer-aggregated [`SignedCheckpoint`] for a round this node
+    /// independently produced but never reached quorum on. The checkpoint is
+    /// accepted only if it commits to the exact payload this node derived
+    /// from decided history (`signing_bytes` equality with the local
+    /// accumulator) and its BLS aggregate verifies. The node's own
+    /// [`consensus::Hashgraph`] is kept — no graph is installed — and the
+    /// round is recorded through the existing [`Self::accept_checkpoint`]
+    /// path with the accumulator-carried snapshot and the retained diffs.
+    /// Returns `true` only if the round is actually recorded as accepted
+    /// afterwards: `accept_checkpoint` can still refuse (snapshot/state-root
+    /// mismatch or a durable-write failure) without a return value, so the
+    /// authoritative `signed_checkpoints` state is re-checked instead of
+    /// assuming success. `false` on any rejection (without mutating
+    /// checkpoint state, except the already-consumed accumulator/diffs on a
+    /// failed accept).
+    pub async fn adopt_signed_checkpoint(&self, checkpoint: SignedCheckpoint) -> bool {
+        let round = checkpoint.payload.round;
+        let accepted =
+            self.signed_checkpoints.lock().await.last().map(|c| c.payload.round).unwrap_or(0);
+        if round <= accepted {
+            return false;
+        }
+        let decided = self.hashgraph.lock().await.highest_decided_round();
+        if round > decided {
+            tracing::warn!(
+                round,
+                decided,
+                "rejecting checkpoint-only adoption above the decided round"
+            );
+            return false;
+        }
+        let (signing_bytes, snapshot) = {
+            let accumulators = self.checkpoint_accumulators.lock().await;
+            match accumulators.get(&round) {
+                Some(acc) => (acc.signing_bytes(), acc.snapshot().to_vec()),
+                None => return false,
+            }
+        };
+        if checkpoint.payload.signing_bytes() != signing_bytes {
+            tracing::warn!(
+                round,
+                "rejecting checkpoint-only adoption: payload differs from the locally produced checkpoint"
+            );
+            return false;
+        }
+        if !checkpoint.verify() {
+            tracing::warn!(
+                round,
+                "rejecting checkpoint-only adoption: aggregate verification failed"
+            );
+            return false;
+        }
+        {
+            let mut accumulators = self.checkpoint_accumulators.lock().await;
+            accumulators.remove(&round);
+        }
+        let diffs = self.checkpoint_diffs.lock().await.remove(&round).unwrap_or_default();
+        self.accept_checkpoint(checkpoint, snapshot, diffs).await;
+        // `accept_checkpoint` returns `()` but can refuse without recording
+        // (snapshot/state-root mismatch, durable-write failure), so adoption
+        // success is read back from the authoritative accepted state. A
+        // `false` here keeps the driver's `needs_checkpoint_sync` armed for
+        // the next tick instead of silently dropping recovery.
+        self.latest_accepted_checkpoint_round().await.is_some_and(|r| r >= round)
     }
 
     /// Sends every pending checkpoint signature on the given transport. Own
@@ -2218,6 +2393,8 @@ impl GossipNode {
                 // arriving on the gossip port is a protocol violation.
                 Frame::Reconnect(_) => return,
                 Frame::ReconnectResponse(_) => return,
+                Frame::CheckpointRequest => return,
+                Frame::CheckpointResponse(_) => return,
                 Frame::Behind => return,
             }
         }
@@ -2600,7 +2777,20 @@ impl GossipNode {
             Ok(frame) => frame,
             Err(_) => return,
         };
-        let Frame::Reconnect(_request) = frame else { return };
+        match frame {
+            Frame::Reconnect(_) => {}
+            Frame::CheckpointRequest => {
+                let Some(checkpoint) = self.select_checkpoint_for_learner().await else {
+                    return;
+                };
+                if let Err(e) = transport.send_frame(&Frame::CheckpointResponse(checkpoint)).await {
+                    tracing::warn!(error = %e, "failed to send CheckpointResponse");
+                    self.gossip_metrics.lock().await.sync_failures += 1;
+                }
+                return;
+            }
+            _ => return,
+        }
 
         // Serve the highest accepted checkpoint, which leaves the learner a
         // replay window (cp_round, decided_round] fully inside this node's
@@ -3174,6 +3364,245 @@ mod apply_checkpoint_tests {
             node.last_timestamp.load(Ordering::Relaxed),
             0,
             "timestamp watermark is untouched on rejection"
+        );
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_only_tests {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use crypto::MembershipRegistry;
+    use ed25519_dalek::SigningKey;
+    use primitives::NodeId;
+    use tempfile::tempdir;
+
+    use super::*;
+
+    fn registry_with(nodes: &[u64]) -> MembershipRegistry {
+        let mut registry = MembershipRegistry::new();
+        for &id in nodes {
+            let k = SigningKey::from_bytes(&[id as u8; 32]);
+            let bls = crypto::BlsIdentity::from_ikm(&[id as u8; 32]).expect("bls");
+            registry.register(NodeId::new(id), k.verifying_key(), bls.public.to_bytes());
+        }
+        registry
+    }
+
+    async fn make_node(registry: MembershipRegistry) -> Arc<GossipNode> {
+        let dir = tempdir().expect("tempdir");
+        let db = Arc::new(state::StateDb::open(dir.path()).expect("StateDb"));
+        let identity = TlsIdentity::from_seed([9u8; 32], 1).expect("tls");
+        let signing_key = SigningKey::from_bytes(&[1u8; 32]);
+        let node = GossipNode::new(
+            NodeId::new(1),
+            signing_key,
+            registry,
+            identity,
+            Vec::new(),
+            SyncTiming::new(
+                std::time::Duration::from_millis(50),
+                std::time::Duration::from_secs(1),
+            ),
+            db,
+        );
+        Arc::new(node)
+    }
+
+    fn aggregate_for(payload: &consensus::CheckpointPayload, signers: &[u64]) -> SignedCheckpoint {
+        let mut pairs: Vec<(NodeId, blst::min_pk::Signature)> = signers
+            .iter()
+            .map(|&id| {
+                let bls = crypto::BlsIdentity::from_ikm(&[id as u8; 32]).expect("bls");
+                (NodeId::new(id), bls.sign(&payload.signing_bytes()))
+            })
+            .collect();
+        pairs.sort_by_key(|(id, _)| *id);
+        let refs: Vec<&blst::min_pk::Signature> = pairs.iter().map(|(_, sig)| sig).collect();
+        let aggregate_sig = crypto::bls::aggregate(&refs).expect("aggregate succeeds");
+        SignedCheckpoint {
+            payload: payload.clone(),
+            aggregate_sig,
+            signers: pairs.into_iter().map(|(id, _)| id).collect(),
+        }
+    }
+
+    /// Installs a locally-produced accumulator for `round` on `node` (payload
+    /// over the live state's root, snapshot + diffs retained gossip-side) and
+    /// marks the round decided. Returns the payload.
+    async fn produce_local_round(
+        node: &Arc<GossipNode>,
+        round: u64,
+    ) -> consensus::CheckpointPayload {
+        node.hashgraph.lock().await.mark_decided_through(round).expect("empty graph marks");
+        let snapshot = node.executor.lock().await.state().to_bytes().expect("to_bytes succeeds");
+        let state_hash = state::State::root_of_bytes(&snapshot).expect("empty state hashes");
+        let payload = consensus::CheckpointPayload::new(
+            round,
+            [0u8; 32],
+            state_hash,
+            node.registry.lock().await.clone(),
+        );
+        node.checkpoint_accumulators
+            .lock()
+            .await
+            .insert(round, CheckpointAccumulator::new(payload.clone(), snapshot));
+        node.checkpoint_diffs.lock().await.insert(
+            round,
+            vec![stream::pb::StateDiff { key: b"k".to_vec(), value: Some(b"v".to_vec()) }],
+        );
+        payload
+    }
+
+    #[tokio::test]
+    async fn lag_detector_arms_past_threshold() {
+        let node = make_node(registry_with(&[1, 2, 3, 4])).await;
+        node.hashgraph
+            .lock()
+            .await
+            .mark_decided_through(CHECKPOINT_LAG_ROUNDS + 1)
+            .expect("empty graph marks");
+        assert!(!node.needs_checkpoint_only_sync());
+        node.arm_checkpoint_lag_reconnect().await;
+        assert!(
+            node.needs_checkpoint_only_sync(),
+            "decided - accepted = {} > {CHECKPOINT_LAG_ROUNDS} must arm",
+            CHECKPOINT_LAG_ROUNDS + 1
+        );
+    }
+
+    #[tokio::test]
+    async fn lag_detector_quiet_at_threshold() {
+        let node = make_node(registry_with(&[1, 2, 3, 4])).await;
+        node.hashgraph
+            .lock()
+            .await
+            .mark_decided_through(CHECKPOINT_LAG_ROUNDS)
+            .expect("empty graph marks");
+        node.arm_checkpoint_lag_reconnect().await;
+        assert!(
+            !node.needs_checkpoint_only_sync(),
+            "decided - accepted == {CHECKPOINT_LAG_ROUNDS} must not arm"
+        );
+    }
+
+    #[tokio::test]
+    async fn adopt_accepts_matching_aggregate_and_advances() {
+        let node = make_node(registry_with(&[1, 2, 3, 4])).await;
+        let payload = produce_local_round(&node, 3).await;
+        let checkpoint = aggregate_for(&payload, &[1, 2, 3]);
+
+        assert!(node.adopt_signed_checkpoint(checkpoint.clone()).await);
+        assert_eq!(node.latest_accepted_checkpoint_round().await, Some(3));
+        assert!(
+            !node.checkpoint_accumulators.lock().await.contains_key(&3),
+            "accumulator removed on adoption"
+        );
+        assert!(!node.checkpoint_diffs.lock().await.contains_key(&3), "diffs pruned on adoption");
+        assert!(
+            node.state_snapshots.lock().await.contains_key(&3),
+            "snapshot recorded for reconnect serving"
+        );
+        // Re-adopting the same round is rejected: it is no longer ahead of
+        // the accepted watermark.
+        assert!(!node.adopt_signed_checkpoint(checkpoint).await);
+    }
+
+    #[tokio::test]
+    async fn adopt_rejects_wrong_signing_bytes() {
+        let node = make_node(registry_with(&[1, 2, 3, 4])).await;
+        let payload = produce_local_round(&node, 3).await;
+        let tampered = consensus::CheckpointPayload::new(
+            3,
+            [0u8; 32],
+            [9u8; 32],
+            payload.roster_snapshot.clone(),
+        );
+        assert_ne!(tampered.signing_bytes(), payload.signing_bytes());
+        let checkpoint = aggregate_for(&tampered, &[1, 2, 3]);
+
+        assert!(!node.adopt_signed_checkpoint(checkpoint).await);
+        assert_eq!(node.latest_accepted_checkpoint_round().await, None);
+        assert!(
+            node.checkpoint_accumulators.lock().await.contains_key(&3),
+            "rejected adoption leaves the accumulator in place"
+        );
+    }
+
+    #[tokio::test]
+    async fn adopt_returns_false_when_accept_refuses() {
+        // The accumulator's snapshot does not rebuild to the payload's
+        // state_hash, so `accept_checkpoint` refuses without recording. The
+        // checkpoint itself is fully valid (matching signing bytes, quorum
+        // aggregate), isolating the refused-accept path: adoption must report
+        // `false` so the driver keeps `needs_checkpoint_sync` armed.
+        let node = make_node(registry_with(&[1, 2, 3, 4])).await;
+        node.hashgraph.lock().await.mark_decided_through(3).expect("empty graph marks");
+        let snapshot = node.executor.lock().await.state().to_bytes().expect("to_bytes succeeds");
+        let payload = consensus::CheckpointPayload::new(
+            3,
+            [0u8; 32],
+            [9u8; 32],
+            node.registry.lock().await.clone(),
+        );
+        node.checkpoint_accumulators
+            .lock()
+            .await
+            .insert(3, CheckpointAccumulator::new(payload.clone(), snapshot));
+        node.checkpoint_diffs.lock().await.insert(3, Vec::new());
+        let checkpoint = aggregate_for(&payload, &[1, 2, 3]);
+        assert!(checkpoint.verify(), "test checkpoint must be internally valid");
+
+        assert!(
+            !node.adopt_signed_checkpoint(checkpoint).await,
+            "refused accept must report false, not success"
+        );
+        assert_eq!(node.latest_accepted_checkpoint_round().await, None);
+    }
+
+    #[tokio::test]
+    async fn adopt_rejects_above_decided_and_without_accumulator() {
+        let node = make_node(registry_with(&[1, 2, 3, 4])).await;
+        let payload = produce_local_round(&node, 3).await;
+        // Above the decided round: rejected before any accumulator lookup.
+        let future = consensus::CheckpointPayload::new(
+            5,
+            [0u8; 32],
+            payload.state_hash,
+            payload.roster_snapshot.clone(),
+        );
+        assert!(!node.adopt_signed_checkpoint(aggregate_for(&future, &[1, 2, 3])).await);
+
+        // Decided but never produced locally (no accumulator): rejected.
+        node.hashgraph.lock().await.mark_decided_through(4).expect("marks");
+        let foreign = consensus::CheckpointPayload::new(
+            4,
+            [0u8; 32],
+            payload.state_hash,
+            payload.roster_snapshot.clone(),
+        );
+        assert!(!node.adopt_signed_checkpoint(aggregate_for(&foreign, &[1, 2, 3])).await);
+        assert_eq!(node.latest_accepted_checkpoint_round().await, None);
+    }
+
+    #[tokio::test]
+    async fn produce_checkpoint_retains_diffs_gossip_side() {
+        let node = make_node(registry_with(&[1, 2, 3, 4])).await;
+        node.hashgraph.lock().await.mark_decided_through(1).expect("empty graph marks");
+        let snapshot = node.executor.lock().await.state().to_bytes().expect("to_bytes succeeds");
+        let root = state::State::root_of_bytes(&snapshot).expect("empty state hashes");
+        let hashes = BTreeMap::from([(0, root), (1, root)]);
+        let snapshots = BTreeMap::from([(0, snapshot)]);
+        let diff = stream::pb::StateDiff { key: b"k".to_vec(), value: Some(b"v".to_vec()) };
+        let diffs = BTreeMap::from([(1u64, vec![diff.clone()])]);
+
+        node.produce_checkpoint(1, &hashes, &snapshots, &diffs).await;
+
+        assert_eq!(node.checkpoint_diffs.lock().await.get(&1), Some(&vec![diff]));
+        assert!(
+            node.checkpoint_accumulators.lock().await.contains_key(&1),
+            "single own sig is below quorum, accumulator stays"
         );
     }
 }

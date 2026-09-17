@@ -62,6 +62,7 @@ pub use proto::{
 };
 pub use reconnect::{
     fetch_checkpoint,
+    fetch_checkpoint_only,
     verify_signed_checkpoint,
 };
 pub use sync::{

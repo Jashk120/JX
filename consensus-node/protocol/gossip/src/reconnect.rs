@@ -73,6 +73,40 @@ pub async fn fetch_checkpoint(
     }
 }
 
+/// Opens a TLS connection to `reconnect_addr` (the teacher's dedicated
+/// reconnect port), sends a checkpoint-only request, and receives the
+/// teacher's latest accepted [`SignedCheckpoint`] — without state bytes or
+/// the retained graph.
+///
+/// Unlike [`fetch_checkpoint`], no roster-hash anchoring is applied here:
+/// the caller must validate the checkpoint before adopting it (see
+/// `GossipNode::adopt_signed_checkpoint`, which requires the checkpoint to
+/// commit to the exact payload the learner independently produced and
+/// verifies the BLS aggregate). On a wrong frame type, returns
+/// `Err(GossipError::UnexpectedFrame(..))`.
+pub async fn fetch_checkpoint_only(
+    identity: &TlsIdentity,
+    peer: &PeerInfo,
+    reconnect_addr: SocketAddr,
+) -> Result<SignedCheckpoint> {
+    // The TLS pinning and certificate checks come from `peer`; only the
+    // destination address differs from the gossip port.
+    let mut target = peer.clone();
+    target.addr = reconnect_addr;
+
+    let mut transport = TcpTransport::new(identity.clone());
+    transport.connect(&target).await?;
+    transport.send_frame(&Frame::CheckpointRequest).await?;
+
+    match transport.recv_frame().await? {
+        Frame::CheckpointResponse(checkpoint) => Ok(checkpoint),
+        other => Err(GossipError::UnexpectedFrame {
+            expected: "CheckpointResponse",
+            got: frame_name(&other),
+        }),
+    }
+}
+
 /// Verifies the >2/3 BLS aggregate proof embedded in `checkpoint`.
 ///
 /// The checkpoint's `roster_hash` is compared against `expected_roster_hash`
@@ -96,6 +130,8 @@ fn frame_name(frame: &Frame) -> &'static str {
         Frame::Reconnect(_) => "Reconnect",
         Frame::ReconnectResponse(_) => "ReconnectResponse",
         Frame::Behind => "Behind",
+        Frame::CheckpointRequest => "CheckpointRequest",
+        Frame::CheckpointResponse(_) => "CheckpointResponse",
     }
 }
 
