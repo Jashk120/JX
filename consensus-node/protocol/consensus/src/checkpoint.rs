@@ -16,6 +16,7 @@ use crypto::{
     CanonicalEncode,
     Hashable,
     MembershipRegistry,
+    RosterHistory,
 };
 use primitives::{
     EventHash,
@@ -239,6 +240,76 @@ fn hash_hex(hash: &EventHash) -> String {
         let _ = write!(out, "{byte:02x}");
     }
     out
+}
+
+/// Domain separation tag for [`compute_roster_history_root`]. Distinct from
+/// `WINDOW_ROOT_DST` (`JKAIN-WINDOW-ROOT-V1`), the records-tree tag
+/// (`JKAIN-RECORDS-ROOT-V1`), and `CheckpointDST`
+/// (`JKAIN-CHECKPOINT-BLS-V1`), so the roster-history commitment can never
+/// collide with any other checkpoint hash, even for byte-identical input.
+const ROSTER_HISTORY_ROOT_DST: &[u8] = b"JKAIN-ROSTER-HISTORY-ROOT-V1";
+
+/// Computes the canonical roster-history commitment over decided history.
+///
+/// The canonical selection for checkpoint `round` with window `W` is, with
+/// `window_start = round.saturating_sub(W)`:
+/// the predecessor — the snapshot with the greatest activation round below
+/// `window_start`, when one exists — plus every snapshot with activation
+/// round in `[window_start, round]` inclusive. Snapshots activating after
+/// `round` are excluded. The predecessor is included so the roster active
+/// at `window_start` is reconstructible from the committed set alone.
+///
+/// A pure function of decided history: membership activation rounds are
+/// decided by consensus, so every signer holding the same decided rounds
+/// selects the identical set. The raw retained set is deliberately NOT
+/// used: `RosterHistory::prune_before` drops snapshots in lockstep with the
+/// event-graph prune (`hashgraph.rs`), so "what this node retained" is
+/// node-local and would diverge across signers.
+///
+/// The selected snapshots are re-encoded with
+/// `crate::reconnect::encode_roster_history` (deterministic, ascending
+/// activation order) and committed as
+/// `SHA256("JKAIN-ROSTER-HISTORY-ROOT-V1" || encoded_bytes)`. An empty
+/// selection (no snapshot at or below `round`, e.g. round 0) yields
+/// `SHA256(ROSTER_HISTORY_ROOT_DST)` alone (DST-only, stable).
+pub fn roster_history_root(rh: &RosterHistory, round: u64, window_rounds: u64) -> [u8; 32] {
+    compute_roster_history_root(rh, round, window_rounds)
+        .expect("roster history root encoding overflow: entry count exceeds u32::MAX")
+}
+
+pub fn compute_roster_history_root(
+    rh: &RosterHistory,
+    round: u64,
+    window_rounds: u64,
+) -> Result<[u8; 32], primitives::Error> {
+    let window_start = round.saturating_sub(window_rounds);
+    // `snapshots()` iterates ascending, so the trailing assignment below
+    // leaves the greatest activation round below `window_start`.
+    let mut predecessor: Option<(u64, MembershipRegistry)> = None;
+    let mut selected: Vec<(u64, MembershipRegistry)> = Vec::new();
+    for (activation, registry) in rh.snapshots() {
+        if *activation < window_start {
+            predecessor = Some((*activation, registry.clone()));
+        } else if *activation <= round {
+            selected.push((*activation, registry.clone()));
+        }
+    }
+    if let Some(pred) = predecessor {
+        selected.insert(0, pred);
+    }
+    if selected.is_empty() {
+        return Ok(Sha256::digest(ROSTER_HISTORY_ROOT_DST).into());
+    }
+    let count = selected.len();
+    let subset = RosterHistory::from_snapshots(selected).ok_or(primitives::Error::OutOfRange {
+        field: "roster_history_root snapshots",
+        got: count.to_string(),
+    })?;
+    let encoded = crate::reconnect::encode_roster_history(&subset)?;
+    let mut h = Sha256::new();
+    h.update(ROSTER_HISTORY_ROOT_DST);
+    h.update(&encoded);
+    Ok(h.finalize().into())
 }
 
 /// One step in a Merkle inclusion proof for a [`RecordsRootItem`].
@@ -686,7 +757,10 @@ mod tests {
     use rand::rngs::OsRng;
 
     use super::*;
-    use crate::reconnect::RetainedEvent;
+    use crate::reconnect::{
+        RetainedEvent,
+        encode_roster_history,
+    };
 
     fn bls_for(id: u64) -> BlsIdentity {
         BlsIdentity::from_ikm(&[id as u8; 32]).expect("bls ikm")
@@ -1282,5 +1356,69 @@ mod tests {
         assert_eq!(hg.get(&hash_a1).expect("present").ancestor_seqs_len(), 2);
         // ... yet the canonical root for round 1 is unchanged.
         assert_eq!(compute_window_root(&hg, 1, 5), before);
+    }
+
+    fn roster_registries() -> (MembershipRegistry, MembershipRegistry, MembershipRegistry) {
+        let keys = window_keys(&[1, 2, 3]);
+        (window_registry(&keys[..1]), window_registry(&keys[..2]), window_registry(&keys))
+    }
+
+    fn history_of(entries: Vec<(u64, MembershipRegistry)>) -> RosterHistory {
+        RosterHistory::from_snapshots(entries).expect("test history builds")
+    }
+
+    #[test]
+    fn roster_history_root_is_deterministic() {
+        let (reg1, _, reg3) = roster_registries();
+        let first = history_of(vec![(1, reg1.clone()), (5, reg3.clone())]);
+        let second = history_of(vec![(1, reg1), (5, reg3)]);
+        assert_eq!(roster_history_root(&first, 5, 4), roster_history_root(&second, 5, 4));
+    }
+
+    #[test]
+    fn roster_history_root_changes_with_window_rounds() {
+        let (reg1, reg2, reg3) = roster_registries();
+        let rh = history_of(vec![(1, reg1), (3, reg2), (5, reg3)]);
+        // W=0 selects {3, 5} (predecessor 3 plus round 5); W=4 selects
+        // {1, 3, 5}. Different canonical sets, different roots.
+        assert_ne!(roster_history_root(&rh, 5, 0), roster_history_root(&rh, 5, 4));
+    }
+
+    #[test]
+    fn roster_history_root_includes_predecessor() {
+        let (reg1, reg2, reg3) = roster_registries();
+        let without_mid = history_of(vec![(1, reg1.clone()), (5, reg3.clone())]);
+        let with_mid = history_of(vec![(1, reg1.clone()), (3, reg2), (5, reg3.clone())]);
+        // With window_start = 3 both selections must contain round 1: pin
+        // the {1, 5} selection byte-for-byte through the public encoding.
+        let expected_subset = history_of(vec![(1, reg1), (5, reg3)]);
+        let expected_bytes = encode_roster_history(&expected_subset).expect("test history encodes");
+        let mut h = Sha256::new();
+        h.update(b"JKAIN-ROSTER-HISTORY-ROOT-V1");
+        h.update(&expected_bytes);
+        let expected: [u8; 32] = h.finalize().into();
+        assert_eq!(roster_history_root(&without_mid, 5, 2), expected);
+        // ... and the in-window round 3 is bound too: the two histories differ.
+        assert_ne!(roster_history_root(&without_mid, 5, 2), roster_history_root(&with_mid, 5, 2));
+    }
+
+    #[test]
+    fn roster_history_root_ignores_out_of_window_snapshot() {
+        let (reg1, _, reg3) = roster_registries();
+        let keys = window_keys(&[4]);
+        let reg7 = window_registry(&keys);
+        let base = history_of(vec![(1, reg1.clone()), (5, reg3.clone())]);
+        let extended = history_of(vec![(1, reg1), (5, reg3), (7, reg7)]);
+        // Activation round 7 is above the checkpoint round: excluded.
+        assert_eq!(roster_history_root(&base, 5, 4), roster_history_root(&extended, 5, 4));
+    }
+
+    #[test]
+    fn roster_history_root_empty_is_dst_only() {
+        let (reg1, _, _) = roster_registries();
+        let rh = history_of(vec![(1, reg1)]);
+        // No snapshot at or below round 0: the selection is empty.
+        let expected: [u8; 32] = Sha256::digest(b"JKAIN-ROSTER-HISTORY-ROOT-V1").into();
+        assert_eq!(roster_history_root(&rh, 0, 0), expected);
     }
 }
