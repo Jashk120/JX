@@ -136,7 +136,7 @@ serialize byte-for-byte identically.
 
 ## 3. Sequence diagram — one gossip sync round (T12 concurrent fanout)
 
-Each `sync_interval` the driver fans out to `k = FanoutMode::effective_k(N)` peers concurrently via `tokio::JoinSet` + `Semaphore(k)` (backpressure: skip spawn if `k` in-flight) where `effective_k(N)=ceil(N*ratio)` with `ratio 0.6@N≤10→0.3@N≥30` and `k_max 4@N≤6, 17@7≤N≤99 (Hedera cap), 12@N≥100` — `N=6→4, 10→6, 29→9` (computed vs cap `17`), `100→12`. Peers come from `PeerManager::pick_k` (scored selection with ε-greedy exploration), transports are `Arc<Mutex<TcpTransport|QuicTransport>>` in an `LruCache` hot-pool (`outbound_capacity` 10 for `N=6`, 30 for `N=100`, interpolated, LRU eviction over usefulness), deltas are filtered per-peer by `DedupState`/`SyncConfig` (`self 1000 ms / ancestor 250 ms / non-ancestor 3000 ms`), and `GossipMetrics` (`sync_attempts/success`, `p50/p95_rtt_ms`, `cache_hit_rate`) is updated per sync. QUIC (`QuicTransport` via `quinn`+`rustls` SPKI verifier) reuses the same `gossip_addr` as UDP endpoint with `TcpTransport` fallback; `Frame` `[tag:u8][len:u32BE][payload]` is unchanged.
+Each `sync_interval` the driver fans out to `k = FanoutMode::effective_k(N)` peers concurrently via `tokio::JoinSet` + `Semaphore(k)` (backpressure: skip spawn if `k` in-flight) where `effective_k(N)=ceil(N*ratio)` with `ratio 0.6@N≤10→0.3@N≥30` and `k_max 4@N≤6, 17@7≤N≤99 (Hedera cap), 12@N≥100` — `N=6→4, 10→6, 29→9` (computed vs cap `17`), `100→12`. Peers come from `PeerManager::pick_k` (scored selection with ε-greedy exploration), transports are `Arc<Mutex<TcpTransport>>` in an `LruCache` hot-pool (`outbound_capacity` 10 for `N=6`, 30 for `N=100`, interpolated, LRU eviction over usefulness), deltas are filtered per-peer by `DedupState`/`SyncConfig` (`self 1000 ms / ancestor 250 ms / non-ancestor 3000 ms`), and `GossipMetrics` (`sync_attempts/success`, `p50/p95_rtt_ms`, `cache_hit_rate`) is updated per sync. The pinned-TLS TCP hot-pool (`TcpTransport` + `rustls` SPKI pin over `gossip_addr`) reuses connections across rounds; `Frame` `[tag:u8][len:u32BE][payload]` is unchanged over the TLS stream.
 
 ### 3.1 ASCII
 
@@ -147,9 +147,9 @@ Each `sync_interval` the driver fans out to `k = FanoutMode::effective_k(N)` pee
 └──────────┘                               │                                          └──────────┘
       │ peers.lock() → PeerManager.pick_k(k) → Vec<PeerInfo> (scored, at-most-once)   │
       │ for each peer in parallel (JoinSet, Semaphore):                               │
-      │   outbound LruCache entry → Arc<Mutex<TcpTransport|QuicTransport>> (reuse or connect)│
-      │     connect → TcpStream::connect(peer.addr) or QUIC Endpoint (quinn)          │
-      │            → TlsConnector/QuicClientConfig (FingerprintVerifier vs spki_fingerprint)│
+      │   outbound LruCache entry → Arc<Mutex<TcpTransport>> (reuse or connect)        │
+      │     connect → TcpStream::connect(peer.addr) → TlsConnector (rustls)             │
+      │            → FingerprintVerifier (spki_fingerprint pin)                          │
       │   dedup_state[peer].prune_expired()                                            │
       │   hashgraph.lock() → known_summary(&hg, &registry) → Vec<(NodeId,u64)>         │
       │                                                                        │        │
@@ -196,7 +196,7 @@ sequenceDiagram
     participant A as Initiator (node A)
     participant PM as PeerManager::pick_k(k)
     participant Pool as LruCache hot-pool (10@N=6, 30@N=100)
-    participant T as TcpTransport|QuicTransport (TLS 1.3/SPKI, QUIC quinn)
+    participant T as TcpTransport (TLS 1.3/SPKI pinned TCP)
     participant B as Responder (node Bᵢ, one of k)
     participant H as Hashgraph (Arc<Mutex<Hashgraph>>)
     participant D as DedupState per peer
@@ -205,7 +205,7 @@ sequenceDiagram
     PM-->>A: Vec<PeerInfo> k peers (scored, ε-greedy, at-most-once)
     par k concurrent syncs — JoinSet + Semaphore(k), backpressure skip if k in-flight
         A->>Pool: LruCache entry → Arc<Mutex<Transport>> (reuse or connect, LRU evict)
-        A->>T: connect(peer) — TLS 1.3 SPKI pin or QUIC (quinn) + SPKI verifier
+        A->>T: connect(peer) — TLS 1.3 SPKI pin (rustls)
         A->>D: prune_expired() + should_filter thresholds (1000/250/3000 ms)
         A->>H: lock() → known_summary() → Vec<(NodeId,u64)>
         A->>B: Frame::SyncRequest{from, known}
@@ -249,14 +249,14 @@ The sync driver calls `GossipNode::process_finalized_rounds()`
 Scaling to 100/1,000 nodes is tracked in `../docs/OPTIMIZATION.md` (2026-08-20).
 At a high level:
 
-* **Gossip track:** `QUIC + dynamic smart peer selection + bounded concurrent
+* **Gossip track:** `pinned-TLS TCP hot-pool + dynamic smart peer selection + bounded concurrent
   fanout`. `SyncTransport` stays abstract so `TcpTransport`
-  (`protocol/gossip/src/transport.rs:46`) remains as benchmark/fallback.
-  Active QUIC pool 10–30, scored selection (frontier usefulness, success EWMA,
+  (`protocol/gossip/src/transport.rs:46`) remains the single transport.
+  Active TCP pool 10–30, scored selection (frontier usefulness, success EWMA,
   latency, freshness, diversity, recent-selection penalty, failure/backoff),
-  adaptive fanout/interval with hard bounds, persistent QUIC for hot peers /
-  resumption for cold, topology-aware diversity, gossip scheduling detached
-  from `Hashgraph` processing. Sequence `G0 instrument → G1 QUIC → G2
+  adaptive fanout/interval with hard bounds, persistent TCP for hot peers /
+  on-demand connect for cold, topology-aware diversity, gossip scheduling detached
+  from `Hashgraph` processing. Sequence `G0 instrument → G1 TCP hot-pool → G2
   concurrent fanout → G3 scoring → G4 adaptive → G5 compression/batching →
   G6 100/500/1,000-node bench`.
 * **Execution track:** optional `access_list` + serial fallback (typed

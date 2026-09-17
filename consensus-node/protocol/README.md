@@ -57,4 +57,4 @@ The `executor/` layer consumes the total order `consensus` produces and the
 `node/` layer (the `jkaind` daemon) drives a live cluster with `gossip`.
 See `docs/JKain_Consensus_Spec.md` for the algorithm this layer
 implements and `docs/OPTIMIZATION.md` for the locked scaling design
-(QUIC + adaptive fanout, deterministic parallel execution).
+(pinned-TLS TCP hot-pool + adaptive fanout, deterministic parallel execution).

@@ -6,18 +6,16 @@ Implements Consensus Spec §5: nodes periodically fan out to `k =
 FanoutMode::effective_k(N)` peers concurrently (`JoinSet`+`Semaphore(k)`,
 `ratio 0.6@N≤10 → 0.3@N≥30`, `k_max 4@N≤6, 17@7≤N≤99 (Hedera cap), 12@N≥100` —
 `N=6→4, 10→6, 29→9, 100→12`; Hedera `17` is cap not computed), exchange event deltas over
-pinned TLS (TCP/QUIC) connections, and fold the newly received events into a
+pinned-TLS TCP connections, and fold the newly received events into a
 locally-created event of their own. Depends on `primitives` for the value
 types, `crypto` for hashing, signing, and membership, and `consensus` for the
 hashgraph that stores and orders events.
 
-Transport is `SyncTransport` over raw TCP with TLS 1.3 (rustls) and
-length-prefixed canonical frames — the conservative, well-understood transport
-the whitepaper (§2.2) deliberately chooses for the consensus-hot path — plus
-`QuicTransport` via `quinn`+`rustls` SPKI verifier (same `spki_fingerprint` pin,
-single `gossip_addr` as QUIC endpoint, `TcpTransport` fallback, `Frame`
-`[tag:u8][len:u32BE][payload]` unchanged over QUIC bidi streams). `SyncTransport`
-stays abstract so `TcpTransport` remains as benchmark/fallback; bounded fanout,
+Transport is `TcpTransport`: `SyncTransport` over pinned-TLS TCP with TLS 1.3
+(rustls) and length-prefixed canonical frames — the conservative,
+well-understood transport the whitepaper (§2.2) deliberately chooses for the
+consensus-hot path — with an `LruCache` hot-pool of reused connections.
+`SyncTransport` stays abstract so alternative transports remain benchmarkable; bounded fanout,
 `LruCache` hot-pool, per-peer dedup and `GossipMetrics` are implemented (T12)
 per `docs/OPTIMIZATION.md:3.4` (G-track G1–G6).
 
@@ -36,9 +34,8 @@ per `docs/OPTIMIZATION.md:3.4` (G-track G1–G6).
   every startup. Peers pin by comparing the presented certificate's SPKI
   fingerprint against the address-book entry, independent of the consensus
   key registry.
-- `transport` — `SyncTransport` (connect / send / recv frame), `TcpTransport`
-  over `tokio` + rustls, and `QuicTransport` via `quinn` + `rustls` SPKI verifier
-  (same pin, QUIC bidi streams, TCP fallback). `LruCache` hot-pool outbound
+- `transport` — `SyncTransport` (connect / send / recv frame) and `TcpTransport`
+  over `tokio` + rustls with SPKI-pinned TLS 1.3. `LruCache` hot-pool outbound
   (`outbound_capacity` 10@N=6, 30@N=100) reused across sync rounds with LRU
   eviction; `GossipMetrics` tracks `sync_attempts/success`, `p50/p95_rtt`,
   `cache_hit_rate`.

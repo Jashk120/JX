@@ -10,14 +10,11 @@
 //! `primitives` for the value types, `crypto` for hashing, signing, and
 //! membership, and `consensus` for the hashgraph that stores and orders events.
 //!
-//! Transport is `SyncTransport` over raw TCP with TLS 1.3 (rustls) and
-//! length-prefixed canonical frames, the conservative transport the whitepaper
-//! (section 2.2) chooses for the consensus hot path, plus `QuicTransport` via
-//! `quinn`+`rustls` SPKI verifier (same `spki_fingerprint` pin, single
-//! `gossip_addr` as QUIC endpoint, `TcpTransport` fallback, `Frame`
-//! `[tag:u8][len:u32BE][payload]` unchanged over QUIC bidi streams).
-//! `SyncTransport` stays abstract so `TcpTransport` remains as benchmark and
-//! fallback. Bounded fanout, `LruCache` hot-pool, per-peer dedup and
+//! Transport is `TcpTransport`: `SyncTransport` over pinned-TLS TCP with
+//! TLS 1.3 (rustls) and length-prefixed canonical frames, the conservative
+//! transport the whitepaper (section 2.2) chooses for the consensus hot path,
+//! with an `LruCache` hot-pool of reused connections.
+//! Bounded fanout, `LruCache` hot-pool, per-peer dedup and
 //! `GossipMetrics` are implemented (T12) per `docs/OPTIMIZATION.md:3.4`
 //! (G-track G1 to G6).
 
@@ -76,7 +73,6 @@ pub use sync::{
 };
 pub use tls::TlsIdentity;
 pub use transport::{
-    QuicTransport,
     SyncTransport,
     TcpTransport,
 };

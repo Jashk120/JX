@@ -108,14 +108,12 @@ Verify: `ClusterConfig(num_nodes=6, sync_interval_ms=500)` (prod) / `80` / `250`
 
 ### Concurrent fanout k=4 (T12, N=6, `sync_interval 25ms`, `FanoutMode::Auto`)
 
-`tokio::JoinSet` + `Semaphore(k)` fanout, `PeerManager::pick_k` scored selection, `LruCache` hot-pool `10@N=6`, per-peer `DedupState` (`self 1000 ms / ancestor 250 ms / non-ancestor 3000 ms`), `GossipMetrics` (`p50/p95_rtt`), QUIC `QuicTransport` (`quinn`+SPKI, TCP fallback).
+`tokio::JoinSet` + `Semaphore(k)` fanout, `PeerManager::pick_k` scored selection, `LruCache` hot-pool `10@N=6`, per-peer `DedupState` (`self 1000 ms / ancestor 250 ms / non-ancestor 3000 ms`), `GossipMetrics` (`p50/p95_rtt`), pinned-TLS TCP hot-pool (`TcpTransport`+SPKI).
 
 | fanout | transport | dedup | **p50 decided** | vs k=1 (0.54s) |
 |---|--- |---|---:|---|
 | **k=1** (baseline, serial TCP) | TCP | off | **0.54s** | 1× |
 | **k=4 auto** (`effective_k(6)=4`, `ratio 0.6`, `JoinSet+Semaphore`) | TCP | off | **~0.35s** | ~1.5× faster |
-| **k=4 auto** | **QUIC** (`quinn`+SPKI) | off | **~0.25s** | ~2.2× faster |
-| **k=4 auto** | **QUIC** | **on** (`SyncConfig 1000/250/3000 ms`) | **~0.20s** | ~2.7× faster |
 
 Fanout `k` from `FanoutMode::Auto` (`protocol/gossip/src/peer_manager.rs:effective_k`): `k=ceil(N*ratio)` clamped to `[k_min,k_max]`, `ratio 0.6@N≤10 → 0.3@N≥30`, `k_max 4@N≤6, 17@7≤N≤99 Hedera cap, 12@N≥100` — `N=6→4, 10→6, 29→9` (computed vs cap `17`), `100→12`.
 

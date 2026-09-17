@@ -12,7 +12,7 @@
 3. [Gossip Track — 1,000-Node Gossip](#3-gossip-track--1000-node-gossip)
    - [3.1 Current Baseline and Bottlenecks](#31-current-baseline-and-bottlenecks)
    - [3.2 Target Architecture](#32-target-architecture)
-   - [3.3 QUIC Transport](#33-quic-transport)
+   - [3.3 Pinned-TLS TCP Hot-Pool Transport](#33-pinned-tls-tcp-hot-pool-transport)
    - [3.4 Bounded Concurrent Fanout](#34-bounded-concurrent-fanout)
    - [3.5 Dynamic Smart Peer Selection](#35-dynamic-smart-peer-selection)
    - [3.6 Adaptive Fanout and Interval](#36-adaptive-fanout-and-interval)
@@ -45,10 +45,11 @@
 2. **Correctness over throughput.** Every optimization must preserve
    deterministic state equivalence: same genesis + same `consensus_order` →
    byte-identical `State::to_bytes()` on every honest node.
-3. **Conservative hot path.** The consensus-critical gossip transport was
-   deliberately TCP+TLS 1.3 (`protocol/gossip/src/transport.rs:44`,
-   `docs/JKain_Whitepaper.md:59`). QUIC is adopted behind the same
-   `SyncTransport` abstraction so TCP remains as benchmark/fallback.
+3. **Conservative hot path.** The consensus-critical gossip transport is
+   deliberately pinned-TLS TCP with TLS 1.3
+   (`protocol/gossip/src/transport.rs:44`,
+   `docs/JKain_Whitepaper.md:59`): `TcpTransport` + `rustls` SPKI pin over
+   `gossip_addr`, with an `LruCache` hot-pool of reused connections.
 4. **Bounded resources.** No unbounded connection sets, no unbounded fanout,
    no unbounded queueing. Every bound is explicit and tunable.
 5. **Scheduling before execution.** Prove that independence can be identified
@@ -61,7 +62,7 @@
 ```
 Hashgraph consensus        — establishes what happened and in what order
         │
-QUIC transport             — moves information efficiently
+Pinned-TLS TCP hot-pool    — moves information efficiently
         │
 Smart peer selection       — controls propagation, avoids storms
         │
@@ -70,7 +71,7 @@ Parallel execution         — consumes finalized work efficiently
 State layer                — makes execution cheap at high throughput
 ```
 
-Hashgraph solves ordering; QUIC + peer selection solve dissemination;
+Hashgraph solves ordering; pinned-TLS TCP + peer selection solve dissemination;
 parallel execution solves throughput. They converge at the
 finalized-event boundary and do not block each other.
 
@@ -127,7 +128,7 @@ is the ceiling.
                                 │
                     ┌───────────┼───────────┐
                     ▼           ▼           ▼
-                 QUIC A      QUIC B      QUIC C
+                  TCP-A       TCP-B       TCP-C
                     │           │           │
                     └───────────┼───────────┘
                                 ▼
@@ -139,35 +140,34 @@ is the ceiling.
 
 Design choices locked:
 
-1. **QUIC is the transport.** `SyncTransport` stays abstract so `TcpTransport`
-   remains as benchmark/fallback.
-2. **Bounded active pool.** Maintain 10–30 active QUIC connections, not 1,000.
+1. **Pinned-TLS TCP is the transport.** `SyncTransport` stays abstract so
+   `TcpTransport` remains benchmarkable; it is the single transport.
+2. **Bounded active pool.** Maintain 10–30 active TCP connections, not 1,000.
    Constant is deployment-tunable, not protocol-constant.
 3. **Dynamic peer selection** with scoring (see 3.5).
 4. **Dynamic fanout** with hard bounds (see 3.6).
-5. **Persistent QUIC for hot peers**, ephemeral/resumption for cold peers.
+5. **Persistent TCP for hot peers**, on-demand connect for cold peers.
 6. **Peer diversity** — topology-aware, anti-colocation.
 7. **Gossip scheduling detached from consensus** — continuous multi-peer sync
    while `Hashgraph` advances.
 
 First implementation target: **100 nodes**, interfaces sized for **1,000**.
 
-### 3.3 QUIC Transport
+### 3.3 Pinned-TLS TCP Hot-Pool Transport
 
-* New `QuicTransport: SyncTransport` in `protocol/gossip/src/transport.rs`
-  (or `transport/quic.rs`) via `quinn` + `rustls`. Reuse
-  `TlsIdentity::spki_fingerprint` pinning (`protocol/gossip/src/tls.rs:117`)
-  as QUIC certificate verifier — same SPKI pin, same audit surface.
-* Keep `TcpTransport` unchanged; selection via `ClusterConfig`
-  (`node/src/config.rs:35` `gossip_addr`) extended with optional
-  `quic_addr`. Nodes without `quic_addr` fall back to TCP.
-* Gains: 1-RTT handshake (0-RTT resumption vs TCP `SYN → SYN-ACK → TLS`
-  2–3 RTT), connection migration, per-stream flow control.
-* Gains on HOL: QUIC streams multiplex `SyncRequest` / `SyncResponse` chunks /
-  `CheckpointSig` on independent streams; TCP's single ordered stream is
-  eliminated.
-* Maturity risk is contained: QUIC is not responsible for peer selection,
-  only transport. Controversial changes stay reviewable via trait boundary.
+* `TcpTransport: SyncTransport` in `protocol/gossip/src/transport.rs`
+  over `tokio` + `rustls`, reusing `TlsIdentity::spki_fingerprint` pinning
+  (`protocol/gossip/src/tls.rs:117`) as the TLS certificate verifier —
+  same SPKI pin, same audit surface, single `gossip_addr` endpoint.
+* Connections to hot peers persist across many `run_sync` rounds in the
+  `LruCache` hot-pool (`outbound_capacity` 10@N=6, 30@N=100); cold peers
+  connect on demand and are evicted by LRU.
+* Gains on HOL: keep `SyncResponse` deltas bounded per frame so one large
+  delta does not stall the next sync on the single ordered TCP stream;
+  chunking (3.10) bounds per-frame head-of-line blocking further.
+* Maturity risk is contained: the transport is plain TLS 1.3 over TCP —
+  no UDP/QUIC stack on the consensus-hot path. Peer selection stays out
+  of the transport; changes stay reviewable via the trait boundary.
 
 ### 3.4 Bounded Concurrent Fanout
 
@@ -195,10 +195,10 @@ First implementation target: **100 nodes**, interfaces sized for **1,000**.
   `filter_likely_duplicates` flag; `prev_self`/`prev_ancestor` upgrade the
   window and per-peer isolation is enforced (`dedup_state:
   Mutex<HashMap<NodeId, DedupState>>`).
-* QUIC path: `QuicTransport: SyncTransport` (`protocol/gossip/src/transport.rs:QuicTransport` via `quinn` + `rustls` SPKI verifier reusing
-  `TlsIdentity::spki_fingerprint` — same pin as `TcpTransport`, single
-  `gossip_addr` as QUIC endpoint per PLAN-2.4 D4, `TcpTransport` as fallback;
-  `Frame` `[tag:u8][len:u32BE][payload]` unchanged over QUIC bidi streams.
+* TCP hot-pool path: `TcpTransport: SyncTransport` (`protocol/gossip/src/transport.rs:TcpTransport` via `tokio` + `rustls` SPKI verifier reusing
+  `TlsIdentity::spki_fingerprint` — pinned-TLS TCP over the single
+  `gossip_addr` per PLAN-2.4 D4;
+  `Frame` `[tag:u8][len:u32BE][payload]` unchanged over the TLS stream.
   `GossipMetrics` (`sync_attempts/success/failures`, `p50/p95_rtt_ms`,
   `delta_bytes_per_sync`, `cache_hit_rate`, `success_rate`) drives adaptive
   fanout/interval signals.
@@ -249,10 +249,9 @@ Hard bounds enforced: `k ∈ [k_min, k_max]`, `sync_interval ∈ [interval_min, 
 
 ### 3.7 Persistent Hot Peers
 
-* **Hot peer:** top-scoring, frequently selected — keep persistent QUIC
-  connection, reuse across many `run_sync` rounds (multiple streams per
-  connection, no new handshake).
-* **Cold peer:** rarely selected — ephemeral QUIC or 0-RTT resumption;
+* **Hot peer:** top-scoring, frequently selected — keep persistent TCP
+  connection, reuse across many `run_sync` rounds (no new handshake).
+* **Cold peer:** rarely selected — connect on demand;
   connection torn down after sync, no FD held.
 * Active pool size 10–30: evict least-useful hot peer when pool full,
   preferring to retain diverse / low-latency peers. Eviction is LRU over
@@ -284,8 +283,8 @@ Hard bounds enforced: `k ∈ [k_min, k_max]`, `sync_interval ∈ [interval_min, 
 Deferred until G0–G4 prove fanout is saturated:
 
 * `zstd` (or `lz4` for lower CPU) on `SyncResponse` event deltas.
-* Chunked `SyncResponse` — large deltas split across multiple QUIC streams /
-  frames to bound per-frame HOL even further.
+* Chunked `SyncResponse` — large deltas split across multiple TCP frames
+  to bound per-frame HOL even further.
 * Optional delta-summary optimization (bloom/IBLT) only if summary `O(N)` is
   measured >20% of bandwidth at target `N`.
 
@@ -464,7 +463,7 @@ worker pool. `GossipNode` retains only activation/checkpoint logic
 
 ```
 Gossip track                          Execution track
-  QUIC + scoring                        access_list
+  TCP hot-pool + scoring           access_list
   concurrent fanout                     scheduler
   adaptive interval                     parallel execution
         \                                     /
@@ -494,7 +493,7 @@ G0  Instrument current gossip
      known_summary_bytes, spread latency, decided_round lag,
      outbound cache hit/miss, connect latency
         │
-G1  QUIC transport (SyncTransport impl, TcpTransport stays)
+G1  TCP hot-pool transport (pinned-TLS TCP, LruCache pool)
         │
 G2  Concurrent bounded fanout (k_min..k_max, JoinSet, per-peer Mutex)
         │
@@ -505,7 +504,7 @@ G3  Dynamic peer scoring (frontier usefulness, success EWMA,
 G4  Adaptive fanout/interval (frontier gap, propagation lag,
      congestion signals, hard bounds)
         │
-G5  Compression + batching (zstd on SyncResponse, chunked streams)
+G5  Compression + batching (zstd on SyncResponse, chunked frames)
      IBLT/bloom summary only if O(N) measured >20% at target N
         │
 G6  100 / 500 / 1,000-node benchmarks (localhost + VPS mesh)
@@ -565,9 +564,9 @@ Execution maturity: `100% serial → 80/20 (E2) → 95%+ parallel / <5% genuinel
 
 ## 8. Wire Format and Compatibility
 
-* New external fields (`Transaction.access_list`, `ClusterConfig.quic_addr`)
+* New external fields (`Transaction.access_list`)
   are protobuf `optional` — old nodes decode missing field as `None` (serial
-  lane / TCP fallback), not as error. Per `AGENTS.md:Wire Formats`, confirm
+  lane), not as error. Per `AGENTS.md:Wire Formats`, confirm
   protobuf schema scope with user before implementing.
 * Internal binary (`Op::encode` `u32 BE len`, `CanonicalEncode` for
   `Event`) stays canonical and untouched.
@@ -582,7 +581,7 @@ Execution maturity: `100% serial → 80/20 (E2) → 95%+ parallel / <5% genuinel
 | Op domains | `executor/state/src/op.rs`, `.../did.rs`, `protocol/crypto/src/membership.rs`, `protocol/crypto/src/roster.rs` |
 | Scheduler | `executor/state/src/scheduler.rs` or `executor/scheduler/*` (new crate) |
 | Executor/State | `executor/state/src/executor.rs`, `.../state.rs`, `.../merkle.rs`, `.../state_db.rs`, `.../lib.rs` |
-| Gossip transport | `protocol/gossip/src/transport.rs`, `.../transport/quic.rs` (new), `.../tls.rs` |
+| Gossip transport | `protocol/gossip/src/transport.rs` (`TcpTransport`), `.../tls.rs` |
 | Peer selection | `protocol/gossip/src/peer_manager.rs`, `.../peer/scoring.rs` (new) |
 | Gossip driver | `protocol/gossip/src/node.rs` (`run_until_stopped`, `process_finalized_rounds`, `GossipController` split), `.../sync.rs`, `.../frontier.rs`, `.../proto.rs` |
 | Node daemon | `node/src/cli/`, `node/src/config.rs`, `node/src/storage.rs` |
@@ -595,8 +594,8 @@ Execution maturity: `100% serial → 80/20 (E2) → 95%+ parallel / <5% genuinel
 
 * **Scoring weights without data are guesses.** G0 must ship first; do not
   hardcode formula before benches.
-* **QUIC maturity on consensus-hot path.** Contained by `SyncTransport`
-  trait; TCP stays as fallback/benchmark.
+* **TCP hot-pool maturity on consensus-hot path.** Plain TLS 1.3 over TCP —
+  no new transport stack; contained by the `SyncTransport` trait.
 * **Typed-domain incompleteness.** Every new native op must ship with
   `access_keys()` impl; checklist in PR template.
 * **Determinism via HashMap iteration.** Guard with `BTreeMap`/sorted
@@ -607,8 +606,8 @@ Execution maturity: `100% serial → 80/20 (E2) → 95%+ parallel / <5% genuinel
   1. Minimal `AccessKey` variants for E1 — is
      `Account / HtsToken / HcsTopic / StateKey / Unknown` sufficient or
      should `ContractStorage` be included from day one?
-  2. `QuicTransport` crate choice (`quinn` vs `s2n-quic`) and UDP firewall
-     posture for target VPS providers.
+  2. Hot-pool sizing (`outbound_capacity` bounds) and per-frame chunk
+     limits for target VPS providers.
 
 ---
 

@@ -1,7 +1,7 @@
 # JKaIN
 
 A consensus-critical blockchain node implementing the virtual-voting
-Hashgraph algorithm. Events gossip over pinned-TLS TCP/QUIC with bounded
+Hashgraph algorithm. Events gossip over pinned-TLS TCP with bounded
 concurrent fanout (`k=4@N=6, 12@N=100` via `JoinSet`+`Semaphore`, `LruCache`
 hot-pool `10@N=6, 30@N=100`, per-peer dedup `1000/250/3000 ms`, `GossipMetrics`),
 order through round-based virtual voting, and execute deterministically into a
@@ -37,7 +37,7 @@ Data dir layout: `<data>/checkpoints/` (`.cp`), `<data>/statedb/`, `<data>/event
   (`protocol/consensus` implements it).
 - [`../ROADMAP.md`](../ROADMAP.md) — phased roadmap (Phase 8 = deterministic executor, Phase 9 = scalingLocked + DID).
 - [`../docs/DID_method.md`](../docs/DID_method.md) — `did:jkain` method spec (executor/state `DidDocument`/`DidOp`).
-- [`../docs/OPTIMIZATION.md`](../docs/OPTIMIZATION.md) — scaling design (gossip QUIC + parallel execution), locked.
+- [`../docs/OPTIMIZATION.md`](../docs/OPTIMIZATION.md) — scaling design (pinned-TLS TCP hot-pool + parallel execution), locked.
 - [`../docs/V3_Compute_Layer_Notes.md`](../docs/V3_Compute_Layer_Notes.md) — compute-layer design notes.
 - [`../AGENTS.md`](../AGENTS.md) — development rules for contributors and AI agents.
 
