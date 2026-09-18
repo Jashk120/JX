@@ -90,14 +90,19 @@ margin. W is still pending owner ratification and is not yet wired into
 
 ## 7. Caveats / not measured
 
-- N=6 only (the plan's open question 4 spans 6..100).
+- N=6 and N=8 only (the plan's open question 4 spans 6..100). A follow-up N=8
+  run (80 ms, healthy, ~44 decided rounds) measured
+  `first_seen_max_round_span = 3` and `member_chain_max_transition_round_span
+  = 0`. The `first_seen_timestamp` boundary depth rose from 2 (N=6) to 3 (N=8),
+  so it may grow with `N`; `W = 16` still has margin, but this is the quantity
+  the N=100 gate exists to bound and it is not safe to extrapolate from N=8.
 - No forking (Byzantine) creators, so the fork slow path (`ancestor_event_for_creator`) and its transition depth are unexercised.
 - 80 ms sync interval and healthy/partition only (no 25 ms, no churn-kill-restart).
 - The transition counters are per-`Hashgraph` and reset if a node rebuilds its graph on reconnect (observed on one node in run B), so per-run peaks may under-count across resets.
 
 ## 8. Follow-ups
 
-- (a) Ratify W then wire `RETENTION_ROUNDS: 2 -> W` with the reconnect floor change.
+- (a) Wired: `RETENTION_ROUNDS = SIGNED_WINDOW_ROUNDS = 16` (PLAN-4 Phase A); owner ratification of the value is still outstanding.
 - (b) Candidate optimization: exploit the monotonicity above to skip the `member_chain_reaches` chain descent entirely for creators with no known fork (it cannot change the result), removing the hard-stop work; requires the determinism argument in `ancestry.rs:65-78`.
 - (c) Re-run this spike at N=100 and with injected forks before shipping a wide deployment.
 
