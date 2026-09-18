@@ -266,6 +266,13 @@ const MAX_PENDING_SIGS_PER_ROUND: usize = 64;
 /// unreachable through gossip alone.
 const CHECKPOINT_LAG_ROUNDS: u64 = 16;
 
+/// Rounds of serialized full-state snapshots to keep after a checkpoint.
+/// Independent of `RETENTION_ROUNDS` (the event-window length): a reconnect
+/// teacher only ever serves the state at the latest accepted checkpoint
+/// (`state_snapshots.range(..=cp_round)`), so a small margin is enough.
+/// Snapshots are whole serialized states, so this must not grow with W.
+const SNAPSHOT_RETENTION_ROUNDS: u64 = 2;
+
 const MAX_PENDING_TRANSACTIONS: usize = 1_024;
 
 /// A JKain node: owns a hashgraph, a TLS identity, the known-peer table,
@@ -1980,13 +1987,14 @@ impl GossipNode {
     }
 
     /// Records an accepted checkpoint and prunes history below it, keeping a
-    /// `RETENTION_ROUNDS` margin so a peer that fell behind can still
-    /// delta-sync.
+    /// `RETENTION_ROUNDS` event-window margin so a peer that fell behind can
+    /// still delta-sync.
     ///
-    /// State snapshots older than the prune floor are dropped too: a learner
-    /// is always served the highest accepted checkpoint (round ≥ `round -
-    /// RETENTION_ROUNDS`), so anything below the floor can never be served
-    /// again and keeping it would only grow memory.
+    /// State snapshots use the much smaller `SNAPSHOT_RETENTION_ROUNDS` margin
+    /// instead: a learner is always served the latest accepted checkpoint's
+    /// snapshot (`state_snapshots.range(..=cp_round).next_back()`), so
+    /// anything below that floor can never be served again and keeping whole
+    /// serialized states would only grow memory.
     async fn accept_checkpoint(
         &self,
         accepted: SignedCheckpoint,
@@ -2066,21 +2074,22 @@ impl GossipNode {
             let mut diffs = self.checkpoint_diffs.lock().await;
             diffs.retain(|r, _| *r > round);
         }
-        let prune_before_round = round.saturating_sub(RETENTION_ROUNDS);
+        let window_prune_before = round.saturating_sub(RETENTION_ROUNDS);
+        let snapshot_prune_before = round.saturating_sub(SNAPSHOT_RETENTION_ROUNDS);
         {
             let mut snapshots = self.state_snapshots.lock().await;
-            snapshots.retain(|&snap_round, _| snap_round >= prune_before_round);
+            snapshots.retain(|&snap_round, _| snap_round >= snapshot_prune_before);
         }
         {
             let mut cumulative = self.cumulative_state_hashes.lock().await;
-            cumulative.retain(|&r, _| r == 0 || r >= prune_before_round);
+            cumulative.retain(|&r, _| r == 0 || r >= snapshot_prune_before);
         }
-        if let Err(e) = self.state_db.prune_snapshots_before(prune_before_round) {
-            tracing::warn!(prune_before_round, error = %e, "failed to prune state snapshots");
+        if let Err(e) = self.state_db.prune_snapshots_before(snapshot_prune_before) {
+            tracing::warn!(snapshot_prune_before, error = %e, "failed to prune state snapshots");
         }
         let pruned = {
             let mut hg = self.hashgraph.lock().await;
-            hg.prune_before_round(prune_before_round)
+            hg.prune_before_round(window_prune_before)
         };
         // Mirror the in-memory prune in the durable log and state database
         // (Phase 8) and make everything up to this checkpoint durable.
@@ -3915,6 +3924,75 @@ mod checkpoint_only_tests {
         assert!(
             node.checkpoint_accumulators.lock().await.contains_key(&1),
             "single own sig is below quorum, accumulator stays"
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_retention_is_independent_of_event_window() {
+        use crypto::Signable as _;
+        use primitives::{
+            Timestamp,
+            UnsignedEvent,
+        };
+
+        // Regression: `RETENTION_ROUNDS` (16, the signed event window) must
+        // not govern whole-state snapshots. Accept rounds 1 then 5: the
+        // snapshot floor (5 - SNAPSHOT_RETENTION_ROUNDS = 3) prunes the
+        // round-1 snapshot, while the event-window floor (5 - 16, saturated
+        // to 0) leaves the round-1 event in the graph.
+        let node = make_node(registry_with(&[1, 2, 3, 4])).await;
+
+        // Accept round 1 so its snapshot is recorded.
+        let payload1 = produce_local_round(&node, 1).await;
+        assert!(node.adopt_signed_checkpoint(aggregate_for(&payload1, &[1, 2, 3])).await);
+        assert!(
+            node.state_snapshots.lock().await.contains_key(&1),
+            "round-1 snapshot recorded on accept"
+        );
+
+        // Seed one ordered round-1 event plus a round-1 cumulative hash, then
+        // accept round 5. Both floors are exercised by the single accept.
+        // The event is inserted after the decided watermark reaches 5 (an
+        // empty graph can mark arbitrarily far ahead); inserting before
+        // would cap the watermark at the event's round.
+        let payload5 = produce_local_round(&node, 5).await;
+        let event = UnsignedEvent::new(NodeId::new(1), None, None, Timestamp::new(10), Vec::new())
+            .sign(&SigningKey::from_bytes(&[1u8; 32]))
+            .expect("sign bounded");
+        let event_hash = {
+            let mut hg = node.hashgraph.lock().await;
+            hg.insert_accepted(
+                consensus::RetainedEvent {
+                    event,
+                    seq: 1,
+                    round: 1,
+                    ancestor_seqs: vec![1, 0, 0, 0],
+                    round_received: Some(1),
+                    consensus_timestamp: Some(Timestamp::new(10)),
+                },
+                5,
+            )
+            .expect("round-1 retained event inserts")
+        };
+        node.cumulative_state_hashes.lock().await.insert(1, [0x11; 32]);
+
+        assert!(node.adopt_signed_checkpoint(aggregate_for(&payload5, &[1, 2, 3])).await);
+
+        assert!(
+            !node.state_snapshots.lock().await.contains_key(&1),
+            "round-1 snapshot pruned by SNAPSHOT_RETENTION_ROUNDS floor (5 - 2 = 3)"
+        );
+        assert!(
+            node.state_snapshots.lock().await.contains_key(&5),
+            "latest accepted snapshot always retained"
+        );
+        assert!(
+            !node.cumulative_state_hashes.lock().await.contains_key(&1),
+            "round-1 cumulative hash pruned by the snapshot floor"
+        );
+        assert!(
+            node.hashgraph.lock().await.get(&event_hash).is_some(),
+            "round-1 event survives: event-window floor saturates to 0, above it"
         );
     }
 }
