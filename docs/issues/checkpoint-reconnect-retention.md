@@ -1,6 +1,7 @@
 # Checkpoint lag and reconnect retention
 
-Status: open — Stage 1 next, Stage 2 proposed
+Status: Stage 1 shipped (`c2f485c`); PLAN-4 Phase A signed window shipped;
+Stage 2 proposed
 Date: 2026-09-17
 Component: `consensus-node/protocol/{consensus,gossip}`, `consensus-node/node`
 
@@ -179,6 +180,24 @@ Rule after this change (`Hashgraph::insert_accepted`):
 - Verification: the reconnect transfer must be accepted end to end; the
   existing `insert_accepted_rejects_forged_ancestor_seqs` (both present) must
   still reject.
+
+**Landed — PLAN-4 Phase A.** The retained window and the roster history are
+now committed by the checkpoint itself, so the overstatement residual above is
+closed at the window layer rather than by the validator. `signing_bytes` grew
+136 → 200 B with `window_root` (a canonical Merkle root over
+`window(R, SIGNED_WINDOW_ROUNDS)` derived from decided history) and
+`roster_history_root`; `RETENTION_ROUNDS` is coupled to
+`SIGNED_WINDOW_ROUNDS = 16` (Phase-0 walk-depth spike); the teacher serves the
+canonical roster subset; and the learner recomputes both roots from the
+transfer and rejects on mismatch before any live or durable state is touched.
+The event log now persists `consensus_timestamp` so a node restored from its
+own log derives the same window leaf as its peers.
+
+The `insert_accepted` floor check is deliberately **retained** rather than
+retired: restoring exact equality would re-break the one-pruned-parent case,
+and removing validation would drop the guard on the trusted log-replay path
+that shares the routine. With the window authenticated, the check is a
+redundant consistency test, not the trust boundary.
 
 ---
 
