@@ -285,11 +285,24 @@ pub fn roster_history_root(rh: &RosterHistory, round: u64, window_rounds: u64) -
         .expect("roster history root encoding overflow: entry count exceeds u32::MAX")
 }
 
-pub fn compute_roster_history_root(
+/// The canonical roster-history selection for checkpoint `round` with
+/// window `W`: with `window_start = round.saturating_sub(W)`, the
+/// predecessor — the snapshot with the greatest activation round below
+/// `window_start`, when one exists — plus every snapshot with activation
+/// round in `[window_start, round]` inclusive. Snapshots activating after
+/// `round` are excluded. The predecessor is included so the roster active
+/// at `window_start` is reconstructible from the committed set alone.
+///
+/// Returns `None` when the selection is empty (no snapshot at or below
+/// `round`, e.g. round 0). This is the exact subset
+/// [`compute_roster_history_root`] commits to: the reconnect teacher serves
+/// this selection (not its raw retained history), and the learner seeds its
+/// scratch graph from it.
+pub fn canonical_roster_history(
     rh: &RosterHistory,
     round: u64,
     window_rounds: u64,
-) -> Result<[u8; 32], primitives::Error> {
+) -> Option<RosterHistory> {
     let window_start = round.saturating_sub(window_rounds);
     // `snapshots()` iterates ascending, so the trailing assignment below
     // leaves the greatest activation round below `window_start`.
@@ -306,13 +319,19 @@ pub fn compute_roster_history_root(
         selected.insert(0, pred);
     }
     if selected.is_empty() {
-        return Ok(Sha256::digest(ROSTER_HISTORY_ROOT_DST).into());
+        return None;
     }
-    let count = selected.len();
-    let subset = RosterHistory::from_snapshots(selected).ok_or(primitives::Error::OutOfRange {
-        field: "roster_history_root snapshots",
-        got: count.to_string(),
-    })?;
+    RosterHistory::from_snapshots(selected)
+}
+
+pub fn compute_roster_history_root(
+    rh: &RosterHistory,
+    round: u64,
+    window_rounds: u64,
+) -> Result<[u8; 32], primitives::Error> {
+    let Some(subset) = canonical_roster_history(rh, round, window_rounds) else {
+        return Ok(Sha256::digest(ROSTER_HISTORY_ROOT_DST).into());
+    };
     let encoded = crate::reconnect::encode_roster_history(&subset)?;
     let mut h = Sha256::new();
     h.update(ROSTER_HISTORY_ROOT_DST);
@@ -1498,6 +1517,24 @@ mod tests {
         let extended = history_of(vec![(1, reg1), (5, reg3), (7, reg7)]);
         // Activation round 7 is above the checkpoint round: excluded.
         assert_eq!(roster_history_root(&base, 5, 4), roster_history_root(&extended, 5, 4));
+    }
+
+    #[test]
+    fn canonical_roster_history_encodes_to_the_committed_bytes() {
+        let (reg1, reg2, reg3) = roster_registries();
+        let rh = history_of(vec![(1, reg1.clone()), (3, reg2), (5, reg3.clone())]);
+        // The canonical selection for round 5, W=2 is the predecessor (round
+        // 1) plus the in-window rounds 3 and 5; encoding it must reproduce
+        // exactly the bytes the root hashes.
+        let canonical = canonical_roster_history(&rh, 5, 2).expect("selection is non-empty");
+        let encoded = encode_roster_history(&canonical).expect("test history encodes");
+        let mut h = Sha256::new();
+        h.update(b"JKAIN-ROSTER-HISTORY-ROOT-V1");
+        h.update(&encoded);
+        let expected: [u8; 32] = h.finalize().into();
+        assert_eq!(compute_roster_history_root(&rh, 5, 2).expect("root computes"), expected);
+        // Round 0 with nothing at or below it selects nothing.
+        assert!(canonical_roster_history(&rh, 0, 0).is_none());
     }
 
     #[test]

@@ -16,6 +16,7 @@ use common::*;
 use consensus::{
     CheckpointAccumulator,
     CheckpointPayload,
+    SIGNED_WINDOW_ROUNDS,
     encode_roster_history,
 };
 use crypto::{
@@ -233,13 +234,17 @@ async fn from_checkpoint_rejects_roster_key_mismatched_to_the_learner() {
     let state = state::State::new(temp_state_db().state_keyspace());
     let state_bytes = state.to_bytes().expect("to_bytes succeeds");
     let state_hash = state.root();
-    let payload = CheckpointPayload::new(
-        1,
-        consensus::compute_records_root(&[]),
-        state_hash,
-        [0u8; 32],
-        [0u8; 32],
-        roster.clone(),
+    let history = RosterHistory::new(roster.clone());
+    let payload = anchor_roots_for_empty_transfer(
+        CheckpointPayload::new(
+            1,
+            consensus::compute_records_root(&[]),
+            state_hash,
+            [0u8; 32],
+            [0u8; 32],
+            roster.clone(),
+        ),
+        &history,
     );
 
     // Both members sign: the 2-node roster's quorum is all of them.
@@ -251,7 +256,7 @@ async fn from_checkpoint_rejects_roster_key_mismatched_to_the_learner() {
     let response = ReconnectResponse {
         signed_checkpoint: accepted,
         state_bytes,
-        roster_history_bytes: encode_roster_history(&RosterHistory::new(roster)).expect("bounded"),
+        roster_history_bytes: encode_roster_history(&history).expect("bounded"),
         decided_round: 1,
         retained: Vec::new(),
         last_timestamp: 0,
@@ -308,6 +313,31 @@ fn honest_two_event_retained() -> (MembershipRegistry, Vec<consensus::RetainedEv
     (registry, retained)
 }
 
+/// Fills a fixture payload's `window_root`/`roster_history_root` from the
+/// exact transfer the learner verifies, so fixtures reach the check under
+/// test instead of tripping the commitment checks. The window is anchored
+/// over the empty scratch the learner rebuilds when `retained` carries no
+/// insertable events.
+fn anchor_roots_for_empty_transfer(
+    payload: CheckpointPayload,
+    roster_history: &RosterHistory,
+) -> CheckpointPayload {
+    let mut anchored = payload;
+    let round = anchored.round;
+    anchored.roster_history_root =
+        consensus::compute_roster_history_root(roster_history, round, SIGNED_WINDOW_ROUNDS)
+            .expect("test history hashes");
+    let canonical =
+        consensus::canonical_roster_history(roster_history, round, SIGNED_WINDOW_ROUNDS)
+            .expect("test selection is non-empty");
+    let mut scratch = consensus::Hashgraph::from_checkpoint(&anchored, canonical);
+    scratch.mark_decided_through(round).expect("test watermark applies");
+    anchored.window_root =
+        consensus::try_compute_window_root(&scratch, round, SIGNED_WINDOW_ROUNDS)
+            .expect("test window computes");
+    anchored
+}
+
 fn checkpoint_response_for(
     roster: &MembershipRegistry,
     state_bytes: Vec<u8>,
@@ -315,13 +345,17 @@ fn checkpoint_response_for(
     retained: Vec<consensus::RetainedEvent>,
     decided_round: u64,
 ) -> ReconnectResponse {
-    let payload = CheckpointPayload::new(
-        1,
-        consensus::compute_records_root(&[]),
-        state_hash,
-        [0u8; 32],
-        [0u8; 32],
-        roster.clone(),
+    let history = RosterHistory::new(roster.clone());
+    let payload = anchor_roots_for_empty_transfer(
+        CheckpointPayload::new(
+            1,
+            consensus::compute_records_root(&[]),
+            state_hash,
+            [0u8; 32],
+            [0u8; 32],
+            roster.clone(),
+        ),
+        &history,
     );
     let mut accumulator = CheckpointAccumulator::new(payload.clone(), Vec::new());
     accumulator.add_sig(checkpoint_sig_for(1, 1, &payload.signing_bytes()), roster);
@@ -331,8 +365,7 @@ fn checkpoint_response_for(
     ReconnectResponse {
         signed_checkpoint: accepted,
         state_bytes,
-        roster_history_bytes: encode_roster_history(&RosterHistory::new(roster.clone()))
-            .expect("bounded"),
+        roster_history_bytes: encode_roster_history(&history).expect("bounded"),
         decided_round,
         retained,
         last_timestamp: 0,

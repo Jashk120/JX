@@ -19,8 +19,11 @@ pub use checkpoint::{
     SIGNED_WINDOW_ROUNDS,
     SignedCheckpoint,
     build_records_proofs,
+    canonical_roster_history,
     compute_records_root,
     compute_records_root_with_proofs,
+    compute_roster_history_root,
+    try_compute_window_root,
     verify_records_proof,
 };
 pub use error::{

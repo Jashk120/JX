@@ -657,8 +657,8 @@ impl Hashgraph {
 
         let consensus_timestamp = match (round_received, consensus_timestamp) {
             (Some(_), Some(timestamp)) => Some(timestamp),
-            // Legacy event-log records persist only `round_received`
-            // (`EventLog::set_round_received`), so the H-3 contract keeps the
+            // Legacy event-log records written before `EventLog::set_ordering`
+            // persisted only `round_received`, so the H-3 contract keeps the
             // zero-timestamp fallback for them. A peer-supplied timestamp is
             // used verbatim when present.
             (Some(_), None) => Some(Timestamp::new(0)),
@@ -2583,9 +2583,9 @@ mod tests {
         );
 
         // Legacy fallback (H-3 contract): an ordered record without a
-        // consensus timestamp — what the durable event log produces, since
-        // `EventLog::set_round_received` persists only the round — inserts
-        // with `Timestamp(0)`; a timestamp on an unordered record is rejected.
+        // consensus timestamp — what a pre-`set_ordering` durable event log
+        // produces, since it persisted only the round — inserts with
+        // `Timestamp(0)`; a timestamp on an unordered record is rejected.
         let mut hg_legacy =
             Hashgraph::from_checkpoint(&checkpoint, crypto::RosterHistory::new(registry.clone()));
         let event_legacy = UnsignedEvent::new(node_a, None, None, Timestamp::new(999), Vec::new())

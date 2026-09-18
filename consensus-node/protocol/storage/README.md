@@ -23,8 +23,9 @@ set since the prune floor.
 
 ## Contents
 
-- `EventLog` — the log: `append`, `set_round_received` (records ordering as
-  events are finalized), `replay` (the whole set in insertion order),
+- `EventLog` — the log: `append`, `set_ordering` (records `round_received`
+  and `consensus_timestamp` as events are finalized), `replay` (the whole set
+  in insertion order),
   `prune` (mirrors an in-memory prune), roster-history persistence, and
   `flush`.
 - `EventSink` — the lossy sink interface the gossip layer and daemon drive
@@ -44,8 +45,9 @@ set since the prune floor.
 - Records are encoded with `consensus::encode_retained_event` (the same
   type the reconnect protocol uses), keeping internal Rust-to-Rust storage
   on the canonical binary encoding — not protobuf.
-- `round_received` is recorded lazily by the node as ordering completes, so
-  a replay reproduces the exact finalized order.
+- `round_received` and `consensus_timestamp` are recorded lazily by the node
+  as ordering completes (`set_ordering`), so a replay reproduces the exact
+  finalized order — and therefore the identical signed-window leaf.
 - The `by_seq` key space is guarded with checked arithmetic: `recover_next_seq`
   and `append` return a `Corrupt` error on exhaustion instead of wrapping to
   0 and overwriting sequence 0.

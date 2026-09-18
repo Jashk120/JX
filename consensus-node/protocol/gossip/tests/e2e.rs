@@ -1051,15 +1051,14 @@ async fn reconnect_existing_node_catches_up() {
         );
     }
 
-    // Backstop: force every teacher's retained window strictly above node 4's
-    // empty frontier, so the delta-gap is deterministic no matter how far past
+    // No manual pruning here: the learner verifies the signed window
+    // `[R-16, R]` against the transferred retained events, so amputating
+    // the teachers' graphs below an arbitrary round would destroy the very
+    // integrity the checkpoint commits to. The teachers' natural retention
+    // (`RETENTION_ROUNDS == SIGNED_WINDOW_ROUNDS`) already keeps every
+    // served window intact, and the explicit `request_reconnect()` below
+    // forces the checkpoint path deterministically no matter how far past
     // round 4 the cluster actually got before node 4 froze.
-    for teacher in &refs {
-        let mut hg = teacher.node.hashgraph.lock().await;
-        if hg.next_round_to_order() > 4 {
-            hg.prune_before_round(4);
-        }
-    }
 
     // The wipe left node 4 with an empty graph below the teachers' retained
     // floor. Flag it for reconnect BEFORE resuming: otherwise the first

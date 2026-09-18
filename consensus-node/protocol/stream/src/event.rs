@@ -217,7 +217,13 @@ impl storage::EventSink for EventStreamWriter {
 
     /// Ordering is not backfilled into the event stream; a mirror that needs
     /// a round→event mapping reads the record stream instead.
-    fn set_round_received(&self, _hash: &primitives::EventHash, _round_received: u64) {}
+    fn set_ordering(
+        &self,
+        _hash: &primitives::EventHash,
+        _round_received: u64,
+        _consensus_timestamp: Option<primitives::Timestamp>,
+    ) {
+    }
 
     /// The event stream carries no roster history.
     fn set_roster_history(&self, _bytes: &[u8]) {}

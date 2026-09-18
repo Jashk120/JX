@@ -37,7 +37,10 @@ use fjall::{
     KeyspaceCreateOptions,
     PersistMode,
 };
-use primitives::EventHash;
+use primitives::{
+    EventHash,
+    Timestamp,
+};
 
 use crate::Result;
 use crate::error::EventLogError;
@@ -120,6 +123,7 @@ impl EventLog {
                 .ok_or_else(|| EventLogError::Corrupt("stored record undecodable".into()))?;
             if stored.round_received.is_none() && record.round_received.is_some() {
                 stored.round_received = record.round_received;
+                stored.consensus_timestamp = record.consensus_timestamp;
                 self.write_both(log_seq, hash.as_bytes().as_slice(), &stored)?;
             }
             return Ok(false);
@@ -135,10 +139,18 @@ impl EventLog {
         Ok(true)
     }
 
-    /// Records the finalized `round_received` of an already-logged event. A
-    /// no-op when the event is not in the log (it may predate logging) or its
-    /// ordering is already recorded.
-    pub fn set_round_received(&self, hash: &EventHash, round_received: u64) -> Result<()> {
+    /// Records the finalized ordering (`round_received` plus
+    /// `consensus_timestamp`) of an already-logged event in a single write,
+    /// so a replay reproduces the exact window leaf the checkpoint commits
+    /// to. A no-op when the event is not in the log (it may predate logging)
+    /// or its ordering is already recorded — finalized ordering never
+    /// changes, so the first write wins regardless of the values passed.
+    pub fn set_ordering(
+        &self,
+        hash: &EventHash,
+        round_received: u64,
+        consensus_timestamp: Option<Timestamp>,
+    ) -> Result<()> {
         let _guard = self.write_lock.lock().map_err(|_| EventLogError::Poisoned)?;
         let Some(existing) = self.by_hash.get(hash.as_bytes().as_slice())? else {
             return Ok(());
@@ -149,6 +161,7 @@ impl EventLog {
             return Ok(());
         }
         stored.round_received = Some(round_received);
+        stored.consensus_timestamp = consensus_timestamp;
         self.write_both(log_seq, hash.as_bytes().as_slice(), &stored)
     }
 
@@ -249,8 +262,14 @@ pub trait EventSink: Send + Sync {
     /// Appends a freshly inserted event (with its record metadata) to the
     /// log.
     fn append(&self, record: &RetainedEvent);
-    /// Records that `hash`'s `roundReceived` is `round_received`.
-    fn set_round_received(&self, hash: &EventHash, round_received: u64);
+    /// Records that `hash`'s finalized ordering is `round_received` plus
+    /// `consensus_timestamp`.
+    fn set_ordering(
+        &self,
+        hash: &EventHash,
+        round_received: u64,
+        consensus_timestamp: Option<Timestamp>,
+    );
     /// Persists the encoded roster history.
     fn set_roster_history(&self, bytes: &[u8]);
     /// Removes the given events from the log, mirroring an in-memory prune.
@@ -266,9 +285,14 @@ impl EventSink for EventLog {
         }
     }
 
-    fn set_round_received(&self, hash: &EventHash, round_received: u64) {
-        if let Err(e) = EventLog::set_round_received(self, hash, round_received) {
-            eprintln!("[event-log] failed to record round_received: {e}");
+    fn set_ordering(
+        &self,
+        hash: &EventHash,
+        round_received: u64,
+        consensus_timestamp: Option<Timestamp>,
+    ) {
+        if let Err(e) = EventLog::set_ordering(self, hash, round_received, consensus_timestamp) {
+            eprintln!("[event-log] failed to record ordering: {e}");
         }
     }
 
@@ -367,48 +391,52 @@ mod tests {
     }
 
     #[test]
-    fn set_round_received_merges_ordering() {
+    fn set_ordering_merges_round_and_timestamp() {
         let dir = tempdir().expect("temp dir");
         let log = EventLog::open(dir.path()).expect("opens");
         let record = sample_record(1, 1, 1);
         let hash = record_hash(&record);
         log.append(&record).expect("append");
-        log.set_round_received(&hash, 5).expect("set order");
+        log.set_ordering(&hash, 5, Some(Timestamp::new(50))).expect("set order");
 
         let replayed = log.replay().expect("replays");
         assert_eq!(replayed.len(), 1);
         assert_eq!(replayed[0].round_received, Some(5));
+        assert_eq!(replayed[0].consensus_timestamp, Some(Timestamp::new(50)));
     }
 
     #[test]
-    fn set_round_received_never_overwrites_recorded_ordering() {
+    fn set_ordering_never_overwrites_recorded_ordering() {
         let dir = tempdir().expect("temp dir");
         let log = EventLog::open(dir.path()).expect("opens");
         let record = sample_record(1, 1, 1);
         let hash = record_hash(&record);
         log.append(&record).expect("append");
-        log.set_round_received(&hash, 5).expect("set order");
-        // `round_received` is consensus-final: a second call must be a no-op
-        // regardless of the value passed.
-        log.set_round_received(&hash, 5).expect("equal value is a no-op");
-        log.set_round_received(&hash, 9).expect("different value is a no-op");
+        log.set_ordering(&hash, 5, Some(Timestamp::new(50))).expect("set order");
+        // Finalized ordering never changes: later calls must be a no-op
+        // regardless of the values passed.
+        log.set_ordering(&hash, 5, Some(Timestamp::new(50))).expect("equal value is a no-op");
+        log.set_ordering(&hash, 9, Some(Timestamp::new(90))).expect("different value is a no-op");
 
         let replayed = log.replay().expect("replays");
         assert_eq!(replayed.len(), 1);
         assert_eq!(replayed[0].round_received, Some(5));
+        assert_eq!(replayed[0].consensus_timestamp, Some(Timestamp::new(50)));
     }
 
     #[test]
-    fn append_merges_incoming_round_received() {
+    fn append_merges_incoming_ordering() {
         let dir = tempdir().expect("temp dir");
         let log = EventLog::open(dir.path()).expect("opens");
         let mut record = sample_record(1, 1, 1);
         log.append(&record).expect("append");
         // A reconnect teacher delivers the same event, already ordered.
         record.round_received = Some(4);
+        record.consensus_timestamp = Some(Timestamp::new(40));
         assert!(!log.append(&record).expect("dedup append"));
         let replayed = log.replay().expect("replays");
         assert_eq!(replayed[0].round_received, Some(4));
+        assert_eq!(replayed[0].consensus_timestamp, Some(Timestamp::new(40)));
     }
 
     #[test]
@@ -682,11 +710,11 @@ mod tests {
     }
 
     #[test]
-    fn set_round_received_on_missing_hash_is_noop() {
+    fn set_ordering_on_missing_hash_is_noop() {
         let dir = tempdir().expect("temp dir");
         let log = EventLog::open(dir.path()).expect("opens");
         let missing = EventHash::new([0xDE; 32]);
-        log.set_round_received(&missing, 99).expect("noop for missing hash");
+        log.set_ordering(&missing, 99, Some(Timestamp::new(9))).expect("noop for missing hash");
     }
 
     #[test]

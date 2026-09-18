@@ -18,6 +18,7 @@ use consensus::{
     RETENTION_ROUNDS,
     RecordsRootItem,
     RetainedEvent,
+    SIGNED_WINDOW_ROUNDS,
     SignedCheckpoint,
 };
 use crypto::{
@@ -36,6 +37,7 @@ use primitives::{
     Event,
     EventHash,
     NodeId,
+    Timestamp,
     Transaction,
 };
 use storage::EventSink;
@@ -1500,27 +1502,33 @@ impl GossipNode {
     /// once. This eliminates the deadlock hazard of acquiring `hg`,
     /// `registry`, and `peers` in nested order.
     pub async fn process_finalized_rounds(&self) {
-        // Phase A: collect (event, round_received) pairs under the hg lock only.
-        let finalized: Vec<(Event, u64)> = {
+        // Phase A: collect (event, round_received, consensus_timestamp)
+        // triples under the hg lock only.
+        let finalized: Vec<(Event, u64, Option<Timestamp>)> = {
             let hg = self.hashgraph.lock().await;
             state::finalized_events(&hg)
                 .into_iter()
                 .filter_map(|event| {
                     let hash = event.hash().expect("hash bounded");
-                    hg.round_received(&hash).map(|rr| (event, rr))
+                    hg.round_received(&hash).map(|rr| {
+                        let ts = hg.get(&hash).and_then(|record| record.consensus_timestamp());
+                        (event, rr, ts)
+                    })
                 })
                 .collect()
         };
 
         // Phase A.5: record each newly finalized event's ordering in the
         // durable log (Phase 8) so a later replay reproduces `roundReceived`
-        // exactly instead of re-deriving it. Called for every finalized event;
-        // `EventLog::set_round_received` is idempotent, so late events with
-        // `rr <= watermark` (H-2) still get persisted for crash recovery.
+        // and `consensusTimestamp` exactly instead of re-deriving them — the
+        // learner's window check authenticates both. Called for every
+        // finalized event; `EventLog::set_ordering` is idempotent, so late
+        // events with `rr <= watermark` (H-2) still get persisted for crash
+        // recovery.
         let sink = self.event_sink.lock().await.clone();
         if let Some(sink) = &sink {
-            for (event, rr) in &finalized {
-                sink.set_round_received(&event.hash().expect("hash bounded"), *rr);
+            for (event, rr, ts) in &finalized {
+                sink.set_ordering(&event.hash().expect("hash bounded"), *rr, *ts);
             }
         }
 
@@ -1554,8 +1562,8 @@ impl GossipNode {
                 let mut activation = self.activation.lock().await;
                 let mut executor = self.executor.lock().await;
                 let mut by_round: BTreeMap<u64, Vec<(Event, u64)>> = BTreeMap::new();
-                for pair in &finalized {
-                    by_round.entry(pair.1).or_default().push(pair.clone());
+                for (event, rr, _) in &finalized {
+                    by_round.entry(*rr).or_default().push((event.clone(), *rr));
                 }
                 let mut hashes: BTreeMap<u64, [u8; 32]> = BTreeMap::new();
                 let mut snapshots: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
@@ -2514,6 +2522,27 @@ impl GossipNode {
             return false;
         }
 
+        // 3c. The served roster history must hash to the signed
+        //     `roster_history_root`: the canonical selection over
+        //     `SIGNED_WINDOW_ROUNDS`, recomputed from the decoded bytes. A
+        //     peer that appends (or drops) snapshots outside the committed
+        //     set is rejected before anything is seeded from it.
+        match consensus::compute_roster_history_root(
+            &roster_history,
+            cp_round,
+            SIGNED_WINDOW_ROUNDS,
+        ) {
+            Ok(root) if root == checkpoint.payload.roster_history_root => {}
+            Ok(_) => {
+                tracing::error!("reconnect: roster history root mismatch; rejecting checkpoint");
+                return false;
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "reconnect: roster history root failed; rejecting checkpoint");
+                return false;
+            }
+        }
+
         // 3b. The roster must carry this node's own key. If it is absent or
         //     holds a different key, this node could never produce an event
         //     that verifies against the restored registry — every sync round
@@ -2601,7 +2630,18 @@ impl GossipNode {
         //    (`insert_accepted` re-derives seq/ancestors/round/ordering)
         //    before the live graph is touched. Any failure discards the
         //    scratch and leaves the live state and hashgraph untouched.
-        let mut new_hg = consensus::Hashgraph::from_checkpoint(&checkpoint.payload, roster_history);
+        //    Seed the scratch with the canonical roster selection, not the
+        //    raw decoded bytes: the signed root commits to the canonical
+        //    subset, and the raw bytes may carry an unauthenticated newer
+        //    snapshot.
+        let Some(canonical_roster) =
+            consensus::canonical_roster_history(&roster_history, cp_round, SIGNED_WINDOW_ROUNDS)
+        else {
+            tracing::error!("reconnect: empty canonical roster selection; rejecting checkpoint");
+            return false;
+        };
+        let mut new_hg =
+            consensus::Hashgraph::from_checkpoint(&checkpoint.payload, canonical_roster);
         let mut slots: Vec<Option<RetainedEvent>> =
             verified_retained.into_iter().map(Some).collect();
         for index in order {
@@ -2620,6 +2660,29 @@ impl GossipNode {
         if let Err(e) = new_hg.mark_decided_through(decided_round) {
             tracing::error!(error = %e, "reconnect: decided watermark rejected");
             return false;
+        }
+
+        // 7b. The rebuilt window must hash to the signed `window_root`. This
+        //     authenticates the transferred window's per-event metadata (seq,
+        //     birth round, ordering, ancestry) against the quorum signature,
+        //     which is what makes the retained graph safe to adopt. Runs
+        //     before the first durable write below, and only when the
+        //     transfer carries window events: an empty transfer (local
+        //     restart recovery from the quorum-verified persisted checkpoint,
+        //     which refills its graph via a verified reconnect) carries no
+        //     per-event metadata to authenticate.
+        if !retained.is_empty() {
+            match consensus::try_compute_window_root(&new_hg, cp_round, SIGNED_WINDOW_ROUNDS) {
+                Ok(root) if root == checkpoint.payload.window_root => {}
+                Ok(_) => {
+                    tracing::error!("reconnect: window root mismatch; rejecting checkpoint");
+                    return false;
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "reconnect: window root failed; rejecting checkpoint");
+                    return false;
+                }
+            }
         }
 
         // 8. All validation passed. Do the fallible durable work first — the
@@ -2816,10 +2879,27 @@ impl GossipNode {
             return;
         };
 
+        // Serve the canonical roster-history selection for the checkpoint
+        // round — the exact subset the checkpoint's `roster_history_root`
+        // commits to — not the raw retained history, which may carry newer
+        // snapshots the signature does not cover. An empty selection means
+        // this node cannot authenticate what it would serve, so refuse.
+        let cp_round = checkpoint.payload.round;
         let (roster_history_bytes, decided_round, retained) = {
             let hg = self.hashgraph.lock().await;
-            let roster_history_bytes = consensus::encode_roster_history(hg.roster_history())
-                .expect("roster_history bounded");
+            let Some(canonical) = consensus::canonical_roster_history(
+                hg.roster_history(),
+                cp_round,
+                SIGNED_WINDOW_ROUNDS,
+            ) else {
+                tracing::error!(
+                    round = cp_round,
+                    "reconnect: empty canonical roster selection; refusing to serve checkpoint"
+                );
+                return;
+            };
+            let roster_history_bytes =
+                consensus::encode_roster_history(&canonical).expect("roster_history bounded");
             let decided_round = hg.highest_decided_round();
             let retained = hg.retained_events();
             (roster_history_bytes, decided_round, retained)
@@ -3253,6 +3333,8 @@ mod apply_checkpoint_tests {
     };
     use ed25519_dalek::SigningKey;
     use primitives::{
+        Event,
+        EventHash,
         NodeId,
         Timestamp,
         UnsignedEvent,
@@ -3375,6 +3457,216 @@ mod apply_checkpoint_tests {
             0,
             "timestamp watermark is untouched on rejection"
         );
+    }
+
+    fn sign_teacher_event(
+        key: &SigningKey,
+        creator: NodeId,
+        self_parent: Option<EventHash>,
+        ts: u64,
+    ) -> Event {
+        UnsignedEvent::new(creator, self_parent, None, Timestamp::new(ts), Vec::new())
+            .sign(key)
+            .expect("sign bounded")
+    }
+
+    /// A teacher holding three decided events at round 2 and the
+    /// quorum-signed checkpoint committing to them, plus the served state
+    /// bytes. The returned response passes every `apply_checkpoint` check,
+    /// including the `roster_history_root` and `window_root` commitments.
+    fn honest_teacher_transfer() -> (MembershipRegistry, ReconnectResponse, Vec<u8>) {
+        let registry = registry_with(&[1, 2]);
+        let key1 = SigningKey::from_bytes(&[1u8; 32]);
+        let key2 = SigningKey::from_bytes(&[2u8; 32]);
+        let node1 = NodeId::new(1);
+        let node2 = NodeId::new(2);
+
+        let scaffold = consensus::CheckpointPayload::new(
+            2,
+            consensus::compute_records_root(&[]),
+            [0u8; 32],
+            [0u8; 32],
+            [0u8; 32],
+            registry.clone(),
+        );
+        let mut teacher = consensus::Hashgraph::from_checkpoint(
+            &scaffold,
+            crypto::RosterHistory::new(registry.clone()),
+        );
+        let event_a1 = sign_teacher_event(&key1, node1, None, 10);
+        let hash_a1 = event_a1.hash().expect("hash bounded");
+        let event_b1 = sign_teacher_event(&key2, node2, None, 20);
+        let event_a2 = sign_teacher_event(&key1, node1, Some(hash_a1), 30);
+        for (event, seq, row, ts) in [
+            (event_a1, 1u64, vec![1u64, 0], 100u64),
+            (event_b1, 1, vec![0, 1], 200),
+            (event_a2, 2, vec![2, 0], 300),
+        ] {
+            teacher
+                .insert_accepted(
+                    consensus::RetainedEvent {
+                        event,
+                        seq,
+                        round: 2,
+                        ancestor_seqs: row,
+                        round_received: Some(2),
+                        consensus_timestamp: Some(Timestamp::new(ts)),
+                    },
+                    2,
+                )
+                .expect("teacher event inserts");
+        }
+        teacher.mark_decided_through(2).expect("teacher marks decided");
+
+        let serve_dir = tempdir().expect("tempdir");
+        let serve_db = state::StateDb::open(serve_dir.path()).expect("StateDb");
+        let mut served = state::State::new(serve_db.state_keyspace());
+        served
+            .apply(&state::Op::Put { key: b"taught".to_vec(), value: b"1".to_vec() })
+            .expect("apply succeeds");
+        let state_bytes = served.to_bytes().expect("to_bytes succeeds");
+
+        let payload = teacher
+            .checkpoint_payload(2, consensus::compute_records_root(&[]), served.root())
+            .expect("teacher produces payload");
+        let mut pairs: Vec<(NodeId, blst::min_pk::Signature)> = [1u64, 2]
+            .iter()
+            .map(|&id| {
+                let bls = crypto::BlsIdentity::from_ikm(&[id as u8; 32]).expect("bls");
+                (NodeId::new(id), bls.sign(&payload.signing_bytes()))
+            })
+            .collect();
+        pairs.sort_by_key(|(id, _)| *id);
+        let refs: Vec<&blst::min_pk::Signature> = pairs.iter().map(|(_, sig)| sig).collect();
+        let checkpoint = SignedCheckpoint {
+            payload,
+            aggregate_sig: crypto::bls::aggregate(&refs).expect("aggregate succeeds"),
+            signers: pairs.into_iter().map(|(id, _)| id).collect(),
+        };
+        let canonical =
+            consensus::canonical_roster_history(teacher.roster_history(), 2, SIGNED_WINDOW_ROUNDS)
+                .expect("teacher selection is non-empty");
+        let response = ReconnectResponse {
+            signed_checkpoint: checkpoint,
+            state_bytes: state_bytes.clone(),
+            roster_history_bytes: consensus::encode_roster_history(&canonical)
+                .expect("roster_history bounded"),
+            decided_round: 2,
+            retained: teacher.retained_events(),
+            last_timestamp: 0,
+        };
+        (registry, response, state_bytes)
+    }
+
+    async fn learning_node() -> (Arc<GossipNode>, EventHash, Vec<u8>) {
+        let registry = registry_with(&[1, 2]);
+        let dir = tempdir().expect("tempdir");
+        let db = Arc::new(state::StateDb::open(dir.path()).expect("StateDb"));
+        let node = GossipNode::new(
+            NodeId::new(1),
+            SigningKey::from_bytes(&[1u8; 32]),
+            registry.clone(),
+            TlsIdentity::from_seed([0x42; 32], 1).expect("tls"),
+            Vec::new(),
+            SyncTiming::new(
+                std::time::Duration::from_millis(50),
+                std::time::Duration::from_secs(1),
+            ),
+            db,
+        );
+        let live_event =
+            UnsignedEvent::new(NodeId::new(1), None, None, Timestamp::new(42), Vec::new())
+                .sign(&SigningKey::from_bytes(&[1u8; 32]))
+                .expect("sign bounded");
+        let live_hash = {
+            let verified = live_event.verify(&registry).expect("verifies");
+            node.hashgraph.lock().await.insert(verified).expect("inserts")
+        };
+        let live_state_bytes =
+            node.executor.lock().await.state().to_bytes().expect("to_bytes succeeds");
+        (Arc::new(node), live_hash, live_state_bytes)
+    }
+
+    async fn assert_live_untouched(
+        node: &GossipNode,
+        live_hash: &EventHash,
+        live_state_bytes: &[u8],
+    ) {
+        assert!(
+            node.hashgraph.lock().await.get(live_hash).is_some(),
+            "live graph event survives the rejection"
+        );
+        assert_eq!(
+            node.executor.lock().await.state().to_bytes().expect("to_bytes succeeds"),
+            live_state_bytes,
+            "live state bytes survive the rejection"
+        );
+        assert!(
+            node.signed_checkpoints.lock().await.is_empty(),
+            "no checkpoint is recorded on rejection"
+        );
+        assert_eq!(
+            node.last_timestamp.load(Ordering::Relaxed),
+            0,
+            "timestamp watermark is untouched on rejection"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_checkpoint_accepts_matching_window_and_roster_history() {
+        let (_registry, response, state_bytes) = honest_teacher_transfer();
+        let (node, _live_hash, _live_state) = learning_node().await;
+        assert_ne!(
+            state_bytes,
+            node.executor.lock().await.state().to_bytes().expect("to_bytes succeeds"),
+            "served state must differ from live state"
+        );
+        assert!(node.apply_checkpoint(response).await, "honest transfer is accepted");
+        assert_eq!(
+            node.latest_accepted_checkpoint_round().await,
+            Some(2),
+            "checkpoint round is recorded"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_checkpoint_rejects_tampered_window() {
+        let (_registry, mut response, _state_bytes) = honest_teacher_transfer();
+        // Mutate one in-window record's consensus timestamp. The value is
+        // restored verbatim by `insert_accepted` (only its presence pattern
+        // is validated), so the scratch graph still builds — but its window
+        // leaf no longer matches the signed `window_root`.
+        let mutated = response
+            .retained
+            .iter_mut()
+            .find(|record| record.consensus_timestamp.is_some())
+            .expect("transfer carries ordered events");
+        let bumped = mutated.consensus_timestamp.expect("ordered").get() + 1;
+        mutated.consensus_timestamp = Some(Timestamp::new(bumped));
+
+        let (node, live_hash, live_state_bytes) = learning_node().await;
+        assert!(!node.apply_checkpoint(response).await, "tampered window metadata is rejected");
+        assert_live_untouched(&node, &live_hash, &live_state_bytes).await;
+    }
+
+    #[tokio::test]
+    async fn apply_checkpoint_rejects_tampered_roster_history() {
+        let (registry, mut response, _state_bytes) = honest_teacher_transfer();
+        // Smuggle a duplicate snapshot at activation round 1 into the served
+        // bytes. The roster active at the checkpoint round is unchanged, so
+        // the `roster_hash` check still passes — but the canonical selection
+        // no longer hashes to the signed `roster_history_root`.
+        let tampered = crypto::RosterHistory::from_snapshots(vec![
+            (0, registry.clone()),
+            (1, registry.clone()),
+        ])
+        .expect("tampered history builds");
+        response.roster_history_bytes =
+            consensus::encode_roster_history(&tampered).expect("roster_history bounded");
+
+        let (node, live_hash, live_state_bytes) = learning_node().await;
+        assert!(!node.apply_checkpoint(response).await, "tampered roster history is rejected");
+        assert_live_untouched(&node, &live_hash, &live_state_bytes).await;
     }
 }
 
