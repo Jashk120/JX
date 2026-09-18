@@ -3,7 +3,6 @@ use std::collections::{
     HashSet,
     VecDeque,
 };
-use std::sync::atomic::Ordering;
 
 use primitives::{
     EventHash,
@@ -138,10 +137,10 @@ impl Hashgraph {
         // member"), never a hard stop.
         if current.is_none() {
             if up_to_seq != 0 {
-                self.walk_metrics.member_chain_hard_stops.fetch_add(1, Ordering::Relaxed);
+                self.walk_metrics.record_member_chain_hard_stop();
             }
             // No event visited, so the round span is 0 by definition.
-            self.walk_metrics.member_chain_max_round_span.fetch_max(0, Ordering::Relaxed);
+            self.walk_metrics.record_member_chain_round_span(0);
             return Ok(false);
         }
 
@@ -156,7 +155,7 @@ impl Hashgraph {
                 (Some(start), Some(deepest)) => start.saturating_sub(deepest),
                 _ => 0,
             };
-            self.walk_metrics.member_chain_max_round_span.fetch_max(span, Ordering::Relaxed);
+            self.walk_metrics.record_member_chain_round_span(span);
         };
 
         let mut steps: u64 = 0;
@@ -167,21 +166,17 @@ impl Hashgraph {
                 deepest_round = Some(deepest_round.map_or(round, |deepest| deepest.min(round)));
             }
             if self.see(&hash, y)? {
-                self.walk_metrics.member_chain_max_steps.fetch_max(steps, Ordering::Relaxed);
+                self.walk_metrics.record_member_chain_steps(steps);
                 record_round_span(start_round, deepest_round);
                 // Transition-only depth: this event is where the walk flips
                 // to `see == true`. Other exits (genesis, pruned edge) never
                 // touch these two counters.
-                self.walk_metrics
-                    .member_chain_max_transition_steps
-                    .fetch_max(steps, Ordering::Relaxed);
+                self.walk_metrics.record_member_chain_transition_steps(steps);
                 let transition_span = match (start_round, record.map(|r| r.round())) {
                     (Some(start), Some(transition)) => start.saturating_sub(transition),
                     _ => 0,
                 };
-                self.walk_metrics
-                    .member_chain_max_transition_round_span
-                    .fetch_max(transition_span, Ordering::Relaxed);
+                self.walk_metrics.record_member_chain_transition_round_span(transition_span);
                 return Ok(true);
             }
             // Follow the self-parent chain, but stop when the parent was
@@ -192,16 +187,14 @@ impl Hashgraph {
             let parent = record.and_then(|r| r.event().self_parent().copied());
             match parent {
                 None => {
-                    self.walk_metrics.member_chain_max_steps.fetch_max(steps, Ordering::Relaxed);
+                    self.walk_metrics.record_member_chain_steps(steps);
                     record_round_span(start_round, deepest_round);
                     return Ok(false);
                 }
                 Some(parent) => {
                     if self.get(&parent).is_none() {
-                        self.walk_metrics.member_chain_hard_stops.fetch_add(1, Ordering::Relaxed);
-                        self.walk_metrics
-                            .member_chain_max_steps
-                            .fetch_max(steps, Ordering::Relaxed);
+                        self.walk_metrics.record_member_chain_hard_stop();
+                        self.walk_metrics.record_member_chain_steps(steps);
                         record_round_span(start_round, deepest_round);
                         return Ok(false);
                     }
@@ -209,7 +202,7 @@ impl Hashgraph {
                 }
             }
         }
-        self.walk_metrics.member_chain_max_steps.fetch_max(steps, Ordering::Relaxed);
+        self.walk_metrics.record_member_chain_steps(steps);
         record_round_span(start_round, deepest_round);
         Ok(false)
     }

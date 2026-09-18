@@ -45,8 +45,6 @@
 //! `assign_order` scans the stored events once per finalized round (not per
 //! insertion), and events that are already ordered are skipped.
 
-use std::sync::atomic::Ordering;
-
 use primitives::{
     EventHash,
     NodeId,
@@ -204,15 +202,14 @@ impl Hashgraph {
             let event = match self.creator_chain_event(witness, *node_id, *idx, low) {
                 Some(event) => event,
                 None => {
-                    self.walk_metrics.first_seen_missing_boundary.fetch_add(1, Ordering::Relaxed);
+                    self.walk_metrics.record_first_seen_missing_boundary();
                     return None;
                 }
             };
-            self.walk_metrics.first_seen_max_span.fetch_max(up_to - low, Ordering::Relaxed);
+            self.walk_metrics.record_first_seen_span(up_to - low);
             if let Some(boundary_round) = self.get(&event).map(|r| r.round()) {
-                self.walk_metrics.first_seen_max_round_span.fetch_max(
+                self.walk_metrics.record_first_seen_round_span(
                     witness_record.round().saturating_sub(boundary_round),
-                    Ordering::Relaxed,
                 );
             }
             let replace = match earliest {

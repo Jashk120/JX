@@ -196,8 +196,112 @@ pub struct WalkMetrics {
     pub(crate) member_chain_max_transition_round_span: AtomicU64,
 }
 
-/// Plain `Copy` snapshot of [`WalkMetrics`], for reporting (e.g. the
-/// `jkaind status` JSON). Read via [`Hashgraph::walk_metrics`].
+/// Debug-only counter updates for [`WalkMetrics`].
+///
+/// Each method compiles to nothing in release builds (`#[cfg(debug_assertions)]`
+/// gates the atomic update out, leaving only a `let _ =` sink for `self` and
+/// the `u64` argument so callers stay warning-free). In debug builds the behavior is
+/// identical to a direct `fetch_*` with `Ordering::Relaxed`. `walk_metrics()`
+/// keeps loading the counters in all profiles; in release they simply stay zero.
+impl WalkMetrics {
+    #[inline]
+    pub(crate) fn record_member_chain_steps(&self, steps: u64) {
+        #[cfg(debug_assertions)]
+        {
+            self.member_chain_max_steps.fetch_max(steps, Ordering::Relaxed);
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            let _ = (self, steps);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn record_member_chain_hard_stop(&self) {
+        #[cfg(debug_assertions)]
+        {
+            self.member_chain_hard_stops.fetch_add(1, Ordering::Relaxed);
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            let _ = self;
+        }
+    }
+
+    #[inline]
+    pub(crate) fn record_member_chain_round_span(&self, span: u64) {
+        #[cfg(debug_assertions)]
+        {
+            self.member_chain_max_round_span.fetch_max(span, Ordering::Relaxed);
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            let _ = (self, span);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn record_member_chain_transition_steps(&self, steps: u64) {
+        #[cfg(debug_assertions)]
+        {
+            self.member_chain_max_transition_steps.fetch_max(steps, Ordering::Relaxed);
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            let _ = (self, steps);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn record_member_chain_transition_round_span(&self, span: u64) {
+        #[cfg(debug_assertions)]
+        {
+            self.member_chain_max_transition_round_span.fetch_max(span, Ordering::Relaxed);
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            let _ = (self, span);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn record_first_seen_span(&self, span: u64) {
+        #[cfg(debug_assertions)]
+        {
+            self.first_seen_max_span.fetch_max(span, Ordering::Relaxed);
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            let _ = (self, span);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn record_first_seen_missing_boundary(&self) {
+        #[cfg(debug_assertions)]
+        {
+            self.first_seen_missing_boundary.fetch_add(1, Ordering::Relaxed);
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            let _ = self;
+        }
+    }
+
+    #[inline]
+    pub(crate) fn record_first_seen_round_span(&self, span: u64) {
+        #[cfg(debug_assertions)]
+        {
+            self.first_seen_max_round_span.fetch_max(span, Ordering::Relaxed);
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            let _ = (self, span);
+        }
+    }
+}
+
+/// Plain `Copy` snapshot of [`WalkMetrics`], for reporting (e.g. the/// `jkaind status` JSON). Read via [`Hashgraph::walk_metrics`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct WalkMetricsSnapshot {
     pub member_chain_max_steps: u64,

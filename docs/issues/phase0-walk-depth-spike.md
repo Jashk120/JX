@@ -37,6 +37,13 @@ including false-answer closures that descend to genesis or the prune edge.
 Transition-only maxima record only walks where `see(hash,y)` first returns
 true, that is the depth at which the answer flips from false to true.
 
+The counters are debug-only: updates go through `WalkMetrics` helper methods
+gated by `cfg(debug_assertions)`, so release builds compile the updates out
+(zero cost on the consensus hot path) and `walk_metrics` reports zeros there.
+Debug builds keep the exact behavior described above, which is what the 6-node
+harness and the scheduled N=100 + forks spike re-run use. If release-build
+measurement is ever needed, add a dedicated Cargo feature for it.
+
 ## 3. Runs
 
 Three real 6-node runs (80 ms sync interval, debug `jkaind`, direct LAN):
