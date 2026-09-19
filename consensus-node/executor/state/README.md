@@ -37,23 +37,57 @@ for the state's LSM backing.
   check without shipping the whole state.
 - `Op` — the transaction payload: one opcode byte plus length-prefixed
   fields. `0x00` `Put { key, value }`, `0x01` `Delete { key }`, `0x03`
-  `DidOp { id, document, signature, signed_by }` (`executor/state/src/did.rs`).
+  `DidOp { id, document, signature, signed_by }` (`executor/state/src/did.rs`),
+  `0x04` `SubActorOp { root_did, tag, index, control_key, operating_key,
+  new_root, consistency_proof, inclusion_proof, signature, signed_by }` and
+  `0x05` `RebindOp { actor_id, new_operating_key, proof_of_possession,
+  authorizing_signature }` (`executor/state/src/sub_actor.rs`).
   `DecodedOp` is the top-level decode result: `Put`/`Delete` go to `State`,
   `DidOp` goes through `Executor::apply_did_op` (creation self-signed against
   the new document's own verification method, updates authorized by the prior
-  document's indexed key, deactivation as a tombstone `Put` not `Delete`), while
+  document's indexed key, deactivation as a tombstone `Put` not `Delete`),
+  `SubActorOp` goes through `Executor::apply_sub_actor_op` (replay
+  short-circuit, root-document signature, then the RFC-6962 inclusion and
+  consistency proofs must both agree with `new_root` before it is written)
+  and `RebindOp` through `Executor::apply_rebind_op` (root-control-only:
+  proof of possession by the new key, authorization by the root control key;
+  the membership commitment is untouched), while
   `0x02` `MembershipOp` bodies are decoded by `crypto::MembershipOp` and
   returned as a side channel. `DidDocument` holds 1..=5 `VerifyingKey`s plus a
   `deactivated` flag with binary `encode`/`decode`. Any other opcode, a
   truncated payload, or trailing bytes decodes to a deterministic
   `ExecutorError`.
+- `merkle_log` (in `merkle_log.rs`) — the append-only RFC-6962 binary Merkle
+  log over actor membership, separate from the state SMT: `leaf_hash =
+  SHA256(0x00 || data)`, `node_hash = SHA256(0x01 || left || right)`,
+  `EMPTY_ROOT = SHA256("")`, `mth` splitting at the largest power of two
+  strictly below `n`, plus `prove/verify_inclusion` (`PATH`, §2.1.1) and
+  `prove/verify_consistency` (`PROOF`, §2.1.2) with `u64BE/u64BE/u32BE`
+  wire-framed proofs.
+- `root_actor` / `sub_actor` (in `root_actor.rs` / `sub_actor.rs`) — canonical
+  actor records. `ActorId` is `Root(DidId)` (`0x00 || DidId::encode()`) or
+  `Sub { root_did, tag, index }` (`0x01 || DidId::encode() || tag:u8 ||
+  index:u32BE`, tags `0=defi, 1=messenger, 2=game, 3=generic`, u31 indices);
+  `actor_state_key(id) = 0xA1 || id.encode()`. `RootActor { did_id,
+  merkle_root, leaf_count, control_key }` commits to the sub-actor set via the
+  `merkle_log` root. `SubActor { actor_id, control_key, operating_key }`
+  carries the immutable control key (committed as the
+  `b"jkain:subactor-leaf:v1"`-domain-separated leaf) and the mutable operating
+  key (rebinds stay outside the commitment).
 - `Executor` — applies transactions to a `State` in the order presented.
   `execute_event` applies every valid transaction and returns
-  `(Vec<ExecutorError>, Vec<MembershipOp>, Vec<DidError>)`; DID ops route
+  `(Vec<ExecutorError>, Vec<MembershipOp>, Vec<OpError>)`, where `OpError`
+  carries DID (`DidError`) and actor (`ActorError`) semantic failures
+  distinctly; DID ops route
   through `apply_did_op` (with `is_creation` flag for duplicate/unknown-id
   checks, 1..=5 key limit, `AlreadyDeactivated` guard, and `UnknownSigner` /
   `InvalidSignature` checks) and ultimately write via the same `State::Put`
-  path (with Merkle rehash) so proofs cover DID keys. Membership ops never
+  path (with Merkle rehash) so proofs cover DID keys. A successful creation
+  additionally writes a fresh `RootActor` (`EMPTY_ROOT`, `leaf_count 0`,
+  control key copied from the new document); a successful update/rotation
+  replaces the stored root's control key while preserving its commitment
+  (recreating a fresh empty root when the record is absent); a deactivation
+  writes the document only. Membership ops never
   touch `State`. `bucket_finalized` feeds a finalized `(event,
   roundReceived)` batch through the executor once, bucketing membership ops
   by roundReceived behind a processed-round watermark (idempotent).
@@ -61,7 +95,8 @@ for the state's LSM backing.
   per-round **after-image `StateDiff`s**: for each round a
   `BTreeMap<key, Option<value>>` capturing the **final value per distinct
   key** after the round's events (last-write-wins), `Some(value)` for `Put`
-  (including DID puts) and `None` for `Delete` tombstones, **canonically
+  (including DID/sub-actor/rebind puts and their root-actor after-images) and `None` for
+  `Delete` tombstones, **canonically
   sorted ascending by key, deduped, non-empty keys**, and excluding
   `MembershipOp`. The caller persists them as `RecordStreamFile.state_diffs`
   and they are validated mirror-side (`ValidateStateDiffs`) for sort/dedup.

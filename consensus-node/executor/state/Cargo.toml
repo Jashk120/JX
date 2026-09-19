@@ -8,8 +8,8 @@ primitives   = { workspace = true }
 consensus    = { workspace = true }
 crypto       = { workspace = true }
 ed25519-dalek = { workspace = true }
+x25519-dalek = { workspace = true }
 sha2         = { workspace = true }
-hmac         = { workspace = true }
 fjall        = { workspace = true }
 thiserror    = { workspace = true }
 

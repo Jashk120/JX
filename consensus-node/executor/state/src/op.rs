@@ -16,6 +16,8 @@
 //! | `0x01` | `Delete` | key          |
 //! | `0x02` | `MembershipOp` | decoded by `crypto::MembershipOp::decode` (body only, no `0x02` prefix) |
 //! | `0x03` | `DidOp` | decoded by `DidOp::decode` (body only, no `0x03` prefix) |
+//! | `0x04` | `SubActorOp` | decoded by `SubActorOp::decode` (body only, no `0x04` prefix) |
+//! | `0x05` | `RebindOp` | decoded by `RebindOp::decode` (body only, no `0x05` prefix) |
 //!
 //! A `Put` writes (or overwrites) `value` under `key`; a `Delete` removes
 //! `key` (a no-op if absent). A `MembershipOp` never touches `State` — the
@@ -33,11 +35,22 @@ use crate::error::{
     ExecutorError,
     Result,
 };
+use crate::sub_actor::{
+    RebindOp,
+    SubActorOp,
+};
 
 const OP_PUT: u8 = 0x00;
 const OP_DELETE: u8 = 0x01;
 const OP_MEMBERSHIP: u8 = 0x02;
 const OP_DID: u8 = 0x03;
+const OP_SUB_ACTOR: u8 = 0x04;
+const OP_REBIND: u8 = 0x05;
+
+/// First byte reserved for DID state keys (`did_state_key`).
+const RESERVED_DID_PREFIX: u8 = 0xD1;
+/// First byte reserved for actor state keys.
+const RESERVED_ACTOR_PREFIX: u8 = 0xA1;
 
 /// A single state transition decoded from a `Transaction` payload.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -60,12 +73,14 @@ impl Op {
         match opcode {
             OP_PUT => {
                 let key = take_bytes(&mut cursor)?;
+                reject_reserved_prefix(&key)?;
                 let value = take_bytes(&mut cursor)?;
                 reject_trailing(cursor)?;
                 Ok(Op::Put { key, value })
             }
             OP_DELETE => {
                 let key = take_bytes(&mut cursor)?;
+                reject_reserved_prefix(&key)?;
                 reject_trailing(cursor)?;
                 Ok(Op::Delete { key })
             }
@@ -95,11 +110,17 @@ impl Op {
 /// The result of decoding a single transaction payload. KV operations go to
 /// `State`; membership operations are returned as a side channel and never
 /// touch `State`.
+///
+/// `SubActorOp` and `RebindOp` travel boxed: their bodies (proofs and key
+/// material) dwarf every other variant, and the workspace denies
+/// `clippy::variant_size_differences`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DecodedOp {
     Kv(Op),
     Membership(MembershipOp),
     Did(DidOp),
+    SubActor(Box<SubActorOp>),
+    Rebind(Box<RebindOp>),
 }
 
 impl DecodedOp {
@@ -113,6 +134,7 @@ impl DecodedOp {
             OP_PUT => {
                 let mut cursor = cursor;
                 let key = take_bytes(&mut cursor)?;
+                reject_reserved_prefix(&key)?;
                 let value = take_bytes(&mut cursor)?;
                 reject_trailing(cursor)?;
                 Ok(DecodedOp::Kv(Op::Put { key, value }))
@@ -120,6 +142,7 @@ impl DecodedOp {
             OP_DELETE => {
                 let mut cursor = cursor;
                 let key = take_bytes(&mut cursor)?;
+                reject_reserved_prefix(&key)?;
                 reject_trailing(cursor)?;
                 Ok(DecodedOp::Kv(Op::Delete { key }))
             }
@@ -137,6 +160,20 @@ impl DecodedOp {
                 // tag was consumed above. `DidOp::decode` receives the DID
                 // body (network, alias, uuid, document, signature, signed_by).
                 DidOp::decode(cursor).map(DecodedOp::Did).map_err(|_| ExecutorError::MalformedDidOp)
+            }
+            OP_SUB_ACTOR => {
+                // `cursor` is already the body slice — the outer 0x04 type
+                // tag was consumed above.
+                SubActorOp::decode(cursor)
+                    .map(|op| DecodedOp::SubActor(Box::new(op)))
+                    .map_err(|_| ExecutorError::MalformedSubActorOp)
+            }
+            OP_REBIND => {
+                // `cursor` is already the body slice — the outer 0x05 type
+                // tag was consumed above.
+                RebindOp::decode(cursor)
+                    .map(|op| DecodedOp::Rebind(Box::new(op)))
+                    .map_err(|_| ExecutorError::MalformedRebindOp)
             }
             _ => Err(ExecutorError::UnknownOpcode(opcode)),
         }
@@ -157,6 +194,14 @@ fn take_bytes(cursor: &mut &[u8]) -> Result<Vec<u8>> {
 
 fn reject_trailing(cursor: &[u8]) -> Result<()> {
     if cursor.is_empty() { Ok(()) } else { Err(ExecutorError::TrailingBytes) }
+}
+
+fn reject_reserved_prefix(key: &[u8]) -> Result<()> {
+    match key.first().copied() {
+        Some(RESERVED_DID_PREFIX) => Err(ExecutorError::ReservedKeyPrefix(RESERVED_DID_PREFIX)),
+        Some(RESERVED_ACTOR_PREFIX) => Err(ExecutorError::ReservedKeyPrefix(RESERVED_ACTOR_PREFIX)),
+        _ => Ok(()),
+    }
 }
 
 fn write_bytes(buf: &mut Vec<u8>, bytes: &[u8]) {
@@ -256,8 +301,64 @@ mod tests {
     }
 
     #[test]
+    fn malformed_sub_actor_body_is_rejected() {
+        // 0x04 followed by a truncated body (opcode-adjacent bytes only).
+        let payload = [OP_SUB_ACTOR, 0x00];
+        assert_eq!(DecodedOp::decode(&payload), Err(ExecutorError::MalformedSubActorOp));
+    }
+
+    #[test]
+    fn malformed_rebind_body_is_rejected() {
+        // 0x05 followed by a truncated body (opcode-adjacent bytes only).
+        let payload = [OP_REBIND, 0x00];
+        assert_eq!(DecodedOp::decode(&payload), Err(ExecutorError::MalformedRebindOp));
+    }
+
+    #[test]
     fn unknown_opcode_under_decoded_op_is_rejected() {
         let payload = [0x7f];
         assert_eq!(DecodedOp::decode(&payload), Err(ExecutorError::UnknownOpcode(0x7f)));
+    }
+
+    #[test]
+    fn op_decode_rejects_reserved_did_prefix_put() {
+        let op = Op::Put { key: vec![0xD1, 1, 2], value: b"v".to_vec() };
+        assert_eq!(Op::decode(&op.encode()), Err(ExecutorError::ReservedKeyPrefix(0xD1)));
+    }
+
+    #[test]
+    fn op_decode_rejects_reserved_actor_prefix_put() {
+        let op = Op::Put { key: vec![0xA1, 1, 2], value: b"v".to_vec() };
+        assert_eq!(Op::decode(&op.encode()), Err(ExecutorError::ReservedKeyPrefix(0xA1)));
+    }
+
+    #[test]
+    fn op_decode_rejects_reserved_prefix_delete() {
+        let op = Op::Delete { key: vec![0xD1, 1, 2] };
+        assert_eq!(Op::decode(&op.encode()), Err(ExecutorError::ReservedKeyPrefix(0xD1)));
+        let op = Op::Delete { key: vec![0xA1, 1, 2] };
+        assert_eq!(Op::decode(&op.encode()), Err(ExecutorError::ReservedKeyPrefix(0xA1)));
+    }
+
+    #[test]
+    fn decoded_op_decode_rejects_reserved_prefix_put() {
+        let put = Op::Put { key: vec![0xD1, 1, 2], value: b"v".to_vec() };
+        assert_eq!(DecodedOp::decode(&put.encode()), Err(ExecutorError::ReservedKeyPrefix(0xD1)));
+        let put = Op::Put { key: vec![0xA1, 1, 2], value: b"v".to_vec() };
+        assert_eq!(DecodedOp::decode(&put.encode()), Err(ExecutorError::ReservedKeyPrefix(0xA1)));
+    }
+
+    #[test]
+    fn decoded_op_decode_rejects_reserved_prefix_delete() {
+        let delete = Op::Delete { key: vec![0xD1, 1, 2] };
+        assert_eq!(
+            DecodedOp::decode(&delete.encode()),
+            Err(ExecutorError::ReservedKeyPrefix(0xD1))
+        );
+        let delete = Op::Delete { key: vec![0xA1, 1, 2] };
+        assert_eq!(
+            DecodedOp::decode(&delete.encode()),
+            Err(ExecutorError::ReservedKeyPrefix(0xA1))
+        );
     }
 }

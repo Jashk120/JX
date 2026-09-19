@@ -26,6 +26,15 @@ through this crate.
   reconnect address; `Remove` carries just the node id) and the round-indexed
   sequence of registry snapshots that activates changes at their agreed
   round.
+- `derive` — SLIP-0010 `ed25519` hardened-only hierarchical deterministic
+  key derivation. `derive_ed25519` derives a signing key from a seed along a
+  fully hardened path (every element is hardened internally; elements
+  `>= 0x8000_0000` and empty paths are rejected). `did_control_key`
+  derives the canonical DID-control path `m/19019'/0'/generation'`, and
+  `actor_control_key` derives the canonical actor-control path
+  `m/19019'/1'/tag_code'/index'` (`0 = defi, 1 = messenger, 2 = game,
+  3 = generic`). Library-side only: derived private material must never
+  enter consensus state.
 
 ## Design
 

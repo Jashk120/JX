@@ -258,6 +258,7 @@ version = "0.0.1"
 dependencies = [
  "blst",
  "ed25519-dalek",
+ "hmac",
  "primitives",
  "rand",
  "sha2",
@@ -1405,11 +1406,11 @@ dependencies = [
  "crypto",
  "ed25519-dalek",
  "fjall",
- "hmac",
  "primitives",
  "sha2",
  "tempfile",
  "thiserror",
+ "x25519-dalek",
 ]
 
 [[package]]
@@ -1898,6 +1899,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df79d97927682d2fd8adb29682d1140b343be4ac0f08fd68b7765d9c059d3945"
 dependencies = [
  "memchr",
+]
+
+[[package]]
+name = "x25519-dalek"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c7e468321c81fb07fa7f4c636c3972b9100f0346e5b6a9f2bd0603a52f7ed277"
+dependencies = [
+ "curve25519-dalek",
+ "rand_core",
+ "serde",
+ "zeroize",
 ]
 
 [[package]]

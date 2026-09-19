@@ -23,9 +23,32 @@ pub enum ExecutorError {
     MalformedMembershipOp,
     /// The `0x03` DID-op body did not decode cleanly.
     MalformedDidOp,
+    /// The `0x04` sub-actor-op body did not decode cleanly.
+    MalformedSubActorOp,
+    /// The `0x05` rebind-op body did not decode cleanly.
+    MalformedRebindOp,
     /// DID identifier or document contains invalid bytes (e.g. non-UTF8
     /// network/alias or ':' in segment).
     InvalidDid,
+    /// A generic `Put`/`Delete` targeted a reserved state-key prefix (`0xD1`
+    /// DID records or `0xA1` actor records). Carries the offending prefix byte.
+    ReservedKeyPrefix(u8),
+    /// A `DidDocument` carried a version byte other than `0x02`.
+    UnsupportedDidDocumentVersion(u8),
+    /// A `DidDocument` verification method carried an unknown type tag.
+    UnknownVerificationMethodType(u8),
+    /// A `DidDocument` contained no Ed25519 signing method.
+    NoSigningMethod,
+    /// An `ActorId` carried an unknown variant byte (expected `0x00` for a
+    /// root actor or `0x01` for a sub-actor).
+    UnknownActorIdVariant(u8),
+    /// A sub-actor `ActorId` carried an unknown tag code (expected 0..=3).
+    UnknownActorTag(u8),
+    /// A sub-actor `ActorId` carried an index `>= 0x8000_0000` (only u31
+    /// indices are representable on a derivation path).
+    ActorIndexOutOfRange(u32),
+    /// A `SubActor` record was constructed from a root actor ID.
+    ExpectedSubActor,
 }
 
 pub type Result<T> = std::result::Result<T, ExecutorError>;
@@ -39,7 +62,27 @@ impl fmt::Display for ExecutorError {
             Self::TrailingBytes => write!(f, "transaction payload has trailing bytes"),
             Self::MalformedMembershipOp => write!(f, "malformed membership-op payload"),
             Self::MalformedDidOp => write!(f, "malformed DID-op payload"),
+            Self::MalformedSubActorOp => write!(f, "malformed sub-actor-op payload"),
+            Self::MalformedRebindOp => write!(f, "malformed rebind-op payload"),
             Self::InvalidDid => write!(f, "DID identifier contains invalid bytes"),
+            Self::ReservedKeyPrefix(prefix) => {
+                write!(f, "state key uses reserved prefix {prefix:#04x}")
+            }
+            Self::UnsupportedDidDocumentVersion(version) => {
+                write!(f, "unsupported DID document version {version:#04x}")
+            }
+            Self::UnknownVerificationMethodType(method_type) => {
+                write!(f, "unknown verification method type {method_type:#04x}")
+            }
+            Self::NoSigningMethod => write!(f, "DID document has no signing method"),
+            Self::UnknownActorIdVariant(variant) => {
+                write!(f, "unknown actor ID variant {variant:#04x}")
+            }
+            Self::UnknownActorTag(tag) => write!(f, "unknown actor tag {tag:#04x}"),
+            Self::ActorIndexOutOfRange(index) => {
+                write!(f, "actor index out of range {index:#010x}")
+            }
+            Self::ExpectedSubActor => write!(f, "expected sub-actor ID, found root actor ID"),
         }
     }
 }
@@ -95,3 +138,86 @@ impl fmt::Display for DidError {
 }
 
 impl std::error::Error for DidError {}
+
+/// Semantic errors from applying a sub-actor or rebind operation
+/// (post-decode).
+///
+/// Like [`DidError`], these arise from state-dependent authorization and
+/// membership-proof checks, not from the payload bytes alone.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ActorError {
+    /// The `root_did` names no DID document in state (absent or undecodable).
+    UnknownRootDid,
+    /// The root DID document is deactivated and rejects actor operations.
+    RootDeactivated,
+    /// The root actor record for the DID is absent or undecodable.
+    UnknownRootActor,
+    /// The sub-actor state key is already present (replay short-circuit).
+    SubActorAlreadyExists,
+    /// The sub-actor record is absent or undecodable.
+    UnknownSubActor,
+    /// A rebind targeted a root actor ID; Phase A rebinds sub-actors only.
+    ExpectedSubActorId,
+    /// The `signed_by` index is out of range for the root document's
+    /// signing methods.
+    UnknownSigner,
+    /// The Ed25519 signature did not verify against the expected key.
+    InvalidSignature,
+    /// The inclusion proof does not fold the new leaf to `new_root` at
+    /// `leaf_index == old_leaf_count`.
+    InclusionProofInvalid,
+    /// The consistency proof does not fold `old_root` to `new_root` for a
+    /// single-leaf append.
+    ConsistencyProofInvalid,
+    /// The proof of possession did not verify against the new operating key.
+    InvalidProofOfPossession,
+    /// The authorization signature did not verify against the root control key.
+    InvalidAuthorization,
+}
+
+impl fmt::Display for ActorError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownRootDid => write!(f, "root DID not found"),
+            Self::RootDeactivated => write!(f, "root DID is deactivated"),
+            Self::UnknownRootActor => write!(f, "root actor record not found"),
+            Self::SubActorAlreadyExists => write!(f, "sub-actor already exists"),
+            Self::UnknownSubActor => write!(f, "sub-actor not found"),
+            Self::ExpectedSubActorId => write!(f, "expected sub-actor ID, found root actor ID"),
+            Self::UnknownSigner => write!(f, "signed_by index out of range"),
+            Self::InvalidSignature => write!(f, "sub-actor signature verification failed"),
+            Self::InclusionProofInvalid => write!(f, "sub-actor inclusion proof invalid"),
+            Self::ConsistencyProofInvalid => write!(f, "sub-actor consistency proof invalid"),
+            Self::InvalidProofOfPossession => write!(f, "rebind proof of possession invalid"),
+            Self::InvalidAuthorization => write!(f, "rebind authorization signature invalid"),
+        }
+    }
+}
+
+impl std::error::Error for ActorError {}
+
+/// The generalized operation-error channel: semantic (post-decode) failures
+/// of DID and actor operations, carried distinctly.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OpError {
+    Did(DidError),
+    Actor(ActorError),
+}
+
+impl fmt::Display for OpError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Did(e) => write!(f, "DID operation failed: {e}"),
+            Self::Actor(e) => write!(f, "actor operation failed: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for OpError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Did(e) => Some(e),
+            Self::Actor(e) => Some(e),
+        }
+    }
+}

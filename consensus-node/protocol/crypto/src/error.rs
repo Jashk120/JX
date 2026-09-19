@@ -15,6 +15,15 @@ pub enum CryptoError {
     UnknownMembershipOpcode(u8),
     BlsKeyGenFailed,
     BlsAggregateFailed,
+    /// A key-derivation path was empty; at least one hardened index is required.
+    EmptyDerivationPath,
+    /// A derivation index was already hardened (`>= 0x8000_0000`); callers pass
+    /// the non-hardened element and the module hardens it internally.
+    InvalidDerivationIndex(u32),
+    /// An actor tag code was outside the `0..=3` range.
+    InvalidTagCode(u8),
+    /// HMAC initialisation failed while deriving a key.
+    HmacInitFailed,
 }
 
 pub type Result<T> = std::result::Result<T, CryptoError>;
@@ -37,6 +46,12 @@ impl fmt::Display for CryptoError {
             }
             Self::BlsKeyGenFailed => write!(f, "bls key generation failed"),
             Self::BlsAggregateFailed => write!(f, "bls aggregate failed"),
+            Self::EmptyDerivationPath => write!(f, "empty derivation path"),
+            Self::InvalidDerivationIndex(index) => {
+                write!(f, "invalid derivation index {index:#010x}")
+            }
+            Self::InvalidTagCode(tag) => write!(f, "invalid actor tag code {tag}"),
+            Self::HmacInitFailed => write!(f, "hmac initialisation failed"),
         }
     }
 }
