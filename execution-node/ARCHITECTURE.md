@@ -21,12 +21,16 @@ compute node supplies execution, entirely off the consensus path.
 ## Crate stack
 
 ```text
-l1-client    the §6.3.1 boundary (reads + submits; never authorizes)
+l1/client    the §6.3.1 boundary (reads + submits; never authorizes)
     ↑
-actor-host   manifests, WASM runtime, blob/storage boundary
+runtime/actor-host   manifests, WASM runtime, blob/storage boundary
     ↑
 node         the jkainc daemon: config, lifecycle, wiring
 ```
+
+Crates live under role directories (`l1/`, `runtime/`), matching
+`consensus-node/`'s `protocol/` + `executor/` convention. Each umbrella
+directory and each crate has its own `README.md`.
 
 Both `l1-client` and `actor-host` depend on `state` (the L1 executor crate)
 for the actor identity and commitment types. That shared dependency is the

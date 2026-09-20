@@ -45,15 +45,23 @@ shared-state concurrent program.
 
 ```text
 execution-node/
-  Cargo.toml            # [workspace] members = crates/*, node
+  Cargo.toml            # [workspace] members = l1/client, runtime/actor-host, node
   rust-toolchain.toml   # pins the same toolchain as consensus-node
   rustfmt.toml
-  crates/
-    l1-client/          # the §6.3.1 boundary: read-only queries + submit
+  l1/                   # umbrella: the §6.3.1 L1 integration boundary
+    README.md
+    client/             # read-only queries + signed transaction submission
+  runtime/              # umbrella: off-chain actor hosting
+    README.md
     actor-host/         # manifests, the WASM runtime, the storage boundary
   node/                 # the jkainc daemon (wires the crates to a lifecycle)
+  README.md
   ARCHITECTURE.md
 ```
+
+Crates sit under a role directory (`l1/`, `runtime/`) rather than a generic
+`crates/`, matching `consensus-node/`'s `protocol/` + `executor/` convention.
+Each umbrella directory and each crate carries its own `README.md`.
 
 ## Build
 

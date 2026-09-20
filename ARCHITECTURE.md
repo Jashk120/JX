@@ -17,11 +17,11 @@ JKaIN/                          # git root — monorepo
     README.md                   # node-specific build/run docs
     ARCHITECTURE.md             # node internals deep dive
   execution-node/               # Rust workspace: off-chain actor compute (jkainc)
-    Cargo.toml                  # [workspace] members = crates/l1-client, crates/actor-host, node
+    Cargo.toml                  # [workspace] members = l1/client, runtime/actor-host, node
     rust-toolchain.toml         # mirrors consensus-node's toolchain
     rustfmt.toml
-    crates/l1-client/           # the whitepaper §6.3.1 boundary (reads + submits)
-    crates/actor-host/          # actor manifests, WASM runtime, storage boundary
+    l1/client/                  # the whitepaper §6.3.1 boundary (reads + submits)
+    runtime/actor-host/         # actor manifests, WASM runtime, storage boundary
     node/                       # jkainc daemon (scaffold)
     README.md                   # compute-node build/run docs + the Rust-not-Go rationale
     ARCHITECTURE.md             # compute-node internals + blocking design questions

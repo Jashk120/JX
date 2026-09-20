@@ -8,8 +8,8 @@ name = "jkainc"
 path = "src/bin/jkainc.rs"
 
 [dependencies]
-l1-client = { path = "../crates/l1-client" }
-actor-host = { path = "../crates/actor-host" }
+l1-client = { path = "../l1/client" }
+actor-host = { path = "../runtime/actor-host" }
 anyhow = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
