@@ -13,14 +13,14 @@ shared key-value state.
 protocol/     consensus-critical network layer
   primitives/    value types (zero dependencies)
   crypto/        hashing, signing, membership
-  consensus/     virtual-voting Hashgraph: rounds, fame, order, checkpoints (FORMAT_VERSION 6)
+  consensus/     virtual-voting Hashgraph: rounds, fame, order, checkpoints (FORMAT_VERSION 7)
   storage/       Fjall-backed durable event log + roster history
   stream/        mirror stream files: .esf events (+ .esf_sig) + .rsf records (+ .rsf_proofs sidecar)
   gossip/        pinned-TLS gossip network + GossipNode runtime
   test-support/  shared test timing helpers (SYNC_INTERVAL, DEADLINE)
 executor/     deterministic execution layer
   state/        Fjall-backed KV executor + Merkle tree + DID (did:jkain) — emits sorted after-image state_diffs
-node/         the jkaind daemon: config, persistence, restart recovery (FORMAT_VERSION 6, STREAM_VERSION 4)
+node/         the jkaind daemon: config, persistence, restart recovery (FORMAT_VERSION 7, STREAM_VERSION 4)
 ```
 
 Shared protobuf schema lives at the repo root `proto/jkain_stream.proto` and is
@@ -139,7 +139,7 @@ Available `run` flags:
 | `--cluster <path>` | *(required)* | Genesis `cluster.toml` |
 | `--node-id <id>` | *(required)* | This node's `NodeId` |
 | `--secret <path>` | *(required)* | `secret-<id>.bin` (64-byte genesis or 32-byte single-seed for dynamic members) |
-| `--data <dir>` | `data` | Data dir for checkpoints (`<data>/checkpoints/`), state DB (`<data>/statedb/`), event log (`<data>/eventlog/`), streams (`<data>/streams/` — `.esf`+`.esf_sig`, `.rsf`+`.rsf_proofs`, `.ckpt`) — `FORMAT_VERSION` 6, `STREAM_VERSION` 4 |
+| `--data <dir>` | `data` | Data dir for checkpoints (`<data>/checkpoints/`), state DB (`<data>/statedb/`), event log (`<data>/eventlog/`), streams (`<data>/streams/` — `.esf`+`.esf_sig`, `.rsf`+`.rsf_proofs`, `.ckpt`) — `FORMAT_VERSION` 7, `STREAM_VERSION` 4 |
 | `--gossip-port <port>` | from `cluster.toml` | Override gossip listen port |
 | `--reconnect-port <port>` | from `cluster.toml` | Override reconnect listen port (or force one for a gossip-only member) |
 | `--control-socket <path>` | `<data>/jkaind.sock` | Unix control socket (0600) |
@@ -240,6 +240,9 @@ jkaind run --cluster <path> --node-id <id> --secret <path> [--gossip-port <port>
 jkaind status [--socket <path>]
 jkaind tx put --key <k> --value <v> [--socket <path>]
 jkaind tx delete --key <k> [--socket <path>]
+jkaind tx did --network <s> --alias <s> --uuid <32 hex> --control-key <64 hex> --method <ed25519:64hex|x25519:64hex> [...] --signature <128 hex> --signed-by <u8> [--create | --deactivate] [--socket <path>]
+jkaind tx sub-actor --network <s> --alias <s> --uuid <32 hex> --tag <defi|messenger|game|generic> --index <u32> --control-key <64 hex> --operating-key <64 hex> --new-root <64 hex> --consistency-proof <hex> --inclusion-proof <hex> --signature <128 hex> --signed-by <u8> [--socket <path>]
+jkaind tx rebind --network <s> --alias <s> --uuid <32 hex> --tag <defi|messenger|game|generic> --index <u32> --new-operating-key <64 hex> --proof-of-possession <128 hex> --authorizing-signature <128 hex> [--socket <path>]
 jkaind add-member --node-id <id> --gossip <ip:port> [--reconnect <ip:port>] --key <hex> [--socket <path>]
 jkaind member init --node-id <id> --gossip <ip:port> --reconnect <ip:port> --cluster <genesis cluster.toml> --out <dir>
 ```

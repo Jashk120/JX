@@ -348,6 +348,9 @@ impl Executor {
             (true, Some(_)) => Err(DidError::IdentifierAlreadyExists),
             (false, None) => Err(DidError::UnknownIdentifier),
             (true, None) => {
+                if did_op.document().deactivated() {
+                    return Ok(Err(DidError::CreationDeactivated));
+                }
                 let idx = did_op.signed_by() as usize;
                 let Some(verifying_key) = did_op.document().signing_key(idx) else {
                     return Ok(Err(DidError::UnknownSigner));
@@ -957,6 +960,23 @@ mod tests {
         assert_eq!(result.op_errors, vec![OpError::Did(DidError::IdentifierAlreadyExists)]);
         // Only the first document and its root are in state.
         assert_eq!(executor.state().len(), 2);
+    }
+
+    #[test]
+    fn did_creation_rejects_deactivated_document() {
+        // A creation carrying `deactivated: true` is rejected: a document must
+        // exist as an active document before it can be deactivated.
+        let tx = did_tx("alice", 1, &[1], true, true);
+        let event = event_with(vec![tx]);
+
+        let mut executor = new_executor();
+        let result = match executor.execute_event(&event) {
+            Ok(r) => r,
+            Err(e) => panic!("storage error: {e}"),
+        };
+        assert!(result.errors.is_empty());
+        assert_eq!(result.op_errors, vec![OpError::Did(DidError::CreationDeactivated)]);
+        assert!(executor.state().is_empty());
     }
 
     #[test]

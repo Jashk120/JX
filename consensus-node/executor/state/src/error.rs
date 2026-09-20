@@ -123,6 +123,9 @@ pub enum DidError {
     /// The document is already deactivated and cannot be updated or
     /// re-activated.
     AlreadyDeactivated,
+    /// A creation carried `deactivated: true`; a document must exist as an
+    /// active document before it can be deactivated.
+    CreationDeactivated,
 }
 
 impl fmt::Display for DidError {
@@ -133,6 +136,7 @@ impl fmt::Display for DidError {
             Self::IdentifierAlreadyExists => write!(f, "DID identifier already exists"),
             Self::UnknownIdentifier => write!(f, "DID identifier not found"),
             Self::AlreadyDeactivated => write!(f, "DID document is already deactivated"),
+            Self::CreationDeactivated => write!(f, "DID creation cannot be deactivated"),
         }
     }
 }

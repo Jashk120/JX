@@ -12,6 +12,20 @@
 //! jkaind status  [--socket <path>]
 //! jkaind tx put    --key <k> --value <v>  [--socket <path>]
 //! jkaind tx delete --key <k>              [--socket <path>]
+//! jkaind tx did --network <s> --alias <s> --uuid <32 hex> \
+//!               --control-key <64 hex> --method <ed25519:64hex|x25519:64hex> [...] \
+//!               --signature <128 hex> --signed-by <u8> [--create | --deactivate] \
+//!               [--socket <path>]
+//! jkaind tx sub-actor --network <s> --alias <s> --uuid <32 hex> \
+//!                     --tag <defi|messenger|game|generic> --index <u32> \
+//!                     --control-key <64 hex> --operating-key <64 hex> \
+//!                     --new-root <64 hex> --consistency-proof <hex> \
+//!                     --inclusion-proof <hex> --signature <128 hex> --signed-by <u8> \
+//!                     [--socket <path>]
+//! jkaind tx rebind --network <s> --alias <s> --uuid <32 hex> \
+//!                  --tag <defi|messenger|game|generic> --index <u32> \
+//!                  --new-operating-key <64 hex> --proof-of-possession <128 hex> \
+//!                  --authorizing-signature <128 hex> [--socket <path>]
 //! jkaind add-member --node-id <id> --gossip <ip:port> [--reconnect <ip:port>] \
 //!                   --key <hex> --bls-key <96 hex> (--bls-secret <path> | --pop <192 hex>) [--socket <path>]
 //! jkaind member init --node-id <id> --gossip <ip:port> --reconnect <ip:port> \
@@ -95,6 +109,19 @@ fn print_usage() {
          \x20 jkaind status  [--socket <path>]\n\
          \x20 jkaind tx put    --key <k> --value <v> [--socket <path>]\n\
          \x20 jkaind tx delete --key <k>             [--socket <path>]\n\
+         \x20 jkaind tx did --network <s> --alias <s> --uuid <32 hex> \\\n\
+         \x20              --control-key <64 hex> --method <ed25519:64hex|x25519:64hex> [...] \\\n\
+         \x20              --signature <128 hex> --signed-by <u8> [--create | --deactivate] \\\n\
+         \x20              [--socket <path>]\n\
+         \x20 jkaind tx sub-actor --network <s> --alias <s> --uuid <32 hex> \\\n\
+         \x20              --tag <defi|messenger|game|generic> --index <u32> \\\n\
+         \x20              --control-key <64 hex> --operating-key <64 hex> --new-root <64 hex> \\\n\
+         \x20              --consistency-proof <hex> --inclusion-proof <hex> \\\n\
+         \x20              --signature <128 hex> --signed-by <u8> [--socket <path>]\n\
+         \x20 jkaind tx rebind --network <s> --alias <s> --uuid <32 hex> \\\n\
+         \x20              --tag <defi|messenger|game|generic> --index <u32> \\\n\
+         \x20              --new-operating-key <64 hex> --proof-of-possession <128 hex> \\\n\
+         \x20              --authorizing-signature <128 hex> [--socket <path>]\n\
          \x20 jkaind add-member --node-id <id> --gossip <ip:port> \\\n\
          \x20                  [--reconnect <ip:port>] --key <hex> \\\n\
          \x20                  --bls-key <96 hex> (--bls-secret <path> | --pop <192 hex>) \\\n\
