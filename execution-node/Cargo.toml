@@ -1,0 +1,38 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/l1-client",
+    "crates/actor-host",
+    "node",
+]
+
+[workspace.package]
+edition = "2024"
+version = "0.0.1"
+rust-version = "1.85"
+
+[workspace.dependencies]
+# Shared L1 crates. The executor types (`DidId`, `ActorId`, `RootActor`,
+# `SubActor`, the RFC-6962 proof types) are the source of truth for the wire
+# format; a compute node links them rather than re-implementing canonical
+# binary decoding in a second language.
+primitives = { path = "../consensus-node/protocol/primitives" }
+crypto = { path = "../consensus-node/protocol/crypto" }
+state = { path = "../consensus-node/executor/state" }
+
+anyhow = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[workspace.lints.rust]
+unused_must_use = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+must_use_candidate = "allow"
+doc_markdown = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"

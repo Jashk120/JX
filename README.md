@@ -14,6 +14,11 @@ JKaIN/
     Cargo.toml        workspace manifest (resolver = 3)
     Cargo.lock, rust-toolchain.toml, rustfmt.toml
     README.md, ARCHITECTURE.md
+  execution-node/   Off-chain actor compute node (Rust workspace, scaffold) — see execution-node/README.md
+    crates/l1-client/  the whitepaper §6.3.1 L1 boundary (read-only queries + submit)
+    crates/actor-host/ actor manifests, WASM runtime, storage boundary
+    node/              jkainc daemon (scaffold)
+    README.md, ARCHITECTURE.md
   proto/            Shared protobuf schemas (jkain_stream.proto for mirror streams)
   docs/             Whitepaper, consensus spec, DID method, optimization notes (shared)
   .github/          CI / release workflows (run inside consensus-node via working-directory)

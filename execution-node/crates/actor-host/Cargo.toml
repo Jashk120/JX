@@ -1,0 +1,13 @@
+[package]
+name = "actor-host"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+state = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[lints]
+workspace = true
