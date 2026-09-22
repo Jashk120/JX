@@ -1,0 +1,14 @@
+package jkain:actor@0.0.1;
+
+/// Operations a hosted actor exposes to the host.
+///
+/// Provisional interface for the local-hosting milestone: discovery,
+/// actor-to-actor messaging, and lifecycle hooks are intentionally absent.
+interface handler {
+  /// Handle one inbound request addressed to this actor; returns its reply.
+  handle-request: func(request: list<u8>) -> result<list<u8>, string>;
+}
+
+world actor {
+  export handler;
+}

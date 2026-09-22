@@ -78,7 +78,7 @@ cargo test --workspace
 | Piece | State |
 |---|---|
 | `l1-client` boundary traits | scaffold (no transport) |
-| `actor-host` manifest/status types | scaffold (no `wasmtime`, no WIT) |
+| `actor-host` hosting runtime | local hosting (`Runtime` loads WASM components per `wit/actor.wit`, dispatches `handle-request`) |
 | `jkainc` daemon | scaffold (exits with "not implemented") |
 | location/resolution (Phase C) | not started — prerequisite for reachability |
 | replication/state model (§6.4 vs V3 notes) | **unresolved** |

@@ -1,5 +1,4 @@
-//! Off-chain actor hosting: per-actor manifests, the WASM runtime, and the
-//! storage boundary.
+//! Off-chain actor hosting: per-actor manifests and a `wasmtime`-backed runtime.
 //!
 //! Whitepaper §6.3.2: actors are WebAssembly components hosted via a
 //! Component-Model-capable runtime, with raw networking kept out of the
@@ -7,11 +6,21 @@
 //! calls). §6.5: actors are unloaded after idle periods and cold-started on
 //! demand.
 //!
-//! Not yet implemented: the `wasmtime` dependency, the WIT interface, the
-//! `blob_get`/`blob_put` host boundary, and encrypted shared buckets. Nothing
-//! here is wired to a message transport; the entity types below exist so the
-//! manifest and per-actor state shape are reviewable before the runtime lands.
+//! Local-hosting milestone: [`Runtime`] compiles one WASM component per
+//! actor, instantiates it in its own sandboxed [`wasmtime::Store`], and
+//! dispatches inbound requests to the addressed actor's `handle-request`
+//! export. On-chain registration and resolution are deliberately stubbed:
+//! the caller supplies the [`ActorManifest`] (including the on-chain
+//! [`ActorId`](state::ActorId)) directly to [`Runtime::load`]; no L1 lookup
+//! happens here.
+//!
+//! Not built yet: actor discovery, actor-to-actor messaging, the
+//! `blob_get`/`blob_put` storage boundary, encrypted shared buckets, idle
+//! unload, heartbeats, replication, and any HTTP interface.
 
+mod runtime;
+
+pub use runtime::Runtime;
 use state::ActorId;
 
 /// The off-chain manifest describing one actor instance.

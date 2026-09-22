@@ -1,0 +1,15 @@
+[package]
+name = "echo-actor"
+version = "0.0.1"
+edition = "2021"
+
+[workspace]          # opt out of the execution-node workspace
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.51"
+
+[profile.release]
+opt-level = "s"

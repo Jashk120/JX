@@ -8,6 +8,8 @@ state = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+wasmtime = { workspace = true }
+wasmtime-wasi = { workspace = true }
 
 [lints]
 workspace = true
