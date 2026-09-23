@@ -37,6 +37,17 @@ mgr = ClusterManager(ClusterConfig(num_nodes=6, sync_interval_ms=25, sync_timeou
 await mgr.start()
 ```
 
+`sync_interval_ms` defaults to `25`, but the default is read from
+`JKAIN_SYNC_INTERVAL_MS` at config construction, so existing latency/TPS tests
+can be run at another event gap without editing them:
+
+```bash
+JKAIN_SYNC_INTERVAL_MS=10 pytest tests/test_finality_tps.py -m "finality or tps" -v -s
+```
+
+Explicit `ClusterConfig(sync_interval_ms=...)` (e.g. the gap-vs-fanout sweep)
+still overrides the env default.
+
 ### ControlClient
 
 ```python
