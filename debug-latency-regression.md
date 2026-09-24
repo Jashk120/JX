@@ -125,19 +125,30 @@ Only ~13 residual "sync round failed" cluster-wide (genuine double-failures).
 Gates green: `cargo +nightly fmt`, `cargo clippy --workspace --all-targets -D
 warnings`, `cargo test -p gossip`, `pytest tests -m fast` (3/3, 6 s).
 
-### Still open — the backoff's own design flaws (next task)
+### Backoff design flaws — FIXED
 
 The pooling fix removes the *false* failures, so backoff rarely arms now. But
-the mechanism is still unsafe if it ever does arm:
+the mechanism was still unsafe if it ever did arm:
 
-1. **No aggregate cap** — nothing keeps at least one peer available; all 5 can
+1. **No aggregate cap** — nothing kept at least one peer available; all 5 can
    back off simultaneously.
-2. **The fallback shares the hole** — `pick_k` → `random_peer` fallback *also*
+2. **The fallback shared the hole** — `pick_k` → `random_peer` fallback *also*
    filters backoff, so an all-backoff tick syncs with nobody (no "break glass"
    probe).
-3. **The clear condition rarely fires** — `consecutive_failures` only resets on
-   a full success and never decays; a peer that fails twice in a row can
-   re-arm near the 64 s max and spend most of its time backed off.
+3. **The clear condition rarely fired** — `consecutive_failures` only reset on
+   a full success and never decayed; a peer that failed twice in a row could
+   re-arm near the 64 s max.
+
+Fix (`peer_manager.rs`): backoff capped at 2 s (`BACKOFF_BASE` 100 ms,
+`1 << min(failures, 5)`, `BACKOFF_CEILING` 2 s); a failure streak older than
+`FAILURE_STREAK_TTL` (10 s) resets before the next failure is counted; and
+`random_peer` (hence `pick_k`'s fallback) now probes the soonest-recovering
+peer when every peer is backed off, so a tick never syncs with nobody. Unit
+tests cover the probe, the cap, and the streak decay.
+
+*Note:* `test_6node_churn_kill_restart` / `test_isolate_single_node` fail
+~2/3 of the time on the pre-fix tree too (checkpoint divergence) — pre-existing
+flakiness, not caused by this change.
 
 ---
 
