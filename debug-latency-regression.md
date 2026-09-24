@@ -85,6 +85,62 @@ no chaining) was *also* ~2.4 s, and the instant backoff was removed latency hit
 
 ---
 
+## FIX APPLIED (verified)
+
+Root cause refined further: the "failures" are **manufactured by the TCP
+hot-pool**, not genuine peer faults. `TcpTransport::is_connected()` is just
+`stream.is_some()` — not a liveness probe — so a pooled connection the peer's
+OS has already FIN/RST'd still reports "connected". The next sync reuses it,
+skips reconnect, and the first write dies with `Broken pipe`; that is reported
+as a **peer** failure and arms the backoff. On a direct-LAN cluster 13–42% is
+the pooled-socket staleness rate, not real unreliability.
+
+Fix (two parts, `gossip`):
+
+1. `GossipError::is_transport_stale()` (`error.rs`) — `Io` / `Closed` are
+   connection-level; `Framing` / TLS-pin / `Consensus` / `Crypto` stay
+   peer-level.
+2. **Retry-once on a fresh connection** in *both* sync paths (`node.rs`): on a
+   transport-stale round failure, drop the pooled transport, reconnect fresh,
+   retry once — **before** any `record_failure`. Only a failure on the fresh
+   connection escalates to peer backoff. Safe because gossip is idempotent.
+
+The backoff timer itself was **not** touched (owner steer: fix the
+misattribution, not the timer).
+
+### Result (release, 6-node direct LAN, same box)
+
+| metric | before | after |
+|---|---:|---:|
+| `decided p50` (latency test) | 2.239 s | **0.054 s** |
+| `test_fast_latency` p50 | ~2.15 s | **0.106 s** |
+| `test_fast_tps` finalized TPS | 47.6 | **229.1** |
+| `backoff_peers` | 4–5 | **0** |
+| `concurrent_syncs` | 1 | **4** |
+| `success_rate` | 0.55–0.88 | **1.0** |
+| round cadence | ~2.05 s | **~0.05 s** |
+
+Below the 0.230 s baseline — the retry salvages the round instead of losing it.
+Only ~13 residual "sync round failed" cluster-wide (genuine double-failures).
+Gates green: `cargo +nightly fmt`, `cargo clippy --workspace --all-targets -D
+warnings`, `cargo test -p gossip`, `pytest tests -m fast` (3/3, 6 s).
+
+### Still open — the backoff's own design flaws (next task)
+
+The pooling fix removes the *false* failures, so backoff rarely arms now. But
+the mechanism is still unsafe if it ever does arm:
+
+1. **No aggregate cap** — nothing keeps at least one peer available; all 5 can
+   back off simultaneously.
+2. **The fallback shares the hole** — `pick_k` → `random_peer` fallback *also*
+   filters backoff, so an all-backoff tick syncs with nobody (no "break glass"
+   probe).
+3. **The clear condition rarely fires** — `consecutive_failures` only resets on
+   a full success and never decays; a peer that fails twice in a row can
+   re-arm near the 64 s max and spend most of its time backed off.
+
+---
+
 ## The measurement that matters — insert-phase timing
 
 Instrumented `Hashgraph::insert` and logged per-phase wall-clock (nanoseconds,

@@ -1040,7 +1040,7 @@ impl GossipNode {
                 let retry_payload = payload.clone();
                 let timestamp = self.next_timestamp();
                 let start = std::time::Instant::now();
-                let round = {
+                let mut round = {
                     let mut guard = transport_arc.lock().await;
                     let res = tokio::time::timeout(
                         self.sync_timing.sync_timeout,
@@ -1051,7 +1051,7 @@ impl GossipNode {
                             self.node_id,
                             &self.signing_key,
                             peer.node_id,
-                            payload,
+                            payload.clone(),
                             timestamp,
                         ),
                     )
@@ -1064,6 +1064,35 @@ impl GossipNode {
                         ))),
                     }
                 };
+                if let Err(e) = &round
+                    && e.is_transport_stale()
+                {
+                    let mut guard = transport_arc.lock().await;
+                    *guard = TcpTransport::new(self.identity.clone());
+                    if guard.connect(&peer).await.is_ok() {
+                        let res = tokio::time::timeout(
+                            self.sync_timing.sync_timeout,
+                            run_sync(
+                                &mut *guard,
+                                &self.hashgraph,
+                                &registry,
+                                self.node_id,
+                                &self.signing_key,
+                                peer.node_id,
+                                payload,
+                                timestamp,
+                            ),
+                        )
+                        .await;
+                        round = match res {
+                            Ok(r) => r,
+                            Err(_) => Err(GossipError::Sync(format!(
+                                "sync round with peer {peer:?} timed out after {:?}",
+                                self.sync_timing.sync_timeout
+                            ))),
+                        };
+                    }
+                }
 
                 match &round {
                     Err(e) => {
@@ -1336,13 +1365,31 @@ impl GossipNode {
                     let result = tokio::time::timeout(
                         self_clone.sync_timing.sync_timeout,
                         async {
-                            let (fresh, blocked) = exchange_delta(
+                            let mut exchange = exchange_delta(
                                 &mut *guard,
                                 &self_clone.hashgraph,
                                 &registry_clone,
                                 self_clone.node_id,
                             )
-                            .await?;
+                            .await;
+                            if let Err(e) = &exchange
+                                && e.is_transport_stale()
+                            {
+                                // A pooled connection can go stale without
+                                // `is_connected` noticing; reconnect fresh and
+                                // retry once before charging the round to the
+                                // peer.
+                                *guard = TcpTransport::new(self_clone.identity.clone());
+                                guard.connect(&peer_clone).await?;
+                                exchange = exchange_delta(
+                                    &mut *guard,
+                                    &self_clone.hashgraph,
+                                    &registry_clone,
+                                    self_clone.node_id,
+                                )
+                                .await;
+                            }
+                            let (fresh, blocked) = exchange?;
                             if blocked > 0 {
                                 tracing::warn!(
                                     blocked,
