@@ -34,6 +34,7 @@ pub use hashgraph::{
     FameStatus,
     Hashgraph,
     InsertError,
+    InsertTiming,
     WalkMetricsSnapshot,
 };
 pub use reconnect::{

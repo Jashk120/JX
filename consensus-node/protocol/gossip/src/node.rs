@@ -776,6 +776,26 @@ impl GossipNode {
         }
     }
 
+    async fn log_insert_timing(&self) {
+        let t = { self.hashgraph.lock().await.insert_timing() };
+        if t.insert_count == 0 {
+            return;
+        }
+        tracing::info!(
+            insert_count = t.insert_count,
+            insert_avg_ns = t.insert_ns / t.insert_count,
+            finalize_round_avg_ns = t.finalize_round_ns / t.finalize_round_count.max(1),
+            finalize_round_count = t.finalize_round_count,
+            vote_as_witness_avg_ns = t.vote_as_witness_ns / t.vote_as_witness_count.max(1),
+            vote_as_witness_count = t.vote_as_witness_count,
+            vote_candidate_loop_avg_ns = t.vote_candidate_loop_ns / t.vote_as_witness_count.max(1),
+            vote_backfill_loop_avg_ns = t.vote_backfill_loop_ns / t.vote_as_witness_count.max(1),
+            eager_decide_avg_ns = t.eager_decide_ns / t.eager_decide_count.max(1),
+            eager_decide_count = t.eager_decide_count,
+            "insert timing"
+        );
+    }
+
     /// Runs the node: accepts inbound gossip connections and, every
     /// `sync_interval`, syncs with a uniform-random peer. Runs until the
     /// surrounding task is aborted.
@@ -1100,6 +1120,9 @@ impl GossipNode {
                                 );
                             }
                         }
+                        if self.gossip_metrics.lock().await.sync_attempts.is_multiple_of(10) {
+                            self.log_insert_timing().await;
+                        }
                         tracing::debug!(
                             peer = ?peer.node_id,
                             fresh_events = outcome.fresh.len(),
@@ -1423,6 +1446,9 @@ impl GossipNode {
                                         "gossip metrics periodic fanout"
                                     );
                                 }
+                            }
+                            if metrics.lock().await.sync_attempts.is_multiple_of(10) {
+                                self_clone.log_insert_timing().await;
                             }
                             if !outcome.pushback_delivered {
                                 tracing::warn!(

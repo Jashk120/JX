@@ -314,6 +314,24 @@ pub struct WalkMetricsSnapshot {
     pub member_chain_max_transition_round_span: u64,
 }
 
+/// EXPERIMENT (insert profiling): per-phase wall-clock nanoseconds accumulated
+/// over `Hashgraph::insert` calls, for diagnosing where the serialized
+/// critical section spends its time. Plain fields (not atomics) — all access
+/// is behind the single `tokio::sync::Mutex<Hashgraph>` in `GossipNode`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct InsertTiming {
+    pub insert_count: u64,
+    pub insert_ns: u64,
+    pub finalize_round_ns: u64,
+    pub finalize_round_count: u64,
+    pub vote_as_witness_ns: u64,
+    pub vote_as_witness_count: u64,
+    pub vote_candidate_loop_ns: u64,
+    pub vote_backfill_loop_ns: u64,
+    pub eager_decide_ns: u64,
+    pub eager_decide_count: u64,
+}
+
 /// This node's local copy of the hashgraph (Consensus Spec §1.2).
 /// Storage plus the ancestry caching strategy from §1.3's
 /// `[DECISION NEEDED]` note.
@@ -379,6 +397,8 @@ pub struct Hashgraph {
     /// PLAN-4 Phase 0 — diagnostic counters for the ancestry chain walks.
     /// Read-only instrumentation; never affects consensus behavior.
     pub(crate) walk_metrics: WalkMetrics,
+    /// EXPERIMENT (insert profiling): per-phase insert timing accumulator.
+    pub(crate) insert_timing: InsertTiming,
 }
 
 impl Hashgraph {
@@ -403,6 +423,7 @@ impl Hashgraph {
             fully_decided_rounds: BTreeSet::new(),
             next_round_to_order: 1,
             walk_metrics: WalkMetrics::default(),
+            insert_timing: InsertTiming::default(),
         }
     }
 
@@ -445,6 +466,7 @@ impl Hashgraph {
             fully_decided_rounds,
             next_round_to_order: checkpoint.round.saturating_add(1),
             walk_metrics: WalkMetrics::default(),
+            insert_timing: InsertTiming::default(),
         }
     }
 
@@ -540,10 +562,21 @@ impl Hashgraph {
             },
         );
 
-        self.finalize_round(hash, base_round, self_parent_round)?;
+        let t_insert = std::time::Instant::now();
 
-        if self.get(&hash).is_some_and(EventRecord::is_witness) {
+        let t_finalize = std::time::Instant::now();
+        self.finalize_round(hash, base_round, self_parent_round)?;
+        self.insert_timing.finalize_round_ns += t_finalize.elapsed().as_nanos() as u64;
+        self.insert_timing.finalize_round_count += 1;
+
+        let is_witness = self.get(&hash).is_some_and(EventRecord::is_witness);
+        let t_vote = std::time::Instant::now();
+        if is_witness {
             self.vote_as_witness(hash)?;
+        }
+        self.insert_timing.vote_as_witness_ns += t_vote.elapsed().as_nanos() as u64;
+        if is_witness {
+            self.insert_timing.vote_as_witness_count += 1;
         }
 
         // A round whose fame completed earlier but whose view was incomplete
@@ -552,6 +585,9 @@ impl Hashgraph {
         // is still fame-undecided or view-incomplete (see
         // `note_round_decided_if_complete`).
         self.note_round_decided_if_complete(self.next_round_to_order);
+
+        self.insert_timing.insert_ns += t_insert.elapsed().as_nanos() as u64;
+        self.insert_timing.insert_count += 1;
 
         Ok(hash)
     }
@@ -1036,6 +1072,10 @@ impl Hashgraph {
     }
 
     /// PLAN-4 Phase 0 — snapshot of the ancestry-walk diagnostic counters.
+    pub fn insert_timing(&self) -> InsertTiming {
+        self.insert_timing
+    }
+
     pub fn walk_metrics(&self) -> WalkMetricsSnapshot {
         WalkMetricsSnapshot {
             member_chain_max_steps: self
