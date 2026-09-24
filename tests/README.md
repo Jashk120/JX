@@ -33,6 +33,11 @@ pytest tests --markers
 # quick smoke only (proves python harness drives real Rust binary, <30s, no TPS)
 pytest tests -m smoke -v -s
 
+# fast tier: same invariants as the heavy suite, one reused cluster, ~1-2 min
+pytest tests -m fast -v -s
+# or directly
+pytest tests/test_fast.py -v -s
+
 # finality only (latency histograms + breakdowns)
 pytest tests -m finality -v -s
 # or single
@@ -74,11 +79,35 @@ tests/
     proxy.py     LatencyProxy / LatencyMesh (delay/jitter/loss/partition)
     metrics.py   collect_statuses / wait_for_decided_round / wait_for_checkpoint
   conftest.py            shared fixtures: cluster_factory, six_node_cluster
+  test_fast.py           fast tier: 3 tests, one reused cluster, ~1-2 min
   test_gossip_6node.py   main hard suite (7 tests)
   test_chaos.py          chaos scenarios (2 tests)
   pytest.ini             asyncio_mode=auto
   requirements.txt
 ```
+
+## `test_fast.py` – fast tier (3 tests, ~1-2 min)
+
+Same invariants as the heavy suite, but **one 6-node cluster is spawned for the
+whole module** and every sample is small. The heavy suite spawns a fresh
+cluster per test (8-10 min total), which is why it tended not to be run after
+each change; this tier is intended to be run every time.
+
+| Test | What it checks | Budget |
+|------|----------------|--------|
+| `test_fast_latency` | 5 isolated puts, `concurrency=1`: every sample decided, `p50 < 5s` | ~25s |
+| `test_fast_tps` | 120 tx burst: `sent >= 108`, submit TPS > 20, finalized TPS > 5, decided round advances | ~15s |
+| `test_fast_convergence_and_checkpoint` | all 6 healthy, peers >= 4, checkpoint round >= 1 | ~15s |
+
+```
+pytest tests/test_fast.py -v -s                 # ~50s (debug), ~54s (release)
+pytest tests -m fast -v -s                      # same, via marker
+```
+
+The latency ceiling (5s) is deliberately loose enough not to flake on a loaded
+box but tight enough to fail fast on a regression: the measured baseline is
+~0.2-0.5s p50, and a real regression showed 2s+. Assertions print the actual
+numbers so the failure is diagnosable without re-running the heavy suite.
 
 ## `test_gossip_6node.py` – 7 tests
 
@@ -213,9 +242,87 @@ print(res.tps_submit, res.tps_finalized_decided, res.avg_decided_latency, res.de
 
 Each test prints `[finality] ...` histograms and `[tps] ...` tables with `-s`.
 
+## Benchmark Results (2026-09-23, Arch 15.2G, 6-node direct LAN, `sync_interval 25ms`) — LATENCY REGRESSION
+
+Re-measured on HEAD after the PLAN-2.4 / PLAN-4 / PLAN-5 feature work
+(BLS checkpoints, block-node, reconnect window, README/docs passes). **The
+latency documented above (2026-08-29) no longer reproduces.** The same test,
+same box, same `sync_interval`:
+
+| binary | decided p50 | decided p95 | finalized TPS | notes |
+|---|---:|---:|---:|---|
+| `release` @ baseline `f28d648` (2026-08-29) | **0.230s** | — | — | reproduces the 0.536s debug-era number |
+| `release` @ HEAD (2026-09-23) | **2.156s** | 4.028s | **47.6** | current tree |
+| `debug` @ HEAD (2026-09-23) | 3.629s | 4.337s | 226.3 | burst-1000 stalls to 0 TPS |
+
+So the gap is **~10x** (0.230s → 2.156s) on the identical workload and build
+profile. Phase breakdown confirms it is **100% gossip**:
+`gossip (submit->ordered) p50=2.156s`, `consensus (ordered->decided) p50=0.000s`,
+`checkpoint p50=0.000s` — consensus and checkpoint are still free; only
+dissemination regressed.
+
+### Where the regression came from
+
+`git bisect` + a release-build sweep across the range `f28d648..HEAD`:
+
+- `b8f3c1f` (2026-08-30, *"Add dynamic fanout k=auto with scoring, dedup and
+  QUIC hot peers"*) is the first bad commit. It replaced the serial
+  single-peer sync with `FanoutMode::Auto` (`k=4` at N=6), per-peer `DedupState`,
+  and an LRU hot-pool — and at that commit the cluster **stalls** (no round
+  ever decides).
+- `971ad1f` (2026-09-15, *"Fix gossip liveness: chained k-events, push-back
+  SyncOutcome, fame roster gate"*) restores liveness — but at the ~10x cost
+  above. Between these two the cluster does not converge.
+
+### Ruled out by measurement (not reasoning)
+
+| suspect | test | result |
+|---|---|---|
+| fanout `k=4` | `JKAIN_FANOUT=1` | 2.406s — **not** fanout |
+| dedup 3000ms non-ancestor window | `JKAIN_FANOUT=1 JKAIN_DEDUP=false` | 2.353s — **not** dedup |
+| `is_ancestor` / delta building | microbenchmark, 1200-event graph | 0.80ms → 1.11ms per delta call (+39%, i.e. ~215ns/event) — noise |
+| hashing | microbenchmark | 163ns/event — noise |
+| debug build profile | `cargo build --release` | helps ~1.5x but does not fix it |
+| thermals | k10temp sampler during full suite | release peaks 81.9°C @10ms, 77.5°C @20ms; no throttling |
+
+### The dominant cost
+
+Per-event microbenchmark (release, real graph) isolates it:
+
+| operation | per event |
+|---|---:|
+| **Ed25519 `verify_strict`** | **26,243 ns** |
+| `is_ancestor` + dedup check | 215 ns |
+| SHA-256 event hash | 163 ns |
+
+**Signature verification is ~99.9% of per-event cost.** The regression is a
+*volume* problem: the fanout/liveness rewrite mints and re-delivers far more
+events per tick, and every receiver re-verifies each one at ~26µs, serially,
+behind the single `hashgraph` mutex.
+
+### Tuning knobs added while investigating
+
+`ClusterConfig` now reads defaults from the environment so the existing tests
+can be pointed at other settings without editing them:
+
+```bash
+JKAIN_SYNC_INTERVAL_MS=10 pytest tests -m fast -v -s
+JKAIN_FANOUT=1 JKAIN_DEDUP=false pytest tests -m fast -v -s
+JKAIND_BIN=consensus-node/target/release/jkaind pytest tests -m fast -v -s
+```
+
+An explicit `ClusterConfig(...)` argument still wins over the environment.
+
+**Use `pytest tests -m fast` (~1 min) after every refactor step** — the 8-10
+minute heavy suite is what let this drift in unnoticed.
+
 ## Benchmark Results (2026-08-29, Arch 15.2G, 6-node direct LAN, `sync_interval 25ms`)
 
-Live run on `consensus-node/target/debug/jkaind` (ELF, `cargo build --workspace`, `preexec_fn=os.setsid` + `ControlClient` PID tracking, `rambo` protected).
+Historical baseline, kept for comparison. Live run on
+`consensus-node/target/debug/jkaind` (ELF, `cargo build --workspace`,
+`preexec_fn=os.setsid` + `ControlClient` PID tracking, `rambo` protected).
+**Superseded by the 2026-09-23 section above — these numbers no longer
+reproduce on HEAD.**
 
 ### Lowest latency (isolated, `concurrency=1`, no contention)
 
