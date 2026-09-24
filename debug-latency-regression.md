@@ -11,20 +11,77 @@ A ~10× latency regression: `submit→decided` went from **0.230 s** (baseline
 `sync_interval 25 ms`. The phase breakdown is **100% gossip**
 (`submit→ordered`); consensus (`ordered→decided`) and checkpoint are ~0.
 
-**What we now know:** it is **not** a per-event CPU cost. Signature
-verification (26 µs), fanout multiplicity, dedup, the fame gate, the fame
-backfill loop, and the eager-decision pipeline are **all exonerated**. The
-insert critical section's total cost is ~108 µs/event (~0.2% CPU). The latency
-is a **dissemination / hop-count problem** — a tx now takes ~84 sync intervals
-to order instead of ~9.
+**ROOT CAUSE (verified): peer backoff starvation.** Transient TCP errors
+(`Broken pipe`, `connection closed`) call `PeerManager::record_failure`
+(`peer_manager.rs:245`), which sets an exponential `backoff_until`
+(`1 << min(failures, 6)` s → 2, 4, 8, …, 64 s). `pick_k` / `random_peer`
+**never select a peer in backoff**, and only `record_success` clears the
+backoff — but a backed-off peer is never retried, so it can never succeed.
+The backoff is **self-locking**: 4–5 of 5 peers end up backed off, `pick_k(4)`
+returns ~1 (or 0), the fanout collapses k=4 → ~1, dissemination stalls, and
+rounds advance only every **~2.05 s** (= the `2¹` first backoff step).
+`submit→decided` ≈ one round cadence ≈ 2.1 s.
 
-**Leading hypothesis (untested):** `971ad1f`'s "chain k own events per tick"
-deepened each node's `self_parent` chain ~4× (k=4 events/tick chained via
-`self_parent` instead of 1), which (a) makes `strongly_see` walks longer and
-(b) spreads witnesses across more rounds, so a round needs more events to
-reach its strongly-see supermajority. The one measurement that supports this:
-`finalize_round` cost **grows** with the graph (19 µs → 84 µs over the test),
-and `finalize_round` is the dominant insert cost.
+**Proof (A/B, same box, same test):** disabling `record_failure`'s backoff
+(one line) changed:
+
+| signal | backoff ON | backoff OFF |
+|---|---:|---:|
+| `backoff_peers` (of 5) | 4–5 | 0 |
+| `concurrent_syncs` | 1 | 4 |
+| round cadence | ~2.05 s | ~0.1 s |
+| `decided p50` | 2.239 s | **0.105 s** |
+
+21×, and *below* the 0.230 s baseline. (Experiment reverted; backoff restored.)
+
+**Everything else is exonerated:** not a per-event CPU cost (verification
+26 µs; insert ~108 µs/event ≈ 0.2% CPU), not fanout multiplicity, not dedup,
+not the fame gate, not the backfill loop, not eager-decide, and not the driver
+loop (healthy: ~33 ms/tick, ~30 ticks/s). Those levers all washed out *because*
+backoff had already collapsed the effective fanout to ~1 peer — which is also
+why `--fanout 1` and `--fanout auto` measured the same.
+
+**Underlying trigger (separate from the regression):** ~13–42% of syncs fail
+with TCP `Broken pipe` / connection churn (the QUIC hot-pool that was meant to
+fix this was removed in `6522d86`). Without the backoff self-lock, those
+failures are harmless — the no-backoff run still had ~42% failures but ran at
+0.105 s. So the *latency* is the backoff logic, not the failures themselves.
+
+---
+
+## ROOT CAUSE — mechanism in full
+
+1. The `b8f3c1f` / `8beecc6` era introduced `PeerManager` scoring with
+   `record_failure` → exponential `backoff_until`, and `pick_k` filtering
+   `NEG_INFINITY` backoff peers (`peer_manager.rs:211-213`).
+2. A transient TCP error (stale pooled connection → `Broken pipe`) is treated
+   as a *peer* failure and backs the peer off for `2^failures` seconds.
+3. `pick_k` never picks it; `record_success` (the only clearer) never runs for
+   it → the peer stays backed off the full duration.
+4. Multiple peers fail transiently → 4–5 of 5 backed off → `pick_k(4)` yields
+   ~1. `pick_k`'s `random_peer` fallback (`peer_manager.rs:227-231`) *also*
+   filters backoff, so when all 5 are backed off it returns **empty** →
+   `concurrent_syncs: 0`, no sync at all that tick.
+5. Graph growth is starved → round cadence ~2.05 s (= first backoff step) →
+   `submit→decided` ~2.1 s.
+
+### Fix options (not yet implemented)
+
+- **Do not apply peer backoff to transient connection errors** (`Broken pipe` /
+  `Io` / `Closed`): reset the transport and retry next tick (the baseline
+  behaved this way and was fast). Reserve backoff for protocol-level /
+  persistent failures. *Minimal, targeted fix.*
+- **Cap the backoff** much lower (e.g. 100–250 ms) and/or make the first step
+  sub-second, so a transient blip cannot freeze dissemination for 2 s+.
+- **Make the `random_peer` fallback ignore backoff** so an all-backoff tick
+  still makes *some* progress (breaks the zero-sync deadlock).
+- **Fix the connection churn at the source** (persistent hot-pool / QUIC),
+  removing the trigger — but the no-backoff run proves the latency is the
+  backoff logic, not the churn.
+
+**Deep-chain hypothesis is REFUTED:** `--fanout 1` (serial path, 1 event/tick,
+no chaining) was *also* ~2.4 s, and the instant backoff was removed latency hit
+0.105 s.
 
 ---
 
@@ -129,29 +186,29 @@ below), ran the latency test, captured the table above. Conclusions:
 | Insert CPU (any phase) | ~108 µs/event ≈ 0.2% CPU | **ruled out** |
 | Debug build profile / thermals | release helps ~1.5× only; no throttling | **ruled out** |
 
-## What is NOT yet ruled out (the actual latency)
+## How it was localized — loop timing + backoff
 
-The latency is **how many sync intervals (25 ms) a tx needs to reach "ordered"
-on all 6 nodes**. Baseline ~9 intervals; now ~84. This is a
-**graph-structure / round-ordering cadence** problem, not CPU. Leading suspect:
-**deep `self_parent` chains from `971ad1f`'s "chain k own events per tick"** —
-each node mints k=4 chained events per tick, so chains grow ~4× faster, and
-`strongly_see` (round advancement) has to walk 4× deeper chains.
+The insert profiling ruled out CPU, so the next suspect was the dissemination
+*rate*. Instrumenting the driver loop showed it is **healthy**: ~33 ms/tick
+(25 ms sleep + ~8 ms work), ~30 ticks/s, `drain` ~5–10 ms, `process` ~0.5 ms.
+So the loop is not throttled — but `concurrent_syncs` was **1** and
+`backoff_peers` **4–5**, and the round cadence was an eerily regular
+**~2.05 s** (gaps `2.05, 2.11, 2.06, …`, occasionally `4.0` = a skipped beat).
 
-### The discriminating experiment (next step)
+`diagnosis.log` (1 s JSON, written by `node/src/cli/run.rs`) showed the smoking
+gun: `{"concurrent_syncs": 1, "backoff_peers": 4}` — and at the tail
+`{"concurrent_syncs": 0, "backoff_peers": 5}`. The fanout had collapsed to
+~1 peer (and sometimes 0). The `~2.05 s` cadence is exactly the `2¹ = 2 s`
+first backoff step of `record_failure`.
 
-Run the **same instrumented build at `JKAIN_FANOUT=1`** (serial path, 1
-event/tick, shallow chains) and compare:
+The A/B proof is in the TL;DR: disabling backoff → `backoff_peers 0`,
+`concurrent_syncs 4`, round cadence ~0.1 s, `decided p50 0.105 s`.
 
-- If `finalize_round` stays flat (~19 µs) **and** latency drops → deep-chain
-  theory confirmed; fix is structural (don't chain empty-shard events).
-- If fanout=1 is still slow **and** `finalize_round` still grows → depth is
-  coming from somewhere else (e.g. the push-back `SyncOutcome` delivery, or the
-  round/witness assignment).
+### The bimodality is explained too
 
-Also worth a look: the earlier runs showed a sharp **bimodality** (~2.1 s vs
-~4.1 s — a clean 2×). It didn't reproduce in the cleanest run (all ~2.1 s), but
-when it appears it suggests a periodic / every-other-round phenomenon.
+The earlier `~2.1 s` vs `~4.1 s` split is the backoff jumping between the
+`2¹ = 2 s` and `2² = 4 s` steps as `consecutive_failures` climbs — a clean 2×,
+which is why it looked "periodic".
 
 ---
 
@@ -164,6 +221,7 @@ when it appears it suggests a periodic / every-other-round phenomenon.
 | `release` @ HEAD, this box (gates ON) | 3.041 s | box load varies; bimodal ~2.1/4.1 |
 | `release` @ HEAD, this box (gates OFF) | 2.560 s | fame-gate experiment |
 | `release` @ HEAD, this box (instrumented) | 2.116 s | least-loaded run; no bimodality |
+| `release` @ HEAD, backoff **OFF** (experiment) | **0.105 s** | p95 0.190; `backoff_peers 0`, `concurrent_syncs 4` |
 | `--fanout 1` | 2.41 s | user's measurement |
 | `--dedup false` | 2.35 s | user's measurement |
 
@@ -180,23 +238,20 @@ when it appears it suggests a periodic / every-other-round phenomenon.
 
 ## In the tree right now (uncommitted instrumentation on `develop`)
 
-Diagnostic-only, read-only (no consensus-behavior change). Files touched:
+Committed in `ca2e868`: `InsertTiming` instrumentation (hashgraph.rs, fame.rs,
+lib.rs) + `node.rs` `log_insert_timing()` helper + this journal.
 
-- `consensus-node/protocol/consensus/src/hashgraph.rs` — `InsertTiming` struct
-  + `insert_timing` field (init in `new` and `from_checkpoint`) + timing in
-  `insert` + `insert_timing()` getter.
-- `consensus-node/protocol/consensus/src/fame.rs` — timing in `vote_as_witness`
-  (candidate loop / backfill loop / each `try_eager_decide`).
-- `consensus-node/protocol/consensus/src/lib.rs` — `InsertTiming` re-export.
-- `consensus-node/protocol/gossip/src/node.rs` — `log_insert_timing()` helper +
-  2 call sites (serial + fanout periodic metrics logs, every 10 syncs).
+Added this session, **uncommitted**:
 
-The release binary is currently built **with** this instrumentation. To revert
-everything: `git checkout -- consensus-node/protocol/consensus consensus-node/protocol/gossip/src/node.rs`
+- `consensus-node/protocol/gossip/src/node.rs` — driver-loop timing
+  (`loop timing` log: `avg_period_ms` / `avg_drain_ms` / `avg_process_ms`).
+- The backoff experiment (`peer_manager.rs`) was made, measured, and
+  **reverted** — `backoff_secs` is back at `peer_manager.rs:249`.
+
+The release binary is currently built **with the loop-timing only** (backoff
+restored to HEAD). Revert everything with
+`git checkout -- consensus-node/protocol/consensus consensus-node/protocol/gossip/src/node.rs`
 then `cargo build --release --bin jkaind`.
-
-Leftover temp dir from `JKAIN_KEEP_TMP=1`: `/tmp/jkain-harness-cvc20an0`
-(node logs incl. `insert timing` lines, in `data-*/logs/jkaind.log.<date>`).
 
 ## How to reproduce / measure
 
@@ -213,14 +268,15 @@ JKAIN_KEEP_TMP=1 JKAIND_BIN=consensus-node/target/release/jkaind pytest tests/te
 
 ## Open questions for next session
 
-1. Does `JKAIN_FANOUT=1` flatten `finalize_round` and drop latency? (deep-chain
-   discriminator — run it first.)
-2. If deep-chain is confirmed: what's the sound fix? Options to weigh — mint
-   only as many chained events as there is payload to shard (skip empty shards),
-   vs. one event per tick with k parent references, vs. un-chaining the k
-   events (the chain exists to avoid a concurrent self-parent fork; that
-   constraint may be satisfiable differently).
-3. The push-back `SyncOutcome` delivery (`run_sync` / `run_sync_with_precreated_event`)
-   has not been isolated from the chained-events change — they landed together
-   in `971ad1f`.
-4. What drives the ~2.1 s vs ~4.1 s bimodality when it appears?
+1. **Implement the fix.** Minimal: stop treating transient connection errors
+   (`Io` / `Broken pipe` / `Closed`) as peer failures for backoff — reset the
+   transport and retry next tick. Then re-run the fast tier and expect ~0.1 s.
+2. Decide the backoff policy: keep *some* backoff for protocol-level failures
+   (bad frame, wrong pin) vs none for connection errors; cap it sub-second; and
+   make the `random_peer` fallback ignore backoff so the zero-sync deadlock
+   can't recur.
+3. Why is TCP churn so high (~13–42% `Broken pipe`)? The QUIC hot-pool
+   (`6522d86` removed it) was the intended fix. Even with backoff fixed, churn
+   wastes work — worth revisiting the transport.
+4. Does the fix hold under the heavier tests (`-m fast`, `test_tps_sustained_6node`,
+   `-m gossip`)? Backoff also affects the 100 ms-jitter and partition tests.
