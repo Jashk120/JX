@@ -130,18 +130,54 @@ When changing public APIs:
 - Update examples if needed.
 - Keep comments synchronized with implementation.
 
-Every crate and every umbrella directory (a directory containing crates or
-subdirectories, e.g. `consensus-node/protocol/`, `consensus-node/executor/`) must contain a `README.md`
-describing its role in the workspace:
+## Directory READMEs
+
+Every directory that contains source files, crates, or subdirectories must
+contain a `README.md`. The READMEs are the primary map of the codebase: a
+reader who pieces every `README.md` together, top to bottom, must be able to
+understand the whole system without reading the source first.
 
 - Crate `README.md` files live at the crate root (e.g.
   `consensus-node/protocol/gossip/README.md`).
 - Umbrella `README.md` files live at the directory root (e.g.
   `consensus-node/protocol/README.md`) and summarize the crates beneath them.
-- `tests/` and other internal-only directories do not need a `README.md`.
+- Nested source directories also get a `README.md` describing the files they
+  contain (see "Lowest-level directories" below).
+- `tests/` directories document what they cover (see "Testing" below).
+
+### Required contents
+
+Every directory `README.md` must state, in this order:
+
+1. **Purpose** — what this directory is for and the single responsibility it
+   owns in the workspace. Why it exists, not merely what it contains.
+2. **Responsibilities** — the concrete jobs this directory is accountable for,
+   and the jobs it explicitly does not own.
+3. **Contents** — one entry per file and per subdirectory:
+   - Subdirectories: what each child directory does and why it exists.
+   - Files: what each code file does, in detail — the types, entry points, and
+     behavior it provides — so the reader does not need to open it.
+4. **Expected outcome** — what a correct, working state of this directory
+   produces: the observable behavior, guarantees, or invariants that callers
+   rely on.
+5. **Testing** — how this directory is verified: which tests, harnesses, or
+   commands cover it and what they assert. State explicitly if it is untested.
+6. **Do not change** — anything that must be preserved: invariants, wire
+   formats, consensus-critical behavior, locked decisions, or files owned by
+   another directory.
+7. **Dependencies** — what this directory depends on and what depends on it,
+   where that is not obvious from the workspace layout.
+
+### Lowest-level directories
+
+When a directory only holds code files (no subdirectories), its `README.md`
+must describe each code file in detail: its role, its public surface, the
+behavior it implements, and how it fits the parent directory's responsibility.
+A reader must be able to understand the files' behavior from the README alone.
 
 Keep these READMEs synchronized with the code they describe; update them
-when a crate's public surface or role changes.
+whenever a directory's files, public surface, role, tests, or invariants
+change.
 
 ---
 
