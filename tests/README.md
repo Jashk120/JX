@@ -172,7 +172,7 @@ Verify live: `pytest tests/test_smoke.py -m smoke -v -s` prints `node 1 pid=1234
 - **50ms/20ms**: realistic WAN.
 - **100ms/50ms + 5% loss**: severe jitter/loss.
 - **Heterogeneous**: fast (10ms) vs slow (80ms) nodes in same mesh.
-- **Partitions**: `LatencyMesh.set_partition(partA, partB)` blocks ingress on involved proxies; `isolate_node(n)` preserves majority intra-connectivity; `heal()` restores all.
+- **Partitions**: `LatencyMesh.set_partition(partA, partB)` blocks every node in either group — two multi-node groups are a total outage, not a split; `isolate_node(n)` preserves majority intra-connectivity; `heal()` restores all.
 - **Chaos**: latency/drops randomized under load for 60s.
 
 ## Harness API (exact)

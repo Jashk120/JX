@@ -169,6 +169,74 @@ def checkpoint_roster_consistent(statuses: Dict[int, StatusReport]) -> bool:
     return len(set(rosters)) == 1
 
 
+async def wait_for_convergence(
+    nodes: List[NodeHandle],
+    bound: int = 2,
+    timeout: float = 30.0,
+    poll_interval: float = 0.5,
+    min_round: Optional[int] = None,
+) -> Dict[int, StatusReport]:
+    """
+    Poll until the decided_round spread across every node is within ``bound``.
+
+    ``wait_for_decided_round`` returns as soon as the *last* node crosses
+    ``min_round``. When nodes have already raced far past that floor (the usual
+    case after a chaos window), it returns on the first poll and the following
+    ``frontiers_within_bound`` becomes a live snapshot rather than a
+    convergence check. This helper waits for the property the callers actually
+    assert. ``min_round`` may still be supplied to require that every node has
+    advanced past a floor before convergence is accepted.
+
+    Returns the converged statuses; raises TimeoutError otherwise.
+    """
+    deadline = time.monotonic() + timeout
+    last: Dict[int, StatusReport] = {}
+    while time.monotonic() < deadline:
+        last = await collect_statuses(nodes)
+        if len(last) == len(nodes) and frontiers_within_bound(last, bound=bound):
+            if min_round is None or all(s.decided_round >= min_round for s in last.values()):
+                return last
+        await asyncio.sleep(poll_interval)
+    raise TimeoutError(
+        f"wait_for_convergence bound={bound} min_round={min_round} not reached within {timeout}s; "
+        f"last decided: { {nid: s.decided_round for nid, s in last.items()} }"
+    )
+
+
+async def wait_for_checkpoint_convergence(
+    nodes: List[NodeHandle],
+    bound: int = 2,
+    timeout: float = 30.0,
+    poll_interval: float = 0.5,
+) -> Dict[int, StatusReport]:
+    """
+    Poll until every node has a checkpoint and the checkpoint spread is within
+    ``bound``.
+
+    A node whose ``latest_checkpoint_round`` is ``None`` counts as *not*
+    converged. This is deliberate: a manual ``max``/``min`` over the non-None
+    values silently skips such a node, so the assertion can pass while the node
+    under test (e.g. a restarted one) has no checkpoint at all.
+
+    Returns the converged statuses; raises TimeoutError otherwise.
+    """
+    deadline = time.monotonic() + timeout
+    last: Dict[int, StatusReport] = {}
+    while time.monotonic() < deadline:
+        last = await collect_statuses(nodes)
+        if len(last) == len(nodes):
+            rounds = [s.latest_checkpoint_round for s in last.values()]
+            if all(r is not None for r in rounds):
+                vals = [r for r in rounds if r is not None]
+                if max(vals) - min(vals) <= bound:
+                    return last
+        await asyncio.sleep(poll_interval)
+    raise TimeoutError(
+        f"wait_for_checkpoint_convergence bound={bound} not reached within {timeout}s; "
+        f"last checkpoint: { {nid: s.latest_checkpoint_round for nid, s in last.items()} }"
+    )
+
+
 async def submit_until_decided(
     nodes: List[NodeHandle],
     payload: bytes,
