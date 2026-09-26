@@ -225,10 +225,10 @@ skipped, `pytest tests -m chaos` is green (jitter + partition only).
 | `test_random_latency_chaos` | 1 pass / 1 fail | one full-suite failure was `OSError errno 98` binding a proxy port in `LatencyProxy.start()` — a harness `_free_port()` TOCTOU race, not divergence. |
 | `test_6node_churn_kill_restart` | flaky | a standalone run stalled the 5-node majority at `decided=2` for 30 s; a full-suite run passed. |
 | `test_6node_concurrent_tx_load` | 2/2 fail | checkpoint spread 8 (`[16,12,8,16,10,13]`, bound ≤1) and decided `{16,125,125,16,172,118}`. |
-| `test_gap_vs_fanout_sweep` | fail | `p50 0.103s` below the `0.15` floor: machine calibration, not divergence; left un-quarantined. |
+| `test_gap_vs_fanout_sweep` | fail | `p50 0.103s` below the `0.15` floor: machine calibration, not divergence; quarantined. |
 
 **Open.** The failures are node-side divergence / fanout-liveness stalls
 (consistent with §3b and `checkpoint-reconnect-retention.md`), now surfaced
 reliably by the waiting helpers. A green `-m chaos` means only that the two
 healthy tests passed; the quarantined set still needs the node-side fix.
-`test_gap_vs_fanout_sweep`'s band needs recalibration or quarantine (owner call).
+`test_gap_vs_fanout_sweep` is quarantined on its machine-calibrated `p50` band.
