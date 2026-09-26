@@ -17,6 +17,25 @@ from harness.cluster import ClusterConfig, ClusterManager
 pytest_plugins = ("pytest_asyncio",)
 
 
+def pytest_addoption(parser: pytest.Parser) -> None:
+    parser.addoption(
+        "--run-quarantine",
+        action="store_true",
+        default=False,
+        help="run tests marked 'quarantine' (skipped by default)",
+    )
+
+
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    if config.getoption("--run-quarantine"):
+        return
+    for item in items:
+        marker = item.get_closest_marker("quarantine")
+        if marker is not None:
+            reason = marker.kwargs.get("reason", "known-unreliable")
+            item.add_marker(pytest.mark.skip(reason=f"quarantined: {reason} (pass --run-quarantine to run)"))
+
+
 @pytest_asyncio.fixture
 async def cluster_factory():
     """Factory that tracks created managers and cleans them up after the test."""

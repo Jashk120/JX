@@ -52,6 +52,10 @@ pytest tests -m gossip -v -s
 # chaos / partitions only
 pytest tests -m chaos -v -s
 
+# known-unreliable heavy tests are marked `quarantine` and skipped by default;
+# run them explicitly (investigation only):
+pytest tests -m chaos --run-quarantine -v -s
+
 # everything *except* heavy bench (fast CI)
 pytest tests -m "not bench and not slow" -v -s
 pytest tests -m "not slow" -v -s          # fast subset

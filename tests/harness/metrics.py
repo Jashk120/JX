@@ -237,6 +237,34 @@ async def wait_for_checkpoint_convergence(
     )
 
 
+async def wait_for_roster_consistency(
+    nodes: List[NodeHandle],
+    timeout: float = 30.0,
+    poll_interval: float = 0.5,
+) -> Dict[int, StatusReport]:
+    """
+    Poll until every node's checkpoint_roster agrees.
+
+    ``checkpoint_roster_consistent`` alone is a snapshot: a node still catching
+    up on checkpoint acceptance reports an empty roster while its peers already
+    report the quorum roster, so the check fails transiently. Wait for agreement
+    instead -- a roster that never converges is the real split-brain signal.
+
+    Returns the consistent statuses; raises TimeoutError otherwise.
+    """
+    deadline = time.monotonic() + timeout
+    last: Dict[int, StatusReport] = {}
+    while time.monotonic() < deadline:
+        last = await collect_statuses(nodes)
+        if len(last) == len(nodes) and checkpoint_roster_consistent(last):
+            return last
+        await asyncio.sleep(poll_interval)
+    raise TimeoutError(
+        f"wait_for_roster_consistency not reached within {timeout}s; "
+        f"last rosters: { {nid: sorted(m.node_id for m in s.checkpoint_roster) for nid, s in last.items()} }"
+    )
+
+
 async def submit_until_decided(
     nodes: List[NodeHandle],
     payload: bytes,

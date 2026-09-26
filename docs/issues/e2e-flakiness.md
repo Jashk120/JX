@@ -1,7 +1,7 @@
 # Flaky e2e tests: convergence divergence under chaos/churn/isolation
 
-Status: open — findings recorded, no fix attempted
-Date: 2026-09-25
+Status: open — heavy offenders quarantined behind `--run-quarantine`; root cause not fixed
+Date: 2026-09-25 (updated 2026-09-26)
 Component: `tests/` (harness + heavy e2e), `consensus-node/protocol/{gossip,consensus}`
 Related: [`checkpoint-reconnect-retention.md`](checkpoint-reconnect-retention.md)
 (the checkpoint-lag / checkpoint-only recovery this flakiness overlaps with)
@@ -197,3 +197,38 @@ node 6 raced to 30 while nodes 1–5 froze at 9 is
 `/tmp/jkain-harness-jm8smqua`; the chaos-run directory with frontier 91..114
 is `/tmp/jkain-harness-_4mpibv9`. These are `mkdtemp` dirs and may be cleared
 on reboot — re-run with `JKAIN_KEEP_TMP=1` to regenerate.
+
+---
+
+## 8. Update 2026-09-26 — assertions made to wait, offenders quarantined
+
+**The assertions were sampling, not waiting.** The three tests called
+`wait_for_decided_round` and then checked a frontier / checkpoint / roster bound
+on the returned snapshot. Every node satisfies the `min_round` floor long before
+the bound is evaluated, so the wait returned on the first poll and the bound saw
+a live snapshot (§3a confirmed). Fixed in `tests/harness/metrics.py`:
+`wait_for_convergence` (decided spread, optional floor),
+`wait_for_checkpoint_convergence` (a `None` checkpoint counts as divergence) and
+`wait_for_roster_consistency`.
+
+**Quarantine.** The offenders are marked `@pytest.mark.quarantine` and skipped
+unless `--run-quarantine` is passed (`tests/conftest.py`, `tests/pytest.ini`):
+`test_random_latency_chaos`, `test_isolate_single_node`,
+`test_6node_churn_kill_restart`, `test_6node_concurrent_tx_load`. With those
+skipped, `pytest tests -m chaos` is green (jitter + partition only).
+
+**Refreshed evidence (release binary, 6-node, same box).**
+
+| test | result | note |
+|---|---|---|
+| `test_isolate_single_node` | 1 pass / 2 fail | once the snapshot race is gone the failures are **real**: intra-majority spread 163 vs 23 during isolation, and after heal node 6 stuck 59 rounds behind (60 s timeout). |
+| `test_random_latency_chaos` | 1 pass / 1 fail | one full-suite failure was `OSError errno 98` binding a proxy port in `LatencyProxy.start()` — a harness `_free_port()` TOCTOU race, not divergence. |
+| `test_6node_churn_kill_restart` | flaky | a standalone run stalled the 5-node majority at `decided=2` for 30 s; a full-suite run passed. |
+| `test_6node_concurrent_tx_load` | 2/2 fail | checkpoint spread 8 (`[16,12,8,16,10,13]`, bound ≤1) and decided `{16,125,125,16,172,118}`. |
+| `test_gap_vs_fanout_sweep` | fail | `p50 0.103s` below the `0.15` floor: machine calibration, not divergence; left un-quarantined. |
+
+**Open.** The failures are node-side divergence / fanout-liveness stalls
+(consistent with §3b and `checkpoint-reconnect-retention.md`), now surfaced
+reliably by the waiting helpers. A green `-m chaos` means only that the two
+healthy tests passed; the quarantined set still needs the node-side fix.
+`test_gap_vs_fanout_sweep`'s band needs recalibration or quarantine (owner call).
