@@ -796,6 +796,37 @@ impl GossipNode {
         );
     }
 
+    /// Names the roster member(s) whose chain keeps the lowest unordered round
+    /// from completing `round_view_complete` — the condition that freezes
+    /// `decided_round`. `blockers` distinguishes a view gap from a fame stall.
+    async fn log_decided_stall(&self) {
+        let registry = self.registry.lock().await.clone();
+        let (decided, ordered, next_round, blockers) = {
+            let hg = self.hashgraph.lock().await;
+            let next_round = hg.next_round_to_order();
+            let blockers: Vec<(NodeId, u64)> = registry
+                .member_ids()
+                .into_iter()
+                .filter_map(|node| {
+                    let latest_round = hg
+                        .latest_event_by(&node)
+                        .and_then(|hash| hg.get(hash))
+                        .map_or(0, |record| record.round());
+                    (latest_round <= next_round).then_some((node, latest_round))
+                })
+                .collect();
+            (hg.highest_decided_round(), hg.max_ordered_round(), next_round, blockers)
+        };
+        tracing::warn!(
+            decided_round = decided,
+            ordered_round = ordered,
+            next_round_to_order = next_round,
+            blocker_count = blockers.len(),
+            blockers = ?blockers,
+            "decided round stalled: round view incomplete"
+        );
+    }
+
     /// Runs the node: accepts inbound gossip connections and, every
     /// `sync_interval`, syncs with a uniform-random peer. Runs until the
     /// surrounding task is aborted.
@@ -819,6 +850,7 @@ impl GossipNode {
             Arc::new(Mutex::new(LruCache::new(outbound_capacity(self.peers.lock().await.len()))));
         let mut consecutive_failures: u64 = 0;
         let mut decided_watermark: u64 = 0;
+        let mut stall_ticks: u64 = 0;
         loop {
             if stop.load(Ordering::Acquire) {
                 break;
@@ -1197,6 +1229,7 @@ impl GossipNode {
                 };
                 if decided > decided_watermark {
                     decided_watermark = decided;
+                    stall_ticks = 0;
                     tracing::info!(decided_round = decided, "round decided");
                     let m = self.gossip_metrics.lock().await.clone();
                     tracing::info!(
@@ -1221,6 +1254,11 @@ impl GossipNode {
                     let cap = outbound_capacity(self.peers.lock().await.len());
                     if cache.cap() != cap {
                         cache.resize(cap);
+                    }
+                } else {
+                    stall_ticks += 1;
+                    if decided > 0 && stall_ticks.is_multiple_of(40) {
+                        self.log_decided_stall().await;
                     }
                 }
                 continue;
@@ -1530,6 +1568,7 @@ impl GossipNode {
             };
             if decided > decided_watermark {
                 decided_watermark = decided;
+                stall_ticks = 0;
                 tracing::info!(decided_round = decided, "round decided");
                 let m = self.gossip_metrics.lock().await.clone();
                 tracing::info!(
@@ -1553,6 +1592,11 @@ impl GossipNode {
                 let cap = outbound_capacity(self.peers.lock().await.len());
                 if cache.cap() != cap {
                     cache.resize(cap);
+                }
+            } else {
+                stall_ticks += 1;
+                if decided > 0 && stall_ticks.is_multiple_of(40) {
+                    self.log_decided_stall().await;
                 }
             }
         }
