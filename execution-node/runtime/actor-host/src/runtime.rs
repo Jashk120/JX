@@ -103,14 +103,23 @@ impl Runtime {
     /// actor-reported failure.
     pub fn dispatch(&mut self, id: &ActorId, request: &[u8]) -> anyhow::Result<Vec<u8>> {
         let key = id.encode();
-        let inst = self.instances.get_mut(&key).ok_or_else(|| anyhow::anyhow!("unknown actor"))?;
-        let reply = inst
+        let mut inst =
+            self.instances.remove(&key).ok_or_else(|| anyhow::anyhow!("unknown actor"))?;
+        let result = inst
             .bindings
             .jkain_actor_handler()
             .call_handle_request(&mut inst.store, request)
-            .map_err(|e| anyhow::anyhow!("wasmtime: {e}"))?
-            .map_err(|e| anyhow::anyhow!("actor: {e}"))?;
-        Ok(reply)
+            .map_err(|e| anyhow::anyhow!("wasmtime: {e}"))
+            .and_then(|reply| reply.map_err(|e| anyhow::anyhow!("actor: {e}")));
+        self.instances.insert(key, inst);
+        result
+    }
+
+    /// Returns whether an actor with this id is resident, without holding a
+    /// borrow of the runtime across a `dispatch`.
+    #[must_use]
+    pub fn contains(&self, id: &ActorId) -> bool {
+        self.instances.contains_key(&id.encode())
     }
 
     /// Returns the manifest an actor was loaded with, if resident.

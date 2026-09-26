@@ -35,7 +35,11 @@ guests use `wit-bindgen` against the same file and world.
 - `Runtime::status(&self, id: &ActorId) -> Option<ActorStatus>` —
   `Some(Loaded)` when resident, else `None`.
 - `Runtime::dispatch(&mut self, id: &ActorId, request: &[u8])` — calls the
-  actor's `handle-request` and returns its reply; unknown actors error.
+  actor's `handle-request` and returns its reply; unknown actors error. The
+  instance's `Store` is moved out and back so callers can hold no borrow of the
+  runtime across the call.
+- `Runtime::contains(&self, id: &ActorId) -> bool` — residency check that does
+  not hold a borrow, so a driver can test-then-`dispatch` without a conflict.
 
 The registry is keyed by `actor_id.encode()` bytes because `ActorId` does
 not implement `Hash`/`Ord`.

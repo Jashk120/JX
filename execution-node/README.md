@@ -79,13 +79,37 @@ cargo test --workspace
 |---|---|
 | `l1-client` boundary traits | scaffold (no transport) |
 | `actor-host` hosting runtime | local hosting (`Runtime` loads WASM components per `wit/actor.wit`, dispatches `handle-request`) |
-| `jkainc` daemon | scaffold (exits with "not implemented") |
+| `jkainc` daemon | **v1 live**: loads one actor, serves one HTTP/JSON RPC endpoint for all actors, per-message Ed25519 auth, GAS metered only (no economics) |
+| app↔actor SDK / registry / actor↔actor / per-actor SQLite | **out of v1** — see `what-it-is.md` §11 |
 | location/resolution (Phase C) | not started — prerequisite for reachability |
 | replication/state model (§6.4 vs V3 notes) | **unresolved** |
 
 Two design questions block real implementation and are recorded in
 `ARCHITECTURE.md`: the §6.4 / V3-notes replication contradiction, and whether
 reads link the `state` crate directly or go over gRPC.
+
+## v1 daemon (`jkainc`)
+
+One HTTP endpoint fronts every actor on the host; the app POSTs JSON and the
+host routes by `actor_id` into the sandboxed actor. Every request is signed by
+the caller's Ed25519 key. GAS is metered only (counted; no balance/price).
+
+```bash
+# build the actor, then run the host
+cd execution-node/actors/echo && cargo build --release --target wasm32-wasip2 && cd ../..
+JKAINC_LISTEN=127.0.0.1:8787 \
+JKAINC_ACTOR=did:jkain:mainnet:echo:00000000000000000000000000000007 \
+JKAINC_WASM=actors/echo/target/wasm32-wasip2/release/echo_actor.wasm \
+  cargo run -p execution-node --bin jkainc
+```
+
+- `GET /health` → `ok`
+- `POST /actors/load` → `{ actor_id, module, wasm_hex }` (manual v1 deployment)
+- `POST /rpc` → `{ actor_id, payload, public_key, signature, nonce, gas_price }`;
+  `actor_id`/`payload`/`nonce` are hex, `public_key`/`signature` are hex over
+  the canonical message `jkain:rpc:v1 ‖ actor_id ‖ payload ‖ nonce ‖ gas_price`.
+
+See `what-it-is.md` §11 for the v1 scope and open items.
 
 ## Documents
 
