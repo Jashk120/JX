@@ -13,7 +13,14 @@ order finalization. Depends on `primitives` for the value types and
 - `Hashgraph` — the graph store. Inserts verified events (rejecting
   duplicates, missing parents, and unknown creators), maintains
   incremental per-member ancestor metadata, and tracks each event's
-  `FameStatus` (`Undecided` / `Famous` / `NotFamous`).
+  `FameStatus` (`Undecided` / `Famous` / `NotFamous`). Carries read-only
+  per-phase timing instrumentation (`InsertTiming`: `insert_count` /
+  `insert_ns`; `verify_ns` / `verify_count` for pre-lock inbound
+  authentication; `finalize_round`, `vote_as_witness`,
+  `vote_candidate_loop`, `vote_backfill_loop`, and `eager_decide`
+  counters), exposed via `insert_timing()` and fed the pre-lock verify cost
+  through `note_verify(ns)`. Pure observation — it never affects consensus
+  behavior.
 - `ancestry` — graph traversal: `see`, `strongly_see`, and fork detection
   (observer-relative `see` checks with a first-seen branch policy).
 - `round` — round assignment (`base_round` from parent rounds, witness

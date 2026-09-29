@@ -89,7 +89,9 @@ re-exports forming the crate's public API surface (see `lib.rs` entry).
   `ewma_rtt_fast_ms`/`ewma_rtt_slow_ms`, `delta_bytes_per_sync`,
   `cache_hit_rate` legacy empty-delta EWMA, `cache_hits`/`cache_misses`,
   `true_cache_hit_rate`, `pending_dropped`, `effective_k`,
-  `concurrent_syncs`; methods `success_rate`,
+  `concurrent_syncs`, `exec_ns`/`exec_count` and
+  `snapshot_ns`/`snapshot_count` (latency-profiling timers filled by
+  `process_finalized_rounds`); methods `success_rate`,
   `record_sync_success(_with_bytes)`, `record_cache_hit/miss`,
   `set_effective_k`, `set_concurrent_syncs`); `SyncTiming::new`;
   `outbound_capacity(n)` (`10@N≤6, 30@N≥100`, linear between);
@@ -116,8 +118,11 @@ re-exports forming the crate's public API surface (see `lib.rs` entry).
   `JoinSet`+`Semaphore(k)` then serializes own-event creation under
   `own_event_lock` (chained `self_parent`, per-slot `other_parent`);
   `process_finalized_rounds` executes finalized events per round via
-  `Executor::bucket_finalized_with_diffs` (sorted after-image diffs),
-  activates `MembershipOp::Add` at `roundReceived + 1` once fully decided
+  `Executor::bucket_finalized_with_diffs` (sorted after-image diffs; the
+  bucket and the per-round `State::to_bytes` snapshot are timed into
+  `GossipMetrics`'s `exec_ns`/`exec_count` and
+  `snapshot_ns`/`snapshot_count`), activates `MembershipOp::Add` at
+  `roundReceived + 1` once fully decided
   (PoP check via `verify_pop_bytes`, `Hashgraph::add_member`, roster-history
   persist, registry re-register, `add_peer_from_key`), then
   `produce_pending_checkpoints` → `produce_checkpoint` (chained payload via
@@ -161,7 +166,8 @@ re-exports forming the crate's public API surface (see `lib.rs` entry).
   event and pushes `Frame::Event` back — a failed push-back reports
   `pushback_delivered: false` without failing (next delta redelivers;
   payload must NOT be requeued); `insert_verified` verifies via
-  `Verifiable::verify` and treats `AlreadyPresent` as a benign no-op.
+  `Verifiable::verify` (recording the wall time through
+  `Hashgraph::note_verify`) and treats `AlreadyPresent` as a benign no-op.
   Fits the crate as the per-round protocol step the fanout driver invokes.
 - `frontier.rs` — Sync summary, delta computation, dedup. Public surface:
   `SyncConfig { filter_likely_duplicates, non_ancestor_threshold,
@@ -347,8 +353,11 @@ malformed SPKI DER (`tls`); checkpoint quorum edge cases and roster-hash
 anchoring (`reconnect`, `node`); and duplicate-rejecting cluster config
 (`cluster_config`). The integration suites cover cluster convergence,
 partition/rejoin reconciliation, checkpoint chaining, dynamic-membership
-activation, and mirror-stream wiring. Run with `cargo test -p gossip`; see
-the crate `README.md` for the full workspace command.
+activation, mirror-stream wiring, and the latency observability
+(`exec_timing.rs` asserts the `exec`/`snapshot` counters advance;
+`profile_live.rs`, ignored, prints in-situ per-phase costs). Run with
+`cargo test -p gossip`; see the crate `README.md` for the full workspace
+command.
 
 ## 6. Do not change
 

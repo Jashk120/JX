@@ -124,3 +124,16 @@ for the state's LSM backing.
   never applied to `State`: the gossip layer collects them from the side
   channel and drives activation through `RosterHistory` /
   `Hashgraph::add_member`.
+
+## Testing
+
+`cargo test -p state` runs the unit and integration suites. `tests/bench_merkle.rs`
+is an ignored, release-only microbenchmark that quantifies the per-operation
+SHA-256 cost of `SparseMerkleTree::insert` / `delete` / `root` — the one place
+in the node where hashing is genuinely heavy, because every mutation walks
+`DEPTH = 256` levels — and isolates the hash vs. hash-map halves of an insert.
+Run it with:
+
+```bash
+cargo test -p state --release --test bench_merkle -- --ignored --nocapture
+```

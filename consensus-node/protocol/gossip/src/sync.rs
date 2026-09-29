@@ -299,8 +299,11 @@ pub(crate) async fn insert_verified(
     registry: &MembershipRegistry,
     event: Event,
 ) -> Result<Option<EventHash>> {
+    let t_verify = std::time::Instant::now();
     let verified = event.verify(registry)?;
+    let verify_ns = t_verify.elapsed().as_nanos() as u64;
     let mut hashgraph = hashgraph.lock().await;
+    hashgraph.note_verify(verify_ns);
     match hashgraph.insert(verified) {
         Ok(hash) => Ok(Some(hash)),
         Err(consensus::ConsensusError::AlreadyPresent(_)) => Ok(None),

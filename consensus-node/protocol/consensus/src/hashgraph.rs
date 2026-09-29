@@ -322,6 +322,11 @@ pub struct WalkMetricsSnapshot {
 pub struct InsertTiming {
     pub insert_count: u64,
     pub insert_ns: u64,
+    /// Nanoseconds spent authenticating inbound events (`Event::verify`,
+    /// Ed25519 `verify_strict`) via [`Hashgraph::note_verify`]. Measured
+    /// before the insert lock is taken, hence separate from `insert_ns`.
+    pub verify_ns: u64,
+    pub verify_count: u64,
     pub finalize_round_ns: u64,
     pub finalize_round_count: u64,
     pub vote_as_witness_ns: u64,
@@ -1074,6 +1079,14 @@ impl Hashgraph {
     /// PLAN-4 Phase 0 — snapshot of the ancestry-walk diagnostic counters.
     pub fn insert_timing(&self) -> InsertTiming {
         self.insert_timing
+    }
+
+    /// Records the wall-clock cost of authenticating one inbound event
+    /// (Ed25519 `verify_strict`, which runs before the insert lock is held).
+    /// Pure instrumentation — never affects consensus behavior.
+    pub fn note_verify(&mut self, ns: u64) {
+        self.insert_timing.verify_ns = self.insert_timing.verify_ns.saturating_add(ns);
+        self.insert_timing.verify_count = self.insert_timing.verify_count.saturating_add(1);
     }
 
     pub fn walk_metrics(&self) -> WalkMetricsSnapshot {

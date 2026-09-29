@@ -612,6 +612,10 @@ async fn spawn_diagnosis_logger(node: Arc<GossipNode>, path: PathBuf, stop: Arc<
             "true_cache_hit_rate": m.true_cache_hit_rate(),
             "effective_k": m.effective_k,
             "concurrent_syncs": m.concurrent_syncs,
+            "exec_avg_ns": m.exec_ns / m.exec_count.max(1),
+            "exec_count": m.exec_count,
+            "snapshot_avg_ns": m.snapshot_ns / m.snapshot_count.max(1),
+            "snapshot_count": m.snapshot_count,
             "backoff_peers": backoff_peers,
         });
         let text = format!("{}\n", line);

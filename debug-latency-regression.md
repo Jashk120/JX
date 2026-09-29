@@ -186,6 +186,32 @@ Interpretation:
 - Even so, ~108 µs/insert at ~17 inserts/sec/node ≈ **0.2% CPU**. The mutex is
   not contended. Insert CPU is **not** the latency driver.
 
+### Pre-lock authentication and the execution path (added this session)
+
+`insert` timing starts *after* the insert lock is taken, so the inbound
+authentication that precedes it — `Event::verify` (Ed25519 `verify_strict`) —
+is now measured separately via `Hashgraph::note_verify`, surfacing as
+`verify_ns` / `verify_count` in `InsertTiming` and the `insert timing` log.
+The execution path gets the same treatment in `process_finalized_rounds`:
+`exec_ns` / `exec_count` wrap `Executor::bucket_finalized_with_diffs` (the
+state-SMT update, the expensive half of execution) and `snapshot_ns` /
+`snapshot_count` wrap `State::to_bytes` (the per-round snapshot a reconnect
+learner is served). All four counters ride the periodic `gossip metrics` logs
+and the 1 s `diagnosis.log` JSON (`exec_avg_ns`, `snapshot_avg_ns`).
+
+This closes the cost picture: authentication is tens of µs and the insert
+critical section ~108 µs — both orders of magnitude below the ~2 s round
+cadence the backoff bug imposed, so **CPU is numerically exonerated as the
+latency driver**. To re-measure the isolated per-op costs, run the release
+microbenchmarks and the live profile:
+
+```bash
+cd consensus-node
+cargo test -p crypto --release --test bench_crypto  -- --ignored --nocapture
+cargo test -p state  --release --test bench_merkle  -- --ignored --nocapture
+cargo test -p gossip --release --test profile_live  -- --ignored --nocapture
+```
+
 ---
 
 ## Investigation log (chronological, with outcomes)
@@ -303,22 +329,42 @@ which is why it looked "periodic".
   fame roster gate"* — restores liveness at ~10× cost. Changed gossip (chained
   k events, push-back) **and** consensus (fame gate).
 
-## In the tree right now (uncommitted instrumentation on `develop`)
+## In the tree right now (observability on `develop`)
 
 Committed in `ca2e868`: `InsertTiming` instrumentation (hashgraph.rs, fame.rs,
 lib.rs) + `node.rs` `log_insert_timing()` helper + this journal.
 
-Added this session, **uncommitted**:
+Added this session, committed alongside this note. Unlike the earlier
+throwaway probes, these are left in place because they are the permanent
+"what is slowing down" telemetry:
 
-- `consensus-node/protocol/gossip/src/node.rs` — driver-loop timing
-  (`loop timing` log: `avg_period_ms` / `avg_drain_ms` / `avg_process_ms`).
-- The backoff experiment (`peer_manager.rs`) was made, measured, and
-  **reverted** — `backoff_secs` is back at `peer_manager.rs:249`.
+- `consensus-node/protocol/consensus/src/hashgraph.rs` — `InsertTiming` gains
+  `verify_ns` / `verify_count`; `Hashgraph::note_verify(ns)` records the
+  inbound authentication cost (`Event::verify` → Ed25519 `verify_strict`),
+  which runs *before* the insert lock is taken, hence separate from
+  `insert_ns`. `Hashgraph::insert_timing()` exposes the whole snapshot.
+- `consensus-node/protocol/gossip/src/sync.rs` — `insert_verified` times the
+  `Event::verify` call and hands the elapsed nanos to `hashgraph.note_verify`.
+- `consensus-node/protocol/gossip/src/node.rs` — `GossipMetrics` gains
+  `exec_ns` / `exec_count` (time inside
+  `Executor::bucket_finalized_with_diffs`) and `snapshot_ns` /
+  `snapshot_count` (`State::to_bytes`), accumulated per round in
+  `process_finalized_rounds` and printed by the periodic `gossip metrics`
+  logs; `log_insert_timing` now also logs `verify_count` / `verify_avg_ns`.
+- `consensus-node/node/src/cli/run.rs` — the 1 s `diagnosis.log` JSON gains
+  `exec_avg_ns` / `exec_count` / `snapshot_avg_ns` / `snapshot_count`.
+- Measurement tools (release-only, ignored by default unless noted):
+  `crypto/tests/bench_crypto.rs` and `state/tests/bench_merkle.rs` (per-op
+  encode/hash/sign/verify and SMT microbenchmarks), `gossip/tests/profile_live.rs`
+  (live 4-node profile reading the node instrumentation via
+  `insert_timing()` / `GossipMetrics`), and `gossip/tests/exec_timing.rs`
+  (a live guard asserting the exec/snapshot counters actually advance — it
+  runs in the normal `cargo test -p gossip` sweep).
 
-The release binary is currently built **with the loop-timing only** (backoff
-restored to HEAD). Revert everything with
-`git checkout -- consensus-node/protocol/consensus consensus-node/protocol/gossip/src/node.rs`
-then `cargo build --release --bin jkaind`.
+The driver-loop timing (`loop timing` log: `avg_period_ms` / `avg_drain_ms` /
+`avg_process_ms`) and the backoff experiment (`peer_manager.rs`) from the
+prior session were both measured and **reverted** — neither is in the tree.
+`backoff_secs` is back at HEAD (`peer_manager.rs:249`).
 
 ## How to reproduce / measure
 

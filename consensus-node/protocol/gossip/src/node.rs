@@ -121,6 +121,14 @@ pub struct GossipMetrics {
     pub effective_k: usize,
     /// Actual concurrent syncs observed on the last tick (0..effective_k).
     pub concurrent_syncs: usize,
+    /// Accumulated nanoseconds executing finalized events
+    /// (`Executor::bucket_finalized_with_diffs`); read against `exec_count`.
+    pub exec_ns: u64,
+    pub exec_count: u64,
+    /// Accumulated nanoseconds serializing state snapshots (`to_bytes`);
+    /// read against `snapshot_count`.
+    pub snapshot_ns: u64,
+    pub snapshot_count: u64,
 }
 
 impl GossipMetrics {
@@ -784,6 +792,8 @@ impl GossipNode {
         tracing::info!(
             insert_count = t.insert_count,
             insert_avg_ns = t.insert_ns / t.insert_count,
+            verify_count = t.verify_count,
+            verify_avg_ns = t.verify_ns / t.verify_count.max(1),
             finalize_round_avg_ns = t.finalize_round_ns / t.finalize_round_count.max(1),
             finalize_round_count = t.finalize_round_count,
             vote_as_witness_avg_ns = t.vote_as_witness_ns / t.vote_as_witness_count.max(1),
@@ -1176,6 +1186,10 @@ impl GossipNode {
                                     true_cache_hit_rate = m.true_cache_hit_rate(),
                                     effective_k = m.effective_k,
                                     concurrent_syncs = m.concurrent_syncs,
+                                    exec_avg_ns = m.exec_ns / m.exec_count.max(1),
+                                    exec_count = m.exec_count,
+                                    snapshot_avg_ns = m.snapshot_ns / m.snapshot_count.max(1),
+                                    snapshot_count = m.snapshot_count,
                                     consecutive_failures = consecutive_failures,
                                     "gossip metrics periodic"
                                 );
@@ -1247,6 +1261,10 @@ impl GossipNode {
                         true_cache_hit_rate = m.true_cache_hit_rate(),
                         effective_k = m.effective_k,
                         concurrent_syncs = m.concurrent_syncs,
+                        exec_avg_ns = m.exec_ns / m.exec_count.max(1),
+                        exec_count = m.exec_count,
+                        snapshot_avg_ns = m.snapshot_ns / m.snapshot_count.max(1),
+                        snapshot_count = m.snapshot_count,
                         consecutive_failures = consecutive_failures,
                         "gossip metrics"
                     );
@@ -1669,10 +1687,15 @@ impl GossipNode {
             // serialized state is captured at the same point, so a reconnect
             // learner can be served the state exactly as it stood at the
             // checkpoint round.
+            let mut exec_ns: u64 = 0;
+            let mut exec_count: u64 = 0;
+            let mut snapshot_ns: u64 = 0;
+            let mut snapshot_count: u64 = 0;
             let (state_hashes, snapshots, diffs) = {
                 let (pre_batch_hash, pre_batch_bytes) = {
                     let executor = self.executor.lock().await;
                     let root = executor.state().root();
+                    let t_snap = std::time::Instant::now();
                     let bytes = match executor.state().to_bytes() {
                         Ok(b) => b,
                         Err(e) => {
@@ -1681,6 +1704,8 @@ impl GossipNode {
                             return;
                         }
                     };
+                    snapshot_ns += t_snap.elapsed().as_nanos() as u64;
+                    snapshot_count += 1;
                     (root, bytes)
                 };
                 let mut activation = self.activation.lock().await;
@@ -1698,6 +1723,7 @@ impl GossipNode {
                 let original_watermark = *processed_through_round;
                 for (round, events) in by_round {
                     let before_root = executor.state().root();
+                    let t_exec = std::time::Instant::now();
                     let round_diffs_map = match executor.bucket_finalized_with_diffs(
                         pending,
                         processed_through_round,
@@ -1709,6 +1735,8 @@ impl GossipNode {
                             continue;
                         }
                     };
+                    exec_ns += t_exec.elapsed().as_nanos() as u64;
+                    exec_count += 1;
                     let pb_diffs: Vec<stream::pb::StateDiff> = round_diffs_map
                         .get(&round)
                         .map(|vec| {
@@ -1721,6 +1749,7 @@ impl GossipNode {
                         })
                         .unwrap_or_default();
                     let after_root = executor.state().root();
+                    let t_snap = std::time::Instant::now();
                     let snapshot = match executor.state().to_bytes() {
                         Ok(b) => b,
                         Err(e) => {
@@ -1729,6 +1758,8 @@ impl GossipNode {
                             return;
                         }
                     };
+                    snapshot_ns += t_snap.elapsed().as_nanos() as u64;
+                    snapshot_count += 1;
                     if round > original_watermark {
                         hashes.insert(round, after_root);
                         snapshots.insert(round, snapshot);
@@ -1759,6 +1790,14 @@ impl GossipNode {
                 }
                 (hashes, snapshots, diffs)
             };
+
+            {
+                let mut m = self.gossip_metrics.lock().await;
+                m.exec_ns = m.exec_ns.saturating_add(exec_ns);
+                m.exec_count = m.exec_count.saturating_add(exec_count);
+                m.snapshot_ns = m.snapshot_ns.saturating_add(snapshot_ns);
+                m.snapshot_count = m.snapshot_count.saturating_add(snapshot_count);
+            }
 
             // Phase C: activate ops whose activation round is now fully decided.
             let candidate_rrs: Vec<u64> = {

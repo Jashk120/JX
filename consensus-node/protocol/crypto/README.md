@@ -42,3 +42,15 @@ through this crate.
   implements only what it needs, and each concern can evolve alone.
 - No stake/weights: membership is one-member-one-vote, matching the
   `2n/3` supermajority idiom used by the consensus crate.
+
+## Testing
+
+`cargo test -p crypto` runs the unit suite. `tests/bench_crypto.rs` is an
+ignored, release-only microbenchmark that isolates the per-event consensus
+footprint — canonical encoding, SHA-256 event hashing, Ed25519 signing, and
+Ed25519 `verify_strict` authentication — across the empty genesis event and
+the gossip batch cap (`TX_PER_SYNC = 64`). Run it with:
+
+```bash
+cargo test -p crypto --release --test bench_crypto -- --ignored --nocapture
+```
