@@ -66,6 +66,12 @@ use tokio::time::{
 /// `consensus_order` is O(events), so scanning this window is cheap.
 const MAX_ORDERED_ROUND: u64 = 32;
 
+/// Serializes the heavy multi-node e2e tests so they cannot starve each other
+/// (or the rest of this test binary) on a loaded runner. They assert eventual
+/// progress rather than a latency bound, so scheduler contention is the only
+/// thing that can make them fail.
+static HEAVY_TEST_SLOT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+
 // --- E2E-specific helpers -------------------------------------------------------
 
 /// Waits (bounded) until `hash` appears in `node`'s hashgraph. The gossip
@@ -279,6 +285,7 @@ async fn live_cluster_finalizes_identical_consensus_order() {
     // Gossip → consensus ordering: every node must finalize the same
     // consensus order for the rounds it has decided, and that order must
     // respect parent/child roundReceived monotonicity.
+    let _heavy = HEAVY_TEST_SLOT.acquire().await.expect("heavy-test slot");
     let nodes = spawn_cluster(&[1, 2, 3, 4]).await;
     let refs: Vec<&TestNode> = nodes.iter().collect();
 
@@ -286,7 +293,7 @@ async fn live_cluster_finalizes_identical_consensus_order() {
     // once every member's frontier has passed a round, so a fixed warmup can
     // return before any order exists under CI load. Wait for the first ordered
     // round while the cluster is still gossiping, then settle.
-    wait_for_ordered_round(&nodes[0].node, MAX_ORDERED_ROUND, DEADLINE).await;
+    wait_for_ordered_round(&nodes[0].node, MAX_ORDERED_ROUND, HEAVY_DEADLINE).await;
 
     let (counts, lates) = stop_and_settle(&refs, Duration::from_secs(2)).await;
     assert_converged(&counts, &lates, "ordering");
@@ -810,6 +817,7 @@ async fn membership_added_node_joins_live_cluster() {
     // a `MembershipOp::Add` — a real activation round, not silent preloading —
     // and joins as a live member once its membership activates, catching up
     // and participating in consensus.
+    let _heavy = HEAVY_TEST_SLOT.acquire().await.expect("heavy-test slot");
     let (nodes, gossip_addrs, identities, _) = spawn_cluster_with_reconnect(&[1, 2, 3]).await;
     let refs: Vec<&TestNode> = nodes.iter().collect();
 
@@ -844,7 +852,7 @@ async fn membership_added_node_joins_live_cluster() {
         node.node.submit_transaction(payload.clone()).await;
     }
     for node in &refs {
-        wait_for_member(&node.node, node4_id, DEADLINE).await;
+        wait_for_member(&node.node, node4_id, HEAVY_DEADLINE).await;
     }
 
     // Start node 4 as a live member: its registry includes itself (it knows
@@ -880,7 +888,7 @@ async fn membership_added_node_joins_live_cluster() {
 
     // Node 4 catches up on the pre-join history and creates its first event —
     // a new chain head whose self-parent is None.
-    wait_for_new_own_event(&node4, node4_id, &HashSet::new(), DEADLINE).await;
+    wait_for_new_own_event(&node4, node4_id, &HashSet::new(), HEAVY_DEADLINE).await;
     let first = {
         let hashgraph = node4.hashgraph.lock().await;
         let mut own: Vec<EventHash> = hashgraph
@@ -898,12 +906,12 @@ async fn membership_added_node_joins_live_cluster() {
     // Every teacher verifies and inserts node 4's events.
     let first_hash = first.hash().expect("hash bounded");
     for node in &refs {
-        wait_for_event(&node.node, first_hash, DEADLINE).await;
+        wait_for_event(&node.node, first_hash, HEAVY_DEADLINE).await;
     }
 
     // Node 4 has caught up on the shared history from every pre-existing
     // creator, so it participates on equal footing.
-    timeout(DEADLINE, async {
+    timeout(HEAVY_DEADLINE, async {
         loop {
             let hashgraph = node4.hashgraph.lock().await;
             let caught_up = (1..=3).all(|id| hashgraph.latest_event_by(&NodeId::new(id)).is_some());
@@ -936,6 +944,7 @@ async fn reconnect_existing_node_catches_up() {
     // event window). Its frontier is below the teachers' retained window, so
     // its first delta-sync gaps and the driver reconnects from a checkpoint,
     // then resumes producing events.
+    let _heavy = HEAVY_TEST_SLOT.acquire().await.expect("heavy-test slot");
     let (teachers, gossip_addrs, identities, reconnect_addrs) =
         spawn_cluster_with_reconnect(&[1, 2, 3]).await;
     let refs: Vec<&TestNode> = teachers.iter().collect();
@@ -966,7 +975,7 @@ async fn reconnect_existing_node_catches_up() {
         node.node.submit_transaction(payload.clone()).await;
     }
     for node in &refs {
-        wait_for_member(&node.node, node4_id, DEADLINE).await;
+        wait_for_member(&node.node, node4_id, HEAVY_DEADLINE).await;
     }
 
     // Node 4 joins live and participates, so the cluster (now 4 members) can
@@ -1082,7 +1091,7 @@ async fn reconnect_existing_node_catches_up() {
 
     // Generous post-wipe budget: isolated runs already take ~18s total and
     // parallel load slows the checkpoint fetch.
-    const RECONNECT_DEADLINE: Duration = Duration::from_secs(60);
+    const RECONNECT_DEADLINE: Duration = HEAVY_DEADLINE;
     wait_for_new_own_event(&node4, node4_id, &frozen_own, RECONNECT_DEADLINE).await;
 
     // The reconnect's apply_checkpoint restored node 4 from a served

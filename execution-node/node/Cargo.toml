@@ -1,0 +1,29 @@
+[package]
+name = "execution-node"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "jkainc"
+path = "src/bin/jkainc.rs"
+
+[dependencies]
+l1-client = { path = "../l1/client" }
+actor-host = { path = "../runtime/actor-host" }
+state = { workspace = true }
+anyhow = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+axum = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
+sha2 = { workspace = true }
+ed25519-dalek = "2.2.0"
+
+[dev-dependencies]
+ed25519-dalek = { version = "2.2.0", features = ["rand_core"] }
+
+[lints]
+workspace = true

@@ -248,14 +248,20 @@ impl Hashgraph {
             .filter(|&(_, &round)| round < y_round)
             .map(|(&hash, _)| hash)
             .collect();
+        let t_candidate = std::time::Instant::now();
         for candidate in candidates {
             self.vote_of(&y, &candidate)?;
             // Eager pipeline trigger after the vote (even if `vote_of` returned
             // `Decided`, the candidate may have been decided by a prerequisite;
             // `try_eager_decide` is idempotent and checks Undecided first).
+            let t_eager = std::time::Instant::now();
             self.try_eager_decide(&candidate);
+            self.insert_timing.eager_decide_ns += t_eager.elapsed().as_nanos() as u64;
+            self.insert_timing.eager_decide_count += 1;
         }
+        self.insert_timing.vote_candidate_loop_ns += t_candidate.elapsed().as_nanos() as u64;
 
+        let t_backfill = std::time::Instant::now();
         for round in (y_round + 1)..=self.highest_witness_round() {
             if self.fame_of(&y).is_some_and(|status| status != FameStatus::Undecided) {
                 break;
@@ -270,16 +276,24 @@ impl Hashgraph {
             // After backfilling a whole round above `y`, try to decide `y` eagerly
             // from its own `r+1` tally before waiting for a wave aggregator.
             if self.fame_of(&y) == Some(FameStatus::Undecided) {
+                let t_eager = std::time::Instant::now();
                 self.try_eager_decide(&y);
+                self.insert_timing.eager_decide_ns += t_eager.elapsed().as_nanos() as u64;
+                self.insert_timing.eager_decide_count += 1;
                 if self.fame_of(&y).is_some_and(|s| s != FameStatus::Undecided) {
                     break;
                 }
             }
         }
+        self.insert_timing.vote_backfill_loop_ns += t_backfill.elapsed().as_nanos() as u64;
+
         // Final eager attempt for `y` itself in case its voter set was populated
         // incrementally through backfill.
         if self.fame_of(&y) == Some(FameStatus::Undecided) {
+            let t_eager = std::time::Instant::now();
             self.try_eager_decide(&y);
+            self.insert_timing.eager_decide_ns += t_eager.elapsed().as_nanos() as u64;
+            self.insert_timing.eager_decide_count += 1;
         }
 
         Ok(())

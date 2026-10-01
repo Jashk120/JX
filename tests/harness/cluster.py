@@ -37,6 +37,36 @@ def _keep_tmp_enabled() -> bool:
     return os.environ.get("JKAIN_KEEP_TMP", "").strip().lower() in _TRUTHY
 
 
+def _default_sync_interval_ms() -> int:
+    """Gossip sync period default (ms); override with JKAIN_SYNC_INTERVAL_MS.
+
+    Harness default is 25ms; set the env var (e.g. ``10``) to run the existing
+    latency/TPS tests at a different event gap without editing each test.
+    """
+    raw = os.environ.get("JKAIN_SYNC_INTERVAL_MS", "").strip()
+    if raw.isdigit():
+        return int(raw)
+    return 25
+
+
+def _default_fanout() -> str | int:
+    raw = os.environ.get("JKAIN_FANOUT", "").strip()
+    if not raw:
+        return "auto"
+    if raw.isdigit():
+        return int(raw)
+    return raw
+
+
+def _default_dedup_enabled() -> bool:
+    raw = os.environ.get("JKAIN_DEDUP", "").strip().lower()
+    if raw in _TRUTHY:
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Helpers: port allocation, binary discovery
 # ---------------------------------------------------------------------------
@@ -185,7 +215,7 @@ class ClusterConfig:
     # 5ms only via ClusterConfig(num_nodes=6, sync_interval_ms=5, fanout=4)
     # after hot-peer QUIC proven, expect p50 ~0.12s if thermal allows.
     # Abort 5ms runs if k10temp > 85°C. Validated in jkaind run: 5..5000ms.
-    sync_interval_ms: int = 25
+    sync_interval_ms: int = field(default_factory=_default_sync_interval_ms)
     sync_timeout_ms: int = 500
     log_level: str = "info"
     log_file_mode: str = "file"  # "file" -> data/logs/jkaind.log, "-" -> stderr
@@ -197,8 +227,8 @@ class ClusterConfig:
     # Latency≈k*gap*logN fit: 80ms k=4 should match 25ms k=1 at ~0.6s @70°C.
     # Fanout maps to --fanout (auto|1|2|4); dedup/quic map to --dedup/--quic
     # native flags on jkaind (verified via --help).
-    fanout: str | int = "auto"
-    dedup_enabled: bool = True
+    fanout: str | int = field(default_factory=_default_fanout)
+    dedup_enabled: bool = field(default_factory=_default_dedup_enabled)
     quic_enabled: bool = False
 
 

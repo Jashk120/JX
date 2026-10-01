@@ -488,6 +488,36 @@ pub fn kv_op_payload(op: &state::Op) -> Vec<u8> {
     op.encode()
 }
 
+/// The payload encoding that wraps a [`state::DidOp`] in the `0x03`
+/// transaction tag the executor recognizes (`state::DecodedOp::Did`).
+/// Shared by the `tx did` CLI and tests so the wire bytes are always
+/// produced in one place.
+pub fn did_op_payload(op: &state::DidOp) -> Vec<u8> {
+    let mut payload = vec![0x03];
+    payload.extend_from_slice(&op.encode());
+    payload
+}
+
+/// The payload encoding that wraps a [`state::SubActorOp`] in the `0x04`
+/// transaction tag the executor recognizes (`state::DecodedOp::SubActor`).
+/// Shared by the `tx sub-actor` CLI and tests so the wire bytes are always
+/// produced in one place.
+pub fn sub_actor_op_payload(op: &state::SubActorOp) -> Vec<u8> {
+    let mut payload = vec![0x04];
+    payload.extend_from_slice(&op.encode());
+    payload
+}
+
+/// The payload encoding that wraps a [`state::RebindOp`] in the `0x05`
+/// transaction tag the executor recognizes (`state::DecodedOp::Rebind`).
+/// Shared by the `tx rebind` CLI and tests so the wire bytes are always
+/// produced in one place.
+pub fn rebind_op_payload(op: &state::RebindOp) -> Vec<u8> {
+    let mut payload = vec![0x05];
+    payload.extend_from_slice(&op.encode());
+    payload
+}
+
 // --- errors -----------------------------------------------------------------
 
 /// Convenience for client code: `bail!`s unless the response says `ok`.
@@ -657,6 +687,92 @@ mod tests {
         assert_eq!(
             state::DecodedOp::decode(&payload),
             Ok(state::DecodedOp::Membership(op)),
+            "payload decodes to the same op on the executor side"
+        );
+    }
+
+    fn test_did_id() -> state::DidId {
+        state::DidId::new("test".to_string(), "alice".to_string(), [1u8; 16]).expect("valid id")
+    }
+
+    fn test_did_op() -> state::DidOp {
+        let control = ed25519_dalek::SigningKey::from_bytes(&[2u8; 32]).verifying_key();
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[3u8; 32]).verifying_key();
+        let document = state::DidDocument::new(
+            control,
+            vec![state::VerificationMethod::Signing(signing)],
+            false,
+        )
+        .expect("valid document");
+        state::DidOp::new(test_did_id(), document, primitives::Signature::new([7u8; 64]), 0, true)
+    }
+
+    #[test]
+    fn did_op_payload_matches_executor_encoding() {
+        let op = test_did_op();
+        let payload = did_op_payload(&op);
+        assert_eq!(payload[0], 0x03, "executor's DID tag");
+        assert_eq!(
+            state::DecodedOp::decode(&payload),
+            Ok(state::DecodedOp::Did(op)),
+            "payload decodes to the same op on the executor side"
+        );
+    }
+
+    fn test_sub_actor_op() -> state::SubActorOp {
+        let root_did = test_did_id();
+        let actor_id = state::ActorId::Sub {
+            root_did: root_did.clone(),
+            tag: state::Tag::Messenger,
+            index: 3,
+        };
+        let control = ed25519_dalek::SigningKey::from_bytes(&[4u8; 32]).verifying_key();
+        let operating = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]).verifying_key();
+        let leaf = state::subactor_leaf_hash(&actor_id, &control);
+        let new_root = state::mth(std::slice::from_ref(&leaf));
+        let consistency_proof =
+            state::prove_consistency(std::slice::from_ref(&leaf), 0).expect("bootstrap proves");
+        let inclusion_proof =
+            state::prove_inclusion(std::slice::from_ref(&leaf), 0).expect("in range");
+        state::SubActorOp::new(state::SubActorOpParams {
+            root_did,
+            tag: state::Tag::Messenger,
+            index: 3,
+            control_key: control,
+            operating_key: operating,
+            new_root,
+            consistency_proof,
+            inclusion_proof,
+            signature: primitives::Signature::new([7u8; 64]),
+            signed_by: 0,
+        })
+    }
+
+    #[test]
+    fn sub_actor_op_payload_matches_executor_encoding() {
+        let op = test_sub_actor_op();
+        let payload = sub_actor_op_payload(&op);
+        assert_eq!(payload[0], 0x04, "executor's sub-actor tag");
+        assert_eq!(
+            state::DecodedOp::decode(&payload),
+            Ok(state::DecodedOp::SubActor(Box::new(op))),
+            "payload decodes to the same op on the executor side"
+        );
+    }
+
+    #[test]
+    fn rebind_op_payload_matches_executor_encoding() {
+        let op = state::RebindOp::new(
+            state::ActorId::Sub { root_did: test_did_id(), tag: state::Tag::Messenger, index: 3 },
+            ed25519_dalek::SigningKey::from_bytes(&[6u8; 32]).verifying_key(),
+            primitives::Signature::new([7u8; 64]),
+            primitives::Signature::new([8u8; 64]),
+        );
+        let payload = rebind_op_payload(&op);
+        assert_eq!(payload[0], 0x05, "executor's rebind tag");
+        assert_eq!(
+            state::DecodedOp::decode(&payload),
+            Ok(state::DecodedOp::Rebind(Box::new(op))),
             "payload decodes to the same op on the executor side"
         );
     }

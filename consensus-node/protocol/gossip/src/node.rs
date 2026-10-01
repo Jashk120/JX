@@ -121,6 +121,14 @@ pub struct GossipMetrics {
     pub effective_k: usize,
     /// Actual concurrent syncs observed on the last tick (0..effective_k).
     pub concurrent_syncs: usize,
+    /// Accumulated nanoseconds executing finalized events
+    /// (`Executor::bucket_finalized_with_diffs`); read against `exec_count`.
+    pub exec_ns: u64,
+    pub exec_count: u64,
+    /// Accumulated nanoseconds serializing state snapshots (`to_bytes`);
+    /// read against `snapshot_count`.
+    pub snapshot_ns: u64,
+    pub snapshot_count: u64,
 }
 
 impl GossipMetrics {
@@ -776,6 +784,59 @@ impl GossipNode {
         }
     }
 
+    async fn log_insert_timing(&self) {
+        let t = { self.hashgraph.lock().await.insert_timing() };
+        if t.insert_count == 0 {
+            return;
+        }
+        tracing::info!(
+            insert_count = t.insert_count,
+            insert_avg_ns = t.insert_ns / t.insert_count,
+            verify_count = t.verify_count,
+            verify_avg_ns = t.verify_ns / t.verify_count.max(1),
+            finalize_round_avg_ns = t.finalize_round_ns / t.finalize_round_count.max(1),
+            finalize_round_count = t.finalize_round_count,
+            vote_as_witness_avg_ns = t.vote_as_witness_ns / t.vote_as_witness_count.max(1),
+            vote_as_witness_count = t.vote_as_witness_count,
+            vote_candidate_loop_avg_ns = t.vote_candidate_loop_ns / t.vote_as_witness_count.max(1),
+            vote_backfill_loop_avg_ns = t.vote_backfill_loop_ns / t.vote_as_witness_count.max(1),
+            eager_decide_avg_ns = t.eager_decide_ns / t.eager_decide_count.max(1),
+            eager_decide_count = t.eager_decide_count,
+            "insert timing"
+        );
+    }
+
+    /// Names the roster member(s) whose chain keeps the lowest unordered round
+    /// from completing `round_view_complete` — the condition that freezes
+    /// `decided_round`. `blockers` distinguishes a view gap from a fame stall.
+    async fn log_decided_stall(&self) {
+        let registry = self.registry.lock().await.clone();
+        let (decided, ordered, next_round, blockers) = {
+            let hg = self.hashgraph.lock().await;
+            let next_round = hg.next_round_to_order();
+            let blockers: Vec<(NodeId, u64)> = registry
+                .member_ids()
+                .into_iter()
+                .filter_map(|node| {
+                    let latest_round = hg
+                        .latest_event_by(&node)
+                        .and_then(|hash| hg.get(hash))
+                        .map_or(0, |record| record.round());
+                    (latest_round <= next_round).then_some((node, latest_round))
+                })
+                .collect();
+            (hg.highest_decided_round(), hg.max_ordered_round(), next_round, blockers)
+        };
+        tracing::warn!(
+            decided_round = decided,
+            ordered_round = ordered,
+            next_round_to_order = next_round,
+            blocker_count = blockers.len(),
+            blockers = ?blockers,
+            "decided round stalled: round view incomplete"
+        );
+    }
+
     /// Runs the node: accepts inbound gossip connections and, every
     /// `sync_interval`, syncs with a uniform-random peer. Runs until the
     /// surrounding task is aborted.
@@ -799,6 +860,7 @@ impl GossipNode {
             Arc::new(Mutex::new(LruCache::new(outbound_capacity(self.peers.lock().await.len()))));
         let mut consecutive_failures: u64 = 0;
         let mut decided_watermark: u64 = 0;
+        let mut stall_ticks: u64 = 0;
         loop {
             if stop.load(Ordering::Acquire) {
                 break;
@@ -1020,7 +1082,7 @@ impl GossipNode {
                 let retry_payload = payload.clone();
                 let timestamp = self.next_timestamp();
                 let start = std::time::Instant::now();
-                let round = {
+                let mut round = {
                     let mut guard = transport_arc.lock().await;
                     let res = tokio::time::timeout(
                         self.sync_timing.sync_timeout,
@@ -1031,7 +1093,7 @@ impl GossipNode {
                             self.node_id,
                             &self.signing_key,
                             peer.node_id,
-                            payload,
+                            payload.clone(),
                             timestamp,
                         ),
                     )
@@ -1044,6 +1106,35 @@ impl GossipNode {
                         ))),
                     }
                 };
+                if let Err(e) = &round
+                    && e.is_transport_stale()
+                {
+                    let mut guard = transport_arc.lock().await;
+                    *guard = TcpTransport::new(self.identity.clone());
+                    if guard.connect(&peer).await.is_ok() {
+                        let res = tokio::time::timeout(
+                            self.sync_timing.sync_timeout,
+                            run_sync(
+                                &mut *guard,
+                                &self.hashgraph,
+                                &registry,
+                                self.node_id,
+                                &self.signing_key,
+                                peer.node_id,
+                                payload,
+                                timestamp,
+                            ),
+                        )
+                        .await;
+                        round = match res {
+                            Ok(r) => r,
+                            Err(_) => Err(GossipError::Sync(format!(
+                                "sync round with peer {peer:?} timed out after {:?}",
+                                self.sync_timing.sync_timeout
+                            ))),
+                        };
+                    }
+                }
 
                 match &round {
                     Err(e) => {
@@ -1095,10 +1186,17 @@ impl GossipNode {
                                     true_cache_hit_rate = m.true_cache_hit_rate(),
                                     effective_k = m.effective_k,
                                     concurrent_syncs = m.concurrent_syncs,
+                                    exec_avg_ns = m.exec_ns / m.exec_count.max(1),
+                                    exec_count = m.exec_count,
+                                    snapshot_avg_ns = m.snapshot_ns / m.snapshot_count.max(1),
+                                    snapshot_count = m.snapshot_count,
                                     consecutive_failures = consecutive_failures,
                                     "gossip metrics periodic"
                                 );
                             }
+                        }
+                        if self.gossip_metrics.lock().await.sync_attempts.is_multiple_of(10) {
+                            self.log_insert_timing().await;
                         }
                         tracing::debug!(
                             peer = ?peer.node_id,
@@ -1145,6 +1243,7 @@ impl GossipNode {
                 };
                 if decided > decided_watermark {
                     decided_watermark = decided;
+                    stall_ticks = 0;
                     tracing::info!(decided_round = decided, "round decided");
                     let m = self.gossip_metrics.lock().await.clone();
                     tracing::info!(
@@ -1162,6 +1261,10 @@ impl GossipNode {
                         true_cache_hit_rate = m.true_cache_hit_rate(),
                         effective_k = m.effective_k,
                         concurrent_syncs = m.concurrent_syncs,
+                        exec_avg_ns = m.exec_ns / m.exec_count.max(1),
+                        exec_count = m.exec_count,
+                        snapshot_avg_ns = m.snapshot_ns / m.snapshot_count.max(1),
+                        snapshot_count = m.snapshot_count,
                         consecutive_failures = consecutive_failures,
                         "gossip metrics"
                     );
@@ -1169,6 +1272,11 @@ impl GossipNode {
                     let cap = outbound_capacity(self.peers.lock().await.len());
                     if cache.cap() != cap {
                         cache.resize(cap);
+                    }
+                } else {
+                    stall_ticks += 1;
+                    if decided > 0 && stall_ticks.is_multiple_of(40) {
+                        self.log_decided_stall().await;
                     }
                 }
                 continue;
@@ -1313,13 +1421,31 @@ impl GossipNode {
                     let result = tokio::time::timeout(
                         self_clone.sync_timing.sync_timeout,
                         async {
-                            let (fresh, blocked) = exchange_delta(
+                            let mut exchange = exchange_delta(
                                 &mut *guard,
                                 &self_clone.hashgraph,
                                 &registry_clone,
                                 self_clone.node_id,
                             )
-                            .await?;
+                            .await;
+                            if let Err(e) = &exchange
+                                && e.is_transport_stale()
+                            {
+                                // A pooled connection can go stale without
+                                // `is_connected` noticing; reconnect fresh and
+                                // retry once before charging the round to the
+                                // peer.
+                                *guard = TcpTransport::new(self_clone.identity.clone());
+                                guard.connect(&peer_clone).await?;
+                                exchange = exchange_delta(
+                                    &mut *guard,
+                                    &self_clone.hashgraph,
+                                    &registry_clone,
+                                    self_clone.node_id,
+                                )
+                                .await;
+                            }
+                            let (fresh, blocked) = exchange?;
                             if blocked > 0 {
                                 tracing::warn!(
                                     blocked,
@@ -1424,6 +1550,9 @@ impl GossipNode {
                                     );
                                 }
                             }
+                            if metrics.lock().await.sync_attempts.is_multiple_of(10) {
+                                self_clone.log_insert_timing().await;
+                            }
                             if !outcome.pushback_delivered {
                                 tracing::warn!(
                                     peer = ?peer_clone.node_id,
@@ -1457,6 +1586,7 @@ impl GossipNode {
             };
             if decided > decided_watermark {
                 decided_watermark = decided;
+                stall_ticks = 0;
                 tracing::info!(decided_round = decided, "round decided");
                 let m = self.gossip_metrics.lock().await.clone();
                 tracing::info!(
@@ -1480,6 +1610,11 @@ impl GossipNode {
                 let cap = outbound_capacity(self.peers.lock().await.len());
                 if cache.cap() != cap {
                     cache.resize(cap);
+                }
+            } else {
+                stall_ticks += 1;
+                if decided > 0 && stall_ticks.is_multiple_of(40) {
+                    self.log_decided_stall().await;
                 }
             }
         }
@@ -1552,10 +1687,15 @@ impl GossipNode {
             // serialized state is captured at the same point, so a reconnect
             // learner can be served the state exactly as it stood at the
             // checkpoint round.
+            let mut exec_ns: u64 = 0;
+            let mut exec_count: u64 = 0;
+            let mut snapshot_ns: u64 = 0;
+            let mut snapshot_count: u64 = 0;
             let (state_hashes, snapshots, diffs) = {
                 let (pre_batch_hash, pre_batch_bytes) = {
                     let executor = self.executor.lock().await;
                     let root = executor.state().root();
+                    let t_snap = std::time::Instant::now();
                     let bytes = match executor.state().to_bytes() {
                         Ok(b) => b,
                         Err(e) => {
@@ -1564,6 +1704,8 @@ impl GossipNode {
                             return;
                         }
                     };
+                    snapshot_ns += t_snap.elapsed().as_nanos() as u64;
+                    snapshot_count += 1;
                     (root, bytes)
                 };
                 let mut activation = self.activation.lock().await;
@@ -1581,6 +1723,7 @@ impl GossipNode {
                 let original_watermark = *processed_through_round;
                 for (round, events) in by_round {
                     let before_root = executor.state().root();
+                    let t_exec = std::time::Instant::now();
                     let round_diffs_map = match executor.bucket_finalized_with_diffs(
                         pending,
                         processed_through_round,
@@ -1592,6 +1735,8 @@ impl GossipNode {
                             continue;
                         }
                     };
+                    exec_ns += t_exec.elapsed().as_nanos() as u64;
+                    exec_count += 1;
                     let pb_diffs: Vec<stream::pb::StateDiff> = round_diffs_map
                         .get(&round)
                         .map(|vec| {
@@ -1604,6 +1749,7 @@ impl GossipNode {
                         })
                         .unwrap_or_default();
                     let after_root = executor.state().root();
+                    let t_snap = std::time::Instant::now();
                     let snapshot = match executor.state().to_bytes() {
                         Ok(b) => b,
                         Err(e) => {
@@ -1612,6 +1758,8 @@ impl GossipNode {
                             return;
                         }
                     };
+                    snapshot_ns += t_snap.elapsed().as_nanos() as u64;
+                    snapshot_count += 1;
                     if round > original_watermark {
                         hashes.insert(round, after_root);
                         snapshots.insert(round, snapshot);
@@ -1642,6 +1790,14 @@ impl GossipNode {
                 }
                 (hashes, snapshots, diffs)
             };
+
+            {
+                let mut m = self.gossip_metrics.lock().await;
+                m.exec_ns = m.exec_ns.saturating_add(exec_ns);
+                m.exec_count = m.exec_count.saturating_add(exec_count);
+                m.snapshot_ns = m.snapshot_ns.saturating_add(snapshot_ns);
+                m.snapshot_count = m.snapshot_count.saturating_add(snapshot_count);
+            }
 
             // Phase C: activate ops whose activation round is now fully decided.
             let candidate_rrs: Vec<u64> = {

@@ -22,7 +22,9 @@ a process lifecycle. It adds no consensus logic of its own.
 - `src/bin/jkaind.rs` — thin binary wrapper forwarding argv to `node::cli`.
 - `src/control.rs` — the Unix-socket control plane: line-delimited JSON
   requests (`status`, `peers`, `submit_tx`) served over a `0600` socket, plus
-  the transaction payload encodings (`kv_op_payload`, `membership_op_payload`).
+  the transaction payload encodings (`kv_op_payload`, `membership_op_payload`,
+  `did_op_payload`, `sub_actor_op_payload`, `rebind_op_payload`). The control
+  subcommands submit through it: `jkaind tx put|delete|did|sub-actor|rebind`.
 - `src/config.rs` — the `cluster.toml` file format and its conversion to
   `gossip::ClusterConfig`.
 - `src/storage.rs` — atomic checkpoint persistence under the `--data`
@@ -79,7 +81,7 @@ key/config copy steps, and the add-a-third-member flow.
   a 200-byte BLS aggregate checkpoint. Both stream types are chained by a
   running hash and verified by `stream::verify` (+ `chain` + `BLS` + `Merkle`
   + `prev` + `diffs` + `proofs`, `STREAM_VERSION` 4). Data dir format is
-  `FORMAT_VERSION` 6 (200-byte checkpoint signing bytes, hard genesis break).
+  `FORMAT_VERSION` 7 (DID document v2 + reserved DID/actor state-key prefixes, hard genesis break).
 
 ## Boundaries
 

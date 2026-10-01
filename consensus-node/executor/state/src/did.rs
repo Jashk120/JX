@@ -3,7 +3,8 @@
 //! DID operations become a `Transaction` payload so they inherit consensus's
 //! existing ordering and agreement machinery. A `Transaction`'s payload bytes
 //! decode into exactly one [`DidOp`]; the executor applies it to the state by
-//! storing the [`DidDocument`] under the [`DidId`] key.
+//! storing the [`DidDocument`] under the [`did_state_key`] state key
+//! (`0xD1 || DidId::encode()`).
 //!
 //! The format mirrors the executor's `Op` encoding:
 //!
@@ -19,22 +20,27 @@
 //! [network_len: u32 BE][network bytes]
 //! [alias_len: u32 BE][alias bytes]
 //! [uuid: 16 bytes]
-//! [num_keys: u8]
-//! [key_0: 32 bytes]...[key_N: 32 bytes]
+//! [version: u8 (0x02)]
+//! [control_key: 32 bytes Ed25519]
+//! [num_methods: u8]
+//! [method_type: u8][method_key: 32 bytes] × num_methods
 //! [deactivated: u8 (0 or 1)]
 //! [signature: 64 bytes]
 //! [signed_by: u8]
 //! [is_creation: u8 (0 or 1)]
 //! ```
 //!
-//! `num_keys` must be in 1..=5; `signed_by` is an index into the
-//! authorizing document's verification methods. `is_creation` distinguishes
-//! a DID creation (must target an absent identifier) from an update or
-//! deactivation (must target an existing identifier). The signed payload is
-//! `DidId::encode() || DidDocument::encode()`.
+//! `num_methods` must be in 1..=5 (maximum TOTAL methods); at least one
+//! method must be Ed25519 signing (`0x01`); `0x02` is X25519 agreement.
+//! `signed_by` indexes the FILTERED, in-document order of Ed25519 signing
+//! methods only — never `control_key`, never an X25519 method. `is_creation`
+//! distinguishes a DID creation (must target an absent identifier) from an
+//! update or deactivation (must target an existing identifier). The signed
+//! payload is `b"jkain:did:v1" || DidId::encode() || DidDocument::encode()`.
 //!
-//! Decode-time deterministic rejects: more than 5 verification methods,
-//! empty list, truncated fields — same pattern as
+//! Decode-time deterministic rejects: wrong version, unknown method type,
+//! zero Ed25519 signing methods, empty or over-five method list, truncated
+//! fields, invalid Ed25519 point — same pattern as
 //! [`ExecutorError::Truncated`](crate::error::ExecutorError::Truncated).
 
 use ed25519_dalek::VerifyingKey;
@@ -44,6 +50,17 @@ use crate::error::{
     ExecutorError,
     Result,
 };
+
+/// Version byte of the v2 [`DidDocument`] binary encoding.
+pub const DID_DOCUMENT_VERSION: u8 = 0x02;
+/// Method type tag for Ed25519 signing (`ed25519_dalek::VerifyingKey`).
+pub const METHOD_TYPE_ED25519: u8 = 0x01;
+/// Method type tag for X25519 agreement (`x25519_dalek::PublicKey`).
+pub const METHOD_TYPE_X25519: u8 = 0x02;
+/// State-key prefix for DID records: `did_state_key(id) = 0xD1 || id.encode()`.
+pub const DID_STATE_PREFIX: u8 = 0xD1;
+/// Domain tag prefixing every [`DidOp`] signed payload.
+pub const DID_SIGNED_DOMAIN: &[u8] = b"jkain:did:v1";
 
 const MAX_VERIFICATION_METHODS: usize = 5;
 const UUID_LEN: usize = 16;
@@ -98,7 +115,10 @@ impl DidId {
         Ok(Self { network: network.to_owned(), alias: alias.to_owned(), uuid })
     }
 
-    /// Binary encoding for use as a state key.
+    /// Binary encoding of the identifier itself (unprefixed).
+    ///
+    /// The state key is [`did_state_key`] (`0xD1 || encode()`); the
+    /// [`DidOp`] signed payload uses this raw encoding after the domain tag.
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = Vec::new();
         write_bytes(&mut buf, self.network.as_bytes());
@@ -128,43 +148,115 @@ impl std::fmt::Display for DidId {
     }
 }
 
-/// A DID document containing verification methods and a deactivated flag.
+/// The state key for a DID record: `0xD1 || id.encode()`.
 ///
-/// The verification method list is capped at 5 entries and must be non-empty,
-/// enforced at decode time. The `deactivated` flag is a tombstone: when true
-/// the DID is considered retired but the state key remains present.
+/// `DidId::encode()` itself is unchanged and stays raw/unprefixed; only the
+/// state key carries the reserved `0xD1` prefix (generic KV writes to this
+/// prefix are rejected at decode time).
+pub fn did_state_key(id: &DidId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(1 + id.encode().len());
+    key.push(DID_STATE_PREFIX);
+    key.extend_from_slice(&id.encode());
+    key
+}
+
+/// A single type-tagged verification method of a [`DidDocument`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VerificationMethod {
+    /// Ed25519 signing method, addressable by `signed_by`.
+    Signing(VerifyingKey),
+    /// X25519 agreement method, never addressable by `signed_by`.
+    Agreement(x25519_dalek::PublicKey),
+}
+
+impl VerificationMethod {
+    /// The wire type tag: `0x01` for signing, `0x02` for agreement.
+    pub fn method_type(&self) -> u8 {
+        match self {
+            Self::Signing(_) => METHOD_TYPE_ED25519,
+            Self::Agreement(_) => METHOD_TYPE_X25519,
+        }
+    }
+
+    /// The raw 32 bytes of the method key.
+    pub fn key_bytes(&self) -> [u8; 32] {
+        match self {
+            Self::Signing(key) => key.to_bytes(),
+            Self::Agreement(key) => key.to_bytes(),
+        }
+    }
+}
+
+/// A versioned v2 DID document: explicit Ed25519 `control_key` plus
+/// type-tagged verification methods and a deactivated flag.
+///
+/// Binary encoding:
+/// `[version:u8 = 0x02][control_key: 32B][num_methods:u8][(type:u8,key:32B) × num_methods][deactivated:u8]`
+///
+/// `num_methods` must be in 1..=5 (maximum TOTAL methods) and at least one
+/// method must be Ed25519 signing. The `control_key` is independent of the
+/// method list: it participates in the canonical encoding (and thus every
+/// `DidOp` signature) and is never addressable by `signed_by`. The
+/// `deactivated` flag is a tombstone: when true the DID is considered retired
+/// but the state key remains present.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DidDocument {
-    verification_methods: Vec<VerifyingKey>,
+    control_key: VerifyingKey,
+    methods: Vec<VerificationMethod>,
     deactivated: bool,
 }
 
 impl DidDocument {
     pub fn new(
-        verification_methods: Vec<VerifyingKey>,
+        control_key: VerifyingKey,
+        methods: Vec<VerificationMethod>,
         deactivated: bool,
     ) -> std::result::Result<Self, ExecutorError> {
-        if verification_methods.is_empty() || verification_methods.len() > MAX_VERIFICATION_METHODS
-        {
+        if methods.is_empty() || methods.len() > MAX_VERIFICATION_METHODS {
             return Err(ExecutorError::Truncated);
         }
-        Ok(Self { verification_methods, deactivated })
+        if !methods.iter().any(|m| matches!(m, VerificationMethod::Signing(_))) {
+            return Err(ExecutorError::NoSigningMethod);
+        }
+        Ok(Self { control_key, methods, deactivated })
     }
 
-    pub fn verification_methods(&self) -> &[VerifyingKey] {
-        &self.verification_methods
+    pub fn control_key(&self) -> &VerifyingKey {
+        &self.control_key
+    }
+
+    pub fn methods(&self) -> &[VerificationMethod] {
+        &self.methods
     }
 
     pub fn deactivated(&self) -> bool {
         self.deactivated
     }
 
+    /// Returns the `index`-th Ed25519 signing method in filtered,
+    /// in-document order — skipping X25519 agreement methods.
+    ///
+    /// This is the only key `signed_by` can address: the `control_key` and
+    /// agreement methods are never reachable through this accessor.
+    pub fn signing_key(&self, index: usize) -> Option<&VerifyingKey> {
+        self.methods
+            .iter()
+            .filter_map(|m| match m {
+                VerificationMethod::Signing(key) => Some(key),
+                VerificationMethod::Agreement(_) => None,
+            })
+            .nth(index)
+    }
+
     /// Binary encoding for use as a state value.
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = Vec::new();
-        buf.push(self.verification_methods.len() as u8);
-        for key in &self.verification_methods {
-            buf.extend_from_slice(&key.to_bytes());
+        buf.push(DID_DOCUMENT_VERSION);
+        buf.extend_from_slice(&self.control_key.to_bytes());
+        buf.push(self.methods.len() as u8);
+        for method in &self.methods {
+            buf.push(method.method_type());
+            buf.extend_from_slice(&method.key_bytes());
         }
         buf.push(u8::from(self.deactivated));
         buf
@@ -172,20 +264,42 @@ impl DidDocument {
 
     /// Decodes a `DidDocument` from its binary encoding.
     pub fn decode(cursor: &mut &[u8]) -> std::result::Result<Self, ExecutorError> {
-        let num_keys = take_exact(cursor, 1)?[0] as usize;
-        if num_keys == 0 || num_keys > MAX_VERIFICATION_METHODS {
+        let version = take_exact(cursor, 1)?[0];
+        if version != DID_DOCUMENT_VERSION {
+            return Err(ExecutorError::UnsupportedDidDocumentVersion(version));
+        }
+        let control_bytes = take_exact(cursor, 32)?;
+        let control_arr: [u8; 32] =
+            control_bytes.try_into().map_err(|_| ExecutorError::Truncated)?;
+        let control_key =
+            VerifyingKey::from_bytes(&control_arr).map_err(|_| ExecutorError::Truncated)?;
+        let num_methods = take_exact(cursor, 1)?[0] as usize;
+        if num_methods == 0 || num_methods > MAX_VERIFICATION_METHODS {
             return Err(ExecutorError::Truncated);
         }
-        let mut verification_methods = Vec::with_capacity(num_keys);
-        for _ in 0..num_keys {
+        let mut methods = Vec::with_capacity(num_methods);
+        for _ in 0..num_methods {
+            let method_type = take_exact(cursor, 1)?[0];
             let key_bytes = take_exact(cursor, 32)?;
             let arr: [u8; 32] = key_bytes.try_into().map_err(|_| ExecutorError::Truncated)?;
-            let key = VerifyingKey::from_bytes(&arr).map_err(|_| ExecutorError::Truncated)?;
-            verification_methods.push(key);
+            match method_type {
+                METHOD_TYPE_ED25519 => {
+                    let key =
+                        VerifyingKey::from_bytes(&arr).map_err(|_| ExecutorError::Truncated)?;
+                    methods.push(VerificationMethod::Signing(key));
+                }
+                METHOD_TYPE_X25519 => {
+                    methods.push(VerificationMethod::Agreement(x25519_dalek::PublicKey::from(arr)));
+                }
+                other => return Err(ExecutorError::UnknownVerificationMethodType(other)),
+            }
         }
         let deactivated_byte = take_exact(cursor, 1)?[0];
         let deactivated = deactivated_byte != 0;
-        Ok(Self { verification_methods, deactivated })
+        if !methods.iter().any(|m| matches!(m, VerificationMethod::Signing(_))) {
+            return Err(ExecutorError::NoSigningMethod);
+        }
+        Ok(Self { control_key, methods, deactivated })
     }
 }
 
@@ -257,9 +371,12 @@ impl DidOp {
         buf
     }
 
-    /// The signed payload: `id.encode() || document.encode()`.
+    /// The signed payload: `b"jkain:did:v1" || id.encode() || document.encode()`.
+    ///
+    /// The domain tag is new in v2; `id.encode()` stays raw/unprefixed.
     pub fn signed_payload(&self) -> Vec<u8> {
-        let mut buf = self.id.encode();
+        let mut buf = Vec::from(DID_SIGNED_DOMAIN);
+        buf.extend_from_slice(&self.id.encode());
         buf.extend_from_slice(&self.document.encode());
         buf
     }
@@ -356,25 +473,27 @@ mod tests {
     }
 
     fn sample_document() -> DidDocument {
-        DidDocument::new(vec![verifying_key(1)], false).expect("valid doc")
+        DidDocument::new(
+            verifying_key(9),
+            vec![VerificationMethod::Signing(verifying_key(1))],
+            false,
+        )
+        .expect("valid doc")
     }
 
     fn sample_op() -> DidOp {
         let doc = sample_document();
         let id = sample_id();
-        let payload = {
-            let mut buf = id.encode();
-            buf.extend_from_slice(&doc.encode());
-            buf
-        };
-        let sig = signing_key(1).sign(&payload);
-        DidOp {
+        let mut unsigned = DidOp {
             id,
             document: doc,
-            signature: Signature::new(sig.to_bytes()),
+            signature: Signature::new([0u8; 64]),
             signed_by: 0,
             is_creation: true,
-        }
+        };
+        let sig = signing_key(1).sign(&unsigned.signed_payload());
+        unsigned.signature = Signature::new(sig.to_bytes());
+        unsigned
     }
 
     // --- DidId round-trip ---
@@ -482,12 +601,32 @@ mod tests {
         assert_eq!(DidId::decode(&mut cursor), Err(ExecutorError::InvalidDid));
     }
 
-    // --- DidDocument round-trip ---
+    // --- did_state_key ---
 
     #[test]
-    fn did_document_round_trips_through_encode_decode() {
-        let doc = DidDocument::new(vec![verifying_key(1), verifying_key(2)], true).expect("valid");
+    fn did_state_key_is_d1_prefixed_id_encoding() {
+        let id = sample_id();
+        let key = did_state_key(&id);
+        assert_eq!(key[0], 0xD1);
+        assert_eq!(&key[1..], &id.encode()[..]);
+    }
+
+    // --- DidDocument v2 round-trip ---
+
+    #[test]
+    fn did_document_v2_round_trips_with_control_key_and_x25519() {
+        let doc = DidDocument::new(
+            verifying_key(9),
+            vec![
+                VerificationMethod::Signing(verifying_key(1)),
+                VerificationMethod::Agreement(x25519_dalek::PublicKey::from([7u8; 32])),
+                VerificationMethod::Signing(verifying_key(2)),
+            ],
+            true,
+        )
+        .expect("valid");
         let encoded = doc.encode();
+        assert_eq!(encoded[0], 0x02);
         let mut cursor = &encoded[..];
         let decoded = DidDocument::decode(&mut cursor).expect("decodes");
         assert_eq!(decoded, doc);
@@ -495,14 +634,52 @@ mod tests {
     }
 
     #[test]
-    fn did_document_rejects_zero_keys() {
-        assert!(DidDocument::new(vec![], false).is_err());
+    fn did_document_encode_layout_matches_spec() {
+        let control = verifying_key(9);
+        let sign = verifying_key(1);
+        let agree = x25519_dalek::PublicKey::from([7u8; 32]);
+        let doc = DidDocument::new(
+            control,
+            vec![VerificationMethod::Signing(sign), VerificationMethod::Agreement(agree)],
+            false,
+        )
+        .expect("valid");
+        let mut expected = vec![0x02];
+        expected.extend_from_slice(&control.to_bytes());
+        expected.push(2);
+        expected.push(0x01);
+        expected.extend_from_slice(&sign.to_bytes());
+        expected.push(0x02);
+        expected.extend_from_slice(&agree.to_bytes());
+        expected.push(0);
+        assert_eq!(doc.encode(), expected);
     }
 
     #[test]
-    fn did_document_rejects_six_keys() {
-        let keys: Vec<VerifyingKey> = (0..6).map(verifying_key).collect();
-        assert!(DidDocument::new(keys, false).is_err());
+    fn did_document_new_rejects_zero_methods() {
+        assert_eq!(
+            DidDocument::new(verifying_key(9), vec![], false),
+            Err(ExecutorError::Truncated)
+        );
+    }
+
+    #[test]
+    fn did_document_new_rejects_six_methods() {
+        let methods: Vec<VerificationMethod> =
+            (0..6).map(|i| VerificationMethod::Signing(verifying_key(i))).collect();
+        assert_eq!(
+            DidDocument::new(verifying_key(9), methods, false),
+            Err(ExecutorError::Truncated)
+        );
+    }
+
+    #[test]
+    fn did_document_new_rejects_zero_signing_methods() {
+        let methods = vec![VerificationMethod::Agreement(x25519_dalek::PublicKey::from([7u8; 32]))];
+        assert_eq!(
+            DidDocument::new(verifying_key(9), methods, false),
+            Err(ExecutorError::NoSigningMethod)
+        );
     }
 
     // --- DidOp round-trip ---
@@ -535,28 +712,91 @@ mod tests {
         assert_eq!(DidOp::decode(&encoded), Err(ExecutorError::TrailingBytes));
     }
 
-    // --- DidDocument decode-time rejects ---
+    // --- DidDocument v2 decode-time rejects ---
 
-    #[test]
-    fn did_document_decode_rejects_zero_keys() {
-        let buf = [0u8];
-        let mut cursor = &buf[..];
-        assert_eq!(DidDocument::decode(&mut cursor), Err(ExecutorError::Truncated));
+    fn encode_doc_prefix(version: u8, control: &[u8; 32]) -> Vec<u8> {
+        let mut buf = vec![version];
+        buf.extend_from_slice(control);
+        buf
     }
 
     #[test]
-    fn did_document_decode_rejects_six_keys() {
-        let mut buf = vec![6u8];
-        buf.extend_from_slice(&[0u8; 6 * 32]);
+    fn did_document_decode_rejects_bad_version() {
+        let mut buf = encode_doc_prefix(0x01, &verifying_key(9).to_bytes());
+        buf.push(1);
+        buf.push(0x01);
+        buf.extend_from_slice(&verifying_key(1).to_bytes());
+        buf.push(0);
+        let mut cursor = &buf[..];
+        assert_eq!(
+            DidDocument::decode(&mut cursor),
+            Err(ExecutorError::UnsupportedDidDocumentVersion(0x01))
+        );
+    }
+
+    #[test]
+    fn did_document_decode_rejects_unknown_method_type() {
+        let mut buf = encode_doc_prefix(0x02, &verifying_key(9).to_bytes());
+        buf.push(2);
+        buf.push(0x01);
+        buf.extend_from_slice(&verifying_key(1).to_bytes());
+        buf.push(0x7f);
+        buf.extend_from_slice(&[0u8; 32]);
+        buf.push(0);
+        let mut cursor = &buf[..];
+        assert_eq!(
+            DidDocument::decode(&mut cursor),
+            Err(ExecutorError::UnknownVerificationMethodType(0x7f))
+        );
+    }
+
+    #[test]
+    fn did_document_decode_rejects_zero_signing_methods() {
+        let mut buf = encode_doc_prefix(0x02, &verifying_key(9).to_bytes());
+        buf.push(1);
+        buf.push(0x02);
+        buf.extend_from_slice(&[7u8; 32]);
+        buf.push(0);
+        let mut cursor = &buf[..];
+        assert_eq!(DidDocument::decode(&mut cursor), Err(ExecutorError::NoSigningMethod));
+    }
+
+    #[test]
+    fn did_document_decode_rejects_zero_methods() {
+        let mut buf = encode_doc_prefix(0x02, &verifying_key(9).to_bytes());
+        buf.push(0);
         buf.push(0);
         let mut cursor = &buf[..];
         assert_eq!(DidDocument::decode(&mut cursor), Err(ExecutorError::Truncated));
     }
 
     #[test]
+    fn did_document_decode_rejects_six_methods() {
+        let mut buf = encode_doc_prefix(0x02, &verifying_key(9).to_bytes());
+        buf.push(6);
+        for _ in 0..6 {
+            buf.push(0x01);
+            buf.extend_from_slice(&verifying_key(1).to_bytes());
+        }
+        buf.push(0);
+        let mut cursor = &buf[..];
+        assert_eq!(DidDocument::decode(&mut cursor), Err(ExecutorError::Truncated));
+    }
+
+    #[test]
+    fn did_document_decode_rejects_truncated_control_key() {
+        let buf = [0x02, 1, 2, 3];
+        let mut cursor = &buf[..];
+        assert_eq!(DidDocument::decode(&mut cursor), Err(ExecutorError::Truncated));
+    }
+
+    #[test]
     fn did_document_decode_rejects_truncated_key() {
-        let mut buf = vec![2u8];
-        buf.extend_from_slice(&[0u8; 32]);
+        let mut buf = encode_doc_prefix(0x02, &verifying_key(9).to_bytes());
+        buf.push(2);
+        buf.push(0x01);
+        buf.extend_from_slice(&verifying_key(1).to_bytes());
+        buf.push(0x01);
         buf.extend_from_slice(&[0u8; 10]);
         let mut cursor = &buf[..];
         assert_eq!(DidDocument::decode(&mut cursor), Err(ExecutorError::Truncated));
@@ -564,15 +804,19 @@ mod tests {
 
     #[test]
     fn did_document_decode_rejects_missing_deactivated_flag() {
-        let mut buf = vec![1u8];
-        buf.extend_from_slice(&[0u8; 32]);
+        let mut buf = encode_doc_prefix(0x02, &verifying_key(9).to_bytes());
+        buf.push(1);
+        buf.push(0x01);
+        buf.extend_from_slice(&verifying_key(1).to_bytes());
         let mut cursor = &buf[..];
         assert_eq!(DidDocument::decode(&mut cursor), Err(ExecutorError::Truncated));
     }
 
     #[test]
-    fn did_document_rejects_invalid_verifying_key_bytes() {
-        let mut buf = vec![1u8];
+    fn did_document_rejects_invalid_ed25519_point() {
+        let mut buf = encode_doc_prefix(0x02, &verifying_key(9).to_bytes());
+        buf.push(1);
+        buf.push(0x01);
         // A y-coordinate of 2 encodes no valid Edwards point.
         buf.extend_from_slice(&[
             2u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
@@ -583,12 +827,53 @@ mod tests {
         assert_eq!(DidDocument::decode(&mut cursor), Err(ExecutorError::Truncated));
     }
 
+    #[test]
+    fn did_document_rejects_invalid_control_key_point() {
+        let mut buf = vec![0x02];
+        buf.extend_from_slice(&[
+            2u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0,
+        ]);
+        buf.push(1);
+        buf.push(0x01);
+        buf.extend_from_slice(&verifying_key(1).to_bytes());
+        buf.push(0);
+        let mut cursor = &buf[..];
+        assert_eq!(DidDocument::decode(&mut cursor), Err(ExecutorError::Truncated));
+    }
+
+    // --- signing_key semantics ---
+
+    #[test]
+    fn signing_key_skips_x25519_and_never_covers_control_key() {
+        let control = verifying_key(9);
+        let first = verifying_key(1);
+        let second = verifying_key(2);
+        let doc = DidDocument::new(
+            control,
+            vec![
+                VerificationMethod::Agreement(x25519_dalek::PublicKey::from([7u8; 32])),
+                VerificationMethod::Signing(first),
+                VerificationMethod::Agreement(x25519_dalek::PublicKey::from([8u8; 32])),
+                VerificationMethod::Signing(second),
+            ],
+            false,
+        )
+        .expect("valid");
+        assert_eq!(doc.signing_key(0), Some(&first));
+        assert_eq!(doc.signing_key(1), Some(&second));
+        assert_eq!(doc.signing_key(2), None);
+        assert_ne!(doc.signing_key(0), Some(&control));
+        assert_ne!(doc.signing_key(1), Some(&control));
+    }
+
     // --- signed_payload consistency ---
 
     #[test]
-    fn signed_payload_matches_id_and_document_encoding() {
+    fn signed_payload_matches_domain_tag_and_encodings() {
         let op = sample_op();
-        let mut expected = op.id().encode();
+        let mut expected = Vec::from(b"jkain:did:v1".as_slice());
+        expected.extend_from_slice(&op.id().encode());
         expected.extend_from_slice(&op.document().encode());
         assert_eq!(op.signed_payload(), expected);
     }

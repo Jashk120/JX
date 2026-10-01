@@ -34,6 +34,10 @@ use primitives::{
     UnsignedEvent,
 };
 use state::StateDb;
+// Shared test-harness module: every gossip test binary includes it, but only
+// the heavy multi-node e2e tests use this wider liveness budget.
+#[allow(unused_imports)]
+pub use test_support::HEAVY_DEADLINE;
 pub use test_support::{
     DEADLINE,
     POLL_INTERVAL,

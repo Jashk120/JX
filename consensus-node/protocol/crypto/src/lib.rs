@@ -1,6 +1,7 @@
 pub mod bls;
 pub mod canonical;
 pub mod canonical_impls;
+pub mod derive;
 mod error;
 pub mod hash;
 pub mod hashable_impls;
@@ -19,6 +20,11 @@ pub use bls::{
     verify_pop,
 };
 pub use canonical::CanonicalEncode;
+pub use derive::{
+    actor_control_key,
+    derive_ed25519,
+    did_control_key,
+};
 pub use error::{
     CryptoError,
     Result,

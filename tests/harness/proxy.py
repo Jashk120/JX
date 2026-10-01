@@ -26,11 +26,10 @@ ephemeral).  ``set_partition(partA, partB)`` is approximated as:
   proxy so no peer can connect to it.  Its own outgoing connections to other
   proxies still succeed (asymmetric).  Use ``drop_all_to`` semantics for
   symmetric isolation via egress blocking on top.
-* ``set_partition(partA, partB)`` / ``set_isolated`` – when a partition is
-  active, proxies for nodes in the isolated group will drop all inbound
-  connections.  Intra-group traffic for the isolated group is also
-  affected; the majority group remains internally connected.  This still
-  triggers the intended consensus stall for hardening tests.
+* ``set_partition(partA, partB)`` / ``set_isolated`` – blocks the proxies of
+  every node in either group.  With two multi-node groups this blocks all
+  proxies (a total outage, not a split); with a singleton group the majority
+  stays internally connected.  See ``set_partition`` for the full caveat.
 
 For truly symmetric isolation of a single node, combine ingress blocking
 with a short ``drop_prob=1.0`` on all other proxies' handling of that
@@ -365,19 +364,28 @@ class LatencyMesh:
         """
         Block forwarding between partA and partB.
 
-        Approximation: proxies serving nodes in partB will drop all inbound
-        (so A cannot reach B), and proxies serving nodes in partA will drop
-        all inbound (so B cannot reach A).  Intra-group traffic for the
-        majority group is preserved only when isolating a single node via
-        ``isolate_node``; for a general split both groups will see increased
-        drops (full partition).  For hardening tests this still validates
-        stall/recovery behaviour.
+        This does **not** model a true split. Per-node proxies cannot tell which
+        node originated an inbound connection (the source port is ephemeral), so
+        cross-group edges cannot be blocked selectively. Every proxy whose node
+        appears in either group is blocked. When both groups have >= 2 members
+        that is all 2*N proxies -- a **total network outage**, not a partition.
 
-        For isolating one node, prefer ``isolate_node(node_id)`` which
-        preserves intra-group connectivity of the remaining nodes.
+        Intra-group traffic survives only in the single-node case: when one group
+        has exactly one member, that singleton is blocked and the majority is
+        left open. For isolating one node prefer ``isolate_node(node_id)``, which
+        expresses the same asymmetry directly.
+
+        Consequently, a test that passes two multi-node groups only exercises
+        global-outage stall/recovery; it is not evidence that a real partition is
+        handled.
         """
         set_a = set(part_a)
         set_b = set(part_b)
+        if len(set_a) > 1 and len(set_b) > 1:
+            logger.warning(
+                "set_partition: both groups have >1 node; this blocks every proxy "
+                "(total outage), not a true partition"
+            )
         self._partition = (set_a, set_b)
         # Block proxies for cross-group: to enforce separation we block
         # proxies on *both* sides.  For single-node isolation this is

@@ -43,4 +43,12 @@ impl GossipError {
     pub(crate) fn framing(message: impl Into<String>) -> Self {
         Self::Framing(message.into())
     }
+
+    /// A connection-level failure (dead socket / EOF) that a fresh connection
+    /// may fix, as opposed to a peer-level fault (malformed frame, wrong TLS
+    /// pin, consensus rejection). A round that fails this way is retried on a
+    /// new connection instead of being charged to the peer's health score.
+    pub(crate) fn is_transport_stale(&self) -> bool {
+        matches!(self, Self::Io(_) | Self::Closed)
+    }
 }

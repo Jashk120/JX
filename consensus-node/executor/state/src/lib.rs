@@ -22,18 +22,30 @@ mod did;
 mod error;
 mod executor;
 mod merkle;
+mod merkle_log;
 mod op;
+mod root_actor;
 mod state;
 mod state_db;
+mod sub_actor;
 
 pub use did::{
+    DID_DOCUMENT_VERSION,
+    DID_SIGNED_DOMAIN,
+    DID_STATE_PREFIX,
     DidDocument,
     DidId,
     DidOp,
+    METHOD_TYPE_ED25519,
+    METHOD_TYPE_X25519,
+    VerificationMethod,
+    did_state_key,
 };
 pub use error::{
+    ActorError,
     DidError,
     ExecutorError,
+    OpError,
     Result,
     StateDbError,
 };
@@ -47,9 +59,40 @@ pub use merkle::{
     MerkleProof,
     SparseMerkleTree,
 };
+pub use merkle_log::{
+    ConsistencyProof,
+    EMPTY_ROOT,
+    Hash,
+    InclusionProof,
+    leaf_hash,
+    mth,
+    node_hash,
+    prove_consistency,
+    prove_inclusion,
+    verify_consistency,
+    verify_inclusion,
+};
 pub use op::{
     DecodedOp,
     Op,
 };
+pub use root_actor::{
+    ACTOR_STATE_PREFIX,
+    ActorId,
+    RootActor,
+    Tag,
+    actor_state_key,
+};
 pub use state::State;
 pub use state_db::StateDb;
+pub use sub_actor::{
+    REBIND_SIGNED_DOMAIN,
+    RebindOp,
+    SUBACTOR_LEAF_DOMAIN,
+    SUBACTOR_SIGNED_DOMAIN,
+    SubActor,
+    SubActorOp,
+    SubActorOpParams,
+    subactor_leaf_data,
+    subactor_leaf_hash,
+};

@@ -24,6 +24,13 @@ pub const SYNC_TIMEOUT: Duration = Duration::from_millis(500);
 /// 30s is deliberately conservative for 2-core CI runners.
 pub const DEADLINE: Duration = Duration::from_secs(30);
 
+/// Liveness budget for the heavy multi-node e2e tests (live clusters plus
+/// checkpoint/reconnect traffic). They assert eventual progress, not a latency
+/// bound, so under full-workspace parallel load they can be starved well past
+/// [`DEADLINE`]; 90s absorbs scheduler contention while still failing a genuine
+/// hang. Not a protocol deadline.
+pub const HEAVY_DEADLINE: Duration = Duration::from_secs(90);
+
 /// Tighter poll interval used by `wait_for_*` helpers when they must poll.
 /// Tie to `SYNC_INTERVAL` where possible, but keep it distinct so helpers
 /// can poll slightly faster than the driver if desired.

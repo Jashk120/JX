@@ -1,5 +1,6 @@
-//! Control-socket client subcommands: `status`, `tx put|delete`, and
-//! `add-member` — they talk to a running node over its Unix socket.
+//! Control-socket client subcommands: `status`, `tx
+//! put|delete|did|sub-actor|rebind`, and `add-member` — they talk to a running
+//! node over its Unix socket.
 
 use std::net::SocketAddr;
 use std::path::{
@@ -14,7 +15,10 @@ use anyhow::{
 };
 use crypto::MembershipOp;
 use ed25519_dalek::VerifyingKey;
-use primitives::NodeId;
+use primitives::{
+    NodeId,
+    Signature,
+};
 use state::Op;
 
 use crate::cli::args::{
@@ -100,12 +104,17 @@ pub(crate) async fn status_cmd(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// `jkaind tx put|delete`: submits a KV transaction for consensus ordering.
+/// `jkaind tx put|delete|did|sub-actor|rebind`: submits a transaction for
+/// consensus ordering.
 pub(crate) async fn tx_cmd(args: &[String]) -> Result<()> {
-    let sub = args.first().context("tx requires a subcommand: put or delete")?;
+    let sub =
+        args.first().context("tx requires a subcommand: put, delete, did, sub-actor, or rebind")?;
     match sub.as_str() {
         "put" => tx_put(&args[1..]).await,
         "delete" => tx_delete(&args[1..]).await,
+        "did" => tx_did(&args[1..]).await,
+        "sub-actor" => tx_sub_actor(&args[1..]).await,
+        "rebind" => tx_rebind(&args[1..]).await,
         other => bail!("tx: unknown subcommand '{other}'"),
     }
 }
@@ -146,6 +155,305 @@ async fn tx_delete(args: &[String]) -> Result<()> {
     let op = Op::Delete { key: key.into_bytes() };
     submit_payload(&socket, &control::kv_op_payload(&op)).await?;
     tracing::info!(socket = %socket.display(), "delete queued");
+    Ok(())
+}
+
+/// Raw `--network/--alias/--uuid` flag values identifying a root DID. Shared
+/// by the actor subcommands so the root id is parsed one way everywhere.
+struct RootIdFlags {
+    network: Option<String>,
+    alias: Option<String>,
+    uuid_hex: Option<String>,
+}
+
+fn parse_root_did(cmd: &str, flags: &RootIdFlags) -> Result<state::DidId> {
+    let network =
+        flags.network.clone().with_context(|| format!("{cmd}: --network <s> is required"))?;
+    let alias = flags.alias.clone().with_context(|| format!("{cmd}: --alias <s> is required"))?;
+    let uuid_hex =
+        flags.uuid_hex.clone().with_context(|| format!("{cmd}: --uuid <32 hex> is required"))?;
+    let uuid = decode_uuid(&uuid_hex, cmd)?;
+    state::DidId::new(network, alias, uuid).map_err(|_| {
+        anyhow::anyhow!("{cmd}: invalid DID id (--network/--alias must not contain ':')")
+    })
+}
+
+fn decode_uuid(hex: &str, cmd: &str) -> Result<[u8; 16]> {
+    let bytes = crate::config::decode_hex_bytes(hex)
+        .with_context(|| format!("{cmd}: --uuid must be 32 hex chars (16 bytes)"))?;
+    if bytes.len() != 16 {
+        bail!("{cmd}: --uuid must be 32 hex chars (16 bytes), got {} bytes", bytes.len());
+    }
+    let mut uuid = [0u8; 16];
+    uuid.copy_from_slice(&bytes);
+    Ok(uuid)
+}
+
+fn decode_verifying_key(hex: &str, flag: &str, cmd: &str) -> Result<VerifyingKey> {
+    let bytes = decode_hex(hex)
+        .with_context(|| format!("{cmd}: {flag} must be 64 hex chars (32 bytes)"))?;
+    VerifyingKey::from_bytes(&bytes)
+        .with_context(|| format!("{cmd}: {flag} is not a valid Ed25519 verifying key"))
+}
+
+fn decode_signature(hex: &str, flag: &str, cmd: &str) -> Result<Signature> {
+    let bytes = crate::config::decode_hex_bytes(hex)
+        .with_context(|| format!("{cmd}: {flag} must be hex"))?;
+    if bytes.len() != 64 {
+        bail!("{cmd}: {flag} must be 128 hex chars (64 bytes), got {} bytes", bytes.len());
+    }
+    let mut arr = [0u8; 64];
+    arr.copy_from_slice(&bytes);
+    Ok(Signature::new(arr))
+}
+
+fn decode_hash(hex: &str, flag: &str, cmd: &str) -> Result<state::Hash> {
+    decode_hex(hex).with_context(|| format!("{cmd}: {flag} must be 64 hex chars (32 bytes)"))
+}
+
+fn parse_signed_by(signed_by: Option<&String>, cmd: &str) -> Result<u8> {
+    let value = signed_by.with_context(|| format!("{cmd}: --signed-by <u8> is required"))?;
+    value.parse().with_context(|| format!("{cmd}: invalid --signed-by '{value}'"))
+}
+
+fn parse_tag(value: &str, cmd: &str) -> Result<state::Tag> {
+    match value {
+        "defi" => Ok(state::Tag::Defi),
+        "messenger" => Ok(state::Tag::Messenger),
+        "game" => Ok(state::Tag::Game),
+        "generic" => Ok(state::Tag::Generic),
+        other => bail!("{cmd}: unknown --tag '{other}' (expected defi|messenger|game|generic)"),
+    }
+}
+
+fn parse_method(value: &str, cmd: &str) -> Result<state::VerificationMethod> {
+    let (kind, hex) = value.split_once(':').with_context(|| {
+        format!("{cmd}: invalid --method '{value}' (expected ed25519:<64 hex> or x25519:<64 hex>)")
+    })?;
+    let bytes = decode_hex(hex)
+        .with_context(|| format!("{cmd}: invalid --method '{value}' (key must be 64 hex chars)"))?;
+    match kind {
+        "ed25519" => {
+            Ok(state::VerificationMethod::Signing(VerifyingKey::from_bytes(&bytes).with_context(
+                || format!("{cmd}: invalid --method '{value}' (not an Ed25519 point)"),
+            )?))
+        }
+        "x25519" => Ok(state::VerificationMethod::Agreement(x25519_dalek::PublicKey::from(bytes))),
+        other => bail!("{cmd}: unknown --method kind '{other}' (expected ed25519 or x25519)"),
+    }
+}
+
+fn parse_index(index: Option<&String>, cmd: &str) -> Result<u32> {
+    let value = index.with_context(|| format!("{cmd}: --index <u32> is required"))?;
+    value.parse().with_context(|| format!("{cmd}: invalid --index '{value}'"))
+}
+
+/// `jkaind tx did`: submits a `DidOp` (`0x03`) transaction to a running node.
+/// `--create` marks a creation (else an update); `--deactivate` tombstones the
+/// DID and is mutually exclusive with `--create`.
+async fn tx_did(args: &[String]) -> Result<()> {
+    const CMD: &str = "tx did";
+    let mut socket = default_socket();
+    let mut id_flags = RootIdFlags { network: None, alias: None, uuid_hex: None };
+    let mut control_key_hex: Option<String> = None;
+    let mut methods: Vec<String> = Vec::new();
+    let mut signature_hex: Option<String> = None;
+    let mut signed_by: Option<String> = None;
+    let mut create = false;
+    let mut deactivate = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--socket" => socket = PathBuf::from(next_value(args, &mut i, "--socket")?),
+            "--network" => id_flags.network = Some(next_value(args, &mut i, "--network")?),
+            "--alias" => id_flags.alias = Some(next_value(args, &mut i, "--alias")?),
+            "--uuid" => id_flags.uuid_hex = Some(next_value(args, &mut i, "--uuid")?),
+            "--control-key" => control_key_hex = Some(next_value(args, &mut i, "--control-key")?),
+            "--method" => methods.push(next_value(args, &mut i, "--method")?),
+            "--signature" => signature_hex = Some(next_value(args, &mut i, "--signature")?),
+            "--signed-by" => signed_by = Some(next_value(args, &mut i, "--signed-by")?),
+            "--create" => {
+                create = true;
+                i += 1;
+            }
+            "--deactivate" => {
+                deactivate = true;
+                i += 1;
+            }
+            other => bail!("tx did: unknown argument '{other}'"),
+        }
+    }
+    if create && deactivate {
+        bail!("tx did: --create and --deactivate are mutually exclusive");
+    }
+    let id = parse_root_did(CMD, &id_flags)?;
+    let control_hex =
+        control_key_hex.with_context(|| format!("{CMD}: --control-key <64 hex> is required"))?;
+    let control_key = decode_verifying_key(&control_hex, "--control-key", CMD)?;
+    if methods.is_empty() {
+        bail!("tx did: at least one --method <ed25519:64hex|x25519:64hex> is required");
+    }
+    let mut parsed_methods = Vec::with_capacity(methods.len());
+    for method in &methods {
+        parsed_methods.push(parse_method(method, CMD)?);
+    }
+    if !parsed_methods.iter().any(|m| matches!(m, state::VerificationMethod::Signing(_))) {
+        bail!("tx did: at least one --method must be ed25519 (signing)");
+    }
+    let document = state::DidDocument::new(control_key, parsed_methods, deactivate)
+        .with_context(|| format!("{CMD}: invalid document"))?;
+    let sig_hex =
+        signature_hex.with_context(|| format!("{CMD}: --signature <128 hex> is required"))?;
+    let signature = decode_signature(&sig_hex, "--signature", CMD)?;
+    let signed_by = parse_signed_by(signed_by.as_ref(), CMD)?;
+    let op = state::DidOp::new(id, document, signature, signed_by, create);
+    submit_payload(&socket, &control::did_op_payload(&op)).await?;
+    tracing::info!(socket = %socket.display(), "did queued");
+    Ok(())
+}
+
+/// `jkaind tx sub-actor`: submits a `SubActorOp` (`0x04`) transaction to a
+/// running node. Both proofs travel as hex of their canonical encodings.
+async fn tx_sub_actor(args: &[String]) -> Result<()> {
+    const CMD: &str = "tx sub-actor";
+    let mut socket = default_socket();
+    let mut id_flags = RootIdFlags { network: None, alias: None, uuid_hex: None };
+    let mut tag: Option<String> = None;
+    let mut index: Option<String> = None;
+    let mut control_key_hex: Option<String> = None;
+    let mut operating_key_hex: Option<String> = None;
+    let mut new_root_hex: Option<String> = None;
+    let mut consistency_hex: Option<String> = None;
+    let mut inclusion_hex: Option<String> = None;
+    let mut signature_hex: Option<String> = None;
+    let mut signed_by: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--socket" => socket = PathBuf::from(next_value(args, &mut i, "--socket")?),
+            "--network" => id_flags.network = Some(next_value(args, &mut i, "--network")?),
+            "--alias" => id_flags.alias = Some(next_value(args, &mut i, "--alias")?),
+            "--uuid" => id_flags.uuid_hex = Some(next_value(args, &mut i, "--uuid")?),
+            "--tag" => tag = Some(next_value(args, &mut i, "--tag")?),
+            "--index" => index = Some(next_value(args, &mut i, "--index")?),
+            "--control-key" => control_key_hex = Some(next_value(args, &mut i, "--control-key")?),
+            "--operating-key" => {
+                operating_key_hex = Some(next_value(args, &mut i, "--operating-key")?);
+            }
+            "--new-root" => new_root_hex = Some(next_value(args, &mut i, "--new-root")?),
+            "--consistency-proof" => {
+                consistency_hex = Some(next_value(args, &mut i, "--consistency-proof")?);
+            }
+            "--inclusion-proof" => {
+                inclusion_hex = Some(next_value(args, &mut i, "--inclusion-proof")?);
+            }
+            "--signature" => signature_hex = Some(next_value(args, &mut i, "--signature")?),
+            "--signed-by" => signed_by = Some(next_value(args, &mut i, "--signed-by")?),
+            other => bail!("tx sub-actor: unknown argument '{other}'"),
+        }
+    }
+    let root_did = parse_root_did(CMD, &id_flags)?;
+    let tag_value =
+        tag.with_context(|| format!("{CMD}: --tag <defi|messenger|game|generic> is required"))?;
+    let tag = parse_tag(&tag_value, CMD)?;
+    let index = parse_index(index.as_ref(), CMD)?;
+    let control_hex =
+        control_key_hex.with_context(|| format!("{CMD}: --control-key <64 hex> is required"))?;
+    let control_key = decode_verifying_key(&control_hex, "--control-key", CMD)?;
+    let operating_hex = operating_key_hex
+        .with_context(|| format!("{CMD}: --operating-key <64 hex> is required"))?;
+    let operating_key = decode_verifying_key(&operating_hex, "--operating-key", CMD)?;
+    let root_hex =
+        new_root_hex.with_context(|| format!("{CMD}: --new-root <64 hex> is required"))?;
+    let new_root = decode_hash(&root_hex, "--new-root", CMD)?;
+    let consistency_value =
+        consistency_hex.with_context(|| format!("{CMD}: --consistency-proof <hex> is required"))?;
+    let consistency_bytes = crate::config::decode_hex_bytes(&consistency_value)
+        .with_context(|| format!("{CMD}: --consistency-proof must be hex"))?;
+    let consistency_proof = state::ConsistencyProof::decode(&consistency_bytes)
+        .with_context(|| format!("{CMD}: --consistency-proof does not decode"))?;
+    let inclusion_value =
+        inclusion_hex.with_context(|| format!("{CMD}: --inclusion-proof <hex> is required"))?;
+    let inclusion_bytes = crate::config::decode_hex_bytes(&inclusion_value)
+        .with_context(|| format!("{CMD}: --inclusion-proof must be hex"))?;
+    let inclusion_proof = state::InclusionProof::decode(&inclusion_bytes)
+        .with_context(|| format!("{CMD}: --inclusion-proof does not decode"))?;
+    let sig_hex =
+        signature_hex.with_context(|| format!("{CMD}: --signature <128 hex> is required"))?;
+    let signature = decode_signature(&sig_hex, "--signature", CMD)?;
+    let signed_by = parse_signed_by(signed_by.as_ref(), CMD)?;
+    let op = state::SubActorOp::new(state::SubActorOpParams {
+        root_did,
+        tag,
+        index,
+        control_key,
+        operating_key,
+        new_root,
+        consistency_proof,
+        inclusion_proof,
+        signature,
+        signed_by,
+    });
+    submit_payload(&socket, &control::sub_actor_op_payload(&op)).await?;
+    tracing::info!(socket = %socket.display(), "sub-actor queued");
+    Ok(())
+}
+
+/// `jkaind tx rebind`: submits a `RebindOp` (`0x05`) transaction to a running
+/// node, rotating a sub-actor's operating key under root control.
+async fn tx_rebind(args: &[String]) -> Result<()> {
+    const CMD: &str = "tx rebind";
+    let mut socket = default_socket();
+    let mut id_flags = RootIdFlags { network: None, alias: None, uuid_hex: None };
+    let mut tag: Option<String> = None;
+    let mut index: Option<String> = None;
+    let mut new_key_hex: Option<String> = None;
+    let mut pop_hex: Option<String> = None;
+    let mut auth_hex: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--socket" => socket = PathBuf::from(next_value(args, &mut i, "--socket")?),
+            "--network" => id_flags.network = Some(next_value(args, &mut i, "--network")?),
+            "--alias" => id_flags.alias = Some(next_value(args, &mut i, "--alias")?),
+            "--uuid" => id_flags.uuid_hex = Some(next_value(args, &mut i, "--uuid")?),
+            "--tag" => tag = Some(next_value(args, &mut i, "--tag")?),
+            "--index" => index = Some(next_value(args, &mut i, "--index")?),
+            "--new-operating-key" => {
+                new_key_hex = Some(next_value(args, &mut i, "--new-operating-key")?);
+            }
+            "--proof-of-possession" => {
+                pop_hex = Some(next_value(args, &mut i, "--proof-of-possession")?);
+            }
+            "--authorizing-signature" => {
+                auth_hex = Some(next_value(args, &mut i, "--authorizing-signature")?);
+            }
+            other => bail!("tx rebind: unknown argument '{other}'"),
+        }
+    }
+    let root_did = parse_root_did(CMD, &id_flags)?;
+    let tag_value =
+        tag.with_context(|| format!("{CMD}: --tag <defi|messenger|game|generic> is required"))?;
+    let tag = parse_tag(&tag_value, CMD)?;
+    let index = parse_index(index.as_ref(), CMD)?;
+    let key_hex =
+        new_key_hex.with_context(|| format!("{CMD}: --new-operating-key <64 hex> is required"))?;
+    let new_operating_key = decode_verifying_key(&key_hex, "--new-operating-key", CMD)?;
+    let pop_value =
+        pop_hex.with_context(|| format!("{CMD}: --proof-of-possession <128 hex> is required"))?;
+    let proof_of_possession = decode_signature(&pop_value, "--proof-of-possession", CMD)?;
+    let auth_value = auth_hex
+        .with_context(|| format!("{CMD}: --authorizing-signature <128 hex> is required"))?;
+    let authorizing_signature = decode_signature(&auth_value, "--authorizing-signature", CMD)?;
+    let actor_id = state::ActorId::Sub { root_did, tag, index };
+    let op = state::RebindOp::new(
+        actor_id,
+        new_operating_key,
+        proof_of_possession,
+        authorizing_signature,
+    );
+    submit_payload(&socket, &control::rebind_op_payload(&op)).await?;
+    tracing::info!(socket = %socket.display(), "rebind queued");
     Ok(())
 }
 

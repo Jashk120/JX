@@ -95,6 +95,16 @@ impl FanoutMode {
     }
 }
 
+/// Base delay applied after a peer's first consecutive failure.
+const BACKOFF_BASE: Duration = Duration::from_millis(100);
+/// Hard ceiling on a peer's backoff. Gossip is a liveness protocol: a peer
+/// must never be quarantined for long, and a probe is always allowed.
+const BACKOFF_CEILING: Duration = Duration::from_secs(2);
+/// A failure streak older than this is treated as stale and reset before the
+/// next failure is counted, so a briefly-flaky peer does not carry the streak
+/// (and its growing backoff) indefinitely.
+const FAILURE_STREAK_TTL: Duration = Duration::from_secs(10);
+
 /// Per-peer score state — ephemeral, not persisted. Collects G0 signals
 /// (success EWMA, RTT, freshness, diversity, backoff).
 #[derive(Clone, Debug)]
@@ -109,6 +119,8 @@ pub struct PeerScore {
     pub last_success: Option<Instant>,
     /// Consecutive failures for backoff.
     pub consecutive_failures: u32,
+    /// Time of the most recent failure, for decaying `consecutive_failures`.
+    pub last_failure: Option<Instant>,
     /// Backoff until (if penalized).
     pub backoff_until: Option<Instant>,
 }
@@ -121,6 +133,7 @@ impl Default for PeerScore {
             frontier_gap: 0,
             last_success: None,
             consecutive_failures: 0,
+            last_failure: None,
             backoff_until: None,
         }
     }
@@ -183,10 +196,21 @@ impl PeerManager {
             .map(|(idx, _)| idx)
             .collect();
         if eligible.is_empty() {
-            return None;
+            // Break glass: every peer is backed off. Probe the one recovering
+            // soonest rather than stalling the driver for a whole tick.
+            return self.soonest_recovering_peer();
         }
         let idx = eligible[self.rng.r#gen_range(0..eligible.len())];
         Some(self.peers[idx].clone())
+    }
+
+    /// The peer whose backoff expires soonest, used as a forced probe when no
+    /// peer is currently eligible. Returns `None` only when there are no peers.
+    fn soonest_recovering_peer(&self) -> Option<PeerInfo> {
+        self.peers
+            .iter()
+            .min_by_key(|p| self.scores.get(&p.node_id).and_then(|s| s.backoff_until))
+            .cloned()
     }
 
     pub fn pick_k(&mut self, k: usize) -> Vec<PeerInfo> {
@@ -245,9 +269,15 @@ impl PeerManager {
     pub fn record_failure(&mut self, peer: primitives::NodeId) {
         let entry = self.scores.entry(peer).or_default();
         entry.success_rate *= 0.9;
-        entry.consecutive_failures += 1;
-        let backoff_secs = 1u64 << entry.consecutive_failures.min(6);
-        entry.backoff_until = Some(Instant::now() + Duration::from_secs(backoff_secs));
+        let now = Instant::now();
+        if entry.last_failure.is_some_and(|t| now.duration_since(t) > FAILURE_STREAK_TTL) {
+            entry.consecutive_failures = 0;
+        }
+        entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
+        entry.last_failure = Some(now);
+        let exp = entry.consecutive_failures.min(5);
+        let backoff = BACKOFF_BASE.saturating_mul(1u32 << exp).min(BACKOFF_CEILING);
+        entry.backoff_until = Some(now + backoff);
     }
 
     pub fn set_frontier_gap(&mut self, peer: primitives::NodeId, gap: i64) {
@@ -478,6 +508,49 @@ mod tests {
         let picked = manager.pick_k(1);
         assert_eq!(picked.len(), 1);
         assert_eq!(picked[0].node_id, NodeId::new(1));
+    }
+
+    #[test]
+    fn random_peer_probes_when_all_backed_off() {
+        let peers = vec![peer(1), peer(2), peer(3)];
+        let mut manager = PeerManager::with_seed(peers, 7);
+        for id in 1..=3 {
+            manager.record_failure(NodeId::new(id));
+        }
+        assert_eq!(manager.backoff_count(), 3);
+        assert!(manager.random_peer().is_some(), "a probe must still be available");
+        assert_eq!(manager.pick_k(4).len(), 1, "pick_k must fall back to a probe");
+    }
+
+    #[test]
+    fn backoff_is_capped() {
+        let mut manager = PeerManager::with_seed(vec![peer(1)], 7);
+        for _ in 0..30 {
+            manager.record_failure(NodeId::new(1));
+        }
+        let until = manager
+            .scores
+            .get(&NodeId::new(1))
+            .and_then(|s| s.backoff_until)
+            .expect("backoff armed");
+        assert!(
+            until.duration_since(Instant::now()) <= BACKOFF_CEILING,
+            "backoff must not exceed the ceiling"
+        );
+    }
+
+    #[test]
+    fn stale_failure_streak_resets() {
+        let mut manager = PeerManager::with_seed(vec![peer(1)], 7);
+        {
+            let entry = manager.scores.entry(NodeId::new(1)).or_default();
+            entry.consecutive_failures = 5;
+            entry.last_failure =
+                Instant::now().checked_sub(FAILURE_STREAK_TTL + Duration::from_secs(1));
+        }
+        manager.record_failure(NodeId::new(1));
+        let failures = manager.scores.get(&NodeId::new(1)).unwrap().consecutive_failures;
+        assert_eq!(failures, 1, "a stale streak resets before the new failure is counted");
     }
 
     #[test]

@@ -7,6 +7,7 @@ edition.workspace = true
 [dependencies]
 primitives      =   {workspace = true}
 sha2            =   {workspace = true}
+hmac            =   {workspace = true}
 ed25519-dalek   =   {workspace = true, features = ["rand_core"]}
 thiserror       =   {workspace = true}
 blst            =   {workspace = true}
